@@ -18,6 +18,16 @@ set(APITRACE_PUBLIC_INCLUDE_DIRS
     ${PROJECT_SOURCE_DIR}/src/metal/include
 )
 
+set(APITRACE_PRIVATE_INCLUDE_DIRS
+    ${PROJECT_SOURCE_DIR}/src
+)
+
+add_library(apitrace_nlohmann_json INTERFACE)
+target_include_directories(apitrace_nlohmann_json
+    INTERFACE
+        ${PROJECT_SOURCE_DIR}/third_party/nlohmann_json/include
+)
+
 add_library(apitrace_core
     src/api/src/version.cpp
     src/capture/src/capture_hook_plan.cpp
@@ -37,6 +47,7 @@ add_library(apitrace_core
     src/metal/src/translation_trace_recorder.cpp
     src/capture/src/trace_session_state.cpp
     src/retrace/src/replay_session.cpp
+    src/retrace/src/d3d11_replay_parser.cpp
     src/trace/src/trace_bundle_reader.cpp
     src/trace/src/trace_bundle_writer.cpp
     src/trace/src/translation_link_writer.cpp
@@ -46,9 +57,12 @@ add_library(apitrace_core
 target_include_directories(apitrace_core
     PUBLIC
         ${APITRACE_PUBLIC_INCLUDE_DIRS}
+    PRIVATE
+        ${APITRACE_PRIVATE_INCLUDE_DIRS}
 )
 
 target_compile_features(apitrace_core PUBLIC cxx_std_17)
+target_link_libraries(apitrace_core PRIVATE apitrace_nlohmann_json)
 
 add_library(apitrace_platform_windows_d3d11 SHARED
     src/d3d11/src/d3d11_proxy.cpp
@@ -66,16 +80,22 @@ add_library(apitrace_platform_apple_metal
 target_include_directories(apitrace_platform_windows_d3d11
     PUBLIC
         ${APITRACE_PUBLIC_INCLUDE_DIRS}
+    PRIVATE
+        ${APITRACE_PRIVATE_INCLUDE_DIRS}
 )
 
 target_include_directories(apitrace_platform_windows_d3d12
     PUBLIC
         ${APITRACE_PUBLIC_INCLUDE_DIRS}
+    PRIVATE
+        ${APITRACE_PRIVATE_INCLUDE_DIRS}
 )
 
 target_include_directories(apitrace_platform_apple_metal
     PUBLIC
         ${APITRACE_PUBLIC_INCLUDE_DIRS}
+    PRIVATE
+        ${APITRACE_PRIVATE_INCLUDE_DIRS}
 )
 
 target_link_libraries(apitrace_platform_windows_d3d11 PRIVATE apitrace_core)
@@ -103,7 +123,12 @@ if(APITRACE_BUILD_TOOLS)
     set_target_properties(apitrace_retrace PROPERTIES OUTPUT_NAME retrace)
     target_link_libraries(apitrace_retrace PRIVATE apitrace_core)
     target_include_directories(apitrace_retrace PRIVATE ${APITRACE_PUBLIC_INCLUDE_DIRS})
+    target_include_directories(apitrace_retrace PRIVATE ${APITRACE_PRIVATE_INCLUDE_DIRS})
     target_compile_features(apitrace_retrace PRIVATE cxx_std_17)
+endif()
+
+if(WIN32)
+    target_link_libraries(apitrace_core PRIVATE d3d11 dxgi user32)
 endif()
 
 install(TARGETS apitrace_core

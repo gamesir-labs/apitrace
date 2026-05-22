@@ -59,7 +59,9 @@ public:
   const TraceMetadata &metadata() const noexcept;
   const std::vector<EventRecord> &events() const noexcept;
   const std::vector<AssetRecord> &assets() const noexcept;
+  const std::vector<ObjectRecord> &objects() const noexcept;
   const ChecksumIndex &checksums() const noexcept;
+  const std::string &last_error() const noexcept;
 
 private:
   // TODO: split bundle validation from bundle parsing once reader phases become explicit.
