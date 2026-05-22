@@ -9,9 +9,8 @@ TEST_BUILD_DIR="$ROOT_DIR/test/build/windows-x86_64"
 APITRACE_PREFIX="$ROOT_DIR/test/artifacts/windows-x86_64/apitrace"
 DEMO_PREFIX="$ROOT_DIR/test/artifacts/windows-x86_64/demo"
 DEMO_BIN_DIR="$DEMO_PREFIX/bin"
-TRACE_DIR="$DEMO_BIN_DIR/triangle-d3d11.apitrace"
-RUN_LOG="$DEMO_BIN_DIR/triangle-d3d11-run.log"
-VISUAL_SCREENSHOT="$DEMO_BIN_DIR/triangle-d3d11-visual.png"
+TRACE_ROOT_DIR="$DEMO_BIN_DIR/dx11-core-scene-traces"
+RUN_LOG_DIR="$DEMO_BIN_DIR/dx11-core-scene-logs"
 ROOT_TOOLCHAIN="$ROOT_DIR/test/toolchains/windows-x86_64-mingw.cmake"
 DOWNSTREAM_DLL="$ROOT_DIR/../wine-enviroment/lib/wine/x86_64-windows/d3d11.dll"
 WINE_PREFIX="$ROOT_DIR/test/artifacts/wineprefix-d3d11"
@@ -21,7 +20,7 @@ DXMT_WINEMETAL_DLL="$ROOT_DIR/../dxmt/build-gs-native-builtin/src/winemetal/wine
 DXMT_UNIX_DIR="$ROOT_DIR/../dxmt/build-gs-native-builtin/src/winemetal/unix"
 DXMT_PACKAGE_ROOT="$HOME/Library/Application Support/com.gamemac.test/wine-engine/downloads/dxmt-v0.80"
 DXMT_WINE_ROOT=""
-VISUAL_WINDOW_TITLE="${APITRACE_VISUAL_WINDOW_TITLE:-apitrace triangle d3d11}"
+VISUAL_WINDOW_TITLE="${APITRACE_VISUAL_WINDOW_TITLE:-apitrace test demo}"
 VISUAL_DESKTOP="${APITRACE_WINE_VIRTUAL_DESKTOP:-apitrace,1400x900}"
 
 if [ -n "${APITRACE_VISUAL_CHECK:-}" ]; then
@@ -31,6 +30,8 @@ elif [ "$(uname -s)" = "Darwin" ]; then
 else
     VISUAL_CHECK=0
 fi
+
+SCENES="smoke_triangle indexed_instancing textured_quad depth_blend_scissor offscreen_copy_composite"
 
 wine_path() {
     printf 'Z:%s' "$(printf '%s' "$1" | sed 's|/|\\\\|g')"
@@ -200,7 +201,7 @@ if [ -x "$WINESERVER_BIN" ]; then
     WINEPREFIX="$WINE_PREFIX" WINEARCH="win64" "$WINESERVER_BIN" -k >/dev/null 2>&1 || true
 fi
 
-rm -rf "$ROOT_BUILD_DIR" "$TEST_BUILD_DIR" "$APITRACE_PREFIX" "$DEMO_PREFIX" "$TRACE_DIR" "$VISUAL_SCREENSHOT"
+rm -rf "$ROOT_BUILD_DIR" "$TEST_BUILD_DIR" "$APITRACE_PREFIX" "$DEMO_PREFIX" "$TRACE_ROOT_DIR" "$RUN_LOG_DIR"
 
 cmake -S "$ROOT_DIR" -B "$ROOT_BUILD_DIR" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$ROOT_TOOLCHAIN" \
@@ -227,7 +228,6 @@ for runtime_dll in libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
 done
 
 export APITRACE_DOWNSTREAM_D3D11="$(wine_path "$DXMT_D3D11_DLL")"
-export APITRACE_TRACE_BUNDLE="$(wine_path "$TRACE_DIR")"
 if [ "$VISUAL_CHECK" != "0" ]; then
     export APITRACE_TRIANGLE_MAX_FRAMES=300
 else
@@ -248,47 +248,59 @@ if [ ! -f "$WINE_PREFIX/system.reg" ]; then
     "$WINE_BIN" wineboot -u >/dev/null 2>&1 || true
 fi
 
-if [ "$VISUAL_CHECK" != "0" ]; then
-    "$WINE_BIN" explorer "/desktop=$VISUAL_DESKTOP" "$DEMO_BIN_DIR/apitrace_triangle_d3d11.exe" >"$RUN_LOG" 2>&1 &
-    wine_pid="$!"
-    (
-        capture_visual_window "$VISUAL_WINDOW_TITLE" "$VISUAL_SCREENSHOT"
-    ) &
-    capture_pid="$!"
-else
-    "$WINE_BIN" "$DEMO_BIN_DIR/apitrace_triangle_d3d11.exe" >"$RUN_LOG" 2>&1 &
-    wine_pid="$!"
-    capture_pid=""
-fi
+mkdir -p "$TRACE_ROOT_DIR" "$RUN_LOG_DIR"
 
-deadline="$(( $(date +%s) + 90 ))"
-while kill -0 "$wine_pid" 2>/dev/null; do
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-        kill "$wine_pid" >/dev/null 2>&1 || true
-        wait "$wine_pid" >/dev/null 2>&1 || true
-        echo "wine demo timed out" >&2
-        exit 1
+run_scene() {
+    scene="$1"
+    trace_dir="$TRACE_ROOT_DIR/$scene.apitrace"
+    run_log="$RUN_LOG_DIR/$scene-run.log"
+    visual_screenshot="$RUN_LOG_DIR/$scene-visual.png"
+
+    rm -rf "$trace_dir" "$run_log" "$visual_screenshot"
+    export APITRACE_TRACE_BUNDLE="$(wine_path "$trace_dir")"
+
+    if [ "$VISUAL_CHECK" != "0" ]; then
+        "$WINE_BIN" explorer "/desktop=$VISUAL_DESKTOP" "$DEMO_BIN_DIR/apitrace_test_demo.exe" --dx dx11 --scene "$scene" >"$run_log" 2>&1 &
+        wine_pid="$!"
+        (
+            capture_visual_window "$VISUAL_WINDOW_TITLE" "$visual_screenshot"
+        ) &
+        capture_pid="$!"
+    else
+        "$WINE_BIN" "$DEMO_BIN_DIR/apitrace_test_demo.exe" --dx dx11 --scene "$scene" >"$run_log" 2>&1 &
+        wine_pid="$!"
+        capture_pid=""
     fi
-    sleep 1
-done
 
-wait "$wine_pid"
+    deadline="$(( $(date +%s) + 90 ))"
+    while kill -0 "$wine_pid" 2>/dev/null; do
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            kill "$wine_pid" >/dev/null 2>&1 || true
+            wait "$wine_pid" >/dev/null 2>&1 || true
+            echo "wine demo timed out for scene: $scene" >&2
+            exit 1
+        fi
+        sleep 1
+    done
 
-if [ -n "$capture_pid" ]; then
-    wait "$capture_pid"
-    if [ ! -f "$VISUAL_SCREENSHOT" ]; then
-        echo "missing visual screenshot: $VISUAL_SCREENSHOT" >&2
-        exit 1
+    wait "$wine_pid"
+
+    if [ -n "$capture_pid" ]; then
+        wait "$capture_pid"
+        if [ ! -f "$visual_screenshot" ]; then
+            echo "missing visual screenshot: $visual_screenshot" >&2
+            exit 1
+        fi
+        validate_visual_window "$visual_screenshot"
     fi
-    validate_visual_window "$VISUAL_SCREENSHOT"
-fi
 
-python3 - "$TRACE_DIR" <<'PY'
+    python3 - "$trace_dir" "$scene" <<'PY'
 import json
 import pathlib
 import sys
 
 trace_dir = pathlib.Path(sys.argv[1])
+scene_name = sys.argv[2]
 callstream = trace_dir / "callstream.jsonl"
 checksums = trace_dir / "checksums.json"
 objects = trace_dir / "objects" / "objects.json"
@@ -323,20 +335,70 @@ sequences = [record["sequence"] for record in records if "sequence" in record]
 if sequences != sorted(sequences):
     raise SystemExit("callstream sequence is not monotonic")
 
-required_functions = [
-    "D3D11CreateDeviceAndSwapChain",
-    "ID3D11Device::CreateBuffer",
-    "ID3D11DeviceContext::Draw",
-    "IDXGISwapChain::Present",
-]
 seen_functions = {
     record.get("function")
     for record in records
     if record.get("record_kind") == "call"
 }
+
+scene_required_functions = {
+    "smoke_triangle": [
+        "D3D11CreateDeviceAndSwapChain",
+        "ID3D11Device::CreateBuffer",
+        "ID3D11DeviceContext::Draw",
+        "IDXGISwapChain::Present",
+    ],
+    "indexed_instancing": [
+        "D3D11CreateDeviceAndSwapChain",
+        "ID3D11DeviceContext::IASetIndexBuffer",
+        "ID3D11DeviceContext::DrawIndexed",
+        "ID3D11DeviceContext::DrawIndexedInstanced",
+        "IDXGISwapChain::Present",
+    ],
+    "textured_quad": [
+        "D3D11CreateDeviceAndSwapChain",
+        "ID3D11Device::CreateTexture2D",
+        "ID3D11DeviceContext::UpdateSubresource",
+        "ID3D11Device::CreateShaderResourceView",
+        "ID3D11Device::CreateSamplerState",
+        "ID3D11DeviceContext::PSSetShaderResources",
+        "ID3D11DeviceContext::PSSetSamplers",
+        "IDXGISwapChain::Present",
+    ],
+    "depth_blend_scissor": [
+        "D3D11CreateDeviceAndSwapChain",
+        "ID3D11Device::CreateTexture2D",
+        "ID3D11Device::CreateDepthStencilView",
+        "ID3D11Device::CreateDepthStencilState",
+        "ID3D11Device::CreateBlendState",
+        "ID3D11Device::CreateRasterizerState",
+        "ID3D11DeviceContext::ClearDepthStencilView",
+        "ID3D11DeviceContext::RSSetState",
+        "ID3D11DeviceContext::RSSetScissorRects",
+        "ID3D11DeviceContext::OMSetDepthStencilState",
+        "ID3D11DeviceContext::OMSetBlendState",
+        "IDXGISwapChain::Present",
+    ],
+    "offscreen_copy_composite": [
+        "D3D11CreateDeviceAndSwapChain",
+        "ID3D11Device::CreateTexture2D",
+        "ID3D11Device::CreateRenderTargetView",
+        "ID3D11Device::CreateShaderResourceView",
+        "ID3D11Device::CreateSamplerState",
+        "ID3D11DeviceContext::CopyResource",
+        "ID3D11DeviceContext::PSSetShaderResources",
+        "ID3D11DeviceContext::PSSetSamplers",
+        "IDXGISwapChain::Present",
+    ],
+}
+
+required_functions = scene_required_functions.get(scene_name)
+if required_functions is None:
+    raise SystemExit(f"unknown scene for validation: {scene_name}")
+
 missing = [name for name in required_functions if name not in seen_functions]
 if missing:
-    raise SystemExit(f"missing required call records: {missing}")
+    raise SystemExit(f"{scene_name}: missing required call records: {missing}")
 
 def first_call(function_name: str):
     for record in records:
@@ -396,17 +458,44 @@ if not isinstance(bindings, list) or not bindings:
 if not all(isinstance(binding, dict) and required_binding_keys.issubset(binding) for binding in bindings):
     raise SystemExit("IASetVertexBuffers payload has incomplete binding descriptors")
 
+markers = [
+    record for record in records
+    if record.get("record_kind") == "boundary" and record.get("boundary") == "DebugMarker"
+]
+
+def has_marker(phase: str) -> bool:
+    for marker in markers:
+        payload = marker.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("scene_name") == scene_name and payload.get("dx_mode") == "dx11" and payload.get("phase") == phase:
+            return True
+    return False
+
+if not has_marker("start"):
+    raise SystemExit(f"{scene_name}: missing scene start DebugMarker")
+if not has_marker("end"):
+    raise SystemExit(f"{scene_name}: missing scene end DebugMarker")
+
+def collect_paths(value):
+    paths = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key.endswith("_path") and isinstance(child, str):
+                paths.append(child)
+            else:
+                paths.extend(collect_paths(child))
+    elif isinstance(value, list):
+        for child in value:
+            paths.extend(collect_paths(child))
+    return paths
+
 referenced_paths = []
 for record in records:
-    payload = record.get("payload")
-    if not isinstance(payload, dict):
-        continue
-    for key, value in payload.items():
-        if key.endswith("_path") and isinstance(value, str):
-            referenced_paths.append(value)
+    referenced_paths.extend(collect_paths(record.get("payload")))
 
 if not referenced_paths:
-    raise SystemExit("no asset paths were referenced from callstream payloads")
+    raise SystemExit(f"{scene_name}: no asset paths were referenced from callstream payloads")
 
 for relative_path in referenced_paths:
     path = trace_dir / relative_path
@@ -415,13 +504,34 @@ for relative_path in referenced_paths:
     if path.stat().st_size == 0:
         raise SystemExit(f"empty referenced asset: {relative_path}")
 
+if not any(path.startswith("textures/") for path in referenced_paths):
+    raise SystemExit(f"{scene_name}: expected at least one referenced texture asset")
+if not any(path.startswith("buffers/") for path in referenced_paths):
+    raise SystemExit(f"{scene_name}: expected at least one referenced buffer asset")
+
+texture_readback_unmaps = [
+    record for record in records
+    if record.get("record_kind") == "call"
+    and record.get("function") == "ID3D11DeviceContext::Unmap"
+    and isinstance(record.get("payload"), dict)
+    and record["payload"].get("resource_class") == "texture2d"
+    and isinstance(record["payload"].get("snapshot_path"), str)
+]
+if not texture_readback_unmaps:
+    raise SystemExit(f"{scene_name}: missing texture readback snapshot path on Unmap")
+
 print("validated trace bundle:", trace_dir)
+print("scene:", scene_name)
 print("events:", len(records))
 print("assets:", len(referenced_paths))
 PY
+    echo "scene run log: $run_log"
+    echo "scene trace bundle: $trace_dir"
+    if [ "$VISUAL_CHECK" != "0" ]; then
+        echo "scene visual screenshot: $visual_screenshot"
+    fi
+}
 
-echo "run log: $RUN_LOG"
-echo "trace bundle: $TRACE_DIR"
-if [ "$VISUAL_CHECK" != "0" ]; then
-    echo "visual screenshot: $VISUAL_SCREENSHOT"
-fi
+for scene in $SCENES; do
+    run_scene "$scene"
+done

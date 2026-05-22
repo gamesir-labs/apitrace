@@ -1,0 +1,927 @@
+#include "scenes/dx11/scenes.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+
+namespace demo::scenes::dx11 {
+
+namespace {
+
+using demo::runtime::dx11::Dx11Runtime;
+using demo::runtime::dx11::PixelExpectation;
+using demo::runtime::dx11::PixelRgba8;
+using demo::runtime::dx11::ValidationResult;
+
+struct PosColorVertex {
+    float position[3];
+    float color[4];
+};
+
+struct Pos2Vertex {
+    float position[2];
+};
+
+struct InstanceVertex {
+    float offset[2];
+    float color[4];
+};
+
+struct PosUvVertex {
+    float position[3];
+    float uv[2];
+};
+
+struct TintConstants {
+    float tint[4];
+};
+
+const char *vertex_shader_profile(D3D_FEATURE_LEVEL feature_level)
+{
+    switch (feature_level) {
+    case D3D_FEATURE_LEVEL_11_1:
+    case D3D_FEATURE_LEVEL_11_0:
+        return "vs_5_0";
+    case D3D_FEATURE_LEVEL_10_1:
+    case D3D_FEATURE_LEVEL_10_0:
+        return "vs_4_0";
+    case D3D_FEATURE_LEVEL_9_3:
+        return "vs_4_0_level_9_3";
+    case D3D_FEATURE_LEVEL_9_2:
+    case D3D_FEATURE_LEVEL_9_1:
+        return "vs_4_0_level_9_1";
+    default:
+        return "vs_4_0";
+    }
+}
+
+const char *pixel_shader_profile(D3D_FEATURE_LEVEL feature_level)
+{
+    switch (feature_level) {
+    case D3D_FEATURE_LEVEL_11_1:
+    case D3D_FEATURE_LEVEL_11_0:
+        return "ps_5_0";
+    case D3D_FEATURE_LEVEL_10_1:
+    case D3D_FEATURE_LEVEL_10_0:
+        return "ps_4_0";
+    case D3D_FEATURE_LEVEL_9_3:
+        return "ps_4_0_level_9_3";
+    case D3D_FEATURE_LEVEL_9_2:
+    case D3D_FEATURE_LEVEL_9_1:
+        return "ps_4_0_level_9_1";
+    default:
+        return "ps_4_0";
+    }
+}
+
+PixelRgba8 rgba(float r, float g, float b, float a = 1.0f)
+{
+    const auto convert = [](float value) -> std::uint8_t {
+        const float clamped = std::max(0.0f, std::min(1.0f, value));
+        return static_cast<std::uint8_t>(std::lround(clamped * 255.0f));
+    };
+
+    return PixelRgba8{convert(r), convert(g), convert(b), convert(a)};
+}
+
+unsigned int sample_x(const Dx11Runtime &runtime, float fraction)
+{
+    return static_cast<unsigned int>(std::lround(static_cast<double>(runtime.width()) * fraction));
+}
+
+unsigned int sample_y(const Dx11Runtime &runtime, float fraction)
+{
+    return static_cast<unsigned int>(std::lround(static_cast<double>(runtime.height()) * fraction));
+}
+
+template <typename T>
+demo::ComPtr<ID3D11Buffer> create_static_buffer(
+    ID3D11Device *device,
+    UINT bind_flags,
+    const T *data,
+    std::size_t count
+)
+{
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = static_cast<UINT>(sizeof(T) * count);
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = bind_flags;
+
+    D3D11_SUBRESOURCE_DATA initial_data{};
+    initial_data.pSysMem = data;
+
+    demo::ComPtr<ID3D11Buffer> buffer;
+    demo::check_hr(device->CreateBuffer(&desc, &initial_data, buffer.put()), "CreateBuffer(static) failed");
+    return buffer;
+}
+
+template <typename T>
+demo::ComPtr<ID3D11Buffer> create_dynamic_constant_buffer(ID3D11Device *device)
+{
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = sizeof(T);
+    desc.Usage = D3D11_USAGE_DYNAMIC;
+    desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+    demo::ComPtr<ID3D11Buffer> buffer;
+    demo::check_hr(device->CreateBuffer(&desc, nullptr, buffer.put()), "CreateBuffer(constant) failed");
+    return buffer;
+}
+
+template <typename T>
+void update_dynamic_buffer(ID3D11DeviceContext *context, ID3D11Buffer *buffer, const T &value)
+{
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    demo::check_hr(context->Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped), "Map(constant) failed");
+    std::memcpy(mapped.pData, &value, sizeof(T));
+    context->Unmap(buffer, 0);
+}
+
+struct ShaderProgram {
+    demo::ComPtr<ID3D11VertexShader> vertex_shader;
+    demo::ComPtr<ID3D11PixelShader> pixel_shader;
+    demo::ComPtr<ID3D11InputLayout> input_layout;
+};
+
+ShaderProgram create_program(
+    Dx11Runtime &runtime,
+    const char *source,
+    const D3D11_INPUT_ELEMENT_DESC *input_layout_desc,
+    UINT input_layout_count
+)
+{
+    ShaderProgram program;
+    demo::ComPtr<ID3DBlob> vs_blob = demo::compile_shader(
+        source,
+        "vs_main",
+        vertex_shader_profile(runtime.feature_level())
+    );
+    demo::ComPtr<ID3DBlob> ps_blob = demo::compile_shader(
+        source,
+        "ps_main",
+        pixel_shader_profile(runtime.feature_level())
+    );
+
+    demo::check_hr(
+        runtime.device()->CreateVertexShader(
+            vs_blob->GetBufferPointer(),
+            vs_blob->GetBufferSize(),
+            nullptr,
+            program.vertex_shader.put()
+        ),
+        "CreateVertexShader failed"
+    );
+    demo::check_hr(
+        runtime.device()->CreatePixelShader(
+            ps_blob->GetBufferPointer(),
+            ps_blob->GetBufferSize(),
+            nullptr,
+            program.pixel_shader.put()
+        ),
+        "CreatePixelShader failed"
+    );
+    demo::check_hr(
+        runtime.device()->CreateInputLayout(
+            input_layout_desc,
+            input_layout_count,
+            vs_blob->GetBufferPointer(),
+            vs_blob->GetBufferSize(),
+            program.input_layout.put()
+        ),
+        "CreateInputLayout failed"
+    );
+    return program;
+}
+
+template <typename RenderFn, typename ValidateFn>
+ValidationResult run_scene_frames(
+    Dx11Runtime &runtime,
+    unsigned int frame_budget,
+    RenderFn &&render_frame,
+    ValidateFn &&validate_frame
+)
+{
+    const unsigned int frames = frame_budget == 0 ? 1U : frame_budget;
+    ValidationResult result{};
+
+    for (unsigned int frame = 0; frame < frames; ++frame) {
+        if (!runtime.pump_messages()) {
+            return {false, "window closed before validation completed"};
+        }
+
+        render_frame(frame);
+        if (frame + 1 == frames) {
+            result = validate_frame();
+        }
+        runtime.present();
+        if (frame + 1 < frames) {
+            Sleep(16);
+        }
+    }
+
+    return result;
+}
+
+ValidationResult validate_back_buffer(
+    Dx11Runtime &runtime,
+    std::initializer_list<PixelExpectation> expectations
+)
+{
+    return runtime.validate_pixels(runtime.back_buffer(), expectations.begin(), expectations.size());
+}
+
+const char *smoke_triangle_shader_source()
+{
+    return R"(
+cbuffer TintData : register(b0)
+{
+    float4 tint;
+};
+
+struct VSInput
+{
+    float3 position : POSITION;
+    float4 color : COLOR0;
+};
+
+struct PSInput
+{
+    float4 position : SV_POSITION;
+    float4 color : COLOR0;
+};
+
+PSInput vs_main(VSInput input)
+{
+    PSInput output;
+    output.position = float4(input.position, 1.0);
+    output.color = input.color;
+    return output;
+}
+
+float4 ps_main(PSInput input) : SV_TARGET
+{
+    return input.color * tint;
+}
+)";
+}
+
+const char *instancing_shader_source()
+{
+    return R"(
+struct VSInput
+{
+    float2 position : POSITION;
+    float2 instanceOffset : TEXCOORD0;
+    float4 instanceColor : COLOR0;
+};
+
+struct PSInput
+{
+    float4 position : SV_POSITION;
+    float4 color : COLOR0;
+};
+
+PSInput vs_main(VSInput input)
+{
+    PSInput output;
+    output.position = float4(input.position + input.instanceOffset, 0.0, 1.0);
+    output.color = input.instanceColor;
+    return output;
+}
+
+float4 ps_main(PSInput input) : SV_TARGET
+{
+    return input.color;
+}
+)";
+}
+
+const char *textured_shader_source()
+{
+    return R"(
+Texture2D colorTexture : register(t0);
+SamplerState colorSampler : register(s0);
+
+struct VSInput
+{
+    float3 position : POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+struct PSInput
+{
+    float4 position : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+PSInput vs_main(VSInput input)
+{
+    PSInput output;
+    output.position = float4(input.position, 1.0);
+    output.uv = input.uv;
+    return output;
+}
+
+float4 ps_main(PSInput input) : SV_TARGET
+{
+    return colorTexture.Sample(colorSampler, input.uv);
+}
+)";
+}
+
+const char *pos_color_shader_source()
+{
+    return R"(
+struct VSInput
+{
+    float3 position : POSITION;
+    float4 color : COLOR0;
+};
+
+struct PSInput
+{
+    float4 position : SV_POSITION;
+    float4 color : COLOR0;
+};
+
+PSInput vs_main(VSInput input)
+{
+    PSInput output;
+    output.position = float4(input.position, 1.0);
+    output.color = input.color;
+    return output;
+}
+
+float4 ps_main(PSInput input) : SV_TARGET
+{
+    return input.color;
+}
+)";
+}
+
+const char *composite_shader_source()
+{
+    return R"(
+Texture2D offscreenPrimary : register(t0);
+Texture2D offscreenCopy : register(t1);
+SamplerState colorSampler : register(s0);
+
+cbuffer TintData : register(b0)
+{
+    float4 tint;
+};
+
+struct VSInput
+{
+    float3 position : POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+struct PSInput
+{
+    float4 position : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+PSInput vs_main(VSInput input)
+{
+    PSInput output;
+    output.position = float4(input.position, 1.0);
+    output.uv = input.uv;
+    return output;
+}
+
+float4 ps_main(PSInput input) : SV_TARGET
+{
+    float4 a = offscreenPrimary.Sample(colorSampler, input.uv);
+    float4 b = offscreenCopy.Sample(colorSampler, input.uv);
+    return lerp(a, b, 0.5) * tint;
+}
+)";
+}
+
+ValidationResult run_smoke_triangle(Dx11Runtime &runtime, unsigned int frame_budget)
+{
+    static const PosColorVertex vertices[] = {
+        {{0.0f, 0.78f, 0.0f}, {1.0f, 0.50f, 0.20f, 1.0f}},
+        {{0.72f, -0.56f, 0.0f}, {1.0f, 0.50f, 0.20f, 1.0f}},
+        {{-0.72f, -0.56f, 0.0f}, {1.0f, 0.50f, 0.20f, 1.0f}},
+    };
+    static const D3D11_INPUT_ELEMENT_DESC input_layout_desc[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+    };
+    const float clear_color[4] = {0.04f, 0.05f, 0.08f, 1.0f};
+
+    const ShaderProgram program = create_program(runtime, smoke_triangle_shader_source(), input_layout_desc, ARRAYSIZE(input_layout_desc));
+    const auto vertex_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, vertices, ARRAYSIZE(vertices));
+    const auto constant_buffer = create_dynamic_constant_buffer<TintConstants>(runtime.device());
+
+    return run_scene_frames(
+        runtime,
+        frame_budget,
+        [&](unsigned int) {
+            const TintConstants constants{{0.90f, 0.90f, 1.00f, 1.00f}};
+            update_dynamic_buffer(runtime.context(), constant_buffer.get(), constants);
+
+            runtime.bind_back_buffer();
+            runtime.clear_back_buffer(clear_color);
+
+            UINT stride = sizeof(PosColorVertex);
+            UINT offset = 0;
+            ID3D11Buffer *vertex_buffers[] = {vertex_buffer.get()};
+            ID3D11Buffer *constant_buffers[] = {constant_buffer.get()};
+
+            runtime.context()->IASetInputLayout(program.input_layout.get());
+            runtime.context()->IASetVertexBuffers(0, 1, vertex_buffers, &stride, &offset);
+            runtime.context()->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            runtime.context()->VSSetShader(program.vertex_shader.get(), nullptr, 0);
+            runtime.context()->PSSetShader(program.pixel_shader.get(), nullptr, 0);
+            runtime.context()->VSSetConstantBuffers(0, 1, constant_buffers);
+            runtime.context()->PSSetConstantBuffers(0, 1, constant_buffers);
+            runtime.context()->Draw(3, 0);
+        },
+        [&]() {
+            return validate_back_buffer(
+                runtime,
+                {
+                    {"triangle-center", sample_x(runtime, 0.50f), sample_y(runtime, 0.48f), rgba(0.90f, 0.45f, 0.20f), 18},
+                    {"background-corner", 16U, 16U, rgba(clear_color[0], clear_color[1], clear_color[2]), 12},
+                }
+            );
+        }
+    );
+}
+
+ValidationResult run_indexed_instancing(Dx11Runtime &runtime, unsigned int frame_budget)
+{
+    static const Pos2Vertex quad_vertices[] = {
+        {{-0.14f, 0.14f}},
+        {{0.14f, 0.14f}},
+        {{0.14f, -0.14f}},
+        {{-0.14f, -0.14f}},
+    };
+    static const std::uint16_t quad_indices[] = {0, 1, 2, 0, 2, 3};
+    static const InstanceVertex instances[] = {
+        {{0.00f, 0.00f}, {0.86f, 0.65f, 0.25f, 1.0f}},
+        {{-0.42f, 0.00f}, {0.20f, 0.82f, 0.30f, 1.0f}},
+        {{0.42f, 0.00f}, {0.25f, 0.45f, 0.90f, 1.0f}},
+    };
+    static const D3D11_INPUT_ELEMENT_DESC input_layout_desc[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 1, 0, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 8, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+    };
+    const float clear_color[4] = {0.05f, 0.05f, 0.08f, 1.0f};
+
+    const ShaderProgram program = create_program(runtime, instancing_shader_source(), input_layout_desc, ARRAYSIZE(input_layout_desc));
+    const auto vertex_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, quad_vertices, ARRAYSIZE(quad_vertices));
+    const auto index_buffer = create_static_buffer(runtime.device(), D3D11_BIND_INDEX_BUFFER, quad_indices, ARRAYSIZE(quad_indices));
+    const auto instance_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, instances, ARRAYSIZE(instances));
+
+    return run_scene_frames(
+        runtime,
+        frame_budget,
+        [&](unsigned int) {
+            runtime.bind_back_buffer();
+            runtime.clear_back_buffer(clear_color);
+
+            UINT strides[] = {sizeof(Pos2Vertex), sizeof(InstanceVertex)};
+            UINT offsets[] = {0, 0};
+            ID3D11Buffer *vertex_buffers[] = {vertex_buffer.get(), instance_buffer.get()};
+            runtime.context()->IASetInputLayout(program.input_layout.get());
+            runtime.context()->IASetVertexBuffers(0, 2, vertex_buffers, strides, offsets);
+            runtime.context()->IASetIndexBuffer(index_buffer.get(), DXGI_FORMAT_R16_UINT, 0);
+            runtime.context()->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            runtime.context()->VSSetShader(program.vertex_shader.get(), nullptr, 0);
+            runtime.context()->PSSetShader(program.pixel_shader.get(), nullptr, 0);
+            runtime.context()->DrawIndexed(6, 0, 0);
+            runtime.context()->DrawIndexedInstanced(6, 2, 0, 0, 1);
+        },
+        [&]() {
+            return validate_back_buffer(
+                runtime,
+                {
+                    {"instance-left", sample_x(runtime, 0.29f), sample_y(runtime, 0.50f), rgba(0.20f, 0.82f, 0.30f), 18},
+                    {"instance-center", sample_x(runtime, 0.50f), sample_y(runtime, 0.50f), rgba(0.86f, 0.65f, 0.25f), 18},
+                    {"instance-right", sample_x(runtime, 0.71f), sample_y(runtime, 0.50f), rgba(0.25f, 0.45f, 0.90f), 18},
+                    {"background-top", sample_x(runtime, 0.50f), sample_y(runtime, 0.18f), rgba(clear_color[0], clear_color[1], clear_color[2]), 12},
+                }
+            );
+        }
+    );
+}
+
+ValidationResult run_textured_quad(Dx11Runtime &runtime, unsigned int frame_budget)
+{
+    static const PosUvVertex quad_vertices[] = {
+        {{-0.82f, 0.82f, 0.0f}, {0.0f, 0.0f}},
+        {{0.82f, 0.82f, 0.0f}, {1.0f, 0.0f}},
+        {{0.82f, -0.82f, 0.0f}, {1.0f, 1.0f}},
+        {{-0.82f, 0.82f, 0.0f}, {0.0f, 0.0f}},
+        {{0.82f, -0.82f, 0.0f}, {1.0f, 1.0f}},
+        {{-0.82f, -0.82f, 0.0f}, {0.0f, 1.0f}},
+    };
+    static const D3D11_INPUT_ELEMENT_DESC input_layout_desc[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+    };
+    const float clear_color[4] = {0.03f, 0.04f, 0.06f, 1.0f};
+    const std::uint8_t texture_data[] = {
+        255, 32, 32, 255, 32, 255, 32, 255,
+        32, 32, 255, 255, 255, 220, 32, 255,
+    };
+
+    const ShaderProgram program = create_program(runtime, textured_shader_source(), input_layout_desc, ARRAYSIZE(input_layout_desc));
+    const auto vertex_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, quad_vertices, ARRAYSIZE(quad_vertices));
+
+    D3D11_TEXTURE2D_DESC texture_desc{};
+    texture_desc.Width = 2;
+    texture_desc.Height = 2;
+    texture_desc.MipLevels = 1;
+    texture_desc.ArraySize = 1;
+    texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture_desc.SampleDesc.Count = 1;
+    texture_desc.Usage = D3D11_USAGE_DEFAULT;
+    texture_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    demo::ComPtr<ID3D11Texture2D> texture;
+    demo::check_hr(runtime.device()->CreateTexture2D(&texture_desc, nullptr, texture.put()), "CreateTexture2D(texture) failed");
+    runtime.context()->UpdateSubresource(texture.get(), 0, nullptr, texture_data, 2U * 4U, 0);
+
+    demo::ComPtr<ID3D11ShaderResourceView> shader_resource_view;
+    demo::check_hr(
+        runtime.device()->CreateShaderResourceView(texture.get(), nullptr, shader_resource_view.put()),
+        "CreateShaderResourceView failed"
+    );
+
+    D3D11_SAMPLER_DESC sampler_desc{};
+    sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+
+    demo::ComPtr<ID3D11SamplerState> sampler_state;
+    demo::check_hr(runtime.device()->CreateSamplerState(&sampler_desc, sampler_state.put()), "CreateSamplerState failed");
+
+    return run_scene_frames(
+        runtime,
+        frame_budget,
+        [&](unsigned int) {
+            runtime.bind_back_buffer();
+            runtime.clear_back_buffer(clear_color);
+
+            UINT stride = sizeof(PosUvVertex);
+            UINT offset = 0;
+            ID3D11Buffer *vertex_buffers[] = {vertex_buffer.get()};
+            ID3D11ShaderResourceView *shader_resources[] = {shader_resource_view.get()};
+            ID3D11SamplerState *samplers[] = {sampler_state.get()};
+
+            runtime.context()->IASetInputLayout(program.input_layout.get());
+            runtime.context()->IASetVertexBuffers(0, 1, vertex_buffers, &stride, &offset);
+            runtime.context()->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            runtime.context()->VSSetShader(program.vertex_shader.get(), nullptr, 0);
+            runtime.context()->PSSetShader(program.pixel_shader.get(), nullptr, 0);
+            runtime.context()->PSSetShaderResources(0, 1, shader_resources);
+            runtime.context()->PSSetSamplers(0, 1, samplers);
+            runtime.context()->Draw(6, 0);
+
+            ID3D11ShaderResourceView *null_resources[] = {nullptr};
+            runtime.context()->PSSetShaderResources(0, 1, null_resources);
+        },
+        [&]() {
+            return validate_back_buffer(
+                runtime,
+                {
+                    {"quad-top-left", sample_x(runtime, 0.35f), sample_y(runtime, 0.35f), rgba(1.0f, 0.125f, 0.125f), 20},
+                    {"quad-top-right", sample_x(runtime, 0.65f), sample_y(runtime, 0.35f), rgba(0.125f, 1.0f, 0.125f), 20},
+                    {"quad-bottom-left", sample_x(runtime, 0.35f), sample_y(runtime, 0.65f), rgba(0.125f, 0.125f, 1.0f), 20},
+                    {"quad-bottom-right", sample_x(runtime, 0.65f), sample_y(runtime, 0.65f), rgba(1.0f, 0.86f, 0.125f), 20},
+                }
+            );
+        }
+    );
+}
+
+ValidationResult run_depth_blend_scissor(Dx11Runtime &runtime, unsigned int frame_budget)
+{
+    static const PosColorVertex blue_quad[] = {
+        {{-0.60f, 0.42f, 0.80f}, {0.15f, 0.30f, 0.95f, 1.0f}},
+        {{0.60f, 0.42f, 0.80f}, {0.15f, 0.30f, 0.95f, 1.0f}},
+        {{0.60f, -0.42f, 0.80f}, {0.15f, 0.30f, 0.95f, 1.0f}},
+        {{-0.60f, 0.42f, 0.80f}, {0.15f, 0.30f, 0.95f, 1.0f}},
+        {{0.60f, -0.42f, 0.80f}, {0.15f, 0.30f, 0.95f, 1.0f}},
+        {{-0.60f, -0.42f, 0.80f}, {0.15f, 0.30f, 0.95f, 1.0f}},
+    };
+    static const PosColorVertex red_quad[] = {
+        {{-0.34f, 0.24f, 0.60f}, {0.95f, 0.20f, 0.20f, 0.50f}},
+        {{0.34f, 0.24f, 0.60f}, {0.95f, 0.20f, 0.20f, 0.50f}},
+        {{0.34f, -0.24f, 0.60f}, {0.95f, 0.20f, 0.20f, 0.50f}},
+        {{-0.34f, 0.24f, 0.60f}, {0.95f, 0.20f, 0.20f, 0.50f}},
+        {{0.34f, -0.24f, 0.60f}, {0.95f, 0.20f, 0.20f, 0.50f}},
+        {{-0.34f, -0.24f, 0.60f}, {0.95f, 0.20f, 0.20f, 0.50f}},
+    };
+    static const PosColorVertex green_quad[] = {
+        {{-0.30f, 0.18f, 0.90f}, {0.10f, 0.90f, 0.25f, 1.0f}},
+        {{0.30f, 0.18f, 0.90f}, {0.10f, 0.90f, 0.25f, 1.0f}},
+        {{0.30f, -0.18f, 0.90f}, {0.10f, 0.90f, 0.25f, 1.0f}},
+        {{-0.30f, 0.18f, 0.90f}, {0.10f, 0.90f, 0.25f, 1.0f}},
+        {{0.30f, -0.18f, 0.90f}, {0.10f, 0.90f, 0.25f, 1.0f}},
+        {{-0.30f, -0.18f, 0.90f}, {0.10f, 0.90f, 0.25f, 1.0f}},
+    };
+    static const D3D11_INPUT_ELEMENT_DESC input_layout_desc[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+    };
+    const float clear_color[4] = {0.03f, 0.03f, 0.05f, 1.0f};
+
+    const ShaderProgram program = create_program(runtime, pos_color_shader_source(), input_layout_desc, ARRAYSIZE(input_layout_desc));
+    const auto blue_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, blue_quad, ARRAYSIZE(blue_quad));
+    const auto red_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, red_quad, ARRAYSIZE(red_quad));
+    const auto green_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, green_quad, ARRAYSIZE(green_quad));
+
+    D3D11_TEXTURE2D_DESC depth_desc{};
+    depth_desc.Width = static_cast<UINT>(runtime.width());
+    depth_desc.Height = static_cast<UINT>(runtime.height());
+    depth_desc.MipLevels = 1;
+    depth_desc.ArraySize = 1;
+    depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
+    depth_desc.SampleDesc.Count = 1;
+    depth_desc.Usage = D3D11_USAGE_DEFAULT;
+    depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+
+    demo::ComPtr<ID3D11Texture2D> depth_texture;
+    demo::check_hr(runtime.device()->CreateTexture2D(&depth_desc, nullptr, depth_texture.put()), "CreateTexture2D(depth) failed");
+
+    demo::ComPtr<ID3D11DepthStencilView> depth_stencil_view;
+    demo::check_hr(
+        runtime.device()->CreateDepthStencilView(depth_texture.get(), nullptr, depth_stencil_view.put()),
+        "CreateDepthStencilView failed"
+    );
+
+    D3D11_DEPTH_STENCIL_DESC depth_state_desc{};
+    depth_state_desc.DepthEnable = TRUE;
+    depth_state_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    depth_state_desc.DepthFunc = D3D11_COMPARISON_LESS;
+
+    demo::ComPtr<ID3D11DepthStencilState> depth_state;
+    demo::check_hr(runtime.device()->CreateDepthStencilState(&depth_state_desc, depth_state.put()), "CreateDepthStencilState failed");
+
+    D3D11_BLEND_DESC blend_desc{};
+    blend_desc.RenderTarget[0].BlendEnable = TRUE;
+    blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    blend_desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    blend_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+
+    demo::ComPtr<ID3D11BlendState> blend_state;
+    demo::check_hr(runtime.device()->CreateBlendState(&blend_desc, blend_state.put()), "CreateBlendState failed");
+
+    D3D11_RASTERIZER_DESC rasterizer_desc{};
+    rasterizer_desc.FillMode = D3D11_FILL_SOLID;
+    rasterizer_desc.CullMode = D3D11_CULL_NONE;
+    rasterizer_desc.ScissorEnable = TRUE;
+    rasterizer_desc.DepthClipEnable = TRUE;
+
+    demo::ComPtr<ID3D11RasterizerState> rasterizer_state;
+    demo::check_hr(runtime.device()->CreateRasterizerState(&rasterizer_desc, rasterizer_state.put()), "CreateRasterizerState failed");
+
+    const D3D11_RECT scissor_rect{
+        runtime.width() / 4,
+        runtime.height() / 4,
+        runtime.width() * 3 / 4,
+        runtime.height() * 3 / 4,
+    };
+    const float blend_factor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    return run_scene_frames(
+        runtime,
+        frame_budget,
+        [&](unsigned int) {
+            runtime.bind_back_buffer(depth_stencil_view.get());
+            runtime.clear_back_buffer(clear_color);
+            runtime.context()->ClearDepthStencilView(depth_stencil_view.get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+
+            runtime.context()->RSSetState(rasterizer_state.get());
+            runtime.context()->RSSetScissorRects(1, &scissor_rect);
+            runtime.context()->OMSetDepthStencilState(depth_state.get(), 0);
+            runtime.context()->IASetInputLayout(program.input_layout.get());
+            runtime.context()->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            runtime.context()->VSSetShader(program.vertex_shader.get(), nullptr, 0);
+            runtime.context()->PSSetShader(program.pixel_shader.get(), nullptr, 0);
+
+            UINT stride = sizeof(PosColorVertex);
+            UINT offset = 0;
+            ID3D11Buffer *vertex_buffers[] = {blue_buffer.get()};
+            runtime.context()->IASetVertexBuffers(0, 1, vertex_buffers, &stride, &offset);
+            runtime.context()->OMSetBlendState(nullptr, blend_factor, 0xffffffffU);
+            runtime.context()->Draw(6, 0);
+
+            vertex_buffers[0] = red_buffer.get();
+            runtime.context()->IASetVertexBuffers(0, 1, vertex_buffers, &stride, &offset);
+            runtime.context()->OMSetBlendState(blend_state.get(), blend_factor, 0xffffffffU);
+            runtime.context()->Draw(6, 0);
+
+            vertex_buffers[0] = green_buffer.get();
+            runtime.context()->IASetVertexBuffers(0, 1, vertex_buffers, &stride, &offset);
+            runtime.context()->OMSetBlendState(nullptr, blend_factor, 0xffffffffU);
+            runtime.context()->Draw(6, 0);
+        },
+        [&]() {
+            return validate_back_buffer(
+                runtime,
+                {
+                    {"depth-blend-center", sample_x(runtime, 0.50f), sample_y(runtime, 0.50f), rgba(0.55f, 0.25f, 0.58f, 0.50f), 28},
+                    {"depth-blue-only", sample_x(runtime, 0.28f), sample_y(runtime, 0.50f), rgba(0.15f, 0.30f, 0.95f), 20},
+                    {"scissor-outside", sample_x(runtime, 0.14f), sample_y(runtime, 0.50f), rgba(clear_color[0], clear_color[1], clear_color[2]), 12},
+                }
+            );
+        }
+    );
+}
+
+ValidationResult run_offscreen_copy_composite(Dx11Runtime &runtime, unsigned int frame_budget)
+{
+    static const PosColorVertex offscreen_quad[] = {
+        {{-0.72f, 0.72f, 0.0f}, {0.20f, 0.85f, 0.75f, 1.0f}},
+        {{0.72f, 0.72f, 0.0f}, {0.20f, 0.85f, 0.75f, 1.0f}},
+        {{0.72f, -0.72f, 0.0f}, {0.20f, 0.85f, 0.75f, 1.0f}},
+        {{-0.72f, 0.72f, 0.0f}, {0.20f, 0.85f, 0.75f, 1.0f}},
+        {{0.72f, -0.72f, 0.0f}, {0.20f, 0.85f, 0.75f, 1.0f}},
+        {{-0.72f, -0.72f, 0.0f}, {0.20f, 0.85f, 0.75f, 1.0f}},
+    };
+    static const PosUvVertex composite_quad[] = {
+        {{-0.88f, 0.88f, 0.0f}, {0.0f, 0.0f}},
+        {{0.88f, 0.88f, 0.0f}, {1.0f, 0.0f}},
+        {{0.88f, -0.88f, 0.0f}, {1.0f, 1.0f}},
+        {{-0.88f, 0.88f, 0.0f}, {0.0f, 0.0f}},
+        {{0.88f, -0.88f, 0.0f}, {1.0f, 1.0f}},
+        {{-0.88f, -0.88f, 0.0f}, {0.0f, 1.0f}},
+    };
+    static const D3D11_INPUT_ELEMENT_DESC pos_color_layout_desc[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+    };
+    static const D3D11_INPUT_ELEMENT_DESC composite_layout_desc[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+    };
+    const float clear_color[4] = {0.02f, 0.03f, 0.05f, 1.0f};
+
+    const ShaderProgram offscreen_program = create_program(
+        runtime,
+        pos_color_shader_source(),
+        pos_color_layout_desc,
+        ARRAYSIZE(pos_color_layout_desc)
+    );
+    const ShaderProgram composite_program = create_program(
+        runtime,
+        composite_shader_source(),
+        composite_layout_desc,
+        ARRAYSIZE(composite_layout_desc)
+    );
+
+    const auto offscreen_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, offscreen_quad, ARRAYSIZE(offscreen_quad));
+    const auto composite_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, composite_quad, ARRAYSIZE(composite_quad));
+    const auto constant_buffer = create_dynamic_constant_buffer<TintConstants>(runtime.device());
+
+    D3D11_TEXTURE2D_DESC texture_desc{};
+    texture_desc.Width = static_cast<UINT>(runtime.width());
+    texture_desc.Height = static_cast<UINT>(runtime.height());
+    texture_desc.MipLevels = 1;
+    texture_desc.ArraySize = 1;
+    texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture_desc.SampleDesc.Count = 1;
+    texture_desc.Usage = D3D11_USAGE_DEFAULT;
+    texture_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    demo::ComPtr<ID3D11Texture2D> offscreen_texture;
+    demo::check_hr(runtime.device()->CreateTexture2D(&texture_desc, nullptr, offscreen_texture.put()), "CreateTexture2D(offscreen) failed");
+
+    D3D11_TEXTURE2D_DESC copy_desc = texture_desc;
+    copy_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    demo::ComPtr<ID3D11Texture2D> copied_texture;
+    demo::check_hr(runtime.device()->CreateTexture2D(&copy_desc, nullptr, copied_texture.put()), "CreateTexture2D(copy) failed");
+
+    demo::ComPtr<ID3D11RenderTargetView> offscreen_rtv;
+    demo::check_hr(
+        runtime.device()->CreateRenderTargetView(offscreen_texture.get(), nullptr, offscreen_rtv.put()),
+        "CreateRenderTargetView(offscreen) failed"
+    );
+
+    demo::ComPtr<ID3D11ShaderResourceView> offscreen_srv;
+    demo::ComPtr<ID3D11ShaderResourceView> copied_srv;
+    demo::check_hr(
+        runtime.device()->CreateShaderResourceView(offscreen_texture.get(), nullptr, offscreen_srv.put()),
+        "CreateShaderResourceView(offscreen) failed"
+    );
+    demo::check_hr(
+        runtime.device()->CreateShaderResourceView(copied_texture.get(), nullptr, copied_srv.put()),
+        "CreateShaderResourceView(copy) failed"
+    );
+
+    D3D11_SAMPLER_DESC sampler_desc{};
+    sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+
+    demo::ComPtr<ID3D11SamplerState> sampler_state;
+    demo::check_hr(runtime.device()->CreateSamplerState(&sampler_desc, sampler_state.put()), "CreateSamplerState failed");
+
+    return run_scene_frames(
+        runtime,
+        frame_budget,
+        [&](unsigned int) {
+            const TintConstants constants{{0.80f, 1.00f, 0.90f, 1.00f}};
+            update_dynamic_buffer(runtime.context(), constant_buffer.get(), constants);
+
+            ID3D11RenderTargetView *offscreen_targets[] = {offscreen_rtv.get()};
+            runtime.context()->OMSetRenderTargets(1, offscreen_targets, nullptr);
+            runtime.context()->ClearRenderTargetView(offscreen_rtv.get(), clear_color);
+
+            UINT stride = sizeof(PosColorVertex);
+            UINT offset = 0;
+            ID3D11Buffer *offscreen_vertices[] = {offscreen_buffer.get()};
+            runtime.context()->IASetInputLayout(offscreen_program.input_layout.get());
+            runtime.context()->IASetVertexBuffers(0, 1, offscreen_vertices, &stride, &offset);
+            runtime.context()->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            runtime.context()->VSSetShader(offscreen_program.vertex_shader.get(), nullptr, 0);
+            runtime.context()->PSSetShader(offscreen_program.pixel_shader.get(), nullptr, 0);
+            runtime.context()->Draw(6, 0);
+
+            runtime.context()->OMSetRenderTargets(0, nullptr, nullptr);
+            runtime.context()->CopyResource(copied_texture.get(), offscreen_texture.get());
+
+            runtime.bind_back_buffer();
+            runtime.clear_back_buffer(clear_color);
+
+            stride = sizeof(PosUvVertex);
+            ID3D11Buffer *composite_vertices[] = {composite_buffer.get()};
+            ID3D11ShaderResourceView *shader_resources[] = {offscreen_srv.get(), copied_srv.get()};
+            ID3D11SamplerState *samplers[] = {sampler_state.get()};
+            ID3D11Buffer *constant_buffers[] = {constant_buffer.get()};
+
+            runtime.context()->IASetInputLayout(composite_program.input_layout.get());
+            runtime.context()->IASetVertexBuffers(0, 1, composite_vertices, &stride, &offset);
+            runtime.context()->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            runtime.context()->VSSetShader(composite_program.vertex_shader.get(), nullptr, 0);
+            runtime.context()->PSSetShader(composite_program.pixel_shader.get(), nullptr, 0);
+            runtime.context()->PSSetShaderResources(0, 2, shader_resources);
+            runtime.context()->PSSetSamplers(0, 1, samplers);
+            runtime.context()->PSSetConstantBuffers(0, 1, constant_buffers);
+            runtime.context()->Draw(6, 0);
+
+            ID3D11ShaderResourceView *null_resources[] = {nullptr, nullptr};
+            runtime.context()->PSSetShaderResources(0, 2, null_resources);
+        },
+        [&]() {
+            return validate_back_buffer(
+                runtime,
+                {
+                    {"composite-center", sample_x(runtime, 0.50f), sample_y(runtime, 0.50f), rgba(0.16f, 0.85f, 0.675f), 22},
+                    {"composite-edge", sample_x(runtime, 0.08f), sample_y(runtime, 0.08f), rgba(clear_color[0], clear_color[1], clear_color[2]), 12},
+                }
+            );
+        }
+    );
+}
+
+const std::vector<SceneDefinition> kScenes = {
+    {"smoke_triangle", SceneTier::core, true, &run_smoke_triangle},
+    {"indexed_instancing", SceneTier::core, true, &run_indexed_instancing},
+    {"textured_quad", SceneTier::core, true, &run_textured_quad},
+    {"depth_blend_scissor", SceneTier::core, true, &run_depth_blend_scissor},
+    {"offscreen_copy_composite", SceneTier::core, true, &run_offscreen_copy_composite},
+    {"mip_sampling", SceneTier::extended, false, nullptr},
+    {"msaa_resolve", SceneTier::extended, false, nullptr},
+};
+
+} // namespace
+
+const std::vector<SceneDefinition> &registered_scenes()
+{
+    return kScenes;
+}
+
+const SceneDefinition *find_scene(std::string_view name)
+{
+    const auto it = std::find_if(
+        kScenes.begin(),
+        kScenes.end(),
+        [&](const SceneDefinition &scene) {
+            return name == scene.name;
+        }
+    );
+    return it == kScenes.end() ? nullptr : &*it;
+}
+
+} // namespace demo::scenes::dx11

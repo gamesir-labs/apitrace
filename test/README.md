@@ -4,8 +4,7 @@
 
 目标产物：
 
-- `apitrace_triangle_d3d11.exe`
-- `apitrace_triangle_d3d12.exe`
+- `apitrace_test_demo.exe`
 
 推荐构建：
 
@@ -18,11 +17,65 @@ cmake --install test/build/windows-x86_64 --prefix test/artifacts/windows-x86_64
 运行时可用 Wine 直接启动：
 
 ```sh
-wine apitrace_triangle_d3d11.exe
-wine apitrace_triangle_d3d12.exe
+wine apitrace_test_demo.exe --dx dx11 --scene smoke_triangle
+wine apitrace_test_demo.exe --dx dx11 --scene all
+wine apitrace_test_demo.exe --list-scenes --dx dx11
+wine apitrace_test_demo.exe --dx dx12 --scene smoke_triangle
 ```
 
 如果需要配合 apitrace 的 Windows proxy DLL，再把根项目的 Windows cross-build 安装到同一个测试目录即可。
+
+## CLI
+
+固定入口参数：
+
+- `--dx <dx11|dx12>`：当前实现 `dx11`；`dx12` 只保留接口并返回 `not implemented` 风格失败。
+- `--scene <name|all>`：单场景调试或顺序跑完整 `dx11 core` 集合。
+- `--list-scenes`：列出指定 `dx mode` 下当前可运行的 scene 名称。
+
+保留环境变量：
+
+- `APITRACE_TRIANGLE_MAX_FRAMES`
+
+语义：
+
+- 单场景运行时，它是该场景的帧预算。
+- `--scene all` 时，按“每个场景各自拥有同样帧预算”解释。
+
+标准输出日志接口固定为：
+
+- `dx mode: <mode>`
+- `scene start: <name>`
+- `scene pass: <name>`
+- `scene fail: <name> reason=<text>`
+- `summary: passed=X failed=Y skipped=Z`
+
+退出码：
+
+- `0`：本次运行涉及的 scene 全部通过。
+- 非零：参数错误、`dx12` 占位模式、scene 校验失败、或运行时初始化失败。
+
+## DX11 scenes
+
+当前 `dx11 core` scene 顺序与覆盖点：
+
+1. `smoke_triangle`
+   覆盖 swap chain、RTV、input layout、VS/PS、VB、CB、`Map/Unmap`、`Draw`、`Present`。
+2. `indexed_instancing`
+   覆盖 IB、第二输入槽、instance data、`DrawIndexed`、`DrawIndexedInstanced`。
+3. `textured_quad`
+   覆盖 `Texture2D`、`ShaderResourceView`、`SamplerState`、`UpdateSubresource`、`PSSetShaderResources`、`PSSetSamplers`。
+4. `depth_blend_scissor`
+   覆盖 depth texture、DSV、`ClearDepthStencilView`、`OMSetDepthStencilState`、`OMSetBlendState`、`RSSetState`、`RSSetScissorRects`。
+5. `offscreen_copy_composite`
+   覆盖离屏 RT、SRV/RTV 复用、`CopyResource`、二次合成到 backbuffer。
+
+结构预留但未实现：
+
+- `mip_sampling`
+- `msaa_resolve`
+
+每个已实现 scene 都会把结果复制到 staging 资源，并在 CPU 侧对固定像素点做阈值校验。
 
 ## D3D11 MVP 验收
 
@@ -35,9 +88,9 @@ scripts/validate-d3d11-wine.sh
 它会：
 
 - 构建 apitrace 的 Windows `d3d11.dll`
-- 构建 `apitrace_triangle_d3d11.exe`
+- 构建 `apitrace_test_demo.exe`
 - 把 proxy DLL 和 DXMT 运行时放到同一目录
-- 在 Wine 下启动 D3D11 demo
+- 在 Wine 下启动 `--dx dx11 --scene smoke_triangle`
 - 校验 trace bundle 内的 `callstream.jsonl` / `checksums.json` / `objects.json`
 - 校验 shader / buffer 资产引用存在且非空
 
