@@ -30,6 +30,21 @@ void TraceSession::end()
   impl_->state.end();
 }
 
+void TraceSession::append_call_event(const trace::EventRecord &event)
+{
+  impl_->state.append_call_event(event);
+}
+
+trace::AssetRecord TraceSession::register_asset(const trace::AssetRecord &asset)
+{
+  return impl_->state.register_asset(asset);
+}
+
+void TraceSession::record_object(const trace::ObjectRecord &object)
+{
+  impl_->state.record_object(object);
+}
+
 bool TraceSession::active() const noexcept
 {
   return impl_ && impl_->state.active();

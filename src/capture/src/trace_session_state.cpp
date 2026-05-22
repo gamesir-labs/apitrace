@@ -1,6 +1,8 @@
 #include "trace_session_state.hpp"
 
+#include <algorithm>
 #include <utility>
+#include <vector>
 
 namespace apitrace::capture::internal {
 
@@ -90,8 +92,40 @@ void TraceSessionState::begin()
 void TraceSessionState::end()
 {
   runtime_bootstrap_.shutdown_capture();
+  if (options_.enable_object_graph && !objects_.empty()) {
+    std::vector<trace::ObjectRecord> object_records;
+    object_records.reserve(objects_.size());
+    for (const auto &entry : objects_) {
+      object_records.push_back(entry.second);
+    }
+    std::sort(
+        object_records.begin(),
+        object_records.end(),
+        [](const trace::ObjectRecord &lhs, const trace::ObjectRecord &rhs) {
+          return lhs.object_id < rhs.object_id;
+        });
+    bundle_sink_.writer().write_object_index(object_records);
+  }
   bundle_sink_.finalize_bundle();
   active_ = false;
+}
+
+void TraceSessionState::append_call_event(const trace::EventRecord &event)
+{
+  bundle_sink_.writer().append_call_event(event);
+}
+
+trace::AssetRecord TraceSessionState::register_asset(const trace::AssetRecord &asset)
+{
+  return bundle_sink_.writer().register_asset(asset);
+}
+
+void TraceSessionState::record_object(const trace::ObjectRecord &object)
+{
+  if (object.object_id == 0) {
+    return;
+  }
+  objects_[object.object_id] = object;
 }
 
 bool TraceSessionState::active() const noexcept

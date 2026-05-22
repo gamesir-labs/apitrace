@@ -1,6 +1,7 @@
 #pragma once
 
 #include "apitrace/capture_options.hpp"
+#include "apitrace/trace_session.hpp"
 
 #include <memory>
 #include <string_view>
@@ -22,5 +23,9 @@ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+TraceSession *ensure_process_trace_session(trace::ApiKind api);
+TraceSession *current_process_trace_session() noexcept;
+void shutdown_process_trace_session() noexcept;
 
 } // namespace apitrace::runtime

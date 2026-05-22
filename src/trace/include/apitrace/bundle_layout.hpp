@@ -15,6 +15,12 @@ struct BundleLayout {
   std::filesystem::path checksums_path;
   std::filesystem::path analysis_directory_path;
   std::filesystem::path translation_links_path;
+  std::filesystem::path objects_directory_path;
+  std::filesystem::path object_index_path;
+  std::filesystem::path shaders_directory_path;
+  std::filesystem::path textures_directory_path;
+  std::filesystem::path buffers_directory_path;
+  std::filesystem::path pipelines_directory_path;
 
   // TODO: add typed paths for objects/, shaders/, textures/, buffers/, pipelines/, and optional analysis streams.
   // TODO: distinguish required root entries from optional readable indexes once bundle validation exists.

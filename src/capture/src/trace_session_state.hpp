@@ -4,6 +4,8 @@
 #include "apitrace/trace_bundle_io.hpp"
 #include "apitrace/trace_session.hpp"
 
+#include <unordered_map>
+
 namespace apitrace::capture::internal {
 
 class BundleCaptureSink {
@@ -48,6 +50,9 @@ public:
 
   void begin();
   void end();
+  void append_call_event(const trace::EventRecord &event);
+  trace::AssetRecord register_asset(const trace::AssetRecord &asset);
+  void record_object(const trace::ObjectRecord &object);
 
   bool active() const noexcept;
   const TraceOptions &options() const noexcept;
@@ -56,6 +61,7 @@ private:
   TraceOptions options_;
   BundleCaptureSink bundle_sink_;
   RuntimeBootstrap runtime_bootstrap_;
+  std::unordered_map<trace::ObjectId, trace::ObjectRecord> objects_;
   bool active_ = false;
 
   // TODO: separate session planning from session execution once preflight validation exists.

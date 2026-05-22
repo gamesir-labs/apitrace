@@ -30,7 +30,7 @@ public:
   bool open(const std::filesystem::path &bundle_root);
   void write_metadata(const TraceMetadata &metadata);
   void append_call_event(const EventRecord &event);
-  void register_asset(const AssetRecord &asset);
+  AssetRecord register_asset(const AssetRecord &asset);
   void write_object_index(const std::vector<ObjectRecord> &objects);
   void declare_analysis_stream(std::string_view stream_name);
   void append_analysis_record(const AnalysisRecord &record);

@@ -52,6 +52,7 @@ target_compile_features(apitrace_core PUBLIC cxx_std_17)
 
 add_library(apitrace_platform_windows_d3d11 SHARED
     src/d3d11/src/d3d11_proxy.cpp
+    src/d3d11/src/d3d11_capture_internal.cpp
 )
 
 add_library(apitrace_platform_windows_d3d12 SHARED
@@ -86,8 +87,8 @@ target_compile_features(apitrace_platform_windows_d3d12 PUBLIC cxx_std_17)
 target_compile_features(apitrace_platform_apple_metal PUBLIC cxx_std_17)
 
 if(WIN32 AND APITRACE_BUILD_WINDOWS_DLLS)
-    set_target_properties(apitrace_platform_windows_d3d11 PROPERTIES OUTPUT_NAME d3d11)
-    set_target_properties(apitrace_platform_windows_d3d12 PROPERTIES OUTPUT_NAME d3d12)
+    set_target_properties(apitrace_platform_windows_d3d11 PROPERTIES OUTPUT_NAME d3d11 PREFIX "")
+    set_target_properties(apitrace_platform_windows_d3d12 PROPERTIES OUTPUT_NAME d3d12 PREFIX "")
 else()
     set_target_properties(apitrace_platform_windows_d3d11 PROPERTIES EXCLUDE_FROM_ALL TRUE)
     set_target_properties(apitrace_platform_windows_d3d12 PROPERTIES EXCLUDE_FROM_ALL TRUE)
@@ -113,6 +114,24 @@ install(TARGETS apitrace_core
 
 if(APITRACE_BUILD_TOOLS)
     install(TARGETS apitrace_retrace RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
+if(WIN32 AND APITRACE_BUILD_WINDOWS_DLLS)
+    install(TARGETS apitrace_platform_windows_d3d11
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    )
+    install(TARGETS apitrace_platform_windows_d3d12
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    )
+endif()
+
+if(APPLE AND APITRACE_BUILD_METAL_BACKEND)
+    install(TARGETS apitrace_platform_apple_metal
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    )
 endif()
 
 install(DIRECTORY src/api/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

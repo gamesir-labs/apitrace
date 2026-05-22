@@ -2,12 +2,13 @@
 
 ## 作用
 
-`src/d3d11/` 负责 D3D11 相关的模块表面，目前主要是 proxy 入口骨架。
+`src/d3d11/` 负责 D3D11 相关的模块表面，目前已经包含 Wine app-local override 入口和最小 capture MVP。
 
 ## 负责的内容
 
 - D3D11 proxy 描述信息
-- D3D11 capture hook 骨架
+- D3D11 proxy 转发和下游 DLL 解析
+- D3D11 最小 capture hook 和对象包装
 - D3D11 replay backend 骨架
 - D3D11 对象状态注册表骨架
 
@@ -21,8 +22,46 @@
 
 - `d3d11_proxy.hpp` / `d3d11_proxy.cpp`
 - `d3d11_capture.hpp` / `d3d11_capture.cpp`
+- `d3d11_capture_internal.hpp` / `d3d11_capture_internal.cpp`
 - `d3d11_replay.hpp` / `d3d11_replay.cpp`
 - `d3d11_state.hpp` / `d3d11_state.cpp`
+
+当前 MVP 只保证 `test/src/d3d11_triangle.cpp` 经过的最小 D3D11 路径：
+
+- 入口：
+  `D3D11CreateDevice` / `D3D11CoreCreateDevice` / `D3D11CreateDeviceAndSwapChain` / `D3D11On12CreateDevice`
+- 返回对象：
+  `ID3D11Device` / `ID3D11DeviceContext` / `IDXGISwapChain`
+- 已记录调用：
+  `CreateBuffer`
+  `CreateRenderTargetView`
+  `CreateInputLayout`
+  `CreateVertexShader`
+  `CreatePixelShader`
+  `GetImmediateContext`
+  `Map` / `Unmap`
+  `VSSetShader` / `PSSetShader`
+  `VSSetConstantBuffers` / `PSSetConstantBuffers`
+  `IASetInputLayout`
+  `IASetVertexBuffers`
+  `IASetPrimitiveTopology`
+  `OMSetRenderTargets`
+  `RSSetViewports`
+  `ClearRenderTargetView`
+  `Draw`
+  `Present`
+  `GetBuffer`
+
+## 当前未覆盖项
+
+这个 MVP 还不是完整 D3D11 capture。当前明确未做：
+
+- deferred context
+- 更复杂的 DXGI 工厂 / 适配器枚举路径
+- 多线程顺序一致性
+- 完整资源快照和去重策略
+- DXGI 独立 override
+- retrace 兼容性和回放正确性
 
 ## 头文件与实现导航
 
