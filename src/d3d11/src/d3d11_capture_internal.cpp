@@ -28,25 +28,44 @@ constexpr std::size_t kContextVtblSize = 115;
 constexpr std::size_t kSwapChainVtblSize = 18;
 
 constexpr std::size_t kDeviceCreateBufferIndex = 3;
+constexpr std::size_t kDeviceCreateTexture2DIndex = 5;
+constexpr std::size_t kDeviceCreateShaderResourceViewIndex = 7;
 constexpr std::size_t kDeviceCreateRenderTargetViewIndex = 9;
+constexpr std::size_t kDeviceCreateDepthStencilViewIndex = 10;
 constexpr std::size_t kDeviceCreateInputLayoutIndex = 11;
 constexpr std::size_t kDeviceCreateVertexShaderIndex = 12;
 constexpr std::size_t kDeviceCreatePixelShaderIndex = 15;
+constexpr std::size_t kDeviceCreateBlendStateIndex = 20;
+constexpr std::size_t kDeviceCreateDepthStencilStateIndex = 21;
+constexpr std::size_t kDeviceCreateRasterizerStateIndex = 22;
+constexpr std::size_t kDeviceCreateSamplerStateIndex = 23;
 constexpr std::size_t kDeviceGetImmediateContextIndex = 40;
 
 constexpr std::size_t kContextVSSetConstantBuffersIndex = 7;
+constexpr std::size_t kContextPSSetShaderResourcesIndex = 8;
 constexpr std::size_t kContextPSSetShaderIndex = 9;
+constexpr std::size_t kContextPSSetSamplersIndex = 10;
 constexpr std::size_t kContextVSSetShaderIndex = 11;
+constexpr std::size_t kContextDrawIndexedIndex = 12;
 constexpr std::size_t kContextDrawIndex = 13;
 constexpr std::size_t kContextMapIndex = 14;
 constexpr std::size_t kContextUnmapIndex = 15;
 constexpr std::size_t kContextPSSetConstantBuffersIndex = 16;
 constexpr std::size_t kContextIASetInputLayoutIndex = 17;
 constexpr std::size_t kContextIASetVertexBuffersIndex = 18;
+constexpr std::size_t kContextIASetIndexBufferIndex = 19;
+constexpr std::size_t kContextDrawIndexedInstancedIndex = 20;
 constexpr std::size_t kContextIASetPrimitiveTopologyIndex = 24;
 constexpr std::size_t kContextOMSetRenderTargetsIndex = 33;
+constexpr std::size_t kContextOMSetBlendStateIndex = 35;
+constexpr std::size_t kContextOMSetDepthStencilStateIndex = 36;
+constexpr std::size_t kContextRSSetStateIndex = 43;
 constexpr std::size_t kContextRSSetViewportsIndex = 44;
+constexpr std::size_t kContextRSSetScissorRectsIndex = 45;
+constexpr std::size_t kContextCopyResourceIndex = 47;
+constexpr std::size_t kContextUpdateSubresourceIndex = 48;
 constexpr std::size_t kContextClearRenderTargetViewIndex = 50;
+constexpr std::size_t kContextClearDepthStencilViewIndex = 53;
 
 constexpr std::size_t kSwapChainPresentIndex = 8;
 constexpr std::size_t kSwapChainGetBufferIndex = 9;
@@ -102,11 +121,26 @@ using DeviceCreateBufferFn = HRESULT(STDMETHODCALLTYPE *)(
     const D3D11_BUFFER_DESC *,
     const D3D11_SUBRESOURCE_DATA *,
     ID3D11Buffer **);
+using DeviceCreateTexture2DFn = HRESULT(STDMETHODCALLTYPE *)(
+    ID3D11Device *,
+    const D3D11_TEXTURE2D_DESC *,
+    const D3D11_SUBRESOURCE_DATA *,
+    ID3D11Texture2D **);
+using DeviceCreateShaderResourceViewFn = HRESULT(STDMETHODCALLTYPE *)(
+    ID3D11Device *,
+    ID3D11Resource *,
+    const D3D11_SHADER_RESOURCE_VIEW_DESC *,
+    ID3D11ShaderResourceView **);
 using DeviceCreateRenderTargetViewFn = HRESULT(STDMETHODCALLTYPE *)(
     ID3D11Device *,
     ID3D11Resource *,
     const D3D11_RENDER_TARGET_VIEW_DESC *,
     ID3D11RenderTargetView **);
+using DeviceCreateDepthStencilViewFn = HRESULT(STDMETHODCALLTYPE *)(
+    ID3D11Device *,
+    ID3D11Resource *,
+    const D3D11_DEPTH_STENCIL_VIEW_DESC *,
+    ID3D11DepthStencilView **);
 using DeviceCreateInputLayoutFn = HRESULT(STDMETHODCALLTYPE *)(
     ID3D11Device *,
     const D3D11_INPUT_ELEMENT_DESC *,
@@ -126,14 +160,35 @@ using DeviceCreatePixelShaderFn = HRESULT(STDMETHODCALLTYPE *)(
     SIZE_T,
     ID3D11ClassLinkage *,
     ID3D11PixelShader **);
+using DeviceCreateBlendStateFn = HRESULT(STDMETHODCALLTYPE *)(
+    ID3D11Device *,
+    const D3D11_BLEND_DESC *,
+    ID3D11BlendState **);
+using DeviceCreateDepthStencilStateFn = HRESULT(STDMETHODCALLTYPE *)(
+    ID3D11Device *,
+    const D3D11_DEPTH_STENCIL_DESC *,
+    ID3D11DepthStencilState **);
+using DeviceCreateRasterizerStateFn = HRESULT(STDMETHODCALLTYPE *)(
+    ID3D11Device *,
+    const D3D11_RASTERIZER_DESC *,
+    ID3D11RasterizerState **);
+using DeviceCreateSamplerStateFn = HRESULT(STDMETHODCALLTYPE *)(
+    ID3D11Device *,
+    const D3D11_SAMPLER_DESC *,
+    ID3D11SamplerState **);
 using DeviceGetImmediateContextFn = void(STDMETHODCALLTYPE *)(ID3D11Device *, ID3D11DeviceContext **);
 
 using ContextVSSetConstantBuffersFn =
     void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT, ID3D11Buffer *const *);
+using ContextPSSetShaderResourcesFn =
+    void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT, ID3D11ShaderResourceView *const *);
 using ContextPSSetShaderFn =
     void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11PixelShader *, ID3D11ClassInstance *const *, UINT);
+using ContextPSSetSamplersFn =
+    void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT, ID3D11SamplerState *const *);
 using ContextVSSetShaderFn =
     void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11VertexShader *, ID3D11ClassInstance *const *, UINT);
+using ContextDrawIndexedFn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT, INT);
 using ContextDrawFn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT);
 using ContextMapFn =
     HRESULT(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *, UINT, D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE *);
@@ -143,11 +198,26 @@ using ContextPSSetConstantBuffersFn =
 using ContextIASetInputLayoutFn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11InputLayout *);
 using ContextIASetVertexBuffersFn =
     void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT, ID3D11Buffer *const *, const UINT *, const UINT *);
+using ContextIASetIndexBufferFn =
+    void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Buffer *, DXGI_FORMAT, UINT);
+using ContextDrawIndexedInstancedFn =
+    void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT, UINT, INT, UINT);
 using ContextIASetPrimitiveTopologyFn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, D3D11_PRIMITIVE_TOPOLOGY);
 using ContextOMSetRenderTargetsFn =
     void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, ID3D11RenderTargetView *const *, ID3D11DepthStencilView *);
+using ContextOMSetBlendStateFn =
+    void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11BlendState *, const FLOAT[4], UINT);
+using ContextOMSetDepthStencilStateFn =
+    void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11DepthStencilState *, UINT);
+using ContextRSSetStateFn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11RasterizerState *);
 using ContextRSSetViewportsFn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, const D3D11_VIEWPORT *);
+using ContextRSSetScissorRectsFn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, const D3D11_RECT *);
+using ContextCopyResourceFn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *, ID3D11Resource *);
+using ContextUpdateSubresourceFn =
+    void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *, UINT, const D3D11_BOX *, const void *, UINT, UINT);
 using ContextClearRenderTargetViewFn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11RenderTargetView *, const FLOAT[4]);
+using ContextClearDepthStencilViewFn =
+    void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11DepthStencilView *, UINT, FLOAT, UINT8);
 
 using SwapChainPresentFn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT);
 using SwapChainGetBufferFn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, REFIID, void **);
@@ -163,28 +233,47 @@ struct DownstreamModule {
 struct DeviceHookState {
   void **vtable = nullptr;
   DeviceCreateBufferFn create_buffer = nullptr;
+  DeviceCreateTexture2DFn create_texture2d = nullptr;
+  DeviceCreateShaderResourceViewFn create_shader_resource_view = nullptr;
   DeviceCreateRenderTargetViewFn create_render_target_view = nullptr;
+  DeviceCreateDepthStencilViewFn create_depth_stencil_view = nullptr;
   DeviceCreateInputLayoutFn create_input_layout = nullptr;
   DeviceCreateVertexShaderFn create_vertex_shader = nullptr;
   DeviceCreatePixelShaderFn create_pixel_shader = nullptr;
+  DeviceCreateBlendStateFn create_blend_state = nullptr;
+  DeviceCreateDepthStencilStateFn create_depth_stencil_state = nullptr;
+  DeviceCreateRasterizerStateFn create_rasterizer_state = nullptr;
+  DeviceCreateSamplerStateFn create_sampler_state = nullptr;
   DeviceGetImmediateContextFn get_immediate_context = nullptr;
 };
 
 struct ContextHookState {
   void **vtable = nullptr;
   ContextVSSetConstantBuffersFn vs_set_constant_buffers = nullptr;
+  ContextPSSetShaderResourcesFn ps_set_shader_resources = nullptr;
   ContextPSSetShaderFn ps_set_shader = nullptr;
+  ContextPSSetSamplersFn ps_set_samplers = nullptr;
   ContextVSSetShaderFn vs_set_shader = nullptr;
+  ContextDrawIndexedFn draw_indexed = nullptr;
   ContextDrawFn draw = nullptr;
   ContextMapFn map = nullptr;
   ContextUnmapFn unmap = nullptr;
   ContextPSSetConstantBuffersFn ps_set_constant_buffers = nullptr;
   ContextIASetInputLayoutFn ia_set_input_layout = nullptr;
   ContextIASetVertexBuffersFn ia_set_vertex_buffers = nullptr;
+  ContextIASetIndexBufferFn ia_set_index_buffer = nullptr;
+  ContextDrawIndexedInstancedFn draw_indexed_instanced = nullptr;
   ContextIASetPrimitiveTopologyFn ia_set_primitive_topology = nullptr;
   ContextOMSetRenderTargetsFn om_set_render_targets = nullptr;
+  ContextOMSetBlendStateFn om_set_blend_state = nullptr;
+  ContextOMSetDepthStencilStateFn om_set_depth_stencil_state = nullptr;
+  ContextRSSetStateFn rs_set_state = nullptr;
   ContextRSSetViewportsFn rs_set_viewports = nullptr;
+  ContextRSSetScissorRectsFn rs_set_scissor_rects = nullptr;
+  ContextCopyResourceFn copy_resource = nullptr;
+  ContextUpdateSubresourceFn update_subresource = nullptr;
   ContextClearRenderTargetViewFn clear_render_target_view = nullptr;
+  ContextClearDepthStencilViewFn clear_depth_stencil_view = nullptr;
 };
 
 struct SwapChainHookState {
@@ -200,15 +289,33 @@ struct ObjectInfo {
   std::string debug_name;
 };
 
-struct BufferInfo {
+enum class ResourceClass {
+  Buffer,
+  Texture2D,
+};
+
+struct ResourceInfo {
   trace::ObjectId object_id = 0;
+  ResourceClass resource_class = ResourceClass::Buffer;
+  trace::ObjectId parent_object_id = 0;
   UINT byte_width = 0;
+  UINT width = 0;
+  UINT height = 0;
+  UINT mip_levels = 0;
+  UINT array_size = 0;
+  DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+  UINT sample_count = 0;
+  UINT sample_quality = 0;
   UINT bind_flags = 0;
   D3D11_USAGE usage = D3D11_USAGE_DEFAULT;
   UINT cpu_access_flags = 0;
+  UINT misc_flags = 0;
+  UINT structure_byte_stride = 0;
   const void *mapped_ptr = nullptr;
   UINT mapped_subresource = 0;
   D3D11_MAP mapped_type = D3D11_MAP_READ;
+  UINT mapped_row_pitch = 0;
+  UINT mapped_depth_pitch = 0;
 };
 
 struct CaptureState {
@@ -219,7 +326,7 @@ struct CaptureState {
   std::uint64_t frame_index = 0;
   bool frame_begin_pending = true;
   std::unordered_map<const void *, ObjectInfo> objects;
-  std::unordered_map<const void *, BufferInfo> buffers;
+  std::unordered_map<const void *, ResourceInfo> resources;
   std::unordered_map<void **, DeviceHookState> device_hooks;
   std::unordered_map<void **, ContextHookState> context_hooks;
   std::unordered_map<void **, SwapChainHookState> swapchain_hooks;
@@ -417,6 +524,280 @@ std::string map_type_name(D3D11_MAP map_type)
   }
 }
 
+std::string resource_class_name(ResourceClass resource_class)
+{
+  switch (resource_class) {
+  case ResourceClass::Buffer:
+    return "buffer";
+  case ResourceClass::Texture2D:
+    return "texture2d";
+  default:
+    return "unknown";
+  }
+}
+
+std::uint32_t format_bytes_per_pixel(DXGI_FORMAT format)
+{
+  switch (format) {
+  case DXGI_FORMAT_R8G8B8A8_UNORM:
+  case DXGI_FORMAT_B8G8R8A8_UNORM:
+  case DXGI_FORMAT_D32_FLOAT:
+    return 4;
+  default:
+    return 0;
+  }
+}
+
+UINT mip_extent(UINT base_extent, UINT mip_level)
+{
+  const UINT shifted = base_extent >> mip_level;
+  return shifted == 0 ? 1U : shifted;
+}
+
+UINT subresource_mip_level(const ResourceInfo &resource, UINT subresource)
+{
+  if (resource.mip_levels == 0) {
+    return 0;
+  }
+  return subresource % resource.mip_levels;
+}
+
+UINT texture_subresource_width(const ResourceInfo &resource, UINT subresource)
+{
+  return mip_extent(resource.width, subresource_mip_level(resource, subresource));
+}
+
+UINT texture_subresource_height(const ResourceInfo &resource, UINT subresource)
+{
+  return mip_extent(resource.height, subresource_mip_level(resource, subresource));
+}
+
+std::size_t mapped_texture_snapshot_size(const ResourceInfo &resource)
+{
+  if (resource.resource_class != ResourceClass::Texture2D || resource.mapped_row_pitch == 0) {
+    return 0;
+  }
+  return static_cast<std::size_t>(resource.mapped_row_pitch) *
+         static_cast<std::size_t>(texture_subresource_height(resource, resource.mapped_subresource));
+}
+
+std::size_t texture_upload_size(
+    const ResourceInfo &resource,
+    UINT subresource,
+    const D3D11_BOX *dst_box,
+    UINT src_row_pitch,
+    UINT src_depth_pitch)
+{
+  if (resource.resource_class != ResourceClass::Texture2D) {
+    return 0;
+  }
+
+  UINT height = texture_subresource_height(resource, subresource);
+  if (dst_box) {
+    height = dst_box->bottom > dst_box->top ? (dst_box->bottom - dst_box->top) : 0U;
+  }
+  if (height == 0) {
+    return 0;
+  }
+
+  if (src_depth_pitch != 0) {
+    return src_depth_pitch;
+  }
+  if (src_row_pitch != 0) {
+    return static_cast<std::size_t>(src_row_pitch) * static_cast<std::size_t>(height);
+  }
+
+  const auto bytes_per_pixel = format_bytes_per_pixel(resource.format);
+  if (bytes_per_pixel == 0) {
+    return 0;
+  }
+
+  const UINT width = dst_box && dst_box->right > dst_box->left ? (dst_box->right - dst_box->left)
+                                                               : texture_subresource_width(resource, subresource);
+  return static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * bytes_per_pixel;
+}
+
+std::string texture2d_desc_json(const D3D11_TEXTURE2D_DESC &desc)
+{
+  std::ostringstream payload;
+  payload << "{"
+          << "\"width\":" << desc.Width << ","
+          << "\"height\":" << desc.Height << ","
+          << "\"mip_levels\":" << desc.MipLevels << ","
+          << "\"array_size\":" << desc.ArraySize << ","
+          << "\"format\":" << static_cast<unsigned int>(desc.Format) << ","
+          << "\"sample_count\":" << desc.SampleDesc.Count << ","
+          << "\"sample_quality\":" << desc.SampleDesc.Quality << ","
+          << "\"usage\":" << static_cast<unsigned int>(desc.Usage) << ","
+          << "\"bind_flags\":" << desc.BindFlags << ","
+          << "\"cpu_access_flags\":" << desc.CPUAccessFlags << ","
+          << "\"misc_flags\":" << desc.MiscFlags
+          << "}";
+  return payload.str();
+}
+
+std::string sampler_desc_json(const D3D11_SAMPLER_DESC &desc)
+{
+  std::ostringstream payload;
+  payload << "{"
+          << "\"filter\":" << static_cast<unsigned int>(desc.Filter) << ","
+          << "\"address_u\":" << static_cast<unsigned int>(desc.AddressU) << ","
+          << "\"address_v\":" << static_cast<unsigned int>(desc.AddressV) << ","
+          << "\"address_w\":" << static_cast<unsigned int>(desc.AddressW) << ","
+          << "\"mip_lod_bias\":" << desc.MipLODBias << ","
+          << "\"max_anisotropy\":" << desc.MaxAnisotropy << ","
+          << "\"comparison_func\":" << static_cast<unsigned int>(desc.ComparisonFunc) << ","
+          << "\"border_color\":[" << desc.BorderColor[0] << "," << desc.BorderColor[1] << "," << desc.BorderColor[2] << ","
+          << desc.BorderColor[3] << "],"
+          << "\"min_lod\":" << desc.MinLOD << ","
+          << "\"max_lod\":" << desc.MaxLOD
+          << "}";
+  return payload.str();
+}
+
+std::string shader_resource_view_desc_json(const D3D11_SHADER_RESOURCE_VIEW_DESC &desc)
+{
+  std::ostringstream payload;
+  payload << "{"
+          << "\"format\":" << static_cast<unsigned int>(desc.Format) << ","
+          << "\"view_dimension\":" << static_cast<unsigned int>(desc.ViewDimension);
+  if (desc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) {
+    payload << ",\"texture2d\":{\"most_detailed_mip\":" << desc.Texture2D.MostDetailedMip
+            << ",\"mip_levels\":" << desc.Texture2D.MipLevels << "}";
+  }
+  payload << "}";
+  return payload.str();
+}
+
+std::string render_target_view_desc_json(const D3D11_RENDER_TARGET_VIEW_DESC &desc)
+{
+  std::ostringstream payload;
+  payload << "{"
+          << "\"format\":" << static_cast<unsigned int>(desc.Format) << ","
+          << "\"view_dimension\":" << static_cast<unsigned int>(desc.ViewDimension);
+  if (desc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D) {
+    payload << ",\"texture2d\":{\"mip_slice\":" << desc.Texture2D.MipSlice << "}";
+  }
+  payload << "}";
+  return payload.str();
+}
+
+std::string depth_stencil_view_desc_json(const D3D11_DEPTH_STENCIL_VIEW_DESC &desc)
+{
+  std::ostringstream payload;
+  payload << "{"
+          << "\"format\":" << static_cast<unsigned int>(desc.Format) << ","
+          << "\"view_dimension\":" << static_cast<unsigned int>(desc.ViewDimension) << ","
+          << "\"flags\":" << desc.Flags;
+  if (desc.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2D) {
+    payload << ",\"texture2d\":{\"mip_slice\":" << desc.Texture2D.MipSlice << "}";
+  }
+  payload << "}";
+  return payload.str();
+}
+
+std::string blend_desc_json(const D3D11_BLEND_DESC &desc)
+{
+  std::ostringstream payload;
+  payload << "{"
+          << "\"alpha_to_coverage_enable\":" << bool_json(desc.AlphaToCoverageEnable == TRUE) << ","
+          << "\"independent_blend_enable\":" << bool_json(desc.IndependentBlendEnable == TRUE) << ","
+          << "\"render_targets\":[";
+  for (UINT index = 0; index < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++index) {
+    if (index != 0) {
+      payload << ",";
+    }
+    const auto &target = desc.RenderTarget[index];
+    payload << "{"
+            << "\"blend_enable\":" << bool_json(target.BlendEnable == TRUE) << ","
+            << "\"src_blend\":" << static_cast<unsigned int>(target.SrcBlend) << ","
+            << "\"dest_blend\":" << static_cast<unsigned int>(target.DestBlend) << ","
+            << "\"blend_op\":" << static_cast<unsigned int>(target.BlendOp) << ","
+            << "\"src_blend_alpha\":" << static_cast<unsigned int>(target.SrcBlendAlpha) << ","
+            << "\"dest_blend_alpha\":" << static_cast<unsigned int>(target.DestBlendAlpha) << ","
+            << "\"blend_op_alpha\":" << static_cast<unsigned int>(target.BlendOpAlpha) << ","
+            << "\"write_mask\":" << static_cast<unsigned int>(target.RenderTargetWriteMask)
+            << "}";
+  }
+  payload << "]}";
+  return payload.str();
+}
+
+std::string depth_stencil_state_desc_json(const D3D11_DEPTH_STENCIL_DESC &desc)
+{
+  std::ostringstream payload;
+  payload << "{"
+          << "\"depth_enable\":" << bool_json(desc.DepthEnable == TRUE) << ","
+          << "\"depth_write_mask\":" << static_cast<unsigned int>(desc.DepthWriteMask) << ","
+          << "\"depth_func\":" << static_cast<unsigned int>(desc.DepthFunc) << ","
+          << "\"stencil_enable\":" << bool_json(desc.StencilEnable == TRUE) << ","
+          << "\"stencil_read_mask\":" << static_cast<unsigned int>(desc.StencilReadMask) << ","
+          << "\"stencil_write_mask\":" << static_cast<unsigned int>(desc.StencilWriteMask)
+          << "}";
+  return payload.str();
+}
+
+std::string rasterizer_desc_json(const D3D11_RASTERIZER_DESC &desc)
+{
+  std::ostringstream payload;
+  payload << "{"
+          << "\"fill_mode\":" << static_cast<unsigned int>(desc.FillMode) << ","
+          << "\"cull_mode\":" << static_cast<unsigned int>(desc.CullMode) << ","
+          << "\"front_counter_clockwise\":" << bool_json(desc.FrontCounterClockwise == TRUE) << ","
+          << "\"depth_bias\":" << desc.DepthBias << ","
+          << "\"depth_bias_clamp\":" << desc.DepthBiasClamp << ","
+          << "\"slope_scaled_depth_bias\":" << desc.SlopeScaledDepthBias << ","
+          << "\"depth_clip_enable\":" << bool_json(desc.DepthClipEnable == TRUE) << ","
+          << "\"scissor_enable\":" << bool_json(desc.ScissorEnable == TRUE) << ","
+          << "\"multisample_enable\":" << bool_json(desc.MultisampleEnable == TRUE) << ","
+          << "\"antialiased_line_enable\":" << bool_json(desc.AntialiasedLineEnable == TRUE)
+          << "}";
+  return payload.str();
+}
+
+ResourceInfo make_buffer_info(
+    trace::ObjectId object_id,
+    trace::ObjectId parent_object_id,
+    const D3D11_BUFFER_DESC *desc)
+{
+  ResourceInfo info;
+  info.object_id = object_id;
+  info.resource_class = ResourceClass::Buffer;
+  info.parent_object_id = parent_object_id;
+  if (desc) {
+    info.byte_width = desc->ByteWidth;
+    info.bind_flags = desc->BindFlags;
+    info.usage = desc->Usage;
+    info.cpu_access_flags = desc->CPUAccessFlags;
+    info.misc_flags = desc->MiscFlags;
+    info.structure_byte_stride = desc->StructureByteStride;
+  }
+  return info;
+}
+
+ResourceInfo make_texture2d_info(
+    trace::ObjectId object_id,
+    trace::ObjectId parent_object_id,
+    const D3D11_TEXTURE2D_DESC &desc)
+{
+  ResourceInfo info;
+  info.object_id = object_id;
+  info.resource_class = ResourceClass::Texture2D;
+  info.parent_object_id = parent_object_id;
+  info.width = desc.Width;
+  info.height = desc.Height;
+  info.mip_levels = desc.MipLevels;
+  info.array_size = desc.ArraySize;
+  info.format = desc.Format;
+  info.sample_count = desc.SampleDesc.Count;
+  info.sample_quality = desc.SampleDesc.Quality;
+  info.bind_flags = desc.BindFlags;
+  info.usage = desc.Usage;
+  info.cpu_access_flags = desc.CPUAccessFlags;
+  info.misc_flags = desc.MiscFlags;
+  return info;
+}
+
 template <typename Interface>
 trace::ObjectId lookup_object_id_locked(Interface *object)
 {
@@ -477,6 +858,16 @@ std::vector<trace::ObjectId> collect_object_ids_locked(const std::vector<const v
   return object_ids;
 }
 
+ResourceInfo *lookup_resource_info_locked(const void *resource)
+{
+  auto &state = capture_state();
+  const auto it = state.resources.find(resource);
+  if (it == state.resources.end()) {
+    return nullptr;
+  }
+  return &it->second;
+}
+
 void record_boundary_locked(trace::BoundaryKind boundary, std::string payload_json)
 {
   if (auto *session = runtime::ensure_process_trace_session(trace::ApiKind::D3D11)) {
@@ -484,10 +875,31 @@ void record_boundary_locked(trace::BoundaryKind boundary, std::string payload_js
     event.kind = trace::EventKind::Boundary;
     event.boundary = boundary;
     event.callsite.sequence = capture_state().next_sequence++;
-    event.callsite.function_name = boundary == trace::BoundaryKind::Present ? "Present" : "Frame";
+    switch (boundary) {
+    case trace::BoundaryKind::Present:
+      event.callsite.function_name = "Present";
+      break;
+    case trace::BoundaryKind::DebugMarker:
+      event.callsite.function_name = "DebugMarker";
+      break;
+    default:
+      event.callsite.function_name = "Frame";
+      break;
+    }
     event.payload = std::move(payload_json);
     session->append_call_event(event);
   }
+}
+
+void record_scene_marker_locked(const char *scene_name, const char *dx_mode, const char *phase)
+{
+  std::ostringstream payload;
+  payload << "{"
+          << "\"scene_name\":\"" << json_escape(scene_name ? scene_name : "") << "\","
+          << "\"dx_mode\":\"" << json_escape(dx_mode ? dx_mode : "") << "\","
+          << "\"phase\":\"" << json_escape(phase ? phase : "") << "\""
+          << "}";
+  record_boundary_locked(trace::BoundaryKind::DebugMarker, payload.str());
 }
 
 void record_call_locked(
@@ -620,16 +1032,9 @@ HRESULT STDMETHODCALLTYPE hook_create_buffer(
   std::vector<trace::BlobId> blob_refs;
   std::string initial_path_json = "null";
   if (SUCCEEDED(hr) && buffer && *buffer) {
-    const auto object_id = register_object_locked(*buffer, trace::ObjectKind::Resource, "ID3D11Buffer", lookup_object_id_locked(device));
-    BufferInfo buffer_info;
-    buffer_info.object_id = object_id;
-    if (desc) {
-      buffer_info.byte_width = desc->ByteWidth;
-      buffer_info.bind_flags = desc->BindFlags;
-      buffer_info.usage = desc->Usage;
-      buffer_info.cpu_access_flags = desc->CPUAccessFlags;
-    }
-    state.buffers[*buffer] = buffer_info;
+    const auto parent_object_id = lookup_object_id_locked(device);
+    const auto object_id = register_object_locked(*buffer, trace::ObjectKind::Resource, "ID3D11Buffer", parent_object_id);
+    state.resources[*buffer] = make_buffer_info(object_id, parent_object_id, desc);
 
     if (desc && initial_data && initial_data->pSysMem && desc->ByteWidth != 0) {
       auto asset = register_asset_bytes(trace::AssetKind::Buffer, "buffer-initial", initial_data->pSysMem, desc->ByteWidth);
@@ -648,6 +1053,78 @@ HRESULT STDMETHODCALLTYPE hook_create_buffer(
           << "\"initial_data_path\":" << initial_path_json
           << "}";
   record_call_locked("ID3D11Device::CreateBuffer", hr, {device, buffer ? *buffer : nullptr}, blob_refs, payload.str());
+  return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_create_texture2d(
+    ID3D11Device *device,
+    const D3D11_TEXTURE2D_DESC *desc,
+    const D3D11_SUBRESOURCE_DATA *initial_data,
+    ID3D11Texture2D **texture)
+{
+  proxy_debug_log("hook_create_texture2d");
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = device_hook_locked(device);
+  const HRESULT hr = hook.create_texture2d(device, desc, initial_data, texture);
+
+  std::vector<trace::BlobId> blob_refs;
+  std::string initial_path_json = "null";
+  if (SUCCEEDED(hr) && texture && *texture && desc) {
+    const auto object_id = register_object_locked(*texture, trace::ObjectKind::Resource, "ID3D11Texture2D", lookup_object_id_locked(device));
+    state.resources[*texture] = make_texture2d_info(object_id, lookup_object_id_locked(device), *desc);
+
+    if (initial_data && initial_data->pSysMem) {
+      const auto upload_size = texture_upload_size(state.resources[*texture], 0, nullptr, initial_data->SysMemPitch, initial_data->SysMemSlicePitch);
+      if (upload_size != 0) {
+        const auto asset = register_asset_bytes(trace::AssetKind::Texture, "texture-initial", initial_data->pSysMem, upload_size);
+        blob_refs.push_back(asset.blob_id);
+        initial_path_json = "\"" + json_escape(asset.relative_path.generic_string()) + "\"";
+      }
+    }
+  }
+
+  std::ostringstream payload;
+  payload << "{"
+          << "\"resource_class\":\"texture2d\","
+          << "\"desc\":" << (desc ? texture2d_desc_json(*desc) : "null") << ","
+          << "\"has_initial_data\":" << bool_json(initial_data && initial_data->pSysMem != nullptr) << ","
+          << "\"initial_data_path\":" << initial_path_json
+          << "}";
+  record_call_locked("ID3D11Device::CreateTexture2D", hr, {device, texture ? *texture : nullptr}, blob_refs, payload.str());
+  return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_create_shader_resource_view(
+    ID3D11Device *device,
+    ID3D11Resource *resource,
+    const D3D11_SHADER_RESOURCE_VIEW_DESC *desc,
+    ID3D11ShaderResourceView **shader_resource_view)
+{
+  proxy_debug_log("hook_create_shader_resource_view");
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = device_hook_locked(device);
+  const HRESULT hr = hook.create_shader_resource_view(device, resource, desc, shader_resource_view);
+  if (SUCCEEDED(hr) && shader_resource_view && *shader_resource_view) {
+    register_object_locked(
+        *shader_resource_view,
+        trace::ObjectKind::View,
+        "ID3D11ShaderResourceView",
+        lookup_object_id_locked(resource));
+  }
+
+  std::ostringstream payload;
+  payload << "{"
+          << "\"desc_present\":" << bool_json(desc != nullptr) << ","
+          << "\"desc\":" << (desc ? shader_resource_view_desc_json(*desc) : "null")
+          << "}";
+  record_call_locked(
+      "ID3D11Device::CreateShaderResourceView",
+      hr,
+      {device, resource, shader_resource_view ? *shader_resource_view : nullptr},
+      {},
+      payload.str());
   return hr;
 }
 
@@ -671,11 +1148,47 @@ HRESULT STDMETHODCALLTYPE hook_create_render_target_view(
   }
 
   std::ostringstream payload;
-  payload << "{\"desc_present\":" << bool_json(desc != nullptr) << "}";
+  payload << "{"
+          << "\"desc_present\":" << bool_json(desc != nullptr) << ","
+          << "\"desc\":" << (desc ? render_target_view_desc_json(*desc) : "null")
+          << "}";
   record_call_locked(
       "ID3D11Device::CreateRenderTargetView",
       hr,
       {device, resource, render_target_view ? *render_target_view : nullptr},
+      {},
+      payload.str());
+  return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_create_depth_stencil_view(
+    ID3D11Device *device,
+    ID3D11Resource *resource,
+    const D3D11_DEPTH_STENCIL_VIEW_DESC *desc,
+    ID3D11DepthStencilView **depth_stencil_view)
+{
+  proxy_debug_log("hook_create_depth_stencil_view");
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = device_hook_locked(device);
+  const HRESULT hr = hook.create_depth_stencil_view(device, resource, desc, depth_stencil_view);
+  if (SUCCEEDED(hr) && depth_stencil_view && *depth_stencil_view) {
+    register_object_locked(
+        *depth_stencil_view,
+        trace::ObjectKind::View,
+        "ID3D11DepthStencilView",
+        lookup_object_id_locked(resource));
+  }
+
+  std::ostringstream payload;
+  payload << "{"
+          << "\"desc_present\":" << bool_json(desc != nullptr) << ","
+          << "\"desc\":" << (desc ? depth_stencil_view_desc_json(*desc) : "null")
+          << "}";
+  record_call_locked(
+      "ID3D11Device::CreateDepthStencilView",
+      hr,
+      {device, resource, depth_stencil_view ? *depth_stencil_view : nullptr},
       {},
       payload.str());
   return hr;
@@ -804,6 +1317,104 @@ HRESULT STDMETHODCALLTYPE hook_create_pixel_shader(
   return hr;
 }
 
+HRESULT STDMETHODCALLTYPE hook_create_blend_state(
+    ID3D11Device *device,
+    const D3D11_BLEND_DESC *desc,
+    ID3D11BlendState **blend_state)
+{
+  proxy_debug_log("hook_create_blend_state");
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = device_hook_locked(device);
+  const HRESULT hr = hook.create_blend_state(device, desc, blend_state);
+  if (SUCCEEDED(hr) && blend_state && *blend_state) {
+    register_object_locked(*blend_state, trace::ObjectKind::PipelineState, "ID3D11BlendState", lookup_object_id_locked(device));
+  }
+
+  std::ostringstream payload;
+  payload << "{\"desc\":" << (desc ? blend_desc_json(*desc) : "null") << "}";
+  record_call_locked("ID3D11Device::CreateBlendState", hr, {device, blend_state ? *blend_state : nullptr}, {}, payload.str());
+  return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_create_depth_stencil_state(
+    ID3D11Device *device,
+    const D3D11_DEPTH_STENCIL_DESC *desc,
+    ID3D11DepthStencilState **depth_stencil_state)
+{
+  proxy_debug_log("hook_create_depth_stencil_state");
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = device_hook_locked(device);
+  const HRESULT hr = hook.create_depth_stencil_state(device, desc, depth_stencil_state);
+  if (SUCCEEDED(hr) && depth_stencil_state && *depth_stencil_state) {
+    register_object_locked(
+        *depth_stencil_state,
+        trace::ObjectKind::PipelineState,
+        "ID3D11DepthStencilState",
+        lookup_object_id_locked(device));
+  }
+
+  std::ostringstream payload;
+  payload << "{\"desc\":" << (desc ? depth_stencil_state_desc_json(*desc) : "null") << "}";
+  record_call_locked(
+      "ID3D11Device::CreateDepthStencilState",
+      hr,
+      {device, depth_stencil_state ? *depth_stencil_state : nullptr},
+      {},
+      payload.str());
+  return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_create_rasterizer_state(
+    ID3D11Device *device,
+    const D3D11_RASTERIZER_DESC *desc,
+    ID3D11RasterizerState **rasterizer_state)
+{
+  proxy_debug_log("hook_create_rasterizer_state");
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = device_hook_locked(device);
+  const HRESULT hr = hook.create_rasterizer_state(device, desc, rasterizer_state);
+  if (SUCCEEDED(hr) && rasterizer_state && *rasterizer_state) {
+    register_object_locked(
+        *rasterizer_state,
+        trace::ObjectKind::PipelineState,
+        "ID3D11RasterizerState",
+        lookup_object_id_locked(device));
+  }
+
+  std::ostringstream payload;
+  payload << "{\"desc\":" << (desc ? rasterizer_desc_json(*desc) : "null") << "}";
+  record_call_locked(
+      "ID3D11Device::CreateRasterizerState",
+      hr,
+      {device, rasterizer_state ? *rasterizer_state : nullptr},
+      {},
+      payload.str());
+  return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_create_sampler_state(
+    ID3D11Device *device,
+    const D3D11_SAMPLER_DESC *desc,
+    ID3D11SamplerState **sampler_state)
+{
+  proxy_debug_log("hook_create_sampler_state");
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = device_hook_locked(device);
+  const HRESULT hr = hook.create_sampler_state(device, desc, sampler_state);
+  if (SUCCEEDED(hr) && sampler_state && *sampler_state) {
+    register_object_locked(*sampler_state, trace::ObjectKind::PipelineState, "ID3D11SamplerState", lookup_object_id_locked(device));
+  }
+
+  std::ostringstream payload;
+  payload << "{\"desc\":" << (desc ? sampler_desc_json(*desc) : "null") << "}";
+  record_call_locked("ID3D11Device::CreateSamplerState", hr, {device, sampler_state ? *sampler_state : nullptr}, {}, payload.str());
+  return hr;
+}
+
 void STDMETHODCALLTYPE hook_get_immediate_context(ID3D11Device *device, ID3D11DeviceContext **immediate_context)
 {
   auto &state = capture_state();
@@ -844,6 +1455,27 @@ void STDMETHODCALLTYPE hook_vs_set_constant_buffers(
   record_call_locked("ID3D11DeviceContext::VSSetConstantBuffers", S_OK, objects, {}, payload.str());
 }
 
+void STDMETHODCALLTYPE hook_ps_set_shader_resources(
+    ID3D11DeviceContext *context,
+    UINT start_slot,
+    UINT num_views,
+    ID3D11ShaderResourceView *const *shader_resource_views)
+{
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = context_hook_locked(context);
+  hook.ps_set_shader_resources(context, start_slot, num_views, shader_resource_views);
+
+  std::vector<const void *> objects = {context};
+  for (UINT index = 0; index < num_views; ++index) {
+    objects.push_back(shader_resource_views ? shader_resource_views[index] : nullptr);
+  }
+
+  std::ostringstream payload;
+  payload << "{\"start_slot\":" << start_slot << ",\"num_views\":" << num_views << "}";
+  record_call_locked("ID3D11DeviceContext::PSSetShaderResources", S_OK, objects, {}, payload.str());
+}
+
 void STDMETHODCALLTYPE hook_ps_set_shader(
     ID3D11DeviceContext *context,
     ID3D11PixelShader *pixel_shader,
@@ -876,6 +1508,45 @@ void STDMETHODCALLTYPE hook_vs_set_shader(
   record_call_locked("ID3D11DeviceContext::VSSetShader", S_OK, {context, vertex_shader}, {}, payload.str());
 }
 
+void STDMETHODCALLTYPE hook_ps_set_samplers(
+    ID3D11DeviceContext *context,
+    UINT start_slot,
+    UINT num_samplers,
+    ID3D11SamplerState *const *samplers)
+{
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = context_hook_locked(context);
+  hook.ps_set_samplers(context, start_slot, num_samplers, samplers);
+
+  std::vector<const void *> objects = {context};
+  for (UINT index = 0; index < num_samplers; ++index) {
+    objects.push_back(samplers ? samplers[index] : nullptr);
+  }
+
+  std::ostringstream payload;
+  payload << "{\"start_slot\":" << start_slot << ",\"num_samplers\":" << num_samplers << "}";
+  record_call_locked("ID3D11DeviceContext::PSSetSamplers", S_OK, objects, {}, payload.str());
+}
+
+void STDMETHODCALLTYPE hook_draw_indexed(
+    ID3D11DeviceContext *context,
+    UINT index_count,
+    UINT start_index_location,
+    INT base_vertex_location)
+{
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  ensure_frame_begin_locked();
+  auto &hook = context_hook_locked(context);
+  hook.draw_indexed(context, index_count, start_index_location, base_vertex_location);
+
+  std::ostringstream payload;
+  payload << "{\"index_count\":" << index_count << ",\"start_index_location\":" << start_index_location
+          << ",\"base_vertex_location\":" << base_vertex_location << "}";
+  record_call_locked("ID3D11DeviceContext::DrawIndexed", S_OK, {context}, {}, payload.str());
+}
+
 void STDMETHODCALLTYPE hook_draw(ID3D11DeviceContext *context, UINT vertex_count, UINT start_vertex_location)
 {
   auto &state = capture_state();
@@ -904,17 +1575,24 @@ HRESULT STDMETHODCALLTYPE hook_map(
   const HRESULT hr = hook.map(context, resource, subresource, map_type, map_flags, mapped_resource);
 
   if (SUCCEEDED(hr) && mapped_resource) {
-    const auto buffer_it = state.buffers.find(resource);
-    if (buffer_it != state.buffers.end()) {
-      buffer_it->second.mapped_ptr = mapped_resource->pData;
-      buffer_it->second.mapped_subresource = subresource;
-      buffer_it->second.mapped_type = map_type;
+    if (auto *resource_info = lookup_resource_info_locked(resource)) {
+      resource_info->mapped_ptr = mapped_resource->pData;
+      resource_info->mapped_subresource = subresource;
+      resource_info->mapped_type = map_type;
+      resource_info->mapped_row_pitch = mapped_resource->RowPitch;
+      resource_info->mapped_depth_pitch = mapped_resource->DepthPitch;
     }
   }
 
   std::ostringstream payload;
   payload << "{\"subresource\":" << subresource << ",\"map_type\":\"" << map_type_name(map_type)
-          << "\",\"map_flags\":" << map_flags << "}";
+          << "\",\"map_flags\":" << map_flags;
+  if (const auto *resource_info = lookup_resource_info_locked(resource)) {
+    payload << ",\"resource_class\":\"" << resource_class_name(resource_info->resource_class) << "\""
+            << ",\"mapped_row_pitch\":" << resource_info->mapped_row_pitch
+            << ",\"mapped_depth_pitch\":" << resource_info->mapped_depth_pitch;
+  }
+  payload << "}";
   record_call_locked("ID3D11DeviceContext::Map", hr, {context, resource}, {}, payload.str());
   return hr;
 }
@@ -927,23 +1605,39 @@ void STDMETHODCALLTYPE hook_unmap(ID3D11DeviceContext *context, ID3D11Resource *
 
   std::vector<trace::BlobId> blob_refs;
   std::string snapshot_path_json = "null";
-  const auto buffer_it = state.buffers.find(resource);
-  if (buffer_it != state.buffers.end() && buffer_it->second.mapped_ptr && buffer_it->second.byte_width != 0) {
-    const auto asset = register_asset_bytes(
-        trace::AssetKind::Buffer,
-        "buffer-map-snapshot",
-        buffer_it->second.mapped_ptr,
-        buffer_it->second.byte_width);
-    blob_refs.push_back(asset.blob_id);
-    snapshot_path_json = "\"" + json_escape(asset.relative_path.generic_string()) + "\"";
-    buffer_it->second.mapped_ptr = nullptr;
+  std::string resource_class_json = "\"unknown\"";
+  if (auto *resource_info = lookup_resource_info_locked(resource)) {
+    resource_class_json = "\"" + json_escape(resource_class_name(resource_info->resource_class)) + "\"";
+    std::size_t snapshot_size = 0;
+    trace::AssetKind asset_kind = trace::AssetKind::Unknown;
+    const char *asset_name = nullptr;
+    if (resource_info->resource_class == ResourceClass::Buffer && resource_info->mapped_ptr && resource_info->byte_width != 0) {
+      snapshot_size = resource_info->byte_width;
+      asset_kind = trace::AssetKind::Buffer;
+      asset_name = "buffer-map-snapshot";
+    } else if (resource_info->resource_class == ResourceClass::Texture2D && resource_info->mapped_ptr) {
+      snapshot_size = mapped_texture_snapshot_size(*resource_info);
+      asset_kind = trace::AssetKind::Texture;
+      asset_name = "texture-map-snapshot";
+    }
+
+    if (snapshot_size != 0 && asset_kind != trace::AssetKind::Unknown && asset_name) {
+      const auto asset = register_asset_bytes(asset_kind, asset_name, resource_info->mapped_ptr, snapshot_size);
+      blob_refs.push_back(asset.blob_id);
+      snapshot_path_json = "\"" + json_escape(asset.relative_path.generic_string()) + "\"";
+    }
+
+    resource_info->mapped_ptr = nullptr;
+    resource_info->mapped_row_pitch = 0;
+    resource_info->mapped_depth_pitch = 0;
   }
 
   auto &hook = context_hook_locked(context);
   hook.unmap(context, resource, subresource);
 
   std::ostringstream payload;
-  payload << "{\"subresource\":" << subresource << ",\"snapshot_path\":" << snapshot_path_json << "}";
+  payload << "{\"subresource\":" << subresource << ",\"resource_class\":" << resource_class_json
+          << ",\"snapshot_path\":" << snapshot_path_json << "}";
   record_call_locked("ID3D11DeviceContext::Unmap", S_OK, {context, resource}, blob_refs, payload.str());
 }
 
@@ -1015,6 +1709,49 @@ void STDMETHODCALLTYPE hook_ia_set_vertex_buffers(
   record_call_locked("ID3D11DeviceContext::IASetVertexBuffers", S_OK, objects, {}, payload.str());
 }
 
+void STDMETHODCALLTYPE hook_ia_set_index_buffer(
+    ID3D11DeviceContext *context,
+    ID3D11Buffer *index_buffer,
+    DXGI_FORMAT format,
+    UINT offset)
+{
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = context_hook_locked(context);
+  hook.ia_set_index_buffer(context, index_buffer, format, offset);
+
+  std::ostringstream payload;
+  payload << "{\"format\":" << static_cast<unsigned int>(format) << ",\"offset\":" << offset << "}";
+  record_call_locked("ID3D11DeviceContext::IASetIndexBuffer", S_OK, {context, index_buffer}, {}, payload.str());
+}
+
+void STDMETHODCALLTYPE hook_draw_indexed_instanced(
+    ID3D11DeviceContext *context,
+    UINT index_count_per_instance,
+    UINT instance_count,
+    UINT start_index_location,
+    INT base_vertex_location,
+    UINT start_instance_location)
+{
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  ensure_frame_begin_locked();
+  auto &hook = context_hook_locked(context);
+  hook.draw_indexed_instanced(
+      context,
+      index_count_per_instance,
+      instance_count,
+      start_index_location,
+      base_vertex_location,
+      start_instance_location);
+
+  std::ostringstream payload;
+  payload << "{\"index_count_per_instance\":" << index_count_per_instance << ",\"instance_count\":" << instance_count
+          << ",\"start_index_location\":" << start_index_location << ",\"base_vertex_location\":" << base_vertex_location
+          << ",\"start_instance_location\":" << start_instance_location << "}";
+  record_call_locked("ID3D11DeviceContext::DrawIndexedInstanced", S_OK, {context}, {}, payload.str());
+}
+
 void STDMETHODCALLTYPE hook_ia_set_primitive_topology(ID3D11DeviceContext *context, D3D11_PRIMITIVE_TOPOLOGY topology)
 {
   auto &state = capture_state();
@@ -1051,6 +1788,56 @@ void STDMETHODCALLTYPE hook_om_set_render_targets(
   record_call_locked("ID3D11DeviceContext::OMSetRenderTargets", S_OK, objects, {}, payload.str());
 }
 
+void STDMETHODCALLTYPE hook_om_set_blend_state(
+    ID3D11DeviceContext *context,
+    ID3D11BlendState *blend_state,
+    const FLOAT blend_factor[4],
+    UINT sample_mask)
+{
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = context_hook_locked(context);
+  hook.om_set_blend_state(context, blend_state, blend_factor, sample_mask);
+
+  std::ostringstream payload;
+  payload << "{\"blend_factor\":["
+          << (blend_factor ? blend_factor[0] : 0.0f) << ","
+          << (blend_factor ? blend_factor[1] : 0.0f) << ","
+          << (blend_factor ? blend_factor[2] : 0.0f) << ","
+          << (blend_factor ? blend_factor[3] : 0.0f) << "],"
+          << "\"sample_mask\":" << sample_mask << "}";
+  record_call_locked("ID3D11DeviceContext::OMSetBlendState", S_OK, {context, blend_state}, {}, payload.str());
+}
+
+void STDMETHODCALLTYPE hook_om_set_depth_stencil_state(
+    ID3D11DeviceContext *context,
+    ID3D11DepthStencilState *depth_stencil_state,
+    UINT stencil_ref)
+{
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = context_hook_locked(context);
+  hook.om_set_depth_stencil_state(context, depth_stencil_state, stencil_ref);
+
+  std::ostringstream payload;
+  payload << "{\"stencil_ref\":" << stencil_ref << "}";
+  record_call_locked(
+      "ID3D11DeviceContext::OMSetDepthStencilState",
+      S_OK,
+      {context, depth_stencil_state},
+      {},
+      payload.str());
+}
+
+void STDMETHODCALLTYPE hook_rs_set_state(ID3D11DeviceContext *context, ID3D11RasterizerState *rasterizer_state)
+{
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = context_hook_locked(context);
+  hook.rs_set_state(context, rasterizer_state);
+  record_call_locked("ID3D11DeviceContext::RSSetState", S_OK, {context, rasterizer_state}, {}, "{}");
+}
+
 void STDMETHODCALLTYPE hook_rs_set_viewports(ID3D11DeviceContext *context, UINT num_viewports, const D3D11_VIEWPORT *viewports)
 {
   auto &state = capture_state();
@@ -1081,6 +1868,99 @@ void STDMETHODCALLTYPE hook_rs_set_viewports(ID3D11DeviceContext *context, UINT 
   record_call_locked("ID3D11DeviceContext::RSSetViewports", S_OK, {context}, {}, payload.str());
 }
 
+void STDMETHODCALLTYPE hook_rs_set_scissor_rects(ID3D11DeviceContext *context, UINT num_rects, const D3D11_RECT *rects)
+{
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = context_hook_locked(context);
+  hook.rs_set_scissor_rects(context, num_rects, rects);
+
+  std::ostringstream payload;
+  payload << "{\"num_rects\":" << num_rects << ",\"rects\":[";
+  for (UINT index = 0; index < num_rects; ++index) {
+    if (index != 0) {
+      payload << ",";
+    }
+    const auto &rect = rects[index];
+    payload << "{\"left\":" << rect.left << ",\"top\":" << rect.top << ",\"right\":" << rect.right
+            << ",\"bottom\":" << rect.bottom << "}";
+  }
+  payload << "]}";
+  record_call_locked("ID3D11DeviceContext::RSSetScissorRects", S_OK, {context}, {}, payload.str());
+}
+
+void STDMETHODCALLTYPE hook_copy_resource(
+    ID3D11DeviceContext *context,
+    ID3D11Resource *dst_resource,
+    ID3D11Resource *src_resource)
+{
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = context_hook_locked(context);
+  hook.copy_resource(context, dst_resource, src_resource);
+
+  std::ostringstream payload;
+  if (const auto *dst_info = lookup_resource_info_locked(dst_resource)) {
+    payload << "{\"dst_resource_class\":\"" << resource_class_name(dst_info->resource_class) << "\"";
+  } else {
+    payload << "{\"dst_resource_class\":\"unknown\"";
+  }
+  if (const auto *src_info = lookup_resource_info_locked(src_resource)) {
+    payload << ",\"src_resource_class\":\"" << resource_class_name(src_info->resource_class) << "\"";
+  } else {
+    payload << ",\"src_resource_class\":\"unknown\"";
+  }
+  payload << "}";
+  record_call_locked("ID3D11DeviceContext::CopyResource", S_OK, {context, dst_resource, src_resource}, {}, payload.str());
+}
+
+void STDMETHODCALLTYPE hook_update_subresource(
+    ID3D11DeviceContext *context,
+    ID3D11Resource *dst_resource,
+    UINT dst_subresource,
+    const D3D11_BOX *dst_box,
+    const void *src_data,
+    UINT src_row_pitch,
+    UINT src_depth_pitch)
+{
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = context_hook_locked(context);
+  hook.update_subresource(context, dst_resource, dst_subresource, dst_box, src_data, src_row_pitch, src_depth_pitch);
+
+  std::vector<trace::BlobId> blob_refs;
+  std::string data_path_json = "null";
+  std::string resource_class_json = "\"unknown\"";
+  if (const auto *resource_info = lookup_resource_info_locked(dst_resource)) {
+    resource_class_json = "\"" + json_escape(resource_class_name(resource_info->resource_class)) + "\"";
+    if (src_data) {
+      const auto upload_size = resource_info->resource_class == ResourceClass::Buffer
+                                   ? static_cast<std::size_t>(resource_info->byte_width)
+                                   : texture_upload_size(*resource_info, dst_subresource, dst_box, src_row_pitch, src_depth_pitch);
+      if (upload_size != 0) {
+        const auto asset_kind =
+            resource_info->resource_class == ResourceClass::Buffer ? trace::AssetKind::Buffer : trace::AssetKind::Texture;
+        const auto asset_name =
+            resource_info->resource_class == ResourceClass::Buffer ? "buffer-update" : "texture-update";
+        const auto asset = register_asset_bytes(asset_kind, asset_name, src_data, upload_size);
+        blob_refs.push_back(asset.blob_id);
+        data_path_json = "\"" + json_escape(asset.relative_path.generic_string()) + "\"";
+      }
+    }
+  }
+
+  std::ostringstream payload;
+  payload << "{\"dst_subresource\":" << dst_subresource << ",\"resource_class\":" << resource_class_json
+          << ",\"src_row_pitch\":" << src_row_pitch << ",\"src_depth_pitch\":" << src_depth_pitch
+          << ",\"has_dst_box\":" << bool_json(dst_box != nullptr);
+  if (dst_box) {
+    payload << ",\"dst_box\":{\"left\":" << dst_box->left << ",\"top\":" << dst_box->top << ",\"front\":" << dst_box->front
+            << ",\"right\":" << dst_box->right << ",\"bottom\":" << dst_box->bottom << ",\"back\":" << dst_box->back << "}";
+  }
+  payload << ",\"data_path\":" << data_path_json << "}";
+  record_call_locked("ID3D11DeviceContext::UpdateSubresource", S_OK, {context, dst_resource}, blob_refs, payload.str());
+}
+
 void STDMETHODCALLTYPE hook_clear_render_target_view(
     ID3D11DeviceContext *context,
     ID3D11RenderTargetView *render_target_view,
@@ -1097,6 +1977,24 @@ void STDMETHODCALLTYPE hook_clear_render_target_view(
           << (color_rgba ? color_rgba[2] : 0.0f) << ","
           << (color_rgba ? color_rgba[3] : 0.0f) << "]}";
   record_call_locked("ID3D11DeviceContext::ClearRenderTargetView", S_OK, {context, render_target_view}, {}, payload.str());
+}
+
+void STDMETHODCALLTYPE hook_clear_depth_stencil_view(
+    ID3D11DeviceContext *context,
+    ID3D11DepthStencilView *depth_stencil_view,
+    UINT clear_flags,
+    FLOAT depth,
+    UINT8 stencil)
+{
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = context_hook_locked(context);
+  hook.clear_depth_stencil_view(context, depth_stencil_view, clear_flags, depth, stencil);
+
+  std::ostringstream payload;
+  payload << "{\"clear_flags\":" << clear_flags << ",\"depth\":" << depth << ",\"stencil\":" << static_cast<unsigned int>(stencil)
+          << "}";
+  record_call_locked("ID3D11DeviceContext::ClearDepthStencilView", S_OK, {context, depth_stencil_view}, {}, payload.str());
 }
 
 HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags)
@@ -1133,7 +2031,14 @@ HRESULT STDMETHODCALLTYPE hook_get_buffer(IDXGISwapChain *swapchain, UINT buffer
   auto &hook = swapchain_hook_locked(swapchain);
   const HRESULT hr = hook.get_buffer(swapchain, buffer_index, riid, surface);
   if (SUCCEEDED(hr) && surface && *surface) {
-    register_object_locked(*surface, trace::ObjectKind::Resource, "IDXGISwapChain::Buffer", lookup_object_id_locked(swapchain));
+    const auto parent_object_id = lookup_object_id_locked(swapchain);
+    const auto object_id = register_object_locked(*surface, trace::ObjectKind::Resource, "IDXGISwapChain::Buffer", parent_object_id);
+    if (riid == __uuidof(ID3D11Texture2D)) {
+      auto *texture = static_cast<ID3D11Texture2D *>(*surface);
+      D3D11_TEXTURE2D_DESC desc{};
+      texture->GetDesc(&desc);
+      state.resources[texture] = make_texture2d_info(object_id, parent_object_id, desc);
+    }
   }
 
   std::ostringstream payload;
@@ -1161,19 +2066,43 @@ void patch_device(ID3D11Device *device)
   DeviceHookState hook;
   hook.vtable = vtable;
   hook.create_buffer = reinterpret_cast<DeviceCreateBufferFn>(vtable[kDeviceCreateBufferIndex]);
+  hook.create_texture2d = reinterpret_cast<DeviceCreateTexture2DFn>(vtable[kDeviceCreateTexture2DIndex]);
+  hook.create_shader_resource_view =
+      reinterpret_cast<DeviceCreateShaderResourceViewFn>(vtable[kDeviceCreateShaderResourceViewIndex]);
   hook.create_render_target_view =
       reinterpret_cast<DeviceCreateRenderTargetViewFn>(vtable[kDeviceCreateRenderTargetViewIndex]);
+  hook.create_depth_stencil_view =
+      reinterpret_cast<DeviceCreateDepthStencilViewFn>(vtable[kDeviceCreateDepthStencilViewIndex]);
   hook.create_input_layout = reinterpret_cast<DeviceCreateInputLayoutFn>(vtable[kDeviceCreateInputLayoutIndex]);
   hook.create_vertex_shader = reinterpret_cast<DeviceCreateVertexShaderFn>(vtable[kDeviceCreateVertexShaderIndex]);
   hook.create_pixel_shader = reinterpret_cast<DeviceCreatePixelShaderFn>(vtable[kDeviceCreatePixelShaderIndex]);
+  hook.create_blend_state = reinterpret_cast<DeviceCreateBlendStateFn>(vtable[kDeviceCreateBlendStateIndex]);
+  hook.create_depth_stencil_state =
+      reinterpret_cast<DeviceCreateDepthStencilStateFn>(vtable[kDeviceCreateDepthStencilStateIndex]);
+  hook.create_rasterizer_state =
+      reinterpret_cast<DeviceCreateRasterizerStateFn>(vtable[kDeviceCreateRasterizerStateIndex]);
+  hook.create_sampler_state = reinterpret_cast<DeviceCreateSamplerStateFn>(vtable[kDeviceCreateSamplerStateIndex]);
   hook.get_immediate_context = reinterpret_cast<DeviceGetImmediateContextFn>(vtable[kDeviceGetImmediateContextIndex]);
 
   state.device_hooks.emplace(vtable, hook);
   patch_vtable_entry(vtable, kDeviceCreateBufferIndex, reinterpret_cast<void *>(hook_create_buffer));
+  patch_vtable_entry(vtable, kDeviceCreateTexture2DIndex, reinterpret_cast<void *>(hook_create_texture2d));
+  patch_vtable_entry(
+      vtable,
+      kDeviceCreateShaderResourceViewIndex,
+      reinterpret_cast<void *>(hook_create_shader_resource_view));
   patch_vtable_entry(vtable, kDeviceCreateRenderTargetViewIndex, reinterpret_cast<void *>(hook_create_render_target_view));
+  patch_vtable_entry(vtable, kDeviceCreateDepthStencilViewIndex, reinterpret_cast<void *>(hook_create_depth_stencil_view));
   patch_vtable_entry(vtable, kDeviceCreateInputLayoutIndex, reinterpret_cast<void *>(hook_create_input_layout));
   patch_vtable_entry(vtable, kDeviceCreateVertexShaderIndex, reinterpret_cast<void *>(hook_create_vertex_shader));
   patch_vtable_entry(vtable, kDeviceCreatePixelShaderIndex, reinterpret_cast<void *>(hook_create_pixel_shader));
+  patch_vtable_entry(vtable, kDeviceCreateBlendStateIndex, reinterpret_cast<void *>(hook_create_blend_state));
+  patch_vtable_entry(
+      vtable,
+      kDeviceCreateDepthStencilStateIndex,
+      reinterpret_cast<void *>(hook_create_depth_stencil_state));
+  patch_vtable_entry(vtable, kDeviceCreateRasterizerStateIndex, reinterpret_cast<void *>(hook_create_rasterizer_state));
+  patch_vtable_entry(vtable, kDeviceCreateSamplerStateIndex, reinterpret_cast<void *>(hook_create_sampler_state));
   patch_vtable_entry(vtable, kDeviceGetImmediateContextIndex, reinterpret_cast<void *>(hook_get_immediate_context));
   proxy_debug_logf("patch_device installed object=%p vtable=%p", device, vtable);
 }
@@ -1198,8 +2127,12 @@ void patch_context(ID3D11DeviceContext *context)
   hook.vtable = vtable;
   hook.vs_set_constant_buffers =
       reinterpret_cast<ContextVSSetConstantBuffersFn>(vtable[kContextVSSetConstantBuffersIndex]);
+  hook.ps_set_shader_resources =
+      reinterpret_cast<ContextPSSetShaderResourcesFn>(vtable[kContextPSSetShaderResourcesIndex]);
   hook.ps_set_shader = reinterpret_cast<ContextPSSetShaderFn>(vtable[kContextPSSetShaderIndex]);
+  hook.ps_set_samplers = reinterpret_cast<ContextPSSetSamplersFn>(vtable[kContextPSSetSamplersIndex]);
   hook.vs_set_shader = reinterpret_cast<ContextVSSetShaderFn>(vtable[kContextVSSetShaderIndex]);
+  hook.draw_indexed = reinterpret_cast<ContextDrawIndexedFn>(vtable[kContextDrawIndexedIndex]);
   hook.draw = reinterpret_cast<ContextDrawFn>(vtable[kContextDrawIndex]);
   hook.map = reinterpret_cast<ContextMapFn>(vtable[kContextMapIndex]);
   hook.unmap = reinterpret_cast<ContextUnmapFn>(vtable[kContextUnmapIndex]);
@@ -1208,28 +2141,72 @@ void patch_context(ID3D11DeviceContext *context)
   hook.ia_set_input_layout = reinterpret_cast<ContextIASetInputLayoutFn>(vtable[kContextIASetInputLayoutIndex]);
   hook.ia_set_vertex_buffers =
       reinterpret_cast<ContextIASetVertexBuffersFn>(vtable[kContextIASetVertexBuffersIndex]);
+  hook.ia_set_index_buffer = reinterpret_cast<ContextIASetIndexBufferFn>(vtable[kContextIASetIndexBufferIndex]);
+  hook.draw_indexed_instanced =
+      reinterpret_cast<ContextDrawIndexedInstancedFn>(vtable[kContextDrawIndexedInstancedIndex]);
   hook.ia_set_primitive_topology =
       reinterpret_cast<ContextIASetPrimitiveTopologyFn>(vtable[kContextIASetPrimitiveTopologyIndex]);
   hook.om_set_render_targets =
       reinterpret_cast<ContextOMSetRenderTargetsFn>(vtable[kContextOMSetRenderTargetsIndex]);
+  hook.om_set_blend_state = reinterpret_cast<ContextOMSetBlendStateFn>(vtable[kContextOMSetBlendStateIndex]);
+  hook.om_set_depth_stencil_state =
+      reinterpret_cast<ContextOMSetDepthStencilStateFn>(vtable[kContextOMSetDepthStencilStateIndex]);
+  hook.rs_set_state = reinterpret_cast<ContextRSSetStateFn>(vtable[kContextRSSetStateIndex]);
   hook.rs_set_viewports = reinterpret_cast<ContextRSSetViewportsFn>(vtable[kContextRSSetViewportsIndex]);
+  hook.rs_set_scissor_rects =
+      reinterpret_cast<ContextRSSetScissorRectsFn>(vtable[kContextRSSetScissorRectsIndex]);
+  hook.copy_resource = reinterpret_cast<ContextCopyResourceFn>(vtable[kContextCopyResourceIndex]);
+  hook.update_subresource =
+      reinterpret_cast<ContextUpdateSubresourceFn>(vtable[kContextUpdateSubresourceIndex]);
   hook.clear_render_target_view =
       reinterpret_cast<ContextClearRenderTargetViewFn>(vtable[kContextClearRenderTargetViewIndex]);
+  hook.clear_depth_stencil_view =
+      reinterpret_cast<ContextClearDepthStencilViewFn>(vtable[kContextClearDepthStencilViewIndex]);
 
   state.context_hooks.emplace(vtable, hook);
   patch_vtable_entry(vtable, kContextVSSetConstantBuffersIndex, reinterpret_cast<void *>(hook_vs_set_constant_buffers));
+  patch_vtable_entry(
+      vtable,
+      kContextPSSetShaderResourcesIndex,
+      reinterpret_cast<void *>(hook_ps_set_shader_resources));
   patch_vtable_entry(vtable, kContextPSSetShaderIndex, reinterpret_cast<void *>(hook_ps_set_shader));
+  patch_vtable_entry(vtable, kContextPSSetSamplersIndex, reinterpret_cast<void *>(hook_ps_set_samplers));
   patch_vtable_entry(vtable, kContextVSSetShaderIndex, reinterpret_cast<void *>(hook_vs_set_shader));
+  patch_vtable_entry(vtable, kContextDrawIndexedIndex, reinterpret_cast<void *>(hook_draw_indexed));
   patch_vtable_entry(vtable, kContextDrawIndex, reinterpret_cast<void *>(hook_draw));
   patch_vtable_entry(vtable, kContextMapIndex, reinterpret_cast<void *>(hook_map));
   patch_vtable_entry(vtable, kContextUnmapIndex, reinterpret_cast<void *>(hook_unmap));
   patch_vtable_entry(vtable, kContextPSSetConstantBuffersIndex, reinterpret_cast<void *>(hook_ps_set_constant_buffers));
   patch_vtable_entry(vtable, kContextIASetInputLayoutIndex, reinterpret_cast<void *>(hook_ia_set_input_layout));
   patch_vtable_entry(vtable, kContextIASetVertexBuffersIndex, reinterpret_cast<void *>(hook_ia_set_vertex_buffers));
+  patch_vtable_entry(vtable, kContextIASetIndexBufferIndex, reinterpret_cast<void *>(hook_ia_set_index_buffer));
+  patch_vtable_entry(
+      vtable,
+      kContextDrawIndexedInstancedIndex,
+      reinterpret_cast<void *>(hook_draw_indexed_instanced));
   patch_vtable_entry(vtable, kContextIASetPrimitiveTopologyIndex, reinterpret_cast<void *>(hook_ia_set_primitive_topology));
   patch_vtable_entry(vtable, kContextOMSetRenderTargetsIndex, reinterpret_cast<void *>(hook_om_set_render_targets));
+  patch_vtable_entry(vtable, kContextOMSetBlendStateIndex, reinterpret_cast<void *>(hook_om_set_blend_state));
+  patch_vtable_entry(
+      vtable,
+      kContextOMSetDepthStencilStateIndex,
+      reinterpret_cast<void *>(hook_om_set_depth_stencil_state));
+  patch_vtable_entry(vtable, kContextRSSetStateIndex, reinterpret_cast<void *>(hook_rs_set_state));
   patch_vtable_entry(vtable, kContextRSSetViewportsIndex, reinterpret_cast<void *>(hook_rs_set_viewports));
+  patch_vtable_entry(
+      vtable,
+      kContextRSSetScissorRectsIndex,
+      reinterpret_cast<void *>(hook_rs_set_scissor_rects));
+  patch_vtable_entry(vtable, kContextCopyResourceIndex, reinterpret_cast<void *>(hook_copy_resource));
+  patch_vtable_entry(
+      vtable,
+      kContextUpdateSubresourceIndex,
+      reinterpret_cast<void *>(hook_update_subresource));
   patch_vtable_entry(vtable, kContextClearRenderTargetViewIndex, reinterpret_cast<void *>(hook_clear_render_target_view));
+  patch_vtable_entry(
+      vtable,
+      kContextClearDepthStencilViewIndex,
+      reinterpret_cast<void *>(hook_clear_depth_stencil_view));
   proxy_debug_logf("patch_context installed object=%p vtable=%p", context, vtable);
 }
 
@@ -1320,6 +2297,13 @@ void process_attach()
 void process_detach() noexcept
 {
   runtime::shutdown_process_trace_session();
+}
+
+void emit_scene_marker(const char *scene_name, const char *dx_mode, const char *phase) noexcept
+{
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  record_scene_marker_locked(scene_name, dx_mode, phase);
 }
 
 HRESULT WINAPI create_device(

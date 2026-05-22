@@ -7,6 +7,7 @@ namespace apitrace::d3d11::internal {
 
 void process_attach();
 void process_detach() noexcept;
+void emit_scene_marker(const char *scene_name, const char *dx_mode, const char *phase) noexcept;
 
 HRESULT WINAPI core_create_device(
     IDXGIFactory *factory,

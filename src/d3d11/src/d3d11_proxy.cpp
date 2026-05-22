@@ -111,6 +111,14 @@ extern "C" HRESULT WINAPI D3D11On12CreateDevice(
       chosen_feature_level);
 }
 
+extern "C" void WINAPI apitrace_d3d11_emit_scene_marker(
+    const char *scene_name,
+    const char *dx_mode,
+    const char *phase)
+{
+  apitrace::d3d11::internal::emit_scene_marker(scene_name, dx_mode, phase);
+}
+
 extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
 {
   (void)instance;
