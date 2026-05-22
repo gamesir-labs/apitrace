@@ -91,7 +91,7 @@ scripts/validate-d3d11-wine.sh
 - 构建 `apitrace_test_demo.exe`
 - 把 proxy DLL 和 DXMT 运行时放到同一目录
 - 在 Wine 下启动 `--dx dx11 --scene smoke_triangle`
-- 校验 trace bundle 内的 `callstream.jsonl` / `checksums.json` / `objects.json`
+- 校验 trace bundle 内的 `callstream.jsonl` / `checksums.json` / `objects.json` / `pipelines/`
 - 校验 shader / buffer 资产引用存在且非空
 
 在 macOS 桌面环境下，脚本默认还会：
@@ -120,4 +120,4 @@ scripts/validate-d3d11-wine.sh
 - `test/fixtures/retrace/d3d11-triangle/triangle-d3d11.apitrace/`
 - `test/fixtures/retrace/d3d11-triangle/triangle-d3d11-visual.png`
 
-其中 `test/artifacts/` 和 `test/build/` 只保留为临时生成物，不应作为测试输入依赖。要刷新 fixture，先重新跑 `scripts/validate-d3d11-wine.sh`，再把 `test/artifacts/windows-x86_64/demo/bin/dx11-core-scene-traces/` 下对应 scene 的 bundle，以及 `test/artifacts/windows-x86_64/demo/bin/dx11-core-scene-logs/` 下对应 scene 的 `*-visual.png` 同步到上述目录。
+其中 `test/artifacts/` 和 `test/build/` 只保留为临时生成物，不应作为测试输入依赖。要刷新 fixture，先重新跑 `scripts/validate-d3d11-wine.sh`，再把 `test/artifacts/windows-x86_64/demo/bin/dx11-core-scene-traces/` 下对应 scene 的 bundle（包括 `pipelines/` sideband 资产），以及 `test/artifacts/windows-x86_64/demo/bin/dx11-core-scene-logs/` 下对应 scene 的 `*-visual.png` 同步到上述目录。

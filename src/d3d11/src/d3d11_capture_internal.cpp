@@ -4,6 +4,7 @@
 
 #include <windows.h>
 
+#include <array>
 #include <algorithm>
 #include <cstdarg>
 #include <cstdint>
@@ -318,6 +319,77 @@ struct ResourceInfo {
   UINT mapped_depth_pitch = 0;
 };
 
+struct ShaderInfo {
+  trace::ObjectId object_id = 0;
+  std::string stage_name;
+  std::string shader_path;
+  std::uint64_t bytecode_length = 0;
+};
+
+struct InputLayoutElementInfo {
+  std::string semantic_name;
+  UINT semantic_index = 0;
+  DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+  UINT input_slot = 0;
+  UINT aligned_byte_offset = 0;
+  D3D11_INPUT_CLASSIFICATION input_slot_class = D3D11_INPUT_PER_VERTEX_DATA;
+  UINT instance_data_step_rate = 0;
+};
+
+struct InputLayoutInfo {
+  trace::ObjectId object_id = 0;
+  std::string shader_path;
+  std::vector<InputLayoutElementInfo> elements;
+};
+
+struct PipelineStateInfo {
+  trace::ObjectId object_id = 0;
+  std::string desc_json = "null";
+};
+
+struct ViewInfo {
+  trace::ObjectId object_id = 0;
+  trace::ObjectId resource_object_id = 0;
+  std::string desc_json = "null";
+};
+
+struct VertexBufferBindingState {
+  ID3D11Buffer *buffer = nullptr;
+  UINT stride = 0;
+  UINT offset = 0;
+};
+
+struct IndexBufferBindingState {
+  ID3D11Buffer *buffer = nullptr;
+  DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+  UINT offset = 0;
+};
+
+struct ContextPipelineState {
+  ID3D11VertexShader *vertex_shader = nullptr;
+  ID3D11PixelShader *pixel_shader = nullptr;
+  ID3D11InputLayout *input_layout = nullptr;
+  D3D11_PRIMITIVE_TOPOLOGY primitive_topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  std::vector<ID3D11Buffer *> vs_constant_buffers;
+  std::vector<ID3D11Buffer *> ps_constant_buffers;
+  std::vector<VertexBufferBindingState> vertex_buffers;
+  IndexBufferBindingState index_buffer;
+  std::vector<ID3D11ShaderResourceView *> pixel_shader_resources;
+  std::vector<ID3D11SamplerState *> pixel_samplers;
+  ID3D11BlendState *blend_state = nullptr;
+  std::array<FLOAT, 4> blend_factor = {0.0f, 0.0f, 0.0f, 0.0f};
+  UINT sample_mask = 0xffffffffu;
+  ID3D11DepthStencilState *depth_stencil_state = nullptr;
+  UINT stencil_ref = 0;
+  ID3D11RasterizerState *rasterizer_state = nullptr;
+  std::vector<D3D11_VIEWPORT> viewports;
+  std::vector<D3D11_RECT> scissor_rects;
+  std::vector<ID3D11RenderTargetView *> render_target_views;
+  ID3D11DepthStencilView *depth_stencil_view = nullptr;
+  bool pipeline_dirty = true;
+  std::string cached_pipeline_path;
+};
+
 struct CaptureState {
   std::recursive_mutex mutex;
   trace::ObjectId next_object_id = 1000;
@@ -327,6 +399,16 @@ struct CaptureState {
   bool frame_begin_pending = true;
   std::unordered_map<const void *, ObjectInfo> objects;
   std::unordered_map<const void *, ResourceInfo> resources;
+  std::unordered_map<const void *, ShaderInfo> shaders;
+  std::unordered_map<const void *, InputLayoutInfo> input_layouts;
+  std::unordered_map<const void *, PipelineStateInfo> blend_states;
+  std::unordered_map<const void *, PipelineStateInfo> depth_stencil_states;
+  std::unordered_map<const void *, PipelineStateInfo> rasterizer_states;
+  std::unordered_map<const void *, PipelineStateInfo> sampler_states;
+  std::unordered_map<const void *, ViewInfo> shader_resource_views;
+  std::unordered_map<const void *, ViewInfo> render_target_views;
+  std::unordered_map<const void *, ViewInfo> depth_stencil_views;
+  std::unordered_map<const void *, ContextPipelineState> context_pipelines;
   std::unordered_map<void **, DeviceHookState> device_hooks;
   std::unordered_map<void **, ContextHookState> context_hooks;
   std::unordered_map<void **, SwapChainHookState> swapchain_hooks;
@@ -389,6 +471,14 @@ trace::AssetRecord register_asset_bytes(
     return session->register_asset(asset);
   }
   return asset;
+}
+
+trace::AssetRecord register_asset_text(
+    trace::AssetKind kind,
+    std::string debug_name,
+    const std::string &text)
+{
+  return register_asset_bytes(kind, std::move(debug_name), text.data(), text.size());
 }
 
 std::string json_escape(std::string_view text)
@@ -922,6 +1012,373 @@ void record_call_locked(
   }
 }
 
+template <typename Map, typename Key>
+const typename Map::mapped_type *lookup_entry_locked(const Map &map, const Key *key)
+{
+  if (!key) {
+    return nullptr;
+  }
+  const auto it = map.find(key);
+  if (it == map.end()) {
+    return nullptr;
+  }
+  return &it->second;
+}
+
+std::string state_object_json(
+    const char *state_name,
+    const PipelineStateInfo *state_info,
+    const std::string &extra_json = std::string());
+std::string view_object_json(
+    const char *view_name,
+    const ViewInfo *view_info,
+    const char *resource_key = "resource_object_id");
+
+ContextPipelineState &context_pipeline_state_locked(ID3D11DeviceContext *context)
+{
+  auto &state = capture_state();
+  auto [it, inserted] = state.context_pipelines.try_emplace(context);
+  auto &pipeline_state = it->second;
+  if (inserted) {
+    pipeline_state.vs_constant_buffers.resize(D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, nullptr);
+    pipeline_state.ps_constant_buffers.resize(D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, nullptr);
+    pipeline_state.vertex_buffers.resize(D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT);
+    pipeline_state.pixel_shader_resources.resize(D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, nullptr);
+    pipeline_state.pixel_samplers.resize(D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, nullptr);
+    pipeline_state.render_target_views.resize(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, nullptr);
+  }
+  return pipeline_state;
+}
+
+void mark_pipeline_dirty_locked(ID3D11DeviceContext *context)
+{
+  context_pipeline_state_locked(context).pipeline_dirty = true;
+}
+
+std::string object_id_json(trace::ObjectId object_id)
+{
+  if (object_id == 0) {
+    return "null";
+  }
+  return std::to_string(object_id);
+}
+
+std::string float4_json(const std::array<FLOAT, 4> &values)
+{
+  std::ostringstream payload;
+  payload << "[" << values[0] << "," << values[1] << "," << values[2] << "," << values[3] << "]";
+  return payload.str();
+}
+
+std::string viewport_array_json(const std::vector<D3D11_VIEWPORT> &viewports)
+{
+  std::ostringstream payload;
+  payload << "[";
+  for (std::size_t index = 0; index < viewports.size(); ++index) {
+    if (index != 0) {
+      payload << ",";
+    }
+    const auto &viewport = viewports[index];
+    payload << "{"
+            << "\"top_left_x\":" << viewport.TopLeftX << ","
+            << "\"top_left_y\":" << viewport.TopLeftY << ","
+            << "\"width\":" << viewport.Width << ","
+            << "\"height\":" << viewport.Height << ","
+            << "\"min_depth\":" << viewport.MinDepth << ","
+            << "\"max_depth\":" << viewport.MaxDepth
+            << "}";
+  }
+  payload << "]";
+  return payload.str();
+}
+
+std::string rect_array_json(const std::vector<D3D11_RECT> &rects)
+{
+  std::ostringstream payload;
+  payload << "[";
+  for (std::size_t index = 0; index < rects.size(); ++index) {
+    if (index != 0) {
+      payload << ",";
+    }
+    const auto &rect = rects[index];
+    payload << "{\"left\":" << rect.left << ",\"top\":" << rect.top << ",\"right\":" << rect.right
+            << ",\"bottom\":" << rect.bottom << "}";
+  }
+  payload << "]";
+  return payload.str();
+}
+
+std::string vertex_buffer_bindings_json(const std::vector<VertexBufferBindingState> &bindings)
+{
+  std::ostringstream payload;
+  payload << "[";
+  bool first = true;
+  for (std::size_t slot = 0; slot < bindings.size(); ++slot) {
+    const auto &binding = bindings[slot];
+    if (!binding.buffer) {
+      continue;
+    }
+    if (!first) {
+      payload << ",";
+    }
+    first = false;
+    payload << "{"
+            << "\"slot\":" << slot << ","
+            << "\"object_id\":" << lookup_object_id_locked(binding.buffer) << ","
+            << "\"stride\":" << binding.stride << ","
+            << "\"offset\":" << binding.offset
+            << "}";
+  }
+  payload << "]";
+  return payload.str();
+}
+
+std::string object_id_binding_array_json(const std::vector<const void *> &bindings)
+{
+  std::ostringstream payload;
+  payload << "[";
+  bool first = true;
+  for (std::size_t slot = 0; slot < bindings.size(); ++slot) {
+    const void *binding = bindings[slot];
+    if (!binding) {
+      continue;
+    }
+    if (!first) {
+      payload << ",";
+    }
+    first = false;
+    payload << "{\"slot\":" << slot << ",\"object_id\":" << lookup_object_id_locked(binding) << "}";
+  }
+  payload << "]";
+  return payload.str();
+}
+
+std::string shader_resource_bindings_json(
+    const std::vector<ID3D11ShaderResourceView *> &bindings,
+    const std::unordered_map<const void *, ViewInfo> &view_infos)
+{
+  std::ostringstream payload;
+  payload << "[";
+  bool first = true;
+  for (std::size_t slot = 0; slot < bindings.size(); ++slot) {
+    auto *binding = bindings[slot];
+    if (!binding) {
+      continue;
+    }
+    const auto it = view_infos.find(binding);
+    if (!first) {
+      payload << ",";
+    }
+    first = false;
+    payload << "{\"slot\":" << slot
+            << ",\"view\":" << view_object_json("srv", it != view_infos.end() ? &it->second : nullptr) << "}";
+  }
+  payload << "]";
+  return payload.str();
+}
+
+std::string sampler_bindings_json(
+    const std::vector<ID3D11SamplerState *> &bindings,
+    const std::unordered_map<const void *, PipelineStateInfo> &state_infos)
+{
+  std::ostringstream payload;
+  payload << "[";
+  bool first = true;
+  for (std::size_t slot = 0; slot < bindings.size(); ++slot) {
+    auto *binding = bindings[slot];
+    if (!binding) {
+      continue;
+    }
+    const auto it = state_infos.find(binding);
+    if (!first) {
+      payload << ",";
+    }
+    first = false;
+    payload << "{\"slot\":" << slot
+            << ",\"state\":" << state_object_json("sampler", it != state_infos.end() ? &it->second : nullptr) << "}";
+  }
+  payload << "]";
+  return payload.str();
+}
+
+std::string render_target_bindings_json(
+    const std::vector<ID3D11RenderTargetView *> &bindings,
+    const std::unordered_map<const void *, ViewInfo> &view_infos)
+{
+  std::ostringstream payload;
+  payload << "[";
+  bool first = true;
+  for (std::size_t slot = 0; slot < bindings.size(); ++slot) {
+    auto *binding = bindings[slot];
+    if (!binding) {
+      continue;
+    }
+    const auto it = view_infos.find(binding);
+    if (!first) {
+      payload << ",";
+    }
+    first = false;
+    payload << "{\"slot\":" << slot
+            << ",\"view\":" << view_object_json("rtv", it != view_infos.end() ? &it->second : nullptr) << "}";
+  }
+  payload << "]";
+  return payload.str();
+}
+
+std::string shader_stage_json(
+    const char *stage_name,
+    const ShaderInfo *shader_info,
+    const InputLayoutInfo *input_layout_info = nullptr)
+{
+  std::ostringstream payload;
+  payload << "{"
+          << "\"stage\":\"" << json_escape(stage_name ? stage_name : "") << "\","
+          << "\"object_id\":" << (shader_info ? shader_info->object_id : 0);
+  if (shader_info) {
+    payload << ",\"shader_path\":\"" << json_escape(shader_info->shader_path) << "\""
+            << ",\"bytecode_length\":" << shader_info->bytecode_length;
+  } else {
+    payload << ",\"shader_path\":null,\"bytecode_length\":0";
+  }
+  if (input_layout_info) {
+    payload << ",\"input_layout\":{"
+            << "\"object_id\":" << input_layout_info->object_id << ","
+            << "\"shader_path\":\"" << json_escape(input_layout_info->shader_path) << "\","
+            << "\"elements\":[";
+    for (std::size_t index = 0; index < input_layout_info->elements.size(); ++index) {
+      if (index != 0) {
+        payload << ",";
+      }
+      const auto &element = input_layout_info->elements[index];
+      payload << "{"
+              << "\"semantic_name\":\"" << json_escape(element.semantic_name) << "\","
+              << "\"semantic_index\":" << element.semantic_index << ","
+              << "\"format\":" << static_cast<unsigned int>(element.format) << ","
+              << "\"input_slot\":" << element.input_slot << ","
+              << "\"aligned_byte_offset\":" << element.aligned_byte_offset << ","
+              << "\"input_slot_class\":" << static_cast<unsigned int>(element.input_slot_class) << ","
+              << "\"instance_data_step_rate\":" << element.instance_data_step_rate
+              << "}";
+    }
+    payload << "]}";
+  }
+  payload << "}";
+  return payload.str();
+}
+
+std::string state_object_json(
+    const char *state_name,
+    const PipelineStateInfo *state_info,
+    const std::string &extra_json)
+{
+  std::ostringstream payload;
+  payload << "{"
+          << "\"state\":\"" << json_escape(state_name ? state_name : "") << "\","
+          << "\"object_id\":" << (state_info ? state_info->object_id : 0);
+  if (state_info) {
+    payload << ",\"desc\":" << state_info->desc_json;
+  } else {
+    payload << ",\"desc\":null";
+  }
+  if (!extra_json.empty()) {
+    payload << "," << extra_json;
+  }
+  payload << "}";
+  return payload.str();
+}
+
+std::string view_object_json(
+    const char *view_name,
+    const ViewInfo *view_info,
+    const char *resource_key)
+{
+  std::ostringstream payload;
+  payload << "{"
+          << "\"view\":\"" << json_escape(view_name ? view_name : "") << "\","
+          << "\"object_id\":" << (view_info ? view_info->object_id : 0) << ","
+          << "\"" << resource_key << "\":" << (view_info ? view_info->resource_object_id : 0);
+  if (view_info) {
+    payload << ",\"desc\":" << view_info->desc_json;
+  } else {
+    payload << ",\"desc\":null";
+  }
+  payload << "}";
+  return payload.str();
+}
+
+std::string pipeline_state_json_locked(ID3D11DeviceContext *context)
+{
+  auto &state = capture_state();
+  const auto context_it = state.context_pipelines.find(context);
+  if (context_it == state.context_pipelines.end()) {
+    return "{}";
+  }
+  const auto &pipeline = context_it->second;
+
+  const ShaderInfo *vertex_shader = lookup_entry_locked(state.shaders, pipeline.vertex_shader);
+  const ShaderInfo *pixel_shader = lookup_entry_locked(state.shaders, pipeline.pixel_shader);
+  const InputLayoutInfo *input_layout = lookup_entry_locked(state.input_layouts, pipeline.input_layout);
+  const PipelineStateInfo *blend_state = lookup_entry_locked(state.blend_states, pipeline.blend_state);
+  const PipelineStateInfo *depth_stencil_state = lookup_entry_locked(state.depth_stencil_states, pipeline.depth_stencil_state);
+  const PipelineStateInfo *rasterizer_state = lookup_entry_locked(state.rasterizer_states, pipeline.rasterizer_state);
+  const ViewInfo *depth_stencil_view = lookup_entry_locked(state.depth_stencil_views, pipeline.depth_stencil_view);
+
+  std::ostringstream payload;
+  payload << "{"
+          << "\"schema\":\"apitrace.d3d11.graphics_pipeline/v1\","
+          << "\"vertex_shader\":" << shader_stage_json("vertex", vertex_shader) << ","
+          << "\"pixel_shader\":" << shader_stage_json("pixel", pixel_shader, input_layout) << ","
+          << "\"input_assembler\":{"
+          << "\"primitive_topology\":\"" << topology_name(pipeline.primitive_topology) << "\","
+          << "\"vertex_buffers\":" << vertex_buffer_bindings_json(pipeline.vertex_buffers) << ","
+          << "\"index_buffer\":{"
+          << "\"object_id\":" << lookup_object_id_locked(pipeline.index_buffer.buffer) << ","
+          << "\"format\":" << static_cast<unsigned int>(pipeline.index_buffer.format) << ","
+          << "\"offset\":" << pipeline.index_buffer.offset
+          << "}"
+          << "},"
+          << "\"constant_buffers\":{"
+          << "\"vs\":" << object_id_binding_array_json(std::vector<const void *>(
+                                  pipeline.vs_constant_buffers.begin(), pipeline.vs_constant_buffers.end()))
+          << ",\"ps\":" << object_id_binding_array_json(std::vector<const void *>(
+                                      pipeline.ps_constant_buffers.begin(), pipeline.ps_constant_buffers.end()))
+          << "},"
+          << "\"shader_resources\":" << shader_resource_bindings_json(pipeline.pixel_shader_resources, state.shader_resource_views)
+          << ",\"samplers\":" << sampler_bindings_json(pipeline.pixel_samplers, state.sampler_states)
+          << ",\"blend_state\":"
+          << state_object_json(
+                 "blend",
+                 blend_state,
+                 "\"blend_factor\":" + float4_json(pipeline.blend_factor) +
+                     ",\"sample_mask\":" + std::to_string(pipeline.sample_mask))
+          << ",\"depth_stencil_state\":"
+          << state_object_json(
+                 "depth_stencil",
+                 depth_stencil_state,
+                 "\"stencil_ref\":" + std::to_string(pipeline.stencil_ref))
+          << ",\"rasterizer_state\":" << state_object_json("rasterizer", rasterizer_state) << ","
+          << "\"render_target_views\":" << render_target_bindings_json(pipeline.render_target_views, state.render_target_views)
+          << ",\"depth_stencil_view\":" << view_object_json("depth_stencil_view", depth_stencil_view)
+          << ",\"viewports\":" << viewport_array_json(pipeline.viewports) << ","
+          << "\"scissor_rects\":" << rect_array_json(pipeline.scissor_rects)
+          << "}";
+  return payload.str();
+}
+
+std::string capture_pipeline_path_locked(ID3D11DeviceContext *context)
+{
+  auto &pipeline = context_pipeline_state_locked(context);
+  if (!pipeline.pipeline_dirty && !pipeline.cached_pipeline_path.empty()) {
+    return pipeline.cached_pipeline_path;
+  }
+
+  const std::string json = pipeline_state_json_locked(context);
+  const auto asset = register_asset_text(trace::AssetKind::Pipeline, "d3d11-pipeline", json);
+  pipeline.cached_pipeline_path = asset.relative_path.generic_string();
+  pipeline.pipeline_dirty = false;
+  return pipeline.cached_pipeline_path;
+}
+
 void ensure_frame_begin_locked()
 {
   auto &state = capture_state();
@@ -1107,11 +1564,13 @@ HRESULT STDMETHODCALLTYPE hook_create_shader_resource_view(
   auto &hook = device_hook_locked(device);
   const HRESULT hr = hook.create_shader_resource_view(device, resource, desc, shader_resource_view);
   if (SUCCEEDED(hr) && shader_resource_view && *shader_resource_view) {
-    register_object_locked(
+    const auto object_id = register_object_locked(
         *shader_resource_view,
         trace::ObjectKind::View,
         "ID3D11ShaderResourceView",
         lookup_object_id_locked(resource));
+    state.shader_resource_views[*shader_resource_view] =
+        ViewInfo{object_id, lookup_object_id_locked(resource), desc ? shader_resource_view_desc_json(*desc) : "null"};
   }
 
   std::ostringstream payload;
@@ -1140,11 +1599,13 @@ HRESULT STDMETHODCALLTYPE hook_create_render_target_view(
   auto &hook = device_hook_locked(device);
   const HRESULT hr = hook.create_render_target_view(device, resource, desc, render_target_view);
   if (SUCCEEDED(hr) && render_target_view && *render_target_view) {
-    register_object_locked(
+    const auto object_id = register_object_locked(
         *render_target_view,
         trace::ObjectKind::View,
         "ID3D11RenderTargetView",
         lookup_object_id_locked(resource));
+    state.render_target_views[*render_target_view] =
+        ViewInfo{object_id, lookup_object_id_locked(resource), desc ? render_target_view_desc_json(*desc) : "null"};
   }
 
   std::ostringstream payload;
@@ -1173,11 +1634,13 @@ HRESULT STDMETHODCALLTYPE hook_create_depth_stencil_view(
   auto &hook = device_hook_locked(device);
   const HRESULT hr = hook.create_depth_stencil_view(device, resource, desc, depth_stencil_view);
   if (SUCCEEDED(hr) && depth_stencil_view && *depth_stencil_view) {
-    register_object_locked(
+    const auto object_id = register_object_locked(
         *depth_stencil_view,
         trace::ObjectKind::View,
         "ID3D11DepthStencilView",
         lookup_object_id_locked(resource));
+    state.depth_stencil_views[*depth_stencil_view] =
+        ViewInfo{object_id, lookup_object_id_locked(resource), desc ? depth_stencil_view_desc_json(*desc) : "null"};
   }
 
   std::ostringstream payload;
@@ -1213,26 +1676,42 @@ HRESULT STDMETHODCALLTYPE hook_create_input_layout(
       shader_bytecode,
       bytecode_length,
       input_layout);
+  std::vector<trace::BlobId> blob_refs;
+  std::string shader_path;
+  if (shader_bytecode && bytecode_length != 0) {
+    auto asset = register_asset_bytes(trace::AssetKind::ShaderDxbc, "input-layout-shader", shader_bytecode, bytecode_length);
+    blob_refs.push_back(asset.blob_id);
+    shader_path = asset.relative_path.generic_string();
+  }
   if (SUCCEEDED(hr) && input_layout && *input_layout) {
-    register_object_locked(
+    const auto object_id = register_object_locked(
         *input_layout,
         trace::ObjectKind::PipelineState,
         "ID3D11InputLayout",
         lookup_object_id_locked(device));
-  }
-
-  std::vector<trace::BlobId> blob_refs;
-  std::string shader_path_json = "null";
-  if (shader_bytecode && bytecode_length != 0) {
-    auto asset = register_asset_bytes(trace::AssetKind::ShaderDxbc, "input-layout-shader", shader_bytecode, bytecode_length);
-    blob_refs.push_back(asset.blob_id);
-    shader_path_json = "\"" + json_escape(asset.relative_path.generic_string()) + "\"";
+    InputLayoutInfo layout_info;
+    layout_info.object_id = object_id;
+    layout_info.shader_path = shader_path;
+    layout_info.elements.reserve(num_elements);
+    for (UINT index = 0; index < num_elements; ++index) {
+      const auto &element = input_element_descs[index];
+      layout_info.elements.push_back(InputLayoutElementInfo{
+          element.SemanticName ? element.SemanticName : "",
+          element.SemanticIndex,
+          element.Format,
+          element.InputSlot,
+          element.AlignedByteOffset,
+          element.InputSlotClass,
+          element.InstanceDataStepRate,
+      });
+    }
+    state.input_layouts[*input_layout] = std::move(layout_info);
   }
 
   std::ostringstream payload;
   payload << "{\"num_elements\":" << num_elements
           << ",\"bytecode_length\":" << static_cast<std::uint64_t>(bytecode_length)
-          << ",\"shader_path\":" << shader_path_json
+          << ",\"shader_path\":" << (shader_path.empty() ? "null" : "\"" + json_escape(shader_path) + "\"")
           << ",\"elements\":[";
   for (UINT index = 0; index < num_elements; ++index) {
     if (index != 0) {
@@ -1278,7 +1757,8 @@ HRESULT STDMETHODCALLTYPE hook_create_vertex_shader(
     const auto asset = register_asset_bytes(trace::AssetKind::ShaderDxbc, "vertex-shader", shader_bytecode, bytecode_length);
     blob_refs.push_back(asset.blob_id);
     shader_path_json = "\"" + json_escape(asset.relative_path.generic_string()) + "\"";
-    register_object_locked(*vertex_shader, trace::ObjectKind::Shader, "ID3D11VertexShader", lookup_object_id_locked(device));
+    const auto object_id = register_object_locked(*vertex_shader, trace::ObjectKind::Shader, "ID3D11VertexShader", lookup_object_id_locked(device));
+    state.shaders[*vertex_shader] = ShaderInfo{object_id, "vertex", asset.relative_path.generic_string(), static_cast<std::uint64_t>(bytecode_length)};
   }
 
   std::ostringstream payload;
@@ -1307,7 +1787,8 @@ HRESULT STDMETHODCALLTYPE hook_create_pixel_shader(
     const auto asset = register_asset_bytes(trace::AssetKind::ShaderDxbc, "pixel-shader", shader_bytecode, bytecode_length);
     blob_refs.push_back(asset.blob_id);
     shader_path_json = "\"" + json_escape(asset.relative_path.generic_string()) + "\"";
-    register_object_locked(*pixel_shader, trace::ObjectKind::Shader, "ID3D11PixelShader", lookup_object_id_locked(device));
+    const auto object_id = register_object_locked(*pixel_shader, trace::ObjectKind::Shader, "ID3D11PixelShader", lookup_object_id_locked(device));
+    state.shaders[*pixel_shader] = ShaderInfo{object_id, "pixel", asset.relative_path.generic_string(), static_cast<std::uint64_t>(bytecode_length)};
   }
 
   std::ostringstream payload;
@@ -1328,7 +1809,8 @@ HRESULT STDMETHODCALLTYPE hook_create_blend_state(
   auto &hook = device_hook_locked(device);
   const HRESULT hr = hook.create_blend_state(device, desc, blend_state);
   if (SUCCEEDED(hr) && blend_state && *blend_state) {
-    register_object_locked(*blend_state, trace::ObjectKind::PipelineState, "ID3D11BlendState", lookup_object_id_locked(device));
+    const auto object_id = register_object_locked(*blend_state, trace::ObjectKind::PipelineState, "ID3D11BlendState", lookup_object_id_locked(device));
+    state.blend_states[*blend_state] = PipelineStateInfo{object_id, desc ? blend_desc_json(*desc) : "null"};
   }
 
   std::ostringstream payload;
@@ -1348,11 +1830,13 @@ HRESULT STDMETHODCALLTYPE hook_create_depth_stencil_state(
   auto &hook = device_hook_locked(device);
   const HRESULT hr = hook.create_depth_stencil_state(device, desc, depth_stencil_state);
   if (SUCCEEDED(hr) && depth_stencil_state && *depth_stencil_state) {
-    register_object_locked(
+    const auto object_id = register_object_locked(
         *depth_stencil_state,
         trace::ObjectKind::PipelineState,
         "ID3D11DepthStencilState",
         lookup_object_id_locked(device));
+    state.depth_stencil_states[*depth_stencil_state] =
+        PipelineStateInfo{object_id, desc ? depth_stencil_state_desc_json(*desc) : "null"};
   }
 
   std::ostringstream payload;
@@ -1377,11 +1861,13 @@ HRESULT STDMETHODCALLTYPE hook_create_rasterizer_state(
   auto &hook = device_hook_locked(device);
   const HRESULT hr = hook.create_rasterizer_state(device, desc, rasterizer_state);
   if (SUCCEEDED(hr) && rasterizer_state && *rasterizer_state) {
-    register_object_locked(
+    const auto object_id = register_object_locked(
         *rasterizer_state,
         trace::ObjectKind::PipelineState,
         "ID3D11RasterizerState",
         lookup_object_id_locked(device));
+    state.rasterizer_states[*rasterizer_state] =
+        PipelineStateInfo{object_id, desc ? rasterizer_desc_json(*desc) : "null"};
   }
 
   std::ostringstream payload;
@@ -1406,7 +1892,9 @@ HRESULT STDMETHODCALLTYPE hook_create_sampler_state(
   auto &hook = device_hook_locked(device);
   const HRESULT hr = hook.create_sampler_state(device, desc, sampler_state);
   if (SUCCEEDED(hr) && sampler_state && *sampler_state) {
-    register_object_locked(*sampler_state, trace::ObjectKind::PipelineState, "ID3D11SamplerState", lookup_object_id_locked(device));
+    const auto object_id = register_object_locked(*sampler_state, trace::ObjectKind::PipelineState, "ID3D11SamplerState", lookup_object_id_locked(device));
+    state.sampler_states[*sampler_state] =
+        PipelineStateInfo{object_id, desc ? sampler_desc_json(*desc) : "null"};
   }
 
   std::ostringstream payload;
@@ -1444,6 +1932,15 @@ void STDMETHODCALLTYPE hook_vs_set_constant_buffers(
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
   auto &hook = context_hook_locked(context);
   hook.vs_set_constant_buffers(context, start_slot, num_buffers, constant_buffers);
+  auto &pipeline = context_pipeline_state_locked(context);
+  for (UINT index = 0; index < num_buffers; ++index) {
+    const UINT slot = start_slot + index;
+    if (slot >= pipeline.vs_constant_buffers.size()) {
+      continue;
+    }
+    pipeline.vs_constant_buffers[slot] = constant_buffers ? constant_buffers[index] : nullptr;
+  }
+  pipeline.pipeline_dirty = true;
 
   std::vector<const void *> objects = {context};
   for (UINT index = 0; index < num_buffers; ++index) {
@@ -1465,6 +1962,15 @@ void STDMETHODCALLTYPE hook_ps_set_shader_resources(
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
   auto &hook = context_hook_locked(context);
   hook.ps_set_shader_resources(context, start_slot, num_views, shader_resource_views);
+  auto &pipeline = context_pipeline_state_locked(context);
+  for (UINT index = 0; index < num_views; ++index) {
+    const UINT slot = start_slot + index;
+    if (slot >= pipeline.pixel_shader_resources.size()) {
+      continue;
+    }
+    pipeline.pixel_shader_resources[slot] = shader_resource_views ? shader_resource_views[index] : nullptr;
+  }
+  pipeline.pipeline_dirty = true;
 
   std::vector<const void *> objects = {context};
   for (UINT index = 0; index < num_views; ++index) {
@@ -1486,6 +1992,9 @@ void STDMETHODCALLTYPE hook_ps_set_shader(
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
   auto &hook = context_hook_locked(context);
   hook.ps_set_shader(context, pixel_shader, class_instances, num_class_instances);
+  auto &pipeline = context_pipeline_state_locked(context);
+  pipeline.pixel_shader = pixel_shader;
+  pipeline.pipeline_dirty = true;
 
   std::ostringstream payload;
   payload << "{\"class_instance_count\":" << num_class_instances << "}";
@@ -1502,6 +2011,9 @@ void STDMETHODCALLTYPE hook_vs_set_shader(
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
   auto &hook = context_hook_locked(context);
   hook.vs_set_shader(context, vertex_shader, class_instances, num_class_instances);
+  auto &pipeline = context_pipeline_state_locked(context);
+  pipeline.vertex_shader = vertex_shader;
+  pipeline.pipeline_dirty = true;
 
   std::ostringstream payload;
   payload << "{\"class_instance_count\":" << num_class_instances << "}";
@@ -1518,6 +2030,15 @@ void STDMETHODCALLTYPE hook_ps_set_samplers(
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
   auto &hook = context_hook_locked(context);
   hook.ps_set_samplers(context, start_slot, num_samplers, samplers);
+  auto &pipeline = context_pipeline_state_locked(context);
+  for (UINT index = 0; index < num_samplers; ++index) {
+    const UINT slot = start_slot + index;
+    if (slot >= pipeline.pixel_samplers.size()) {
+      continue;
+    }
+    pipeline.pixel_samplers[slot] = samplers ? samplers[index] : nullptr;
+  }
+  pipeline.pipeline_dirty = true;
 
   std::vector<const void *> objects = {context};
   for (UINT index = 0; index < num_samplers; ++index) {
@@ -1540,10 +2061,15 @@ void STDMETHODCALLTYPE hook_draw_indexed(
   ensure_frame_begin_locked();
   auto &hook = context_hook_locked(context);
   hook.draw_indexed(context, index_count, start_index_location, base_vertex_location);
+  const auto pipeline_path = capture_pipeline_path_locked(context);
 
   std::ostringstream payload;
   payload << "{\"index_count\":" << index_count << ",\"start_index_location\":" << start_index_location
-          << ",\"base_vertex_location\":" << base_vertex_location << "}";
+          << ",\"base_vertex_location\":" << base_vertex_location;
+  if (!pipeline_path.empty()) {
+    payload << ",\"pipeline_path\":\"" << json_escape(pipeline_path) << "\"";
+  }
+  payload << "}";
   record_call_locked("ID3D11DeviceContext::DrawIndexed", S_OK, {context}, {}, payload.str());
 }
 
@@ -1554,9 +2080,14 @@ void STDMETHODCALLTYPE hook_draw(ID3D11DeviceContext *context, UINT vertex_count
   ensure_frame_begin_locked();
   auto &hook = context_hook_locked(context);
   hook.draw(context, vertex_count, start_vertex_location);
+  const auto pipeline_path = capture_pipeline_path_locked(context);
 
   std::ostringstream payload;
-  payload << "{\"vertex_count\":" << vertex_count << ",\"start_vertex_location\":" << start_vertex_location << "}";
+  payload << "{\"vertex_count\":" << vertex_count << ",\"start_vertex_location\":" << start_vertex_location;
+  if (!pipeline_path.empty()) {
+    payload << ",\"pipeline_path\":\"" << json_escape(pipeline_path) << "\"";
+  }
+  payload << "}";
   record_call_locked("ID3D11DeviceContext::Draw", S_OK, {context}, {}, payload.str());
 }
 
@@ -1651,6 +2182,15 @@ void STDMETHODCALLTYPE hook_ps_set_constant_buffers(
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
   auto &hook = context_hook_locked(context);
   hook.ps_set_constant_buffers(context, start_slot, num_buffers, constant_buffers);
+  auto &pipeline = context_pipeline_state_locked(context);
+  for (UINT index = 0; index < num_buffers; ++index) {
+    const UINT slot = start_slot + index;
+    if (slot >= pipeline.ps_constant_buffers.size()) {
+      continue;
+    }
+    pipeline.ps_constant_buffers[slot] = constant_buffers ? constant_buffers[index] : nullptr;
+  }
+  pipeline.pipeline_dirty = true;
 
   std::vector<const void *> objects = {context};
   for (UINT index = 0; index < num_buffers; ++index) {
@@ -1668,6 +2208,9 @@ void STDMETHODCALLTYPE hook_ia_set_input_layout(ID3D11DeviceContext *context, ID
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
   auto &hook = context_hook_locked(context);
   hook.ia_set_input_layout(context, input_layout);
+  auto &pipeline = context_pipeline_state_locked(context);
+  pipeline.input_layout = input_layout;
+  pipeline.pipeline_dirty = true;
   record_call_locked("ID3D11DeviceContext::IASetInputLayout", S_OK, {context, input_layout}, {}, "{}");
 }
 
@@ -1683,6 +2226,19 @@ void STDMETHODCALLTYPE hook_ia_set_vertex_buffers(
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
   auto &hook = context_hook_locked(context);
   hook.ia_set_vertex_buffers(context, start_slot, num_buffers, vertex_buffers, strides, offsets);
+  auto &pipeline = context_pipeline_state_locked(context);
+  for (UINT index = 0; index < num_buffers; ++index) {
+    const UINT slot = start_slot + index;
+    if (slot >= pipeline.vertex_buffers.size()) {
+      continue;
+    }
+    pipeline.vertex_buffers[slot] = VertexBufferBindingState{
+        vertex_buffers ? vertex_buffers[index] : nullptr,
+        strides ? strides[index] : 0,
+        offsets ? offsets[index] : 0,
+    };
+  }
+  pipeline.pipeline_dirty = true;
 
   std::vector<const void *> objects = {context};
   for (UINT index = 0; index < num_buffers; ++index) {
@@ -1719,6 +2275,9 @@ void STDMETHODCALLTYPE hook_ia_set_index_buffer(
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
   auto &hook = context_hook_locked(context);
   hook.ia_set_index_buffer(context, index_buffer, format, offset);
+  auto &pipeline = context_pipeline_state_locked(context);
+  pipeline.index_buffer = IndexBufferBindingState{index_buffer, format, offset};
+  pipeline.pipeline_dirty = true;
 
   std::ostringstream payload;
   payload << "{\"format\":" << static_cast<unsigned int>(format) << ",\"offset\":" << offset << "}";
@@ -1744,11 +2303,16 @@ void STDMETHODCALLTYPE hook_draw_indexed_instanced(
       start_index_location,
       base_vertex_location,
       start_instance_location);
+  const auto pipeline_path = capture_pipeline_path_locked(context);
 
   std::ostringstream payload;
   payload << "{\"index_count_per_instance\":" << index_count_per_instance << ",\"instance_count\":" << instance_count
           << ",\"start_index_location\":" << start_index_location << ",\"base_vertex_location\":" << base_vertex_location
-          << ",\"start_instance_location\":" << start_instance_location << "}";
+          << ",\"start_instance_location\":" << start_instance_location;
+  if (!pipeline_path.empty()) {
+    payload << ",\"pipeline_path\":\"" << json_escape(pipeline_path) << "\"";
+  }
+  payload << "}";
   record_call_locked("ID3D11DeviceContext::DrawIndexedInstanced", S_OK, {context}, {}, payload.str());
 }
 
@@ -1758,6 +2322,9 @@ void STDMETHODCALLTYPE hook_ia_set_primitive_topology(ID3D11DeviceContext *conte
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
   auto &hook = context_hook_locked(context);
   hook.ia_set_primitive_topology(context, topology);
+  auto &pipeline = context_pipeline_state_locked(context);
+  pipeline.primitive_topology = topology;
+  pipeline.pipeline_dirty = true;
 
   std::ostringstream payload;
   payload << "{\"topology\":\"" << topology_name(topology) << "\"}";
@@ -1774,6 +2341,19 @@ void STDMETHODCALLTYPE hook_om_set_render_targets(
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
   auto &hook = context_hook_locked(context);
   hook.om_set_render_targets(context, num_views, render_target_views, depth_stencil_view);
+  auto &pipeline = context_pipeline_state_locked(context);
+  for (UINT index = 0; index < num_views; ++index) {
+    const UINT slot = index;
+    if (slot >= pipeline.render_target_views.size()) {
+      continue;
+    }
+    pipeline.render_target_views[slot] = render_target_views ? render_target_views[index] : nullptr;
+  }
+  for (UINT slot = num_views; slot < pipeline.render_target_views.size(); ++slot) {
+    pipeline.render_target_views[slot] = nullptr;
+  }
+  pipeline.depth_stencil_view = depth_stencil_view;
+  pipeline.pipeline_dirty = true;
 
   std::vector<const void *> objects = {context};
   for (UINT index = 0; index < num_views; ++index) {
@@ -1798,6 +2378,13 @@ void STDMETHODCALLTYPE hook_om_set_blend_state(
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
   auto &hook = context_hook_locked(context);
   hook.om_set_blend_state(context, blend_state, blend_factor, sample_mask);
+  auto &pipeline = context_pipeline_state_locked(context);
+  pipeline.blend_state = blend_state;
+  pipeline.sample_mask = sample_mask;
+  if (blend_factor) {
+    pipeline.blend_factor = {blend_factor[0], blend_factor[1], blend_factor[2], blend_factor[3]};
+  }
+  pipeline.pipeline_dirty = true;
 
   std::ostringstream payload;
   payload << "{\"blend_factor\":["
@@ -1818,6 +2405,10 @@ void STDMETHODCALLTYPE hook_om_set_depth_stencil_state(
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
   auto &hook = context_hook_locked(context);
   hook.om_set_depth_stencil_state(context, depth_stencil_state, stencil_ref);
+  auto &pipeline = context_pipeline_state_locked(context);
+  pipeline.depth_stencil_state = depth_stencil_state;
+  pipeline.stencil_ref = stencil_ref;
+  pipeline.pipeline_dirty = true;
 
   std::ostringstream payload;
   payload << "{\"stencil_ref\":" << stencil_ref << "}";
@@ -1835,6 +2426,9 @@ void STDMETHODCALLTYPE hook_rs_set_state(ID3D11DeviceContext *context, ID3D11Ras
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
   auto &hook = context_hook_locked(context);
   hook.rs_set_state(context, rasterizer_state);
+  auto &pipeline = context_pipeline_state_locked(context);
+  pipeline.rasterizer_state = rasterizer_state;
+  pipeline.pipeline_dirty = true;
   record_call_locked("ID3D11DeviceContext::RSSetState", S_OK, {context, rasterizer_state}, {}, "{}");
 }
 
@@ -1844,6 +2438,12 @@ void STDMETHODCALLTYPE hook_rs_set_viewports(ID3D11DeviceContext *context, UINT 
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
   auto &hook = context_hook_locked(context);
   hook.rs_set_viewports(context, num_viewports, viewports);
+  auto &pipeline = context_pipeline_state_locked(context);
+  pipeline.viewports.clear();
+  if (viewports && num_viewports != 0) {
+    pipeline.viewports.assign(viewports, viewports + num_viewports);
+  }
+  pipeline.pipeline_dirty = true;
 
   const float width = (viewports && num_viewports > 0) ? viewports[0].Width : 0.0f;
   const float height = (viewports && num_viewports > 0) ? viewports[0].Height : 0.0f;
@@ -1874,6 +2474,12 @@ void STDMETHODCALLTYPE hook_rs_set_scissor_rects(ID3D11DeviceContext *context, U
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
   auto &hook = context_hook_locked(context);
   hook.rs_set_scissor_rects(context, num_rects, rects);
+  auto &pipeline = context_pipeline_state_locked(context);
+  pipeline.scissor_rects.clear();
+  if (rects && num_rects != 0) {
+    pipeline.scissor_rects.assign(rects, rects + num_rects);
+  }
+  pipeline.pipeline_dirty = true;
 
   std::ostringstream payload;
   payload << "{\"num_rects\":" << num_rects << ",\"rects\":[";

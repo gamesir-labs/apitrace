@@ -72,8 +72,20 @@ SWIFT
 )"
 
         if [ -n "$window_id" ]; then
-            screencapture -x -l "$window_id" "$screenshot_path"
-            return 0
+            capture_attempt=0
+            while [ "$capture_attempt" -lt 10 ]; do
+                if ! screencapture -x -l "$window_id" "$screenshot_path"; then
+                    capture_attempt="$(( capture_attempt + 1 ))"
+                    sleep 1
+                    continue
+                fi
+                if validate_visual_window "$screenshot_path" >/dev/null 2>&1; then
+                    return 0
+                fi
+                capture_attempt="$(( capture_attempt + 1 ))"
+                sleep 1
+            done
+            return 1
         fi
 
         attempt="$(( attempt + 1 ))"
@@ -508,6 +520,8 @@ if not any(path.startswith("textures/") for path in referenced_paths):
     raise SystemExit(f"{scene_name}: expected at least one referenced texture asset")
 if not any(path.startswith("buffers/") for path in referenced_paths):
     raise SystemExit(f"{scene_name}: expected at least one referenced buffer asset")
+if not any(path.startswith("pipelines/") for path in referenced_paths):
+    raise SystemExit(f"{scene_name}: expected at least one referenced pipeline asset")
 
 texture_readback_unmaps = [
     record for record in records

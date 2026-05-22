@@ -96,6 +96,8 @@ PY
 capture_visual_window() {
     window_title="$1"
     screenshot_path="$2"
+    reference_path="$3"
+    reference_dims="$(sips -g pixelWidth -g pixelHeight "$reference_path" 2>/dev/null | awk '/pixelWidth/ {width=$2} /pixelHeight/ {height=$2} END {print width " " height}')"
     attempt=0
     while [ "$attempt" -lt 10 ]; do
         window_id="$(swift - "$window_title" <<'SWIFT'
@@ -128,8 +130,22 @@ SWIFT
 )"
 
         if [ -n "$window_id" ]; then
-            screencapture -x -l "$window_id" "$screenshot_path"
-            return 0
+            sleep 2
+            capture_attempt=0
+            while [ "$capture_attempt" -lt 30 ]; do
+                if ! screencapture -x -l "$window_id" "$screenshot_path"; then
+                    capture_attempt="$(( capture_attempt + 1 ))"
+                    sleep 1
+                    continue
+                fi
+                current_dims="$(sips -g pixelWidth -g pixelHeight "$screenshot_path" 2>/dev/null | awk '/pixelWidth/ {width=$2} /pixelHeight/ {height=$2} END {print width " " height}')"
+                if [ "$current_dims" = "$reference_dims" ] && validate_visual_window "$screenshot_path" >/dev/null 2>&1; then
+                    return 0
+                fi
+                capture_attempt="$(( capture_attempt + 1 ))"
+                sleep 1
+            done
+            return 1
         fi
 
         attempt="$(( attempt + 1 ))"
@@ -434,6 +450,47 @@ for scene_name in $SCENES; do
         exit 1
     fi
 
+    python3 - "$fixture_trace_dir" "$scene_name" <<'PY'
+import json
+import pathlib
+import sys
+
+trace_dir = pathlib.Path(sys.argv[1])
+scene_name = sys.argv[2]
+callstream = trace_dir / "callstream.jsonl"
+
+def collect_paths(value):
+    paths = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key.endswith("_path") and isinstance(child, str):
+                paths.append(child)
+            else:
+                paths.extend(collect_paths(child))
+    elif isinstance(value, list):
+        for child in value:
+            paths.extend(collect_paths(child))
+    return paths
+
+referenced_paths = []
+with callstream.open("r", encoding="utf-8") as stream:
+    for line in stream:
+        line = line.strip()
+        if not line:
+            continue
+        referenced_paths.extend(collect_paths(json.loads(line).get("payload")))
+
+if not any(path.startswith("pipelines/") for path in referenced_paths):
+    raise SystemExit(f"{scene_name}: fixture trace is missing referenced pipeline assets")
+
+for relative_path in referenced_paths:
+    path = trace_dir / relative_path
+    if not path.is_file():
+        raise SystemExit(f"missing referenced fixture asset: {relative_path}")
+    if path.stat().st_size == 0:
+        raise SystemExit(f"empty referenced fixture asset: {relative_path}")
+PY
+
     fixture_trace_path="$(wine_path "$fixture_trace_dir")"
     run_log="$RUN_LOG_DIR/$scene_name-run.log"
     visual_run_log="$RUN_LOG_DIR/$scene_name-visual-run.log"
@@ -449,7 +506,7 @@ for scene_name in $SCENES; do
         "$WINE_BIN" explorer "/desktop=$VISUAL_DESKTOP" "$RETRACE_BIN_DIR/retrace.exe" "$fixture_trace_path" >"$visual_run_log" 2>&1 &
         wine_pid="$!"
         (
-            capture_visual_window "$VISUAL_WINDOW_TITLE" "$visual_screenshot"
+            capture_visual_window "$VISUAL_WINDOW_TITLE" "$visual_screenshot" "$reference_visual"
         ) &
         capture_pid="$!"
         deadline="$(( $(date +%s) + 90 ))"
