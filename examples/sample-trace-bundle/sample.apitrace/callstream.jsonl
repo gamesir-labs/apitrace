@@ -1,0 +1,12 @@
+{"record_kind":"bundle_header","format_version":1,"api":"D3D12","producer":"apitrace-example","entry_file":"callstream.jsonl"}
+{"record_kind":"object_create","sequence":1,"object_id":1001,"object_kind":"Device","debug_name":"ExampleDevice"}
+{"record_kind":"object_create","sequence":2,"object_id":1002,"object_kind":"CommandQueue","parent_object_id":1001,"debug_name":"GraphicsQueue"}
+{"record_kind":"object_create","sequence":3,"object_id":2001,"object_kind":"Shader","debug_name":"FullscreenVS","shader_path":"shaders/a93e3f11.dxil"}
+{"record_kind":"object_create","sequence":4,"object_id":2002,"object_kind":"Shader","debug_name":"FullscreenPS","shader_path":"shaders/2f1c8e9a.dxbc"}
+{"record_kind":"object_create","sequence":5,"object_id":3001,"object_kind":"Resource","debug_name":"BackbufferTexture","texture_path":"textures/c8321ab2.texture.zst"}
+{"record_kind":"boundary","sequence":6,"boundary":"Frame","label":"FrameBegin"}
+{"record_kind":"call","sequence":7,"function":"D3D12CreateDevice","result_code":0,"object_refs":[1001],"blob_refs":[],"payload":{"adapter":"DefaultAdapter","minimum_feature_level":"12_0"}}
+{"record_kind":"call","sequence":8,"function":"CreateGraphicsPipelineState","result_code":0,"object_refs":[1001,2001,2002],"blob_refs":[5001,5002,5003],"payload":{"pipeline_path":"pipelines/18de92a1.pipeline.json"}}
+{"record_kind":"call","sequence":9,"function":"DrawInstanced","result_code":0,"object_refs":[1002,3001],"blob_refs":[6001],"payload":{"vertex_count_per_instance":3,"instance_count":1}}
+{"record_kind":"boundary","sequence":10,"boundary":"Present","label":"PresentMainSwapchain"}
+{"record_kind":"boundary","sequence":11,"boundary":"Frame","label":"FrameEnd"}

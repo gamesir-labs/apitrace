@@ -1,0 +1,18 @@
+{
+  "shaders": [
+    {
+      "path": "shaders/a93e3f11.dxil",
+      "stage": "VS",
+      "entry_point": "main",
+      "profile": "vs_6_0",
+      "note": "Derived analysis example, not the source of truth for replay"
+    },
+    {
+      "path": "shaders/2f1c8e9a.dxbc",
+      "stage": "PS",
+      "entry_point": "main",
+      "profile": "ps_5_0",
+      "note": "Derived analysis example, not the source of truth for replay"
+    }
+  ]
+}

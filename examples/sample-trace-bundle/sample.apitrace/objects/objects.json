@@ -1,0 +1,34 @@
+{
+  "objects": [
+    {
+      "object_id": 1001,
+      "object_kind": "Device",
+      "parent_object_id": 0,
+      "debug_name": "ExampleDevice"
+    },
+    {
+      "object_id": 1002,
+      "object_kind": "CommandQueue",
+      "parent_object_id": 1001,
+      "debug_name": "GraphicsQueue"
+    },
+    {
+      "object_id": 2001,
+      "object_kind": "Shader",
+      "parent_object_id": 0,
+      "debug_name": "FullscreenVS"
+    },
+    {
+      "object_id": 2002,
+      "object_kind": "Shader",
+      "parent_object_id": 0,
+      "debug_name": "FullscreenPS"
+    },
+    {
+      "object_id": 3001,
+      "object_kind": "Resource",
+      "parent_object_id": 0,
+      "debug_name": "BackbufferTexture"
+    }
+  ]
+}

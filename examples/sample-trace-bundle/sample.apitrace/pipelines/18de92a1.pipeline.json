@@ -1,0 +1,9 @@
+{
+  "pipeline_id": 4001,
+  "api": "D3D12",
+  "debug_name": "FullscreenPassPipeline",
+  "root_signature_path": "shaders/b7710210.rootsig",
+  "vertex_shader_path": "shaders/a93e3f11.dxil",
+  "pixel_shader_path": "shaders/2f1c8e9a.dxbc",
+  "notes": "Example readable pipeline asset for architecture review"
+}

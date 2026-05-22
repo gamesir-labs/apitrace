@@ -1,0 +1,16 @@
+{
+  "format_version": 1,
+  "bundle_hash": "sha256:example-bundle-placeholder",
+  "files": {
+    "callstream.jsonl": "sha256:example-callstream-placeholder",
+    "shaders/2f1c8e9a.dxbc": "sha256:example-dxbc-placeholder",
+    "shaders/a93e3f11.dxil": "sha256:example-dxil-placeholder",
+    "shaders/b7710210.rootsig": "sha256:example-rootsig-placeholder",
+    "textures/c8321ab2.texture.zst": "sha256:example-texture-placeholder",
+    "buffers/91aa77f0.buffer.zst": "sha256:example-buffer-placeholder",
+    "pipelines/18de92a1.pipeline.json": "sha256:example-pipeline-placeholder",
+    "objects/objects.json": "sha256:example-objects-placeholder",
+    "analysis/shader-reflection.json": "sha256:example-analysis-placeholder",
+    "analysis/translation-links.jsonl": "sha256:example-translation-links-placeholder"
+  }
+}
