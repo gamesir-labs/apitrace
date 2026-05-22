@@ -1,0 +1,286 @@
+#pragma once
+
+#include <windows.h>
+#include <d3dcompiler.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <utility>
+
+namespace demo {
+
+template <typename T>
+class ComPtr {
+public:
+    ComPtr() = default;
+    ComPtr(const ComPtr &) = delete;
+    ComPtr &operator=(const ComPtr &) = delete;
+
+    ComPtr(ComPtr &&other) noexcept : ptr_(other.detach()) {}
+    ComPtr &operator=(ComPtr &&other) noexcept
+    {
+        if (this != &other) {
+            reset(other.detach());
+        }
+        return *this;
+    }
+
+    ~ComPtr()
+    {
+        reset();
+    }
+
+    T *get() const noexcept { return ptr_; }
+    T *const *get_address_of() const noexcept { return &ptr_; }
+    T **get_address_of() noexcept { return &ptr_; }
+    T **put() noexcept
+    {
+        reset();
+        return &ptr_;
+    }
+
+    T *operator->() const noexcept { return ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    void reset(T *ptr = nullptr) noexcept
+    {
+        if (ptr_) {
+            ptr_->Release();
+        }
+        ptr_ = ptr;
+    }
+
+    T *detach() noexcept
+    {
+        T *tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+private:
+    T *ptr_ = nullptr;
+};
+
+struct Stopwatch {
+    Stopwatch()
+    {
+        QueryPerformanceFrequency(&frequency_);
+        QueryPerformanceCounter(&start_);
+    }
+
+    float seconds() const
+    {
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        return static_cast<float>(now.QuadPart - start_.QuadPart) /
+               static_cast<float>(frequency_.QuadPart);
+    }
+
+private:
+    LARGE_INTEGER frequency_{};
+    LARGE_INTEGER start_{};
+};
+
+inline void fail(const char *message, HRESULT hr = S_OK)
+{
+    if (hr == S_OK) {
+        std::fprintf(stderr, "%s\n", message);
+    } else {
+        std::fprintf(stderr, "%s (0x%08lx)\n", message, static_cast<unsigned long>(hr));
+    }
+    std::fflush(stderr);
+    std::exit(EXIT_FAILURE);
+}
+
+inline void check_hr(HRESULT hr, const char *message)
+{
+    if (FAILED(hr)) {
+        fail(message, hr);
+    }
+}
+
+inline unsigned int read_env_u32(const char *name, unsigned int fallback = 0)
+{
+    const char *value = std::getenv(name);
+    if (!value || !*value) {
+        return fallback;
+    }
+
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || parsed > std::numeric_limits<unsigned int>::max()) {
+        return fallback;
+    }
+    return static_cast<unsigned int>(parsed);
+}
+
+inline bool pump_messages()
+{
+    MSG msg{};
+    while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) {
+            return false;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    return true;
+}
+
+inline LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
+{
+    switch (message) {
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    default:
+        return DefWindowProcA(hwnd, message, wparam, lparam);
+    }
+}
+
+inline HWND create_window(const char *class_name, const char *title, int client_width, int client_height)
+{
+    HINSTANCE instance = GetModuleHandleA(nullptr);
+
+    WNDCLASSA wc{};
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = window_proc;
+    wc.hInstance = instance;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.lpszClassName = class_name;
+
+    if (!RegisterClassA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        fail("RegisterClassA failed");
+    }
+
+    RECT rect{0, 0, client_width, client_height};
+    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+
+    HWND hwnd = CreateWindowExA(
+        0,
+        class_name,
+        title,
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        nullptr,
+        nullptr,
+        instance,
+        nullptr
+    );
+
+    if (!hwnd) {
+        fail("CreateWindowExA failed");
+    }
+
+    ShowWindow(hwnd, SW_SHOWDEFAULT);
+    UpdateWindow(hwnd);
+    return hwnd;
+}
+
+using D3DCompileFn = HRESULT (WINAPI *)(
+    LPCVOID,
+    SIZE_T,
+    LPCSTR,
+    const D3D_SHADER_MACRO *,
+    ID3DInclude *,
+    LPCSTR,
+    LPCSTR,
+    UINT,
+    UINT,
+    ID3DBlob **,
+    ID3DBlob **
+);
+
+inline ComPtr<ID3DBlob> compile_shader(const char *source, const char *entry, const char *profile)
+{
+    static HMODULE compiler = LoadLibraryA("d3dcompiler_47.dll");
+    if (!compiler) {
+        compiler = LoadLibraryA("d3dcompiler_43.dll");
+    }
+    if (!compiler) {
+        fail("failed to load d3dcompiler");
+    }
+
+    auto compile = reinterpret_cast<D3DCompileFn>(GetProcAddress(compiler, "D3DCompile"));
+    if (!compile) {
+        fail("failed to resolve D3DCompile");
+    }
+
+    ComPtr<ID3DBlob> blob;
+    ComPtr<ID3DBlob> errors;
+    HRESULT hr = compile(
+        source,
+        std::strlen(source),
+        "triangle.hlsl",
+        nullptr,
+        nullptr,
+        entry,
+        profile,
+        D3DCOMPILE_ENABLE_STRICTNESS,
+        0,
+        blob.put(),
+        errors.put()
+    );
+
+    if (FAILED(hr)) {
+        if (errors) {
+            std::fprintf(stderr, "%s\n", static_cast<const char *>(errors->GetBufferPointer()));
+        }
+        fail("shader compilation failed", hr);
+    }
+
+    return blob;
+}
+
+inline const char *triangle_shader_source()
+{
+    return R"(
+struct VSInput
+{
+    float3 position : POSITION;
+    float3 color : COLOR0;
+};
+
+struct PSInput
+{
+    float4 position : SV_POSITION;
+    float3 color : COLOR0;
+};
+
+PSInput vs_main(VSInput input)
+{
+    PSInput output;
+    output.position = float4(input.position, 1.0);
+    output.color = input.color;
+    return output;
+}
+
+float4 ps_main(PSInput input) : SV_TARGET
+{
+    return float4(input.color, 1.0);
+}
+)";
+}
+
+struct Vertex {
+    float position[3];
+    float color[3];
+};
+
+struct FrameConstants {
+    float time;
+    float padding[3];
+};
+
+inline constexpr Vertex kTriangleVertices[3] = {
+    {{0.0f, 0.65f, 0.0f}, {1.0f, 0.2f, 0.2f}},
+    {{0.62f, -0.45f, 0.0f}, {0.2f, 1.0f, 0.2f}},
+    {{-0.62f, -0.45f, 0.0f}, {0.2f, 0.2f, 1.0f}},
+};
+
+} // namespace demo
