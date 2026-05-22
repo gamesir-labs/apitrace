@@ -1,0 +1,13 @@
+{
+  "format_version": 1,
+  "bundle_hash": "sha256:f8af371760dc35eab22fb8f948ff22b89526c47e9656fea13d3be64514c7dc9a",
+  "files": {
+    "buffers/3bbab0d482d4b093dcb1be0198d72adf0222d9a970ee5cc0fead912aeeecca33.buffer": "sha256:3bbab0d482d4b093dcb1be0198d72adf0222d9a970ee5cc0fead912aeeecca33",
+    "buffers/3e827a28300db4c391d5c8c8c42bf73f7d3e8195ca0b626227640595bcf447a6.buffer": "sha256:3e827a28300db4c391d5c8c8c42bf73f7d3e8195ca0b626227640595bcf447a6",
+    "callstream.jsonl": "sha256:3ddbc8f0bcf73d3528f4708114235dc4f91ab0b6c011167a00ddae103f567d72",
+    "objects/objects.json": "sha256:548450e41c8eb440527fb3e2949170ffb8b9c8376436e967ba7861bb04ae3ad9",
+    "shaders/86843dc27152f9af3d1fb5d1af43fcd0a691fdd24889e9aba4a7f04c03185731.dxbc": "sha256:86843dc27152f9af3d1fb5d1af43fcd0a691fdd24889e9aba4a7f04c03185731",
+    "shaders/dc77dfccec87fc4dce67efd30aa5569e62abef1f2611a857ce1d6bf8f2d9a405.dxbc": "sha256:dc77dfccec87fc4dce67efd30aa5569e62abef1f2611a857ce1d6bf8f2d9a405",
+    "textures/be32f2bfb95516c7b535ff72008be5557efd8569fd47f6b4b7235398d1f83045.texture": "sha256:be32f2bfb95516c7b535ff72008be5557efd8569fd47f6b4b7235398d1f83045"
+  }
+}

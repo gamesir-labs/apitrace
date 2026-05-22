@@ -102,9 +102,22 @@ scripts/validate-d3d11-wine.sh
 
 ## retrace fixture
 
-当前用于 `retrace` 测试的固定素材放在：
+当前用于 `retrace` 测试的固定素材按 scene 拆分放在：
+
+- `test/fixtures/retrace/d3d11-smoke_triangle/smoke_triangle-d3d11.apitrace/`
+- `test/fixtures/retrace/d3d11-smoke_triangle/smoke_triangle-d3d11-visual.png`
+- `test/fixtures/retrace/d3d11-indexed_instancing/indexed_instancing-d3d11.apitrace/`
+- `test/fixtures/retrace/d3d11-indexed_instancing/indexed_instancing-d3d11-visual.png`
+- `test/fixtures/retrace/d3d11-textured_quad/textured_quad-d3d11.apitrace/`
+- `test/fixtures/retrace/d3d11-textured_quad/textured_quad-d3d11-visual.png`
+- `test/fixtures/retrace/d3d11-depth_blend_scissor/depth_blend_scissor-d3d11.apitrace/`
+- `test/fixtures/retrace/d3d11-depth_blend_scissor/depth_blend_scissor-d3d11-visual.png`
+- `test/fixtures/retrace/d3d11-offscreen_copy_composite/offscreen_copy_composite-d3d11.apitrace/`
+- `test/fixtures/retrace/d3d11-offscreen_copy_composite/offscreen_copy_composite-d3d11-visual.png`
+
+兼容保留的早期 smoke fixture：
 
 - `test/fixtures/retrace/d3d11-triangle/triangle-d3d11.apitrace/`
 - `test/fixtures/retrace/d3d11-triangle/triangle-d3d11-visual.png`
 
-其中 `test/artifacts/` 和 `test/build/` 只保留为临时生成物，不应作为测试输入依赖。要刷新 fixture，先重新跑验收脚本，再把生成的 bundle 覆盖到上述路径。
+其中 `test/artifacts/` 和 `test/build/` 只保留为临时生成物，不应作为测试输入依赖。要刷新 fixture，先重新跑 `scripts/validate-d3d11-wine.sh`，再把 `test/artifacts/windows-x86_64/demo/bin/dx11-core-scene-traces/` 下对应 scene 的 bundle，以及 `test/artifacts/windows-x86_64/demo/bin/dx11-core-scene-logs/` 下对应 scene 的 `*-visual.png` 同步到上述目录。

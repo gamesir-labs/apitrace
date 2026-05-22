@@ -7,12 +7,9 @@ WINESERVER_BIN="$ROOT_DIR/../wine-enviroment/bin/wineserver"
 ROOT_BUILD_DIR="$ROOT_DIR/build/windows-cross"
 RETRACE_PREFIX="$ROOT_DIR/test/artifacts/windows-x86_64/retrace"
 RETRACE_BIN_DIR="$RETRACE_PREFIX/bin"
-RUN_LOG="$RETRACE_BIN_DIR/retrace-d3d11-run.log"
-VISUAL_RUN_LOG="$RETRACE_BIN_DIR/retrace-d3d11-visual-run.log"
-VISUAL_SCREENSHOT="$RETRACE_BIN_DIR/retrace-d3d11-visual.png"
+RUN_LOG_DIR="$RETRACE_BIN_DIR/retrace-d3d11-logs"
 ROOT_TOOLCHAIN="$ROOT_DIR/test/toolchains/windows-x86_64-mingw.cmake"
 WINE_PREFIX="$ROOT_DIR/test/artifacts/wineprefix-d3d11-retrace"
-FIXTURE_TRACE_DIR="$ROOT_DIR/test/fixtures/retrace/d3d11-triangle/triangle-d3d11.apitrace"
 DXMT_D3D11_DLL="$ROOT_DIR/../dxmt/build-gs-native-builtin/src/d3d11/d3d11.dll"
 DXMT_DXGI_DLL="$ROOT_DIR/../dxmt/build-gs-native-builtin/src/dxgi/dxgi.dll"
 DXMT_WINEMETAL_DLL="$ROOT_DIR/../dxmt/build-gs-native-builtin/src/winemetal/winemetal.dll"
@@ -21,6 +18,7 @@ DXMT_PACKAGE_ROOT="$HOME/Library/Application Support/com.gamemac.test/wine-engin
 DXMT_WINE_ROOT=""
 VISUAL_WINDOW_TITLE="${APITRACE_RETRACE_WINDOW_TITLE:-apitrace retrace d3d11}"
 VISUAL_DESKTOP="${APITRACE_WINE_VIRTUAL_DESKTOP:-apitrace-retrace,1400x900}"
+SCENES="${APITRACE_RETRACE_SCENES:-smoke_triangle indexed_instancing textured_quad depth_blend_scissor offscreen_copy_composite}"
 
 if [ -n "${APITRACE_VISUAL_CHECK:-}" ]; then
     VISUAL_CHECK="$APITRACE_VISUAL_CHECK"
@@ -32,6 +30,67 @@ fi
 
 wine_path() {
     printf 'Z:%s' "$(printf '%s' "$1" | sed 's|/|\\\\|g')"
+}
+
+scene_fixture_dir() {
+    scene_name="$1"
+    case "$scene_name" in
+        smoke_triangle)
+            if [ -d "$ROOT_DIR/test/fixtures/retrace/d3d11-smoke_triangle/smoke_triangle-d3d11.apitrace" ]; then
+                printf '%s\n' "$ROOT_DIR/test/fixtures/retrace/d3d11-smoke_triangle/smoke_triangle-d3d11.apitrace"
+                return 0
+            fi
+            printf '%s\n' "$ROOT_DIR/test/fixtures/retrace/d3d11-triangle/triangle-d3d11.apitrace"
+            ;;
+        *)
+            printf '%s\n' "$ROOT_DIR/test/fixtures/retrace/d3d11-$scene_name/$scene_name-d3d11.apitrace"
+            ;;
+    esac
+}
+
+scene_reference_visual() {
+    scene_name="$1"
+    case "$scene_name" in
+        smoke_triangle)
+            if [ -f "$ROOT_DIR/test/fixtures/retrace/d3d11-smoke_triangle/smoke_triangle-d3d11-visual.png" ]; then
+                printf '%s\n' "$ROOT_DIR/test/fixtures/retrace/d3d11-smoke_triangle/smoke_triangle-d3d11-visual.png"
+                return 0
+            fi
+            printf '%s\n' "$ROOT_DIR/test/fixtures/retrace/d3d11-triangle/triangle-d3d11-visual.png"
+            ;;
+        *)
+            printf '%s\n' "$ROOT_DIR/test/fixtures/retrace/d3d11-$scene_name/$scene_name-d3d11-visual.png"
+            ;;
+    esac
+}
+
+scene_expected_stats() {
+    trace_dir="$1"
+    python3 - "$trace_dir" <<'PY'
+import json
+import pathlib
+import sys
+
+trace_dir = pathlib.Path(sys.argv[1])
+callstream = trace_dir / "callstream.jsonl"
+frames = 0
+presents = 0
+with callstream.open("r", encoding="utf-8") as stream:
+    for line in stream:
+        line = line.strip()
+        if not line:
+            continue
+        record = json.loads(line)
+        if record.get("record_kind") != "boundary":
+            continue
+        boundary = record.get("boundary")
+        payload = record.get("payload", {})
+        if boundary == "Frame" and payload.get("label") == "FrameBegin":
+            frames += 1
+        elif boundary == "Present":
+            presents += 1
+print(f"{frames} {presents}")
+PY
 }
 
 capture_visual_window() {
@@ -116,12 +175,102 @@ for y in 0..<rep.pixelsHigh {
     }
 }
 
-if colorfulPixelCount < 1000 {
-    fputs("captured visual window did not contain enough colorful pixels to prove the retrace rendered\n", stderr)
+    if colorfulPixelCount < 1000 {
+        fputs("captured visual window did not contain enough colorful pixels to prove the retrace rendered\n", stderr)
+        exit(1)
+    }
+
+print("visual colorful pixels: \(colorfulPixelCount)")
+SWIFT
+}
+
+validate_visual_against_reference() {
+    scene_name="$1"
+    reference_path="$2"
+    screenshot_path="$3"
+
+    swift - "$scene_name" "$reference_path" "$screenshot_path" <<'SWIFT'
+import AppKit
+import Foundation
+
+let sceneName = CommandLine.arguments[1]
+let referencePath = CommandLine.arguments[2]
+let screenshotPath = CommandLine.arguments[3]
+
+func loadImage(_ path: String) throws -> NSBitmapImageRep {
+    let data = try Data(contentsOf: URL(fileURLWithPath: path))
+    guard let rep = NSBitmapImageRep(data: data) else {
+        throw NSError(domain: "visual-compare", code: 1, userInfo: [NSLocalizedDescriptionKey: "failed to decode \(path)"])
+    }
+    return rep
+}
+
+let reference = try loadImage(referencePath)
+let screenshot = try loadImage(screenshotPath)
+
+guard reference.pixelsWide == screenshot.pixelsWide, reference.pixelsHigh == screenshot.pixelsHigh else {
+    fputs("\(sceneName): visual size mismatch between reference and retrace screenshot\n", stderr)
     exit(1)
 }
 
-print("visual colorful pixels: \(colorfulPixelCount)")
+let width = reference.pixelsWide
+let height = reference.pixelsHigh
+let startX = max(0, Int(Double(width) * 0.12))
+let endX = min(width, Int(Double(width) * 0.88))
+let startY = max(0, Int(Double(height) * 0.18))
+let endY = min(height, Int(Double(height) * 0.90))
+
+var totalDiff = 0.0
+var maxDiff = 0.0
+var mismatchPixels = 0
+var comparedPixels = 0
+
+for y in startY..<endY {
+    for x in startX..<endX {
+        guard
+            let rawReference = reference.colorAt(x: x, y: y),
+            let rawScreenshot = screenshot.colorAt(x: x, y: y)
+        else {
+            continue
+        }
+        let refColor = rawReference.usingColorSpace(.deviceRGB) ?? rawReference
+        let shotColor = rawScreenshot.usingColorSpace(.deviceRGB) ?? rawScreenshot
+        let diff =
+            abs(Double(refColor.redComponent - shotColor.redComponent)) +
+            abs(Double(refColor.greenComponent - shotColor.greenComponent)) +
+            abs(Double(refColor.blueComponent - shotColor.blueComponent))
+        let normalized = diff / 3.0
+        totalDiff += normalized
+        if normalized > maxDiff {
+            maxDiff = normalized
+        }
+        if normalized > 0.10 {
+            mismatchPixels += 1
+        }
+        comparedPixels += 1
+    }
+}
+
+if comparedPixels == 0 {
+    fputs("\(sceneName): visual comparison crop was empty\n", stderr)
+    exit(1)
+}
+
+let averageDiff = totalDiff / Double(comparedPixels)
+let mismatchRatio = Double(mismatchPixels) / Double(comparedPixels)
+
+let averageThreshold = 0.02
+let mismatchThreshold = 0.05
+
+if averageDiff > averageThreshold || mismatchRatio > mismatchThreshold {
+    fputs(
+        "\(sceneName): retrace visual output diverged from reference (avg_diff=\(averageDiff), mismatch_ratio=\(mismatchRatio), max_diff=\(maxDiff))\n",
+        stderr
+    )
+    exit(1)
+}
+
+print("visual reference match: \(sceneName) avg_diff=\(averageDiff) mismatch_ratio=\(mismatchRatio) max_diff=\(maxDiff)")
 SWIFT
 }
 
@@ -171,11 +320,6 @@ if [ ! -x "$WINE_BIN" ]; then
     exit 1
 fi
 
-if [ ! -d "$FIXTURE_TRACE_DIR" ]; then
-    echo "missing retrace fixture: $FIXTURE_TRACE_DIR" >&2
-    exit 1
-fi
-
 if [ -d "$DXMT_PACKAGE_ROOT/wine" ]; then
     DXMT_WINE_ROOT="$DXMT_PACKAGE_ROOT/wine"
     DXMT_D3D11_DLL="$DXMT_PACKAGE_ROOT/wine/x86_64-windows/d3d11.dll"
@@ -195,7 +339,7 @@ if [ -x "$WINESERVER_BIN" ]; then
     WINEPREFIX="$WINE_PREFIX" WINEARCH="win64" "$WINESERVER_BIN" -k >/dev/null 2>&1 || true
 fi
 
-rm -rf "$ROOT_BUILD_DIR" "$RETRACE_PREFIX" "$VISUAL_SCREENSHOT"
+rm -rf "$ROOT_BUILD_DIR" "$RETRACE_PREFIX"
 
 cmake -S "$ROOT_DIR" -B "$ROOT_BUILD_DIR" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$ROOT_TOOLCHAIN" \
@@ -231,55 +375,21 @@ if [ ! -f "$WINE_PREFIX/system.reg" ]; then
     "$WINE_BIN" wineboot -u >/dev/null 2>&1 || true
 fi
 
-fixture_trace_path="$(wine_path "$FIXTURE_TRACE_DIR")"
 retrace_bin_path="$(wine_path "$RETRACE_BIN_DIR")"
+mkdir -p "$RUN_LOG_DIR"
 
-if [ "$VISUAL_CHECK" != "0" ]; then
-    export APITRACE_RETRACE_SHOW_WINDOW=1
-    "$WINE_BIN" explorer "/desktop=$VISUAL_DESKTOP" "$RETRACE_BIN_DIR/retrace.exe" "$fixture_trace_path" >"$VISUAL_RUN_LOG" 2>&1 &
-    wine_pid="$!"
-    (
-        capture_visual_window "$VISUAL_WINDOW_TITLE" "$VISUAL_SCREENSHOT"
-    ) &
-    capture_pid="$!"
-    deadline="$(( $(date +%s) + 90 ))"
-    while kill -0 "$wine_pid" 2>/dev/null; do
-        if [ "$(date +%s)" -ge "$deadline" ]; then
-            kill "$wine_pid" >/dev/null 2>&1 || true
-            wait "$wine_pid" >/dev/null 2>&1 || true
-            echo "wine retrace visual pass timed out" >&2
-            exit 1
-        fi
-        sleep 1
-    done
-
-    set +e
-    wait "$wine_pid"
-    wine_status="$?"
-    set -e
-    if [ "$wine_status" -ne 0 ]; then
-        echo "retrace.exe visual pass exited with code $wine_status" >&2
-        cat "$VISUAL_RUN_LOG" >&2
-        exit 1
-    fi
-
-    wait "$capture_pid"
-    if [ ! -f "$VISUAL_SCREENSHOT" ]; then
-        echo "missing visual screenshot: $VISUAL_SCREENSHOT" >&2
-        exit 1
-    fi
-    validate_visual_window "$VISUAL_SCREENSHOT"
-fi
-
-export APITRACE_RETRACE_SHOW_WINDOW=0
-"$WINE_BIN" cmd /c "cd /d $retrace_bin_path && retrace.exe $fixture_trace_path > retrace-d3d11-run.log 2>&1"
-
-python3 - "$RUN_LOG" <<'PY'
+validate_run_log() {
+    run_log="$1"
+    expected_frames="$2"
+    expected_presents="$3"
+    python3 - "$run_log" "$expected_frames" "$expected_presents" <<'PY'
 import pathlib
 import re
 import sys
 
 run_log = pathlib.Path(sys.argv[1])
+expected_frames = int(sys.argv[2])
+expected_presents = int(sys.argv[3])
 text = run_log.read_text(encoding="utf-8", errors="replace")
 
 def require_stat(name: str, expected: int) -> None:
@@ -297,8 +407,8 @@ backend = backend_match.group(1).strip()
 if backend != "translation-layer-d3d11-dxmt":
     raise SystemExit(f"unexpected backend: {backend}")
 
-require_stat("frames_seen", 300)
-require_stat("presents_seen", 300)
+require_stat("frames_seen", expected_frames)
+require_stat("presents_seen", expected_presents)
 
 calls_match = re.search(r"calls_replayed:\s*(\d+)", text)
 if not calls_match or int(calls_match.group(1)) <= 0:
@@ -306,10 +416,82 @@ if not calls_match or int(calls_match.group(1)) <= 0:
 
 print("validated retrace output:", run_log)
 PY
+}
 
-echo "run log: $RUN_LOG"
-echo "fixture trace: $FIXTURE_TRACE_DIR"
-if [ "$VISUAL_CHECK" != "0" ]; then
-    echo "visual run log: $VISUAL_RUN_LOG"
-    echo "visual screenshot: $VISUAL_SCREENSHOT"
-fi
+for scene_name in $SCENES; do
+    fixture_trace_dir="$(scene_fixture_dir "$scene_name")"
+    if [ ! -d "$fixture_trace_dir" ]; then
+        echo "missing retrace fixture for scene $scene_name: $fixture_trace_dir" >&2
+        exit 1
+    fi
+    reference_visual="$(scene_reference_visual "$scene_name")"
+
+    set -- $(scene_expected_stats "$fixture_trace_dir")
+    expected_frames="$1"
+    expected_presents="$2"
+    if [ "$expected_frames" -le 0 ] || [ "$expected_presents" -le 0 ]; then
+        echo "invalid expected stats for scene $scene_name: frames=$expected_frames presents=$expected_presents" >&2
+        exit 1
+    fi
+
+    fixture_trace_path="$(wine_path "$fixture_trace_dir")"
+    run_log="$RUN_LOG_DIR/$scene_name-run.log"
+    visual_run_log="$RUN_LOG_DIR/$scene_name-visual-run.log"
+    visual_screenshot="$RUN_LOG_DIR/$scene_name-visual.png"
+
+    if [ "$VISUAL_CHECK" != "0" ]; then
+        if [ ! -f "$reference_visual" ]; then
+            echo "missing reference visual for scene $scene_name: $reference_visual" >&2
+            exit 1
+        fi
+        rm -f "$visual_screenshot"
+        export APITRACE_RETRACE_SHOW_WINDOW=1
+        "$WINE_BIN" explorer "/desktop=$VISUAL_DESKTOP" "$RETRACE_BIN_DIR/retrace.exe" "$fixture_trace_path" >"$visual_run_log" 2>&1 &
+        wine_pid="$!"
+        (
+            capture_visual_window "$VISUAL_WINDOW_TITLE" "$visual_screenshot"
+        ) &
+        capture_pid="$!"
+        deadline="$(( $(date +%s) + 90 ))"
+        while kill -0 "$wine_pid" 2>/dev/null; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+                kill "$wine_pid" >/dev/null 2>&1 || true
+                wait "$wine_pid" >/dev/null 2>&1 || true
+                echo "wine retrace visual pass timed out for scene $scene_name" >&2
+                exit 1
+            fi
+            sleep 1
+        done
+
+        set +e
+        wait "$wine_pid"
+        wine_status="$?"
+        set -e
+        if [ "$wine_status" -ne 0 ]; then
+            echo "retrace.exe visual pass exited with code $wine_status for scene $scene_name" >&2
+            cat "$visual_run_log" >&2
+            exit 1
+        fi
+
+        wait "$capture_pid"
+        if [ ! -f "$visual_screenshot" ]; then
+            echo "missing visual screenshot for scene $scene_name: $visual_screenshot" >&2
+            exit 1
+        fi
+        validate_visual_window "$visual_screenshot"
+        validate_visual_against_reference "$scene_name" "$reference_visual" "$visual_screenshot"
+    fi
+
+    export APITRACE_RETRACE_SHOW_WINDOW=0
+    "$WINE_BIN" cmd /c "cd /d $retrace_bin_path && retrace.exe $fixture_trace_path > retrace-d3d11-logs/$scene_name-run.log 2>&1"
+    validate_run_log "$run_log" "$expected_frames" "$expected_presents"
+
+    echo "scene: $scene_name"
+    echo "run log: $run_log"
+    echo "fixture trace: $fixture_trace_dir"
+    if [ "$VISUAL_CHECK" != "0" ]; then
+        echo "visual run log: $visual_run_log"
+        echo "visual screenshot: $visual_screenshot"
+        echo "reference visual: $reference_visual"
+    fi
+done

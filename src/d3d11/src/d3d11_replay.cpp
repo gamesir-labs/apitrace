@@ -175,19 +175,58 @@ std::optional<D3D11_PRIMITIVE_TOPOLOGY> topology_from_name(const std::string &to
   return std::nullopt;
 }
 
+constexpr UINT texture_bytes_per_pixel(DXGI_FORMAT format)
+{
+  switch (format) {
+  case DXGI_FORMAT_R8G8B8A8_UNORM:
+  case DXGI_FORMAT_B8G8R8A8_UNORM:
+  case DXGI_FORMAT_D32_FLOAT:
+    return 4;
+  case DXGI_FORMAT_R16_UINT:
+    return 2;
+  case DXGI_FORMAT_R32_UINT:
+    return 4;
+  default:
+    return 0;
+  }
+}
+
+UINT mip_extent(UINT base_extent, UINT mip_level)
+{
+  const UINT shifted = base_extent >> mip_level;
+  return shifted == 0 ? 1U : shifted;
+}
+
 struct PendingMapState {
   UINT subresource = 0;
   D3D11_MAP map_type = D3D11_MAP_WRITE_DISCARD;
   UINT map_flags = 0;
 };
 
-struct BufferState {
+struct ReplayResourceState {
+  ID3D11Resource *resource = nullptr;
   ID3D11Buffer *buffer = nullptr;
+  ID3D11Texture2D *texture2d = nullptr;
+  replay::internal::ReplayResourceClass resource_class = replay::internal::ReplayResourceClass::Unknown;
   UINT byte_width = 0;
-  D3D11_USAGE usage = D3D11_USAGE_DEFAULT;
+  UINT width = 0;
+  UINT height = 0;
+  UINT mip_levels = 0;
+  UINT array_size = 0;
+  DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+  UINT sample_count = 1;
+  UINT sample_quality = 0;
   UINT bind_flags = 0;
+  D3D11_USAGE usage = D3D11_USAGE_DEFAULT;
   UINT cpu_access_flags = 0;
+  UINT misc_flags = 0;
   std::optional<PendingMapState> pending_map;
+};
+
+struct BoundIndexBufferState {
+  trace::ObjectId buffer_id = 0;
+  DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+  UINT offset = 0;
 };
 
 class TranslationLayerRuntime {
@@ -223,7 +262,8 @@ public:
       }
 
       if (!std::holds_alternative<replay::internal::FrameBoundaryCommand>(command) &&
-          !std::holds_alternative<replay::internal::PresentBoundaryCommand>(command)) {
+          !std::holds_alternative<replay::internal::PresentBoundaryCommand>(command) &&
+          !std::holds_alternative<replay::internal::DebugMarkerCommand>(command)) {
         ++statistics.calls_replayed;
       }
     }
@@ -246,15 +286,20 @@ public:
       }
     }
     owned_objects_.clear();
-    buffers_.clear();
-    resources_.clear();
+    devices_.clear();
+    contexts_.clear();
+    swapchains_.clear();
+    resource_states_.clear();
     render_target_views_.clear();
+    shader_resource_views_.clear();
+    depth_stencil_views_.clear();
     input_layouts_.clear();
     vertex_shaders_.clear();
     pixel_shaders_.clear();
-    swapchains_.clear();
-    devices_.clear();
-    contexts_.clear();
+    sampler_states_.clear();
+    blend_states_.clear();
+    depth_stencil_states_.clear();
+    rasterizer_states_.clear();
 
     if (window_) {
       DestroyWindow(window_);
@@ -267,9 +312,7 @@ public:
   }
 
 private:
-  bool ensure_window(
-      const replay::internal::CreateDeviceAndSwapChainCommand &command,
-      std::string &error)
+  bool ensure_window(const replay::internal::CreateDeviceAndSwapChainCommand &command, std::string &error)
   {
     if (window_) {
       return true;
@@ -347,6 +390,19 @@ private:
     return true;
   }
 
+  bool lookup_resource_state(trace::ObjectId object_id, const char *what, ReplayResourceState *&state, std::string &error)
+  {
+    const auto it = resource_states_.find(object_id);
+    if (it == resource_states_.end() || !it->second.resource) {
+      std::ostringstream message;
+      message << "missing replay resource " << what << " for object_id " << object_id;
+      error = message.str();
+      return false;
+    }
+    state = &it->second;
+    return true;
+  }
+
   bool read_file_bytes(const std::filesystem::path &path, std::vector<std::uint8_t> &bytes, std::string &error) const
   {
     std::ifstream input(path, std::ios::binary);
@@ -373,6 +429,188 @@ private:
     }
   }
 
+  void store_buffer_resource(
+      trace::ObjectId object_id,
+      ID3D11Buffer *buffer,
+      UINT byte_width,
+      D3D11_USAGE usage,
+      UINT bind_flags,
+      UINT cpu_access_flags)
+  {
+    resource_states_[object_id] = ReplayResourceState{
+        buffer,
+        buffer,
+        nullptr,
+        replay::internal::ReplayResourceClass::Buffer,
+        byte_width,
+        0,
+        0,
+        0,
+        0,
+        DXGI_FORMAT_UNKNOWN,
+        1,
+        0,
+        bind_flags,
+        usage,
+        cpu_access_flags,
+        0,
+        std::nullopt,
+    };
+  }
+
+  void store_texture_resource(trace::ObjectId object_id, ID3D11Texture2D *texture, const D3D11_TEXTURE2D_DESC &desc)
+  {
+    resource_states_[object_id] = ReplayResourceState{
+        texture,
+        nullptr,
+        texture,
+        replay::internal::ReplayResourceClass::Texture2D,
+        0,
+        desc.Width,
+        desc.Height,
+        desc.MipLevels,
+        desc.ArraySize,
+        desc.Format,
+        desc.SampleDesc.Count == 0 ? 1u : desc.SampleDesc.Count,
+        desc.SampleDesc.Quality,
+        desc.BindFlags,
+        desc.Usage,
+        desc.CPUAccessFlags,
+        desc.MiscFlags,
+        std::nullopt,
+    };
+  }
+
+  static D3D11_TEXTURE2D_DESC texture_desc_from_command(const replay::internal::Texture2DDesc &source)
+  {
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = source.width;
+    desc.Height = source.height;
+    desc.MipLevels = source.mip_levels;
+    desc.ArraySize = source.array_size;
+    desc.Format = static_cast<DXGI_FORMAT>(source.format);
+    desc.SampleDesc.Count = source.sample_count == 0 ? 1 : source.sample_count;
+    desc.SampleDesc.Quality = source.sample_quality;
+    desc.Usage = static_cast<D3D11_USAGE>(source.usage);
+    desc.BindFlags = source.bind_flags;
+    desc.CPUAccessFlags = source.cpu_access_flags;
+    desc.MiscFlags = source.misc_flags;
+    return desc;
+  }
+
+  static D3D11_SHADER_RESOURCE_VIEW_DESC shader_resource_view_desc_from_command(
+      const replay::internal::ShaderResourceViewDesc &source)
+  {
+    D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
+    desc.Format = static_cast<DXGI_FORMAT>(source.format);
+    desc.ViewDimension = static_cast<D3D11_SRV_DIMENSION>(source.view_dimension);
+    if (source.has_texture2d) {
+      desc.Texture2D.MostDetailedMip = source.texture2d_most_detailed_mip;
+      desc.Texture2D.MipLevels = source.texture2d_mip_levels;
+    }
+    return desc;
+  }
+
+  static D3D11_RENDER_TARGET_VIEW_DESC render_target_view_desc_from_command(
+      const replay::internal::CreateRenderTargetViewCommand &source)
+  {
+    D3D11_RENDER_TARGET_VIEW_DESC desc{};
+    desc.Format = static_cast<DXGI_FORMAT>(source.format);
+    desc.ViewDimension = static_cast<D3D11_RTV_DIMENSION>(source.view_dimension);
+    desc.Texture2D.MipSlice = source.texture2d_mip_slice;
+    return desc;
+  }
+
+  static D3D11_DEPTH_STENCIL_VIEW_DESC depth_stencil_view_desc_from_command(
+      const replay::internal::DepthStencilViewDesc &source)
+  {
+    D3D11_DEPTH_STENCIL_VIEW_DESC desc{};
+    desc.Format = static_cast<DXGI_FORMAT>(source.format);
+    desc.ViewDimension = static_cast<D3D11_DSV_DIMENSION>(source.view_dimension);
+    desc.Flags = source.flags;
+    if (source.has_texture2d) {
+      desc.Texture2D.MipSlice = source.texture2d_mip_slice;
+    }
+    return desc;
+  }
+
+  static D3D11_SAMPLER_DESC sampler_desc_from_command(const replay::internal::SamplerStateDesc &source)
+  {
+    D3D11_SAMPLER_DESC desc{};
+    desc.Filter = static_cast<D3D11_FILTER>(source.filter);
+    desc.AddressU = static_cast<D3D11_TEXTURE_ADDRESS_MODE>(source.address_u);
+    desc.AddressV = static_cast<D3D11_TEXTURE_ADDRESS_MODE>(source.address_v);
+    desc.AddressW = static_cast<D3D11_TEXTURE_ADDRESS_MODE>(source.address_w);
+    desc.MipLODBias = source.mip_lod_bias;
+    desc.MaxAnisotropy = source.max_anisotropy;
+    desc.ComparisonFunc = static_cast<D3D11_COMPARISON_FUNC>(source.comparison_func);
+    std::copy(source.border_color.begin(), source.border_color.end(), desc.BorderColor);
+    desc.MinLOD = source.min_lod;
+    desc.MaxLOD = source.max_lod;
+    return desc;
+  }
+
+  static D3D11_BLEND_DESC blend_desc_from_command(const replay::internal::BlendStateDesc &source)
+  {
+    D3D11_BLEND_DESC desc{};
+    desc.AlphaToCoverageEnable = source.alpha_to_coverage_enable ? TRUE : FALSE;
+    desc.IndependentBlendEnable = source.independent_blend_enable ? TRUE : FALSE;
+    for (std::size_t index = 0; index < source.render_targets.size(); ++index) {
+      const auto &input = source.render_targets[index];
+      auto &target = desc.RenderTarget[index];
+      target.BlendEnable = input.blend_enable ? TRUE : FALSE;
+      target.SrcBlend = static_cast<D3D11_BLEND>(input.src_blend);
+      target.DestBlend = static_cast<D3D11_BLEND>(input.dest_blend);
+      target.BlendOp = static_cast<D3D11_BLEND_OP>(input.blend_op);
+      target.SrcBlendAlpha = static_cast<D3D11_BLEND>(input.src_blend_alpha);
+      target.DestBlendAlpha = static_cast<D3D11_BLEND>(input.dest_blend_alpha);
+      target.BlendOpAlpha = static_cast<D3D11_BLEND_OP>(input.blend_op_alpha);
+      target.RenderTargetWriteMask = input.write_mask;
+    }
+    return desc;
+  }
+
+  static D3D11_DEPTH_STENCIL_DESC depth_stencil_state_desc_from_command(
+      const replay::internal::DepthStencilStateDesc &source)
+  {
+    D3D11_DEPTH_STENCIL_DESC desc{};
+    desc.DepthEnable = source.depth_enable ? TRUE : FALSE;
+    desc.DepthWriteMask = static_cast<D3D11_DEPTH_WRITE_MASK>(source.depth_write_mask);
+    desc.DepthFunc = static_cast<D3D11_COMPARISON_FUNC>(source.depth_func);
+    desc.StencilEnable = source.stencil_enable ? TRUE : FALSE;
+    desc.StencilReadMask = source.stencil_read_mask;
+    desc.StencilWriteMask = source.stencil_write_mask;
+    return desc;
+  }
+
+  static D3D11_RASTERIZER_DESC rasterizer_desc_from_command(const replay::internal::RasterizerStateDesc &source)
+  {
+    D3D11_RASTERIZER_DESC desc{};
+    desc.FillMode = static_cast<D3D11_FILL_MODE>(source.fill_mode);
+    desc.CullMode = static_cast<D3D11_CULL_MODE>(source.cull_mode);
+    desc.FrontCounterClockwise = source.front_counter_clockwise ? TRUE : FALSE;
+    desc.DepthBias = source.depth_bias;
+    desc.DepthBiasClamp = source.depth_bias_clamp;
+    desc.SlopeScaledDepthBias = source.slope_scaled_depth_bias;
+    desc.DepthClipEnable = source.depth_clip_enable ? TRUE : FALSE;
+    desc.ScissorEnable = source.scissor_enable ? TRUE : FALSE;
+    desc.MultisampleEnable = source.multisample_enable ? TRUE : FALSE;
+    desc.AntialiasedLineEnable = source.antialiased_line_enable ? TRUE : FALSE;
+    return desc;
+  }
+
+  static UINT texture_subresource_height(const ReplayResourceState &resource, UINT subresource)
+  {
+    const UINT mip_levels = resource.mip_levels == 0 ? 1 : resource.mip_levels;
+    return mip_extent(resource.height, subresource % mip_levels);
+  }
+
+  static UINT texture_subresource_width(const ReplayResourceState &resource, UINT subresource)
+  {
+    const UINT mip_levels = resource.mip_levels == 0 ? 1 : resource.mip_levels;
+    return mip_extent(resource.width, subresource % mip_levels);
+  }
+
   bool execute_command(
       const replay::internal::CreateDeviceAndSwapChainCommand &command,
       replay::ReplayStatistics &statistics,
@@ -383,7 +621,7 @@ private:
       return false;
     }
     if (!devices_.empty() || !contexts_.empty() || !swapchains_.empty()) {
-      error = "multiple D3D11CreateDeviceAndSwapChain calls are unsupported in the MVP";
+      error = "multiple D3D11CreateDeviceAndSwapChain calls are unsupported";
       return false;
     }
 
@@ -432,10 +670,7 @@ private:
     return true;
   }
 
-  bool execute_command(
-      const replay::internal::GetBufferCommand &command,
-      replay::ReplayStatistics &statistics,
-      std::string &error)
+  bool execute_command(const replay::internal::GetBufferCommand &command, replay::ReplayStatistics &statistics, std::string &error)
   {
     (void)statistics;
     IDXGISwapChain *swapchain = nullptr;
@@ -450,8 +685,10 @@ private:
       return false;
     }
 
+    D3D11_TEXTURE2D_DESC desc{};
+    back_buffer->GetDesc(&desc);
     own(back_buffer);
-    resources_[command.resource_id] = back_buffer;
+    store_texture_resource(command.resource_id, back_buffer, desc);
     return true;
   }
 
@@ -461,20 +698,22 @@ private:
       std::string &error)
   {
     (void)statistics;
-    if (command.desc_present) {
-      error = "CreateRenderTargetView with explicit desc is unsupported in the MVP";
+    ID3D11Device *device = nullptr;
+    ReplayResourceState *resource = nullptr;
+    if (!lookup_object(devices_, command.device_id, "device", device, error) ||
+        !lookup_resource_state(command.resource_id, "resource", resource, error)) {
       return false;
     }
 
-    ID3D11Device *device = nullptr;
-    ID3D11Resource *resource = nullptr;
-    if (!lookup_object(devices_, command.device_id, "device", device, error) ||
-        !lookup_object(resources_, command.resource_id, "resource", resource, error)) {
-      return false;
+    D3D11_RENDER_TARGET_VIEW_DESC desc{};
+    const D3D11_RENDER_TARGET_VIEW_DESC *desc_ptr = nullptr;
+    if (command.desc_present) {
+      desc = render_target_view_desc_from_command(command);
+      desc_ptr = &desc;
     }
 
     ID3D11RenderTargetView *view = nullptr;
-    const HRESULT hr = device->CreateRenderTargetView(resource, nullptr, &view);
+    const HRESULT hr = device->CreateRenderTargetView(resource->resource, desc_ptr, &view);
     if (FAILED(hr)) {
       error = format_hresult("ID3D11Device::CreateRenderTargetView", hr);
       return false;
@@ -482,6 +721,130 @@ private:
 
     own(view);
     render_target_views_[command.view_id] = view;
+    return true;
+  }
+
+  bool execute_command(const replay::internal::CreateTexture2DCommand &command, replay::ReplayStatistics &statistics, std::string &error)
+  {
+    (void)statistics;
+    ID3D11Device *device = nullptr;
+    if (!lookup_object(devices_, command.device_id, "device", device, error)) {
+      return false;
+    }
+
+    const D3D11_TEXTURE2D_DESC desc = texture_desc_from_command(command.desc);
+    std::vector<std::uint8_t> initial_data_bytes;
+    D3D11_SUBRESOURCE_DATA initial_data{};
+    D3D11_SUBRESOURCE_DATA *initial_data_ptr = nullptr;
+    if (command.has_initial_data) {
+      if (!read_file_bytes(command.initial_data_path, initial_data_bytes, error)) {
+        return false;
+      }
+      initial_data.pSysMem = initial_data_bytes.data();
+      if (desc.Height > 0 && !initial_data_bytes.empty()) {
+        initial_data.SysMemPitch = static_cast<UINT>(initial_data_bytes.size() / desc.Height);
+      }
+      initial_data.SysMemSlicePitch = static_cast<UINT>(initial_data_bytes.size());
+      initial_data_ptr = &initial_data;
+    }
+
+    ID3D11Texture2D *texture = nullptr;
+    const HRESULT hr = device->CreateTexture2D(&desc, initial_data_ptr, &texture);
+    if (FAILED(hr)) {
+      error = format_hresult("ID3D11Device::CreateTexture2D", hr);
+      return false;
+    }
+
+    own(texture);
+    store_texture_resource(command.texture_id, texture, desc);
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::CreateShaderResourceViewCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11Device *device = nullptr;
+    ReplayResourceState *resource = nullptr;
+    if (!lookup_object(devices_, command.device_id, "device", device, error) ||
+        !lookup_resource_state(command.resource_id, "resource", resource, error)) {
+      return false;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
+    const D3D11_SHADER_RESOURCE_VIEW_DESC *desc_ptr = nullptr;
+    if (command.desc_present) {
+      desc = shader_resource_view_desc_from_command(command.desc);
+      desc_ptr = &desc;
+    }
+
+    ID3D11ShaderResourceView *view = nullptr;
+    const HRESULT hr = device->CreateShaderResourceView(resource->resource, desc_ptr, &view);
+    if (FAILED(hr)) {
+      error = format_hresult("ID3D11Device::CreateShaderResourceView", hr);
+      return false;
+    }
+
+    own(view);
+    shader_resource_views_[command.view_id] = view;
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::CreateSamplerStateCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11Device *device = nullptr;
+    if (!lookup_object(devices_, command.device_id, "device", device, error)) {
+      return false;
+    }
+
+    const D3D11_SAMPLER_DESC desc = sampler_desc_from_command(command.desc);
+    ID3D11SamplerState *sampler = nullptr;
+    const HRESULT hr = device->CreateSamplerState(&desc, &sampler);
+    if (FAILED(hr)) {
+      error = format_hresult("ID3D11Device::CreateSamplerState", hr);
+      return false;
+    }
+
+    own(sampler);
+    sampler_states_[command.sampler_id] = sampler;
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::CreateDepthStencilViewCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11Device *device = nullptr;
+    ReplayResourceState *resource = nullptr;
+    if (!lookup_object(devices_, command.device_id, "device", device, error) ||
+        !lookup_resource_state(command.resource_id, "resource", resource, error)) {
+      return false;
+    }
+
+    D3D11_DEPTH_STENCIL_VIEW_DESC desc{};
+    const D3D11_DEPTH_STENCIL_VIEW_DESC *desc_ptr = nullptr;
+    if (command.desc_present) {
+      desc = depth_stencil_view_desc_from_command(command.desc);
+      desc_ptr = &desc;
+    }
+
+    ID3D11DepthStencilView *view = nullptr;
+    const HRESULT hr = device->CreateDepthStencilView(resource->resource, desc_ptr, &view);
+    if (FAILED(hr)) {
+      error = format_hresult("ID3D11Device::CreateDepthStencilView", hr);
+      return false;
+    }
+
+    own(view);
+    depth_stencil_views_[command.view_id] = view;
     return true;
   }
 
@@ -618,27 +981,96 @@ private:
     }
 
     own(buffer);
-    resources_[command.buffer_id] = buffer;
-    buffers_[command.buffer_id] = BufferState{
+    store_buffer_resource(
+        command.buffer_id,
         buffer,
         command.byte_width,
         static_cast<D3D11_USAGE>(command.usage),
         command.bind_flags,
-        command.cpu_access_flags,
-        std::nullopt,
-    };
+        command.cpu_access_flags);
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::CreateBlendStateCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11Device *device = nullptr;
+    if (!lookup_object(devices_, command.device_id, "device", device, error)) {
+      return false;
+    }
+
+    const D3D11_BLEND_DESC desc = blend_desc_from_command(command.desc);
+    ID3D11BlendState *state = nullptr;
+    const HRESULT hr = device->CreateBlendState(&desc, &state);
+    if (FAILED(hr)) {
+      error = format_hresult("ID3D11Device::CreateBlendState", hr);
+      return false;
+    }
+
+    own(state);
+    blend_states_[command.blend_state_id] = state;
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::CreateDepthStencilStateCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11Device *device = nullptr;
+    if (!lookup_object(devices_, command.device_id, "device", device, error)) {
+      return false;
+    }
+
+    const D3D11_DEPTH_STENCIL_DESC desc = depth_stencil_state_desc_from_command(command.desc);
+    ID3D11DepthStencilState *state = nullptr;
+    const HRESULT hr = device->CreateDepthStencilState(&desc, &state);
+    if (FAILED(hr)) {
+      error = format_hresult("ID3D11Device::CreateDepthStencilState", hr);
+      return false;
+    }
+
+    own(state);
+    depth_stencil_states_[command.depth_stencil_state_id] = state;
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::CreateRasterizerStateCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11Device *device = nullptr;
+    if (!lookup_object(devices_, command.device_id, "device", device, error)) {
+      return false;
+    }
+
+    const D3D11_RASTERIZER_DESC desc = rasterizer_desc_from_command(command.desc);
+    ID3D11RasterizerState *state = nullptr;
+    const HRESULT hr = device->CreateRasterizerState(&desc, &state);
+    if (FAILED(hr)) {
+      error = format_hresult("ID3D11Device::CreateRasterizerState", hr);
+      return false;
+    }
+
+    own(state);
+    rasterizer_states_[command.rasterizer_state_id] = state;
     return true;
   }
 
   bool execute_command(const replay::internal::MapCommand &command, replay::ReplayStatistics &statistics, std::string &error)
   {
     (void)statistics;
-    const auto buffer_it = buffers_.find(command.resource_id);
-    if (buffer_it == buffers_.end() || !buffer_it->second.buffer) {
-      error = "missing replay buffer for Map";
+    ReplayResourceState *resource = nullptr;
+    if (!lookup_resource_state(command.resource_id, "resource", resource, error)) {
       return false;
     }
-    buffer_it->second.pending_map = PendingMapState{
+    resource->pending_map = PendingMapState{
         command.subresource,
         map_type_from_name(command.map_type),
         command.map_flags,
@@ -653,42 +1085,103 @@ private:
   {
     (void)statistics;
     ID3D11DeviceContext *context = nullptr;
-    if (!lookup_object(contexts_, command.context_id, "context", context, error)) {
+    ReplayResourceState *resource = nullptr;
+    if (!lookup_object(contexts_, command.context_id, "context", context, error) ||
+        !lookup_resource_state(command.resource_id, "resource", resource, error)) {
       return false;
     }
-
-    const auto buffer_it = buffers_.find(command.resource_id);
-    if (buffer_it == buffers_.end() || !buffer_it->second.buffer) {
-      error = "missing replay buffer for Unmap";
-      return false;
-    }
-    if (!buffer_it->second.pending_map.has_value()) {
-      error = "Unmap without a prior Map is unsupported in the MVP";
-      return false;
-    }
-
-    std::vector<std::uint8_t> snapshot_bytes;
-    if (!read_file_bytes(command.snapshot_path, snapshot_bytes, error)) {
+    if (!resource->pending_map.has_value()) {
+      error = "Unmap without a prior Map is unsupported";
       return false;
     }
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    const auto pending = *buffer_it->second.pending_map;
-    const HRESULT hr = context->Map(buffer_it->second.buffer, pending.subresource, pending.map_type, pending.map_flags, &mapped);
+    const auto pending = *resource->pending_map;
+    const HRESULT hr = context->Map(resource->resource, pending.subresource, pending.map_type, pending.map_flags, &mapped);
     if (FAILED(hr)) {
       error = format_hresult("ID3D11DeviceContext::Map", hr);
       return false;
     }
 
-    const std::size_t copy_size = std::min<std::size_t>(snapshot_bytes.size(), buffer_it->second.byte_width);
-    if (copy_size != 0) {
-      std::memcpy(mapped.pData, snapshot_bytes.data(), copy_size);
+    if (pending.map_type != D3D11_MAP_READ) {
+      std::vector<std::uint8_t> snapshot_bytes;
+      if (!read_file_bytes(command.snapshot_path, snapshot_bytes, error)) {
+        context->Unmap(resource->resource, pending.subresource);
+        return false;
+      }
+
+      std::size_t copy_size = snapshot_bytes.size();
+      if (resource->resource_class == replay::internal::ReplayResourceClass::Buffer) {
+        copy_size = std::min<std::size_t>(copy_size, resource->byte_width);
+      } else if (resource->resource_class == replay::internal::ReplayResourceClass::Texture2D) {
+        copy_size = std::min<std::size_t>(
+            copy_size,
+            static_cast<std::size_t>(mapped.RowPitch) *
+                static_cast<std::size_t>(texture_subresource_height(*resource, pending.subresource)));
+      }
+      if (copy_size != 0) {
+        std::memcpy(mapped.pData, snapshot_bytes.data(), copy_size);
+      }
     }
-    if (copy_size < buffer_it->second.byte_width) {
-      std::memset(static_cast<std::uint8_t *>(mapped.pData) + copy_size, 0, buffer_it->second.byte_width - copy_size);
+
+    context->Unmap(resource->resource, pending.subresource);
+    resource->pending_map.reset();
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::UpdateSubresourceCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11DeviceContext *context = nullptr;
+    ReplayResourceState *resource = nullptr;
+    if (!lookup_object(contexts_, command.context_id, "context", context, error) ||
+        !lookup_resource_state(command.resource_id, "resource", resource, error)) {
+      return false;
     }
-    context->Unmap(buffer_it->second.buffer, pending.subresource);
-    buffer_it->second.pending_map.reset();
+
+    std::vector<std::uint8_t> data_bytes;
+    if (!read_file_bytes(command.data_path, data_bytes, error)) {
+      return false;
+    }
+
+    D3D11_BOX dst_box{};
+    const D3D11_BOX *dst_box_ptr = nullptr;
+    if (command.has_dst_box) {
+      dst_box.left = command.dst_box.left;
+      dst_box.top = command.dst_box.top;
+      dst_box.front = command.dst_box.front;
+      dst_box.right = command.dst_box.right;
+      dst_box.bottom = command.dst_box.bottom;
+      dst_box.back = command.dst_box.back;
+      dst_box_ptr = &dst_box;
+    }
+
+    UINT row_pitch = command.src_row_pitch;
+    if (resource->resource_class == replay::internal::ReplayResourceClass::Texture2D && row_pitch == 0 && !data_bytes.empty()) {
+      const UINT height = dst_box_ptr ? (dst_box.bottom - dst_box.top) : texture_subresource_height(*resource, command.dst_subresource);
+      if (height != 0) {
+        row_pitch = static_cast<UINT>(data_bytes.size() / height);
+      }
+      if (row_pitch == 0) {
+        const UINT bytes_per_pixel = texture_bytes_per_pixel(resource->format);
+        row_pitch = texture_subresource_width(*resource, command.dst_subresource) * bytes_per_pixel;
+      }
+    }
+    UINT depth_pitch = command.src_depth_pitch;
+    if (depth_pitch == 0) {
+      depth_pitch = static_cast<UINT>(data_bytes.size());
+    }
+
+    context->UpdateSubresource(
+        resource->resource,
+        command.dst_subresource,
+        dst_box_ptr,
+        data_bytes.empty() ? nullptr : data_bytes.data(),
+        row_pitch,
+        depth_pitch);
     return true;
   }
 
@@ -698,11 +1191,6 @@ private:
       std::string &error)
   {
     (void)statistics;
-    if (command.has_depth_stencil) {
-      error = "depth-stencil OMSetRenderTargets is unsupported in the MVP";
-      return false;
-    }
-
     ID3D11DeviceContext *context = nullptr;
     if (!lookup_object(contexts_, command.context_id, "context", context, error)) {
       return false;
@@ -718,10 +1206,16 @@ private:
       views.push_back(view);
     }
 
+    ID3D11DepthStencilView *depth_stencil_view = nullptr;
+    if (command.has_depth_stencil &&
+        !lookup_object(depth_stencil_views_, command.depth_stencil_view_id, "depth-stencil-view", depth_stencil_view, error)) {
+      return false;
+    }
+
     context->OMSetRenderTargets(
         static_cast<UINT>(views.size()),
         views.empty() ? nullptr : views.data(),
-        nullptr);
+        depth_stencil_view);
     return true;
   }
 
@@ -765,8 +1259,23 @@ private:
         !lookup_object(render_target_views_, command.render_target_view_id, "render-target-view", view, error)) {
       return false;
     }
-
     context->ClearRenderTargetView(view, command.color.data());
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::ClearDepthStencilViewCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11DeviceContext *context = nullptr;
+    ID3D11DepthStencilView *view = nullptr;
+    if (!lookup_object(contexts_, command.context_id, "context", context, error) ||
+        !lookup_object(depth_stencil_views_, command.depth_stencil_view_id, "depth-stencil-view", view, error)) {
+      return false;
+    }
+    context->ClearDepthStencilView(view, command.clear_flags, command.depth, command.stencil);
     return true;
   }
 
@@ -782,7 +1291,6 @@ private:
         !lookup_object(input_layouts_, command.input_layout_id, "input-layout", input_layout, error)) {
       return false;
     }
-
     context->IASetInputLayout(input_layout);
     return true;
   }
@@ -808,12 +1316,12 @@ private:
       if (binding.buffer_id == 0) {
         buffers.push_back(nullptr);
       } else {
-        const auto buffer_it = buffers_.find(binding.buffer_id);
-        if (buffer_it == buffers_.end() || !buffer_it->second.buffer) {
+        ReplayResourceState *resource = nullptr;
+        if (!lookup_resource_state(binding.buffer_id, "vertex-buffer", resource, error) || !resource->buffer) {
           error = "missing replay vertex buffer";
           return false;
         }
-        buffers.push_back(buffer_it->second.buffer);
+        buffers.push_back(resource->buffer);
       }
       strides.push_back(binding.stride);
       offsets.push_back(binding.offset);
@@ -825,6 +1333,26 @@ private:
         buffers.empty() ? nullptr : buffers.data(),
         strides.empty() ? nullptr : strides.data(),
         offsets.empty() ? nullptr : offsets.data());
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::SetIndexBufferCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11DeviceContext *context = nullptr;
+    ReplayResourceState *resource = nullptr;
+    if (!lookup_object(contexts_, command.context_id, "context", context, error) ||
+        !lookup_resource_state(command.buffer_id, "index-buffer", resource, error) || !resource->buffer) {
+      error = error.empty() ? "missing replay index buffer" : error;
+      return false;
+    }
+
+    const DXGI_FORMAT format = static_cast<DXGI_FORMAT>(command.format);
+    context->IASetIndexBuffer(resource->buffer, format, command.offset);
+    bound_index_buffer_ = BoundIndexBufferState{command.buffer_id, format, command.offset};
     return true;
   }
 
@@ -894,12 +1422,12 @@ private:
         buffers.push_back(nullptr);
         continue;
       }
-      const auto buffer_it = buffers_.find(buffer_id);
-      if (buffer_it == buffers_.end() || !buffer_it->second.buffer) {
+      ReplayResourceState *resource = nullptr;
+      if (!lookup_resource_state(buffer_id, "constant-buffer", resource, error) || !resource->buffer) {
         error = "missing replay constant buffer";
         return false;
       }
-      buffers.push_back(buffer_it->second.buffer);
+      buffers.push_back(resource->buffer);
     }
 
     if (command.vertex_stage) {
@@ -910,7 +1438,10 @@ private:
     return true;
   }
 
-  bool execute_command(const replay::internal::DrawCommand &command, replay::ReplayStatistics &statistics, std::string &error)
+  bool execute_command(
+      const replay::internal::SetShaderResourcesCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
   {
     (void)statistics;
     ID3D11DeviceContext *context = nullptr;
@@ -918,7 +1449,207 @@ private:
       return false;
     }
 
+    std::vector<ID3D11ShaderResourceView *> views;
+    views.reserve(command.shader_resource_view_ids.size());
+    for (const auto view_id : command.shader_resource_view_ids) {
+      if (view_id == 0) {
+        views.push_back(nullptr);
+        continue;
+      }
+      ID3D11ShaderResourceView *view = nullptr;
+      if (!lookup_object(shader_resource_views_, view_id, "shader-resource-view", view, error)) {
+        return false;
+      }
+      views.push_back(view);
+    }
+
+    context->PSSetShaderResources(command.start_slot, static_cast<UINT>(views.size()), views.data());
+    for (std::size_t index = 0; index < views.size(); ++index) {
+      const auto slot = static_cast<std::size_t>(command.start_slot) + index;
+      if (slot < ps_shader_resources_.size()) {
+        ps_shader_resources_[slot] = views[index];
+      }
+    }
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::SetSamplersCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11DeviceContext *context = nullptr;
+    if (!lookup_object(contexts_, command.context_id, "context", context, error)) {
+      return false;
+    }
+
+    std::vector<ID3D11SamplerState *> samplers;
+    samplers.reserve(command.sampler_ids.size());
+    for (const auto sampler_id : command.sampler_ids) {
+      if (sampler_id == 0) {
+        samplers.push_back(nullptr);
+        continue;
+      }
+      ID3D11SamplerState *sampler = nullptr;
+      if (!lookup_object(sampler_states_, sampler_id, "sampler-state", sampler, error)) {
+        return false;
+      }
+      samplers.push_back(sampler);
+    }
+
+    context->PSSetSamplers(command.start_slot, static_cast<UINT>(samplers.size()), samplers.data());
+    for (std::size_t index = 0; index < samplers.size(); ++index) {
+      const auto slot = static_cast<std::size_t>(command.start_slot) + index;
+      if (slot < ps_samplers_.size()) {
+        ps_samplers_[slot] = samplers[index];
+      }
+    }
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::SetDepthStencilStateCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11DeviceContext *context = nullptr;
+    if (!lookup_object(contexts_, command.context_id, "context", context, error)) {
+      return false;
+    }
+    ID3D11DepthStencilState *state = nullptr;
+    if (command.depth_stencil_state_id != 0 &&
+        !lookup_object(depth_stencil_states_, command.depth_stencil_state_id, "depth-stencil-state", state, error)) {
+      return false;
+    }
+    context->OMSetDepthStencilState(state, command.stencil_ref);
+    bound_depth_stencil_state_ = state;
+    bound_stencil_ref_ = command.stencil_ref;
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::SetBlendStateCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11DeviceContext *context = nullptr;
+    if (!lookup_object(contexts_, command.context_id, "context", context, error)) {
+      return false;
+    }
+    ID3D11BlendState *state = nullptr;
+    if (command.blend_state_id != 0 &&
+        !lookup_object(blend_states_, command.blend_state_id, "blend-state", state, error)) {
+      return false;
+    }
+    context->OMSetBlendState(state, command.blend_factor.data(), command.sample_mask);
+    bound_blend_state_ = state;
+    bound_blend_factor_ = command.blend_factor;
+    bound_sample_mask_ = command.sample_mask;
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::SetRasterizerStateCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11DeviceContext *context = nullptr;
+    if (!lookup_object(contexts_, command.context_id, "context", context, error)) {
+      return false;
+    }
+    ID3D11RasterizerState *state = nullptr;
+    if (command.rasterizer_state_id != 0 &&
+        !lookup_object(rasterizer_states_, command.rasterizer_state_id, "rasterizer-state", state, error)) {
+      return false;
+    }
+    context->RSSetState(state);
+    bound_rasterizer_state_ = state;
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::SetScissorRectsCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11DeviceContext *context = nullptr;
+    if (!lookup_object(contexts_, command.context_id, "context", context, error)) {
+      return false;
+    }
+
+    std::vector<D3D11_RECT> rects;
+    rects.reserve(command.rects.size());
+    for (const auto &source : command.rects) {
+      rects.push_back(D3D11_RECT{source.left, source.top, source.right, source.bottom});
+    }
+    context->RSSetScissorRects(static_cast<UINT>(rects.size()), rects.data());
+    return true;
+  }
+
+  bool execute_command(const replay::internal::DrawCommand &command, replay::ReplayStatistics &statistics, std::string &error)
+  {
+    (void)statistics;
+    ID3D11DeviceContext *context = nullptr;
+    if (!lookup_object(contexts_, command.context_id, "context", context, error)) {
+      return false;
+    }
     context->Draw(command.vertex_count, command.start_vertex_location);
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::DrawIndexedCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11DeviceContext *context = nullptr;
+    if (!lookup_object(contexts_, command.context_id, "context", context, error)) {
+      return false;
+    }
+    context->DrawIndexed(command.index_count, command.start_index_location, command.base_vertex_location);
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::DrawIndexedInstancedCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11DeviceContext *context = nullptr;
+    if (!lookup_object(contexts_, command.context_id, "context", context, error)) {
+      return false;
+    }
+    context->DrawIndexedInstanced(
+        command.index_count_per_instance,
+        command.instance_count,
+        command.start_index_location,
+        command.base_vertex_location,
+        command.start_instance_location);
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::CopyResourceCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11DeviceContext *context = nullptr;
+    ReplayResourceState *dst = nullptr;
+    ReplayResourceState *src = nullptr;
+    if (!lookup_object(contexts_, command.context_id, "context", context, error) ||
+        !lookup_resource_state(command.dst_resource_id, "copy-dst", dst, error) ||
+        !lookup_resource_state(command.src_resource_id, "copy-src", src, error)) {
+      return false;
+    }
+    context->CopyResource(dst->resource, src->resource);
     return true;
   }
 
@@ -969,6 +1700,17 @@ private:
     return true;
   }
 
+  bool execute_command(
+      const replay::internal::DebugMarkerCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)command;
+    (void)statistics;
+    (void)error;
+    return true;
+  }
+
   HWND window_ = nullptr;
   bool window_class_registered_ = false;
   bool show_window_ = false;
@@ -976,12 +1718,26 @@ private:
   std::unordered_map<trace::ObjectId, ID3D11Device *> devices_;
   std::unordered_map<trace::ObjectId, ID3D11DeviceContext *> contexts_;
   std::unordered_map<trace::ObjectId, IDXGISwapChain *> swapchains_;
-  std::unordered_map<trace::ObjectId, ID3D11Resource *> resources_;
-  std::unordered_map<trace::ObjectId, BufferState> buffers_;
+  std::unordered_map<trace::ObjectId, ReplayResourceState> resource_states_;
   std::unordered_map<trace::ObjectId, ID3D11RenderTargetView *> render_target_views_;
+  std::unordered_map<trace::ObjectId, ID3D11ShaderResourceView *> shader_resource_views_;
+  std::unordered_map<trace::ObjectId, ID3D11DepthStencilView *> depth_stencil_views_;
   std::unordered_map<trace::ObjectId, ID3D11InputLayout *> input_layouts_;
   std::unordered_map<trace::ObjectId, ID3D11VertexShader *> vertex_shaders_;
   std::unordered_map<trace::ObjectId, ID3D11PixelShader *> pixel_shaders_;
+  std::unordered_map<trace::ObjectId, ID3D11SamplerState *> sampler_states_;
+  std::unordered_map<trace::ObjectId, ID3D11BlendState *> blend_states_;
+  std::unordered_map<trace::ObjectId, ID3D11DepthStencilState *> depth_stencil_states_;
+  std::unordered_map<trace::ObjectId, ID3D11RasterizerState *> rasterizer_states_;
+  std::array<ID3D11ShaderResourceView *, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> ps_shader_resources_{};
+  std::array<ID3D11SamplerState *, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT> ps_samplers_{};
+  std::optional<BoundIndexBufferState> bound_index_buffer_;
+  ID3D11DepthStencilState *bound_depth_stencil_state_ = nullptr;
+  UINT bound_stencil_ref_ = 0;
+  ID3D11BlendState *bound_blend_state_ = nullptr;
+  std::array<float, 4> bound_blend_factor_ = {0.0f, 0.0f, 0.0f, 0.0f};
+  UINT bound_sample_mask_ = 0;
+  ID3D11RasterizerState *bound_rasterizer_state_ = nullptr;
 };
 
 } // namespace
