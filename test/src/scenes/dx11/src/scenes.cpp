@@ -160,6 +160,15 @@ void update_dynamic_buffer(ID3D11DeviceContext *context, ID3D11Buffer *buffer, c
     context->Unmap(buffer, 0);
 }
 
+template <typename T>
+void update_dynamic_buffer_array(ID3D11DeviceContext *context, ID3D11Buffer *buffer, const T *values, std::size_t count)
+{
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    demo::check_hr(context->Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped), "Map(dynamic array) failed");
+    std::memcpy(mapped.pData, values, sizeof(T) * count);
+    context->Unmap(buffer, 0);
+}
+
 struct ShaderProgram {
     demo::ComPtr<ID3D11VertexShader> vertex_shader;
     demo::ComPtr<ID3D11PixelShader> pixel_shader;
@@ -269,6 +278,69 @@ float lerp(float from, float to, float t)
     return from + (to - from) * t;
 }
 
+template <typename Vertex>
+std::vector<Vertex> require_struct_count(const char *asset_path, const std::vector<float> &scalars, std::size_t component_count)
+{
+    if (scalars.size() % component_count != 0) {
+        const std::string message = std::string("asset component count mismatch: ") + asset_path;
+        demo::fail(message.c_str());
+    }
+    return std::vector<Vertex>(scalars.size() / component_count);
+}
+
+std::vector<PosColorVertex> load_pos_color_vertices_asset(const char *asset_path)
+{
+    const std::vector<float> scalars = demo::load_installed_numeric_asset<float>(asset_path);
+    std::vector<PosColorVertex> vertices = require_struct_count<PosColorVertex>(asset_path, scalars, 7U);
+    for (std::size_t index = 0; index < vertices.size(); ++index) {
+        const std::size_t base = index * 7U;
+        vertices[index] = {
+            {scalars[base + 0U], scalars[base + 1U], scalars[base + 2U]},
+            {scalars[base + 3U], scalars[base + 4U], scalars[base + 5U], scalars[base + 6U]},
+        };
+    }
+    return vertices;
+}
+
+std::vector<Pos2Vertex> load_pos2_vertices_asset(const char *asset_path)
+{
+    const std::vector<float> scalars = demo::load_installed_numeric_asset<float>(asset_path);
+    std::vector<Pos2Vertex> vertices = require_struct_count<Pos2Vertex>(asset_path, scalars, 2U);
+    for (std::size_t index = 0; index < vertices.size(); ++index) {
+        const std::size_t base = index * 2U;
+        vertices[index] = {{scalars[base + 0U], scalars[base + 1U]}};
+    }
+    return vertices;
+}
+
+std::vector<InstanceVertex> load_instance_vertices_asset(const char *asset_path)
+{
+    const std::vector<float> scalars = demo::load_installed_numeric_asset<float>(asset_path);
+    std::vector<InstanceVertex> instances = require_struct_count<InstanceVertex>(asset_path, scalars, 6U);
+    for (std::size_t index = 0; index < instances.size(); ++index) {
+        const std::size_t base = index * 6U;
+        instances[index] = {
+            {scalars[base + 0U], scalars[base + 1U]},
+            {scalars[base + 2U], scalars[base + 3U], scalars[base + 4U], scalars[base + 5U]},
+        };
+    }
+    return instances;
+}
+
+std::vector<PosUvVertex> load_pos_uv_vertices_asset(const char *asset_path)
+{
+    const std::vector<float> scalars = demo::load_installed_numeric_asset<float>(asset_path);
+    std::vector<PosUvVertex> vertices = require_struct_count<PosUvVertex>(asset_path, scalars, 5U);
+    for (std::size_t index = 0; index < vertices.size(); ++index) {
+        const std::size_t base = index * 5U;
+        vertices[index] = {
+            {scalars[base + 0U], scalars[base + 1U], scalars[base + 2U]},
+            {scalars[base + 3U], scalars[base + 4U]},
+        };
+    }
+    return vertices;
+}
+
 template <std::size_t N>
 std::array<PosColorVertex, N> translate_vertices(const PosColorVertex (&source)[N], float dx, float dy)
 {
@@ -281,11 +353,33 @@ std::array<PosColorVertex, N> translate_vertices(const PosColorVertex (&source)[
     return translated;
 }
 
+std::vector<PosColorVertex> translate_vertices(const std::vector<PosColorVertex> &source, float dx, float dy)
+{
+    std::vector<PosColorVertex> translated(source.size());
+    for (std::size_t index = 0; index < source.size(); ++index) {
+        translated[index] = source[index];
+        translated[index].position[0] += dx;
+        translated[index].position[1] += dy;
+    }
+    return translated;
+}
+
 template <std::size_t N>
 std::array<PosUvVertex, N> translate_vertices(const PosUvVertex (&source)[N], float dx, float dy)
 {
     std::array<PosUvVertex, N> translated{};
     for (std::size_t index = 0; index < N; ++index) {
+        translated[index] = source[index];
+        translated[index].position[0] += dx;
+        translated[index].position[1] += dy;
+    }
+    return translated;
+}
+
+std::vector<PosUvVertex> translate_vertices(const std::vector<PosUvVertex> &source, float dx, float dy)
+{
+    std::vector<PosUvVertex> translated(source.size());
+    for (std::size_t index = 0; index < source.size(); ++index) {
         translated[index] = source[index];
         translated[index].position[0] += dx;
         translated[index].position[1] += dy;
@@ -467,19 +561,15 @@ float4 ps_main(PSInput input) : SV_TARGET
 
 ValidationResult run_smoke_triangle(Dx11Runtime &runtime, unsigned int frame_budget)
 {
-    static const PosColorVertex vertices[] = {
-        {{0.0f, 0.78f, 0.0f}, {1.0f, 0.50f, 0.20f, 1.0f}},
-        {{0.72f, -0.56f, 0.0f}, {1.0f, 0.50f, 0.20f, 1.0f}},
-        {{-0.72f, -0.56f, 0.0f}, {1.0f, 0.50f, 0.20f, 1.0f}},
-    };
     static const D3D11_INPUT_ELEMENT_DESC input_layout_desc[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
     };
     const float clear_color[4] = {0.04f, 0.05f, 0.08f, 1.0f};
+    const std::vector<PosColorVertex> vertices = load_pos_color_vertices_asset("assets/dx11/smoke_triangle_vertices.txt");
 
     const ShaderProgram program = create_program(runtime, smoke_triangle_shader_source(), input_layout_desc, ARRAYSIZE(input_layout_desc));
-    const auto vertex_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, vertices, ARRAYSIZE(vertices));
+    const auto vertex_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, vertices.data(), vertices.size());
     const auto constant_buffer = create_dynamic_constant_buffer<SmokeTriangleConstants>(runtime.device());
 
     return run_scene_frames(
@@ -530,36 +620,29 @@ ValidationResult run_smoke_triangle(Dx11Runtime &runtime, unsigned int frame_bud
 
 ValidationResult run_indexed_instancing(Dx11Runtime &runtime, unsigned int frame_budget)
 {
-    static const Pos2Vertex quad_vertices[] = {
-        {{-0.14f, 0.14f}},
-        {{0.14f, 0.14f}},
-        {{0.14f, -0.14f}},
-        {{-0.14f, -0.14f}},
-    };
-    static const std::uint16_t quad_indices[] = {0, 1, 2, 0, 2, 3};
-    static const InstanceVertex instances[] = {
-        {{0.00f, 0.00f}, {0.86f, 0.65f, 0.25f, 1.0f}},
-        {{-0.42f, 0.00f}, {0.20f, 0.82f, 0.30f, 1.0f}},
-        {{0.42f, 0.00f}, {0.25f, 0.45f, 0.90f, 1.0f}},
-    };
     static const D3D11_INPUT_ELEMENT_DESC input_layout_desc[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 1, 0, D3D11_INPUT_PER_INSTANCE_DATA, 1},
         {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 8, D3D11_INPUT_PER_INSTANCE_DATA, 1},
     };
     const float clear_color[4] = {0.05f, 0.05f, 0.08f, 1.0f};
+    const std::vector<Pos2Vertex> quad_vertices = load_pos2_vertices_asset("assets/dx11/indexed_instancing_vertices.txt");
+    const std::vector<std::uint16_t> quad_indices = demo::load_installed_numeric_asset<std::uint16_t>(
+        "assets/dx11/indexed_instancing_indices.txt"
+    );
+    const std::vector<InstanceVertex> instances = load_instance_vertices_asset("assets/dx11/indexed_instancing_instances.txt");
 
     const ShaderProgram program = create_program(runtime, instancing_shader_source(), input_layout_desc, ARRAYSIZE(input_layout_desc));
-    const auto vertex_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, quad_vertices, ARRAYSIZE(quad_vertices));
-    const auto index_buffer = create_static_buffer(runtime.device(), D3D11_BIND_INDEX_BUFFER, quad_indices, ARRAYSIZE(quad_indices));
-    const auto instance_buffer = create_dynamic_vertex_buffer<InstanceVertex>(runtime.device(), ARRAYSIZE(instances));
+    const auto vertex_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, quad_vertices.data(), quad_vertices.size());
+    const auto index_buffer = create_static_buffer(runtime.device(), D3D11_BIND_INDEX_BUFFER, quad_indices.data(), quad_indices.size());
+    const auto instance_buffer = create_dynamic_vertex_buffer<InstanceVertex>(runtime.device(), instances.size());
 
     return run_scene_frames(
         runtime,
         frame_budget,
         [&](unsigned int frame, unsigned int total_frames) {
             const float t = animation_progress(frame, total_frames);
-            std::array<InstanceVertex, ARRAYSIZE(instances)> animated_instances{};
+            std::vector<InstanceVertex> animated_instances(instances.size());
             for (std::size_t index = 0; index < animated_instances.size(); ++index) {
                 animated_instances[index] = instances[index];
                 animated_instances[index].offset[0] = lerp(instances[index].offset[0] * 0.18f, instances[index].offset[0], t);
@@ -569,7 +652,12 @@ ValidationResult run_indexed_instancing(Dx11Runtime &runtime, unsigned int frame
                 animated_instances[index].color[2] = lerp(0.30f, instances[index].color[2], t);
                 animated_instances[index].color[3] = 1.0f;
             }
-            update_dynamic_buffer(runtime.context(), instance_buffer.get(), animated_instances);
+            update_dynamic_buffer_array(
+                runtime.context(),
+                instance_buffer.get(),
+                animated_instances.data(),
+                animated_instances.size()
+            );
 
             runtime.bind_back_buffer();
             runtime.clear_back_buffer(clear_color);
@@ -848,22 +936,6 @@ ValidationResult run_depth_blend_scissor(Dx11Runtime &runtime, unsigned int fram
 
 ValidationResult run_offscreen_copy_composite(Dx11Runtime &runtime, unsigned int frame_budget)
 {
-    static const PosColorVertex offscreen_quad[] = {
-        {{-0.72f, 0.72f, 0.0f}, {0.20f, 0.85f, 0.75f, 1.0f}},
-        {{0.72f, 0.72f, 0.0f}, {0.20f, 0.85f, 0.75f, 1.0f}},
-        {{0.72f, -0.72f, 0.0f}, {0.20f, 0.85f, 0.75f, 1.0f}},
-        {{-0.72f, 0.72f, 0.0f}, {0.20f, 0.85f, 0.75f, 1.0f}},
-        {{0.72f, -0.72f, 0.0f}, {0.20f, 0.85f, 0.75f, 1.0f}},
-        {{-0.72f, -0.72f, 0.0f}, {0.20f, 0.85f, 0.75f, 1.0f}},
-    };
-    static const PosUvVertex composite_quad[] = {
-        {{-0.88f, 0.88f, 0.0f}, {0.0f, 0.0f}},
-        {{0.88f, 0.88f, 0.0f}, {1.0f, 0.0f}},
-        {{0.88f, -0.88f, 0.0f}, {1.0f, 1.0f}},
-        {{-0.88f, 0.88f, 0.0f}, {0.0f, 0.0f}},
-        {{0.88f, -0.88f, 0.0f}, {1.0f, 1.0f}},
-        {{-0.88f, -0.88f, 0.0f}, {0.0f, 1.0f}},
-    };
     static const D3D11_INPUT_ELEMENT_DESC pos_color_layout_desc[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
@@ -873,6 +945,10 @@ ValidationResult run_offscreen_copy_composite(Dx11Runtime &runtime, unsigned int
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
     };
     const float clear_color[4] = {0.02f, 0.03f, 0.05f, 1.0f};
+    const std::vector<PosColorVertex> offscreen_quad =
+        load_pos_color_vertices_asset("assets/dx11/offscreen_copy_composite_offscreen_quad.txt");
+    const std::vector<PosUvVertex> composite_quad =
+        load_pos_uv_vertices_asset("assets/dx11/offscreen_copy_composite_composite_quad.txt");
 
     const ShaderProgram offscreen_program = create_program(
         runtime,
@@ -887,8 +963,13 @@ ValidationResult run_offscreen_copy_composite(Dx11Runtime &runtime, unsigned int
         ARRAYSIZE(composite_layout_desc)
     );
 
-    const auto offscreen_buffer = create_dynamic_vertex_buffer<PosColorVertex>(runtime.device(), ARRAYSIZE(offscreen_quad));
-    const auto composite_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, composite_quad, ARRAYSIZE(composite_quad));
+    const auto offscreen_buffer = create_dynamic_vertex_buffer<PosColorVertex>(runtime.device(), offscreen_quad.size());
+    const auto composite_buffer = create_static_buffer(
+        runtime.device(),
+        D3D11_BIND_VERTEX_BUFFER,
+        composite_quad.data(),
+        composite_quad.size()
+    );
     const auto constant_buffer = create_dynamic_constant_buffer<TintConstants>(runtime.device());
 
     D3D11_TEXTURE2D_DESC texture_desc{};
@@ -953,7 +1034,12 @@ ValidationResult run_offscreen_copy_composite(Dx11Runtime &runtime, unsigned int
                 lerp(0.24f, 0.0f, t),
                 lerp(-0.16f, 0.0f, t)
             );
-            update_dynamic_buffer(runtime.context(), offscreen_buffer.get(), animated_offscreen_vertices);
+            update_dynamic_buffer_array(
+                runtime.context(),
+                offscreen_buffer.get(),
+                animated_offscreen_vertices.data(),
+                animated_offscreen_vertices.size()
+            );
 
             ID3D11RenderTargetView *offscreen_targets[] = {offscreen_rtv.get()};
             runtime.context()->OMSetRenderTargets(1, offscreen_targets, nullptr);

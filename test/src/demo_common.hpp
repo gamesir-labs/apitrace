@@ -9,7 +9,9 @@
 #include <cstdint>
 #include <fstream>
 #include <limits>
+#include <sstream>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -245,6 +247,38 @@ inline std::vector<std::uint8_t> load_installed_asset_bytes(const char *relative
     }
 
     return bytes;
+}
+
+inline std::string load_installed_asset_text(const char *relative_path)
+{
+    const std::vector<std::uint8_t> bytes = load_installed_asset_bytes(relative_path);
+    return std::string(bytes.begin(), bytes.end());
+}
+
+template <typename T>
+inline std::vector<T> load_installed_numeric_asset(const char *relative_path)
+{
+    static_assert(std::is_arithmetic_v<T>, "numeric asset loader requires arithmetic types");
+
+    const std::string text = load_installed_asset_text(relative_path);
+    std::istringstream stream(text);
+    std::vector<T> values;
+
+    T value{};
+    while (stream >> value) {
+        values.push_back(value);
+    }
+
+    if (stream.fail() && !stream.eof()) {
+        const std::string message = "failed to parse installed numeric asset: " + std::string(relative_path);
+        fail(message.c_str());
+    }
+    if (values.empty()) {
+        const std::string message = "installed numeric asset was empty: " + std::string(relative_path);
+        fail(message.c_str());
+    }
+
+    return values;
 }
 
 using D3DCompileFn = HRESULT (WINAPI *)(

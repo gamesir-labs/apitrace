@@ -60,9 +60,9 @@ wine apitrace_test_demo.exe --dx dx12 --scene smoke_triangle
 当前 `dx11 core` scene 顺序与覆盖点：
 
 1. `smoke_triangle`
-   覆盖 swap chain、RTV、input layout、VS/PS、VB、CB、`Map/Unmap`、`Draw`、`Present`。
+   覆盖 swap chain、RTV、input layout、VS/PS、外部 vertex 资产、VB、CB、`Map/Unmap`、`Draw`、`Present`。
 2. `indexed_instancing`
-   覆盖 IB、第二输入槽、instance data、`DrawIndexed`、`DrawIndexedInstanced`。
+   覆盖外部 vertex/index/instance 资产、IB、第二输入槽、instance data、`DrawIndexed`、`DrawIndexedInstanced`。
 3. `textured_quad`
    覆盖 `Texture2D`、`ShaderResourceView`、`SamplerState`、`UpdateSubresource`、`PSSetShaderResources`、`PSSetSamplers`，并从 `bin/assets/dx11/` 读取打包纹理资产后上传到 GPU。
 4. `depth_blend_scissor`
@@ -85,6 +85,7 @@ wine apitrace_test_demo.exe --dx dx12 --scene smoke_triangle
 关于“资产是否需要跟着 trace”：
 
 - 测试 demo 现在会从外部打包资产目录读取纹理，再通过 D3D11 API 上传。
+- 也会从外部打包资产目录读取 vertex / index / instance 等几何输入，再通过 D3D11 buffer 创建与绑定路径送入 GPU。
 - capture 侧的职责不是在 replay 时重新访问这些原始源文件，而是把进入 D3D11 的资源内容与元数据完整记录到 trace bundle。
 - 因此 replay 只依赖 trace bundle 内的 `textures/`、`buffers/`、`shaders/`、`pipelines/` 等资产，不依赖原始应用安装目录。
 
