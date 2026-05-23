@@ -21,6 +21,7 @@ wine apitrace_test_demo.exe --dx dx11 --scene smoke_triangle
 wine apitrace_test_demo.exe --dx dx11 --scene all
 wine apitrace_test_demo.exe --list-scenes --dx dx11
 wine apitrace_test_demo.exe --dx dx12 --scene smoke_triangle
+wine apitrace_test_demo.exe --list-scenes --dx dx12
 ```
 
 如果需要配合 apitrace 的 Windows proxy DLL，再把根项目的 Windows cross-build 安装到同一个测试目录即可。
@@ -29,7 +30,7 @@ wine apitrace_test_demo.exe --dx dx12 --scene smoke_triangle
 
 固定入口参数：
 
-- `--dx <dx11|dx12>`：当前实现 `dx11`；`dx12` 只保留接口并返回 `not implemented` 风格失败。
+- `--dx <dx11|dx12>`：当前实现 `dx11`；`dx12` 先提供 scene 骨架和单窗口顺序执行框架，scene 本体仍是占位失败。
 - `--scene <name|all>`：单场景调试或顺序跑完整 `dx11 core` 集合。
 - `--list-scenes`：列出指定 `dx mode` 下当前可运行的 scene 名称。
 
@@ -81,6 +82,24 @@ wine apitrace_test_demo.exe --dx dx12 --scene smoke_triangle
 - `msaa_resolve`
 
 每个已实现 scene 都会把结果复制到 staging 资源，并在 CPU 侧对固定像素点做阈值校验。
+
+## DX12 scenes
+
+当前 `dx12` scene 顺序预留为：
+
+1. `smoke_triangle`
+2. `indexed_instancing`
+3. `textured_quad`
+4. `depth_blend_scissor`
+5. `offscreen_copy_composite`
+6. `mip_sampling`
+7. `msaa_resolve`
+
+现在只保留 scene 注册、列表和单窗口顺序执行骨架；每个 scene 仍返回占位失败，后续按测试驱动逐个补实现。
+
+对应的最小验证脚本是：
+
+- `scripts/validate-d3d12-wine.sh`
 
 关于“资产是否需要跟着 trace”：
 

@@ -2,7 +2,9 @@
 
 #include "app/cli.hpp"
 #include "runtime/dx11/runtime.hpp"
+#include "runtime/dx12/runtime.hpp"
 #include "scenes/dx11/scenes.hpp"
+#include "scenes/dx12/scenes.hpp"
 
 #include <windows.h>
 
@@ -38,6 +40,15 @@ std::vector<const demo::scenes::dx11::SceneDefinition *> dx11_scene_order()
     return ordered;
 }
 
+std::vector<const demo::scenes::dx12::SceneDefinition *> dx12_scene_order()
+{
+    std::vector<const demo::scenes::dx12::SceneDefinition *> ordered;
+    for (const demo::scenes::dx12::SceneDefinition &scene : demo::scenes::dx12::registered_scenes()) {
+        ordered.push_back(&scene);
+    }
+    return ordered;
+}
+
 void emit_scene_marker(const char *scene_name, const char *phase)
 {
     static EmitSceneMarkerFn emit_marker = []() -> EmitSceneMarkerFn {
@@ -58,6 +69,9 @@ void emit_scene_marker(const char *scene_name, const char *phase)
 int list_scenes(DxMode mode)
 {
     if (mode == DxMode::dx12) {
+        for (const demo::scenes::dx12::SceneDefinition &scene : demo::scenes::dx12::registered_scenes()) {
+            std::printf("%s\n", scene.name);
+        }
         return 0;
     }
 
@@ -67,14 +81,6 @@ int list_scenes(DxMode mode)
         }
     }
     return 0;
-}
-
-int run_dx12_placeholder(const std::string &scene_name)
-{
-    std::printf("dx mode: dx12\n");
-    std::printf("scene fail: %s reason=dx12 scenes are not implemented yet\n", scene_name.c_str());
-    std::printf("summary: passed=0 failed=1 skipped=0\n");
-    return 1;
 }
 
 int run_dx11(const CliOptions &options)
@@ -130,6 +136,52 @@ int run_dx11(const CliOptions &options)
     return failed == 0 ? 0 : 1;
 }
 
+int run_dx12(const CliOptions &options)
+{
+    std::printf("dx mode: dx12\n");
+
+    std::vector<const demo::scenes::dx12::SceneDefinition *> selected_scenes;
+    if (options.scene == "all") {
+        selected_scenes = dx12_scene_order();
+    } else {
+        const demo::scenes::dx12::SceneDefinition *scene = demo::scenes::dx12::find_scene(options.scene);
+        if (!scene) {
+            std::printf("scene fail: %s reason=unknown scene\n", options.scene.c_str());
+            std::printf("summary: passed=0 failed=1 skipped=0\n");
+            return 1;
+        }
+        selected_scenes.push_back(scene);
+    }
+
+    auto runtime = demo::runtime::dx12::Dx12Runtime::create(
+        kWindowWidth,
+        kWindowHeight,
+        kWindowClassName,
+        kWindowTitle
+    );
+    const unsigned int frame_budget = resolve_frame_budget();
+
+    unsigned int passed = 0;
+    unsigned int failed = 0;
+    unsigned int skipped = 0;
+
+    for (const demo::scenes::dx12::SceneDefinition *scene : selected_scenes) {
+        std::printf("scene start: %s\n", scene->name);
+        const demo::runtime::dx12::ValidationResult result = scene->run(runtime, frame_budget);
+        if (result.passed) {
+            std::printf("scene pass: %s\n", scene->name);
+            ++passed;
+        } else {
+            std::printf("scene fail: %s reason=%s\n", scene->name, result.reason.c_str());
+            ++failed;
+        }
+        runtime.clear_state();
+    }
+
+    std::printf("summary: passed=%u failed=%u skipped=%u\n", passed, failed, skipped);
+    return failed == 0 ? 0 : 1;
+}
+
 } // namespace
 
 int run_demo_app(int argc, char **argv)
@@ -144,7 +196,7 @@ int run_demo_app(int argc, char **argv)
     case DxMode::dx11:
         return run_dx11(options);
     case DxMode::dx12:
-        return run_dx12_placeholder(options.scene);
+        return run_dx12(options);
     default:
         std::fprintf(stderr, "unsupported dx mode\n");
         return 1;

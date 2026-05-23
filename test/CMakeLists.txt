@@ -15,8 +15,12 @@ set(APITRACE_TEST_DEMO_SOURCES
     src/app/src/demo_app.cpp
     src/runtime/dx11/include/runtime/dx11/runtime.hpp
     src/runtime/dx11/src/runtime.cpp
+    src/runtime/dx12/include/runtime/dx12/runtime.hpp
+    src/runtime/dx12/src/runtime.cpp
     src/scenes/dx11/include/scenes/dx11/scenes.hpp
     src/scenes/dx11/src/scenes.cpp
+    src/scenes/dx12/include/scenes/dx12/scenes.hpp
+    src/scenes/dx12/src/scenes.cpp
 )
 
 if(APITRACE_BUILD_TEST_DEMO)
@@ -27,7 +31,9 @@ if(APITRACE_BUILD_TEST_DEMO)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/src/app/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/dx11/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/dx12/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/scenes/dx11/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/scenes/dx12/include
     )
     target_link_libraries(apitrace_test_demo PRIVATE
         d3d11
@@ -37,6 +43,9 @@ if(APITRACE_BUILD_TEST_DEMO)
         ole32
         uuid
     )
+    if(MINGW)
+        target_link_options(apitrace_test_demo PRIVATE -static-libgcc -static-libstdc++)
+    endif()
     install(TARGETS apitrace_test_demo RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
     install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/assets/ DESTINATION ${CMAKE_INSTALL_BINDIR}/assets)
 endif()
