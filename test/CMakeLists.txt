@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(apitrace_test_demo LANGUAGES CXX)
 
+include(GNUInstallDirs)
+
 option(APITRACE_BUILD_TEST_DEMO "Build the multi-scene D3D test demo" ON)
 
 set(APITRACE_TEST_DEMO_SOURCES
@@ -36,4 +38,5 @@ if(APITRACE_BUILD_TEST_DEMO)
         uuid
     )
     install(TARGETS apitrace_test_demo RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/assets/ DESTINATION ${CMAKE_INSTALL_BINDIR}/assets)
 endif()

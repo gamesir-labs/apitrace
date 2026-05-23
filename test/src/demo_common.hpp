@@ -6,8 +6,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
+#include <fstream>
 #include <limits>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace demo {
 
@@ -180,6 +184,67 @@ inline HWND create_window(const char *class_name, const char *title, int client_
     ShowWindow(hwnd, SW_SHOWDEFAULT);
     UpdateWindow(hwnd);
     return hwnd;
+}
+
+inline std::string executable_directory()
+{
+    char path[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        fail("GetModuleFileNameA failed");
+    }
+
+    std::string directory(path, length);
+    const std::size_t separator = directory.find_last_of("\\/");
+    if (separator == std::string::npos) {
+        return ".";
+    }
+    directory.resize(separator);
+    return directory;
+}
+
+inline std::vector<std::uint8_t> load_installed_asset_bytes(const char *relative_path, std::size_t expected_size = 0)
+{
+    std::string full_path = executable_directory();
+    if (!full_path.empty() && full_path.back() != '\\' && full_path.back() != '/') {
+        full_path.push_back('\\');
+    }
+    full_path.append(relative_path);
+    for (char &ch : full_path) {
+        if (ch == '/') {
+            ch = '\\';
+        }
+    }
+
+    std::ifstream stream(full_path, std::ios::binary);
+    if (!stream) {
+        const std::string message = "failed to open installed asset: " + full_path;
+        fail(message.c_str());
+    }
+
+    stream.seekg(0, std::ios::end);
+    const std::streamoff size = stream.tellg();
+    if (size < 0) {
+        const std::string message = "failed to stat installed asset: " + full_path;
+        fail(message.c_str());
+    }
+    stream.seekg(0, std::ios::beg);
+
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+    if (!bytes.empty()) {
+        stream.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!stream) {
+            const std::string message = "failed to read installed asset: " + full_path;
+            fail(message.c_str());
+        }
+    }
+
+    if (expected_size != 0 && bytes.size() != expected_size) {
+        const std::string message = "installed asset size mismatch: " + full_path;
+        fail(message.c_str());
+    }
+
+    return bytes;
 }
 
 using D3DCompileFn = HRESULT (WINAPI *)(

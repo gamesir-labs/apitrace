@@ -38,6 +38,12 @@ struct TintConstants {
     float tint[4];
 };
 
+struct SmokeTriangleConstants {
+    float offset[2];
+    float padding[2];
+    float tint[4];
+};
+
 const char *vertex_shader_profile(D3D_FEATURE_LEVEL feature_level)
 {
     switch (feature_level) {
@@ -132,6 +138,20 @@ demo::ComPtr<ID3D11Buffer> create_dynamic_constant_buffer(ID3D11Device *device)
 }
 
 template <typename T>
+demo::ComPtr<ID3D11Buffer> create_dynamic_vertex_buffer(ID3D11Device *device, std::size_t count)
+{
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = static_cast<UINT>(sizeof(T) * count);
+    desc.Usage = D3D11_USAGE_DYNAMIC;
+    desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+    demo::ComPtr<ID3D11Buffer> buffer;
+    demo::check_hr(device->CreateBuffer(&desc, nullptr, buffer.put()), "CreateBuffer(dynamic vertex) failed");
+    return buffer;
+}
+
+template <typename T>
 void update_dynamic_buffer(ID3D11DeviceContext *context, ID3D11Buffer *buffer, const T &value)
 {
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -212,7 +232,7 @@ ValidationResult run_scene_frames(
             return {false, "window closed before validation completed"};
         }
 
-        render_frame(frame);
+        render_frame(frame, frames);
         if (frame + 1 == frames) {
             result = validate_frame();
         }
@@ -233,11 +253,53 @@ ValidationResult validate_back_buffer(
     return runtime.validate_pixels(runtime.back_buffer(), expectations.begin(), expectations.size());
 }
 
+float animation_progress(unsigned int frame, unsigned int total_frames, unsigned int settle_limit = 48U)
+{
+    if (total_frames <= 1U) {
+        return 1.0f;
+    }
+
+    const unsigned int settle_frames = std::min(total_frames, settle_limit);
+    const unsigned int denominator = settle_frames > 1U ? settle_frames - 1U : 1U;
+    return static_cast<float>(std::min(frame, denominator)) / static_cast<float>(denominator);
+}
+
+float lerp(float from, float to, float t)
+{
+    return from + (to - from) * t;
+}
+
+template <std::size_t N>
+std::array<PosColorVertex, N> translate_vertices(const PosColorVertex (&source)[N], float dx, float dy)
+{
+    std::array<PosColorVertex, N> translated{};
+    for (std::size_t index = 0; index < N; ++index) {
+        translated[index] = source[index];
+        translated[index].position[0] += dx;
+        translated[index].position[1] += dy;
+    }
+    return translated;
+}
+
+template <std::size_t N>
+std::array<PosUvVertex, N> translate_vertices(const PosUvVertex (&source)[N], float dx, float dy)
+{
+    std::array<PosUvVertex, N> translated{};
+    for (std::size_t index = 0; index < N; ++index) {
+        translated[index] = source[index];
+        translated[index].position[0] += dx;
+        translated[index].position[1] += dy;
+    }
+    return translated;
+}
+
 const char *smoke_triangle_shader_source()
 {
     return R"(
 cbuffer TintData : register(b0)
 {
+    float2 offset;
+    float2 padding;
     float4 tint;
 };
 
@@ -256,7 +318,7 @@ struct PSInput
 PSInput vs_main(VSInput input)
 {
     PSInput output;
-    output.position = float4(input.position, 1.0);
+    output.position = float4(input.position.xy + offset, input.position.z, 1.0);
     output.color = input.color;
     return output;
 }
@@ -418,13 +480,23 @@ ValidationResult run_smoke_triangle(Dx11Runtime &runtime, unsigned int frame_bud
 
     const ShaderProgram program = create_program(runtime, smoke_triangle_shader_source(), input_layout_desc, ARRAYSIZE(input_layout_desc));
     const auto vertex_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, vertices, ARRAYSIZE(vertices));
-    const auto constant_buffer = create_dynamic_constant_buffer<TintConstants>(runtime.device());
+    const auto constant_buffer = create_dynamic_constant_buffer<SmokeTriangleConstants>(runtime.device());
 
     return run_scene_frames(
         runtime,
         frame_budget,
-        [&](unsigned int) {
-            const TintConstants constants{{0.90f, 0.90f, 1.00f, 1.00f}};
+        [&](unsigned int frame, unsigned int total_frames) {
+            const float t = animation_progress(frame, total_frames);
+            const SmokeTriangleConstants constants{
+                {lerp(-0.28f, 0.0f, t), lerp(-0.16f, 0.0f, t)},
+                {0.0f, 0.0f},
+                {
+                    lerp(0.45f, 0.90f, t),
+                    lerp(0.55f, 0.90f, t),
+                    lerp(0.75f, 1.00f, t),
+                    1.00f,
+                },
+            };
             update_dynamic_buffer(runtime.context(), constant_buffer.get(), constants);
 
             runtime.bind_back_buffer();
@@ -480,12 +552,25 @@ ValidationResult run_indexed_instancing(Dx11Runtime &runtime, unsigned int frame
     const ShaderProgram program = create_program(runtime, instancing_shader_source(), input_layout_desc, ARRAYSIZE(input_layout_desc));
     const auto vertex_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, quad_vertices, ARRAYSIZE(quad_vertices));
     const auto index_buffer = create_static_buffer(runtime.device(), D3D11_BIND_INDEX_BUFFER, quad_indices, ARRAYSIZE(quad_indices));
-    const auto instance_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, instances, ARRAYSIZE(instances));
+    const auto instance_buffer = create_dynamic_vertex_buffer<InstanceVertex>(runtime.device(), ARRAYSIZE(instances));
 
     return run_scene_frames(
         runtime,
         frame_budget,
-        [&](unsigned int) {
+        [&](unsigned int frame, unsigned int total_frames) {
+            const float t = animation_progress(frame, total_frames);
+            std::array<InstanceVertex, ARRAYSIZE(instances)> animated_instances{};
+            for (std::size_t index = 0; index < animated_instances.size(); ++index) {
+                animated_instances[index] = instances[index];
+                animated_instances[index].offset[0] = lerp(instances[index].offset[0] * 0.18f, instances[index].offset[0], t);
+                animated_instances[index].offset[1] = lerp((static_cast<float>(index) - 1.0f) * 0.14f, 0.0f, t);
+                animated_instances[index].color[0] = lerp(0.20f, instances[index].color[0], t);
+                animated_instances[index].color[1] = lerp(0.25f, instances[index].color[1], t);
+                animated_instances[index].color[2] = lerp(0.30f, instances[index].color[2], t);
+                animated_instances[index].color[3] = 1.0f;
+            }
+            update_dynamic_buffer(runtime.context(), instance_buffer.get(), animated_instances);
+
             runtime.bind_back_buffer();
             runtime.clear_back_buffer(clear_color);
 
@@ -530,17 +615,15 @@ ValidationResult run_textured_quad(Dx11Runtime &runtime, unsigned int frame_budg
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
     };
     const float clear_color[4] = {0.03f, 0.04f, 0.06f, 1.0f};
-    const std::uint8_t texture_data[] = {
-        255, 32, 32, 255, 32, 255, 32, 255,
-        32, 32, 255, 255, 255, 220, 32, 255,
-    };
+    const std::vector<std::uint8_t> texture_data =
+        demo::load_installed_asset_bytes("assets/dx11/textured_quad_base.rgba", 4U * 4U * 4U);
 
     const ShaderProgram program = create_program(runtime, textured_shader_source(), input_layout_desc, ARRAYSIZE(input_layout_desc));
-    const auto vertex_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, quad_vertices, ARRAYSIZE(quad_vertices));
+    const auto vertex_buffer = create_dynamic_vertex_buffer<PosUvVertex>(runtime.device(), ARRAYSIZE(quad_vertices));
 
     D3D11_TEXTURE2D_DESC texture_desc{};
-    texture_desc.Width = 2;
-    texture_desc.Height = 2;
+    texture_desc.Width = 4;
+    texture_desc.Height = 4;
     texture_desc.MipLevels = 1;
     texture_desc.ArraySize = 1;
     texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -550,7 +633,7 @@ ValidationResult run_textured_quad(Dx11Runtime &runtime, unsigned int frame_budg
 
     demo::ComPtr<ID3D11Texture2D> texture;
     demo::check_hr(runtime.device()->CreateTexture2D(&texture_desc, nullptr, texture.put()), "CreateTexture2D(texture) failed");
-    runtime.context()->UpdateSubresource(texture.get(), 0, nullptr, texture_data, 2U * 4U, 0);
+    runtime.context()->UpdateSubresource(texture.get(), 0, nullptr, texture_data.data(), 4U * 4U, 0);
 
     demo::ComPtr<ID3D11ShaderResourceView> shader_resource_view;
     demo::check_hr(
@@ -571,7 +654,15 @@ ValidationResult run_textured_quad(Dx11Runtime &runtime, unsigned int frame_budg
     return run_scene_frames(
         runtime,
         frame_budget,
-        [&](unsigned int) {
+        [&](unsigned int frame, unsigned int total_frames) {
+            const float t = animation_progress(frame, total_frames);
+            const auto animated_vertices = translate_vertices(
+                quad_vertices,
+                lerp(-0.18f, 0.0f, t),
+                lerp(0.10f, 0.0f, t)
+            );
+            update_dynamic_buffer(runtime.context(), vertex_buffer.get(), animated_vertices);
+
             runtime.bind_back_buffer();
             runtime.clear_back_buffer(clear_color);
 
@@ -597,10 +688,10 @@ ValidationResult run_textured_quad(Dx11Runtime &runtime, unsigned int frame_budg
             return validate_back_buffer(
                 runtime,
                 {
-                    {"quad-top-left", sample_x(runtime, 0.35f), sample_y(runtime, 0.35f), rgba(1.0f, 0.125f, 0.125f), 20},
-                    {"quad-top-right", sample_x(runtime, 0.65f), sample_y(runtime, 0.35f), rgba(0.125f, 1.0f, 0.125f), 20},
-                    {"quad-bottom-left", sample_x(runtime, 0.35f), sample_y(runtime, 0.65f), rgba(0.125f, 0.125f, 1.0f), 20},
-                    {"quad-bottom-right", sample_x(runtime, 0.65f), sample_y(runtime, 0.65f), rgba(1.0f, 0.86f, 0.125f), 20},
+                    {"quad-top-left", sample_x(runtime, 0.35f), sample_y(runtime, 0.35f), rgba(1.0f, 0.92f, 0.24f), 20},
+                    {"quad-top-right", sample_x(runtime, 0.65f), sample_y(runtime, 0.35f), rgba(0.31f, 0.78f, 1.0f), 20},
+                    {"quad-bottom-left", sample_x(runtime, 0.35f), sample_y(runtime, 0.65f), rgba(0.71f, 0.27f, 1.0f), 20},
+                    {"quad-bottom-right", sample_x(runtime, 0.65f), sample_y(runtime, 0.65f), rgba(1.0f, 1.0f, 1.0f), 20},
                 }
             );
         }
@@ -704,13 +795,21 @@ ValidationResult run_depth_blend_scissor(Dx11Runtime &runtime, unsigned int fram
     return run_scene_frames(
         runtime,
         frame_budget,
-        [&](unsigned int) {
+        [&](unsigned int frame, unsigned int total_frames) {
+            const float t = animation_progress(frame, total_frames);
+            const D3D11_RECT animated_scissor_rect{
+                static_cast<LONG>(lerp(static_cast<float>(runtime.width() / 2), static_cast<float>(scissor_rect.left), t)),
+                static_cast<LONG>(lerp(static_cast<float>(runtime.height() / 2), static_cast<float>(scissor_rect.top), t)),
+                static_cast<LONG>(lerp(static_cast<float>(runtime.width() / 2 + 32), static_cast<float>(scissor_rect.right), t)),
+                static_cast<LONG>(lerp(static_cast<float>(runtime.height() / 2 + 32), static_cast<float>(scissor_rect.bottom), t)),
+            };
+
             runtime.bind_back_buffer(depth_stencil_view.get());
             runtime.clear_back_buffer(clear_color);
             runtime.context()->ClearDepthStencilView(depth_stencil_view.get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
 
             runtime.context()->RSSetState(rasterizer_state.get());
-            runtime.context()->RSSetScissorRects(1, &scissor_rect);
+            runtime.context()->RSSetScissorRects(1, &animated_scissor_rect);
             runtime.context()->OMSetDepthStencilState(depth_state.get(), 0);
             runtime.context()->IASetInputLayout(program.input_layout.get());
             runtime.context()->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -788,7 +887,7 @@ ValidationResult run_offscreen_copy_composite(Dx11Runtime &runtime, unsigned int
         ARRAYSIZE(composite_layout_desc)
     );
 
-    const auto offscreen_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, offscreen_quad, ARRAYSIZE(offscreen_quad));
+    const auto offscreen_buffer = create_dynamic_vertex_buffer<PosColorVertex>(runtime.device(), ARRAYSIZE(offscreen_quad));
     const auto composite_buffer = create_static_buffer(runtime.device(), D3D11_BIND_VERTEX_BUFFER, composite_quad, ARRAYSIZE(composite_quad));
     const auto constant_buffer = create_dynamic_constant_buffer<TintConstants>(runtime.device());
 
@@ -840,9 +939,21 @@ ValidationResult run_offscreen_copy_composite(Dx11Runtime &runtime, unsigned int
     return run_scene_frames(
         runtime,
         frame_budget,
-        [&](unsigned int) {
-            const TintConstants constants{{0.80f, 1.00f, 0.90f, 1.00f}};
+        [&](unsigned int frame, unsigned int total_frames) {
+            const float t = animation_progress(frame, total_frames);
+            const TintConstants constants{{
+                lerp(0.55f, 0.80f, t),
+                lerp(0.70f, 1.00f, t),
+                lerp(0.60f, 0.90f, t),
+                1.00f,
+            }};
             update_dynamic_buffer(runtime.context(), constant_buffer.get(), constants);
+            const auto animated_offscreen_vertices = translate_vertices(
+                offscreen_quad,
+                lerp(0.24f, 0.0f, t),
+                lerp(-0.16f, 0.0f, t)
+            );
+            update_dynamic_buffer(runtime.context(), offscreen_buffer.get(), animated_offscreen_vertices);
 
             ID3D11RenderTargetView *offscreen_targets[] = {offscreen_rtv.get()};
             runtime.context()->OMSetRenderTargets(1, offscreen_targets, nullptr);

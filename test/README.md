@@ -64,11 +64,16 @@ wine apitrace_test_demo.exe --dx dx12 --scene smoke_triangle
 2. `indexed_instancing`
    覆盖 IB、第二输入槽、instance data、`DrawIndexed`、`DrawIndexedInstanced`。
 3. `textured_quad`
-   覆盖 `Texture2D`、`ShaderResourceView`、`SamplerState`、`UpdateSubresource`、`PSSetShaderResources`、`PSSetSamplers`。
+   覆盖 `Texture2D`、`ShaderResourceView`、`SamplerState`、`UpdateSubresource`、`PSSetShaderResources`、`PSSetSamplers`，并从 `bin/assets/dx11/` 读取打包纹理资产后上传到 GPU。
 4. `depth_blend_scissor`
    覆盖 depth texture、DSV、`ClearDepthStencilView`、`OMSetDepthStencilState`、`OMSetBlendState`、`RSSetState`、`RSSetScissorRects`。
 5. `offscreen_copy_composite`
    覆盖离屏 RT、SRV/RTV 复用、`CopyResource`、二次合成到 backbuffer。
+
+当前 5 个 `dx11 core` scene 都不是静态单帧图，而是“前段动画、后段收敛到稳定终帧”的确定性序列：
+
+- 这样顺序回放时能直接观察 draw 顺序、状态切换、离屏 copy 与最终 present 的连续效果。
+- 同时 visual fixture 仍可稳定截到一致终帧，不会因为截图时机不同而频繁漂移。
 
 结构预留但未实现：
 
@@ -76,6 +81,12 @@ wine apitrace_test_demo.exe --dx dx12 --scene smoke_triangle
 - `msaa_resolve`
 
 每个已实现 scene 都会把结果复制到 staging 资源，并在 CPU 侧对固定像素点做阈值校验。
+
+关于“资产是否需要跟着 trace”：
+
+- 测试 demo 现在会从外部打包资产目录读取纹理，再通过 D3D11 API 上传。
+- capture 侧的职责不是在 replay 时重新访问这些原始源文件，而是把进入 D3D11 的资源内容与元数据完整记录到 trace bundle。
+- 因此 replay 只依赖 trace bundle 内的 `textures/`、`buffers/`、`shaders/`、`pipelines/` 等资产，不依赖原始应用安装目录。
 
 ## D3D11 MVP 验收
 

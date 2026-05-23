@@ -243,7 +243,7 @@ export APITRACE_DOWNSTREAM_D3D11="$(wine_path "$DXMT_D3D11_DLL")"
 if [ "$VISUAL_CHECK" != "0" ]; then
     export APITRACE_TRIANGLE_MAX_FRAMES=300
 else
-    export APITRACE_TRIANGLE_MAX_FRAMES=120
+    export APITRACE_TRIANGLE_MAX_FRAMES=36
 fi
 export WINEDLLOVERRIDES="mscoree,mshtml=d;d3d11,dxgi,winemetal=n,b"
 export WINEDEBUG="-all"
