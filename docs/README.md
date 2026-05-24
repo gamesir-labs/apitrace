@@ -11,6 +11,7 @@
 - [CAPTURE.md](CAPTURE.md)：Windows 侧 capture 入口与实现约束
 - [RETRACE.md](RETRACE.md)：retrace 语义、库层实现和可执行入口
 - [PLAN.md](PLAN.md)：实施阶段、里程碑和主要风险
+- [BUILD.md](BUILD.md)：本仓库的构建流程、host build 与 Windows 交叉编译
 
 ## 阅读顺序建议
 

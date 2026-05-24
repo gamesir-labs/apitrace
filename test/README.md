@@ -14,6 +14,8 @@ cmake --build test/build/windows-x86_64
 cmake --install test/build/windows-x86_64 --prefix test/artifacts/windows-x86_64/demo
 ```
 
+这里的 Windows 交叉编译工具链使用 `x86_64-w64-mingw32-gcc` / `x86_64-w64-mingw32-g++`，避免误选 `clang` / `clang++`。
+
 运行时可用 Wine 直接启动：
 
 ```sh
