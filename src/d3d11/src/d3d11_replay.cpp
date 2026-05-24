@@ -86,6 +86,21 @@ std::string env_string(const char *primary, const char *fallback, const char *de
   return default_value;
 }
 
+DWORD env_millis(const char *name, DWORD fallback)
+{
+  const char *value = std::getenv(name);
+  if (!value || !*value) {
+    return fallback;
+  }
+
+  char *end = nullptr;
+  const unsigned long parsed = std::strtoul(value, &end, 10);
+  if (end == value || (end && *end != '\0')) {
+    return fallback;
+  }
+  return static_cast<DWORD>(parsed);
+}
+
 std::string format_hresult(const char *operation, HRESULT hr)
 {
   std::ostringstream message;
@@ -269,7 +284,7 @@ public:
     }
 
     if (show_window_) {
-      const DWORD deadline = GetTickCount() + 750;
+      const DWORD deadline = GetTickCount() + env_millis("APITRACE_RETRACE_WINDOW_HOLD_MS", 2000);
       while (GetTickCount() < deadline) {
         pump_messages();
         Sleep(15);
@@ -1650,6 +1665,29 @@ private:
       return false;
     }
     context->CopyResource(dst->resource, src->resource);
+    return true;
+  }
+
+  bool execute_command(
+      const replay::internal::ResolveSubresourceCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11DeviceContext *context = nullptr;
+    ReplayResourceState *dst = nullptr;
+    ReplayResourceState *src = nullptr;
+    if (!lookup_object(contexts_, command.context_id, "context", context, error) ||
+        !lookup_resource_state(command.dst_resource_id, "resolve-dst", dst, error) ||
+        !lookup_resource_state(command.src_resource_id, "resolve-src", src, error)) {
+      return false;
+    }
+    context->ResolveSubresource(
+        dst->resource,
+        command.dst_subresource,
+        src->resource,
+        command.src_subresource,
+        static_cast<DXGI_FORMAT>(command.format));
     return true;
   }
 

@@ -438,6 +438,16 @@ struct CopyResourceCommand {
   trace::ObjectId src_resource_id = 0;
 };
 
+struct ResolveSubresourceCommand {
+  ReplayCommandHeader header;
+  trace::ObjectId context_id = 0;
+  trace::ObjectId dst_resource_id = 0;
+  std::uint32_t dst_subresource = 0;
+  trace::ObjectId src_resource_id = 0;
+  std::uint32_t src_subresource = 0;
+  std::uint32_t format = 0;
+};
+
 struct ClearDepthStencilViewCommand {
   ReplayCommandHeader header;
   trace::ObjectId context_id = 0;
@@ -511,6 +521,7 @@ using ReplayCommand = std::variant<
     DrawIndexedCommand,
     DrawIndexedInstancedCommand,
     CopyResourceCommand,
+    ResolveSubresourceCommand,
     PresentCommand,
     FrameBoundaryCommand,
     PresentBoundaryCommand,

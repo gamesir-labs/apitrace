@@ -1303,6 +1303,28 @@ bool parse_copy_resource(
   return true;
 }
 
+bool parse_resolve_subresource(
+    const trace::TraceBundleReader &reader,
+    const trace::EventRecord &event,
+    const json &payload,
+    D3D11ReplayPlan &plan,
+    std::string &error)
+{
+  (void)reader;
+  if (!require_object_ref_count(event, 3, error)) {
+    return false;
+  }
+  auto command = make_command_header<ResolveSubresourceCommand>(event);
+  command.context_id = event.object_refs[0];
+  command.dst_resource_id = event.object_refs[1];
+  command.src_resource_id = event.object_refs[2];
+  command.dst_subresource = payload.value("dst_subresource", 0u);
+  command.src_subresource = payload.value("src_subresource", 0u);
+  command.format = payload.value("format", 0u);
+  plan.commands.emplace_back(std::move(command));
+  return true;
+}
+
 bool parse_present(
     const trace::TraceBundleReader &reader,
     const trace::EventRecord &event,
@@ -1364,6 +1386,7 @@ const std::unordered_map<std::string, ParseCallHandler> &call_handlers()
       {"ID3D11DeviceContext::DrawIndexed", &parse_draw_indexed},
       {"ID3D11DeviceContext::DrawIndexedInstanced", &parse_draw_indexed_instanced},
       {"ID3D11DeviceContext::CopyResource", &parse_copy_resource},
+      {"ID3D11DeviceContext::ResolveSubresource", &parse_resolve_subresource},
       {"IDXGISwapChain::Present", &parse_present},
   };
   return handlers;
