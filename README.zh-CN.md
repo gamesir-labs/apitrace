@@ -9,26 +9,6 @@
 
 开发文档入口见 [docs/README.md](docs/README.md)。
 
-## CI 构建
-
-仓库内置 GitHub Actions 工作流：
-
-- `.github/workflows/build-ci.yml`
-
-当前只在 `push` 时触发，不在 `pull_request` 时触发。
-
-CI artifact 目录结构固定为：
-
-```text
-retrace/
-  retrace.exe
-override/
-  d3d11.dll
-  d3d12.dll
-```
-
-设计上只打包仓库自身生成的最小产物，不附带 headers、静态库，也不附带 MinGW 运行时 DLL。
-
 ## 使用方式
 
 ### 1. capture: Wine override 模式
