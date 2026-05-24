@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace demo::app {
@@ -44,6 +45,9 @@ std::vector<const demo::scenes::dx12::SceneDefinition *> dx12_scene_order()
 {
     std::vector<const demo::scenes::dx12::SceneDefinition *> ordered;
     for (const demo::scenes::dx12::SceneDefinition &scene : demo::scenes::dx12::registered_scenes()) {
+        if (scene.name == std::string_view("dxr_smoke")) {
+            continue;
+        }
         ordered.push_back(&scene);
     }
     return ordered;

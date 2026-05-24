@@ -33,7 +33,7 @@ wine apitrace_test_demo.exe --list-scenes --dx dx12
 - `test/src/scenes/shared/include/scenes/shared/scene_matrix.hpp`
 - `test/src/scenes/shared/src/scene_matrix.cpp`
 
-矩阵顺序就是 `--scene all` 的顺序。这个顺序必须在 `dx11` / `dx12` 间保持一致，后续新增实现也不应调整名称或顺位。
+矩阵顺序默认就是 `--scene all` 的顺序。临时排除项会保留在 `--list-scenes` 与单场景入口中，但不参与 `--scene all`。
 
 | scene | tier | 目标 API 覆盖断言 | 目标视觉断言 | dx11 | dx12 |
 | --- | --- | --- | --- | --- | --- |
@@ -49,7 +49,7 @@ wine apitrace_test_demo.exe --list-scenes --dx dx12
 | `indirect_draw` | core | `ExecuteIndirect` / draw argument buffer / count buffer | indirect command submission draws two distinct quads with stable left/right colors | N/A | 已实现 |
 | `compute_uav_writeback` | core | compute dispatch / UAV writeback / SRV sampling after state transition | compute writes a four-quadrant texture that survives the UAV-to-SRV transition into the final quad | N/A | 已实现 |
 | `resource_lifecycle` | core | resource create / release / recreate / descriptor refresh | recreated texture resources keep producing the final solid color after repeated lifetime churn | N/A | 已实现 |
-| `dxr_smoke` | extended | raytracing tier probe / AS build-update / SBT / DispatchRays smoke entry | raytracing support is probed explicitly and the scene stays skip-safe when the device or compiler path is unavailable | N/A | 已实现 |
+| `dxr_smoke` | extended | raytracing tier probe / AS build-update / SBT / DispatchRays smoke entry | raytracing support is probed explicitly; currently excluded from `--scene all` while the D3DMetal translation layer is unstable | N/A | 手动单场景 |
 | `mesh_shader_smoke` | extended | mesh shader tier probe / task-mesh PSO switch / DispatchMesh smoke entry | mesh shader support is probed explicitly and the scene stays skip-safe when the device or compiler path is unavailable | N/A | 已实现 |
 
 ## CLI 契约
@@ -121,6 +121,7 @@ wine apitrace_test_demo.exe --list-scenes --dx dx12
 - `--scene all` 单窗口顺序执行骨架
 - 真实 runtime：`device` / `queue` / `allocator` / `command list` / `swapchain` / `fence` / backbuffer readback
 - 已实装 scene：`smoke_triangle`、`indexed_instancing`、`textured_quad`、`depth_blend_scissor`、`offscreen_copy_composite`、`mip_sampling`、`msaa_resolve`、`barrier_state_transitions`、`descriptor_root_signature_rebind`、`indirect_draw`、`compute_uav_writeback`、`resource_lifecycle`、`dxr_smoke`、`mesh_shader_smoke`
+- 默认 `--scene all` 暂不包含 `dxr_smoke`；该场景保留为手动单场景入口，等待 D3DMetal DXR 路径稳定后再恢复到默认矩阵。
 - 与 `dx11` 对齐的像素断言和 API 覆盖断言
 - `CopyResource`、mip upload 与采样、MSAA resolve、depth/blend/scissor、split barrier、descriptor rebinding、ExecuteIndirect、compute/UAV、resource lifecycle、mesh shader 的实装路径
 

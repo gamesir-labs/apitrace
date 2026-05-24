@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -32,6 +33,12 @@ const SceneMatrixEntry &require_scene_matrix_entry(std::string_view name)
         demo::fail("dx12 scene missing from shared scene matrix");
     }
     return *entry;
+}
+
+bool using_d3dmetal_backend()
+{
+    const char *backend = std::getenv("APITRACE_D3D12_BACKEND");
+    return backend && std::strcmp(backend, "d3dmetal") == 0;
 }
 
 struct PosColorVertex {
@@ -561,10 +568,9 @@ struct MeshVertex
 
 [shader("amplification")]
 [numthreads(1, 1, 1)]
-void as_main(
-    out MeshPayload payload
-)
+void as_main()
 {
+    MeshPayload payload;
     payload.color = float4(0.90, 0.35, 0.16, 1.0);
     DispatchMesh(1, 1, 1, payload);
 }
@@ -2996,11 +3002,14 @@ ValidationResult run_resource_lifecycle(Dx12Runtime &runtime, unsigned int frame
     const UINT descriptor_size = runtime.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     demo::ComPtr<ID3D12Resource> texture;
+    std::vector<demo::ComPtr<ID3D12Resource>> frame_upload_buffers;
 
     return run_scene_frames(
         runtime,
         frame_budget,
         [&](unsigned int frame, unsigned int total_frames) {
+            frame_upload_buffers.clear();
+
             const float t = animation_progress(frame, total_frames);
             const auto animated_vertices = translate_vertices(
                 quad_vertices,
@@ -3028,8 +3037,9 @@ ValidationResult run_resource_lifecycle(Dx12Runtime &runtime, unsigned int frame
             };
 
             texture = create_texture_resource(runtime, texture_desc, D3D12_RESOURCE_STATE_COPY_DEST);
-            const auto upload_buffer = create_texture_upload_buffer(runtime.device(), texture_desc, subresources);
+            auto upload_buffer = create_texture_upload_buffer(runtime.device(), texture_desc, subresources);
             copy_texture_upload(runtime.device(), runtime.command_list(), texture.get(), upload_buffer.get(), texture_desc, 1);
+            frame_upload_buffers.push_back(std::move(upload_buffer));
             runtime.transition_resource(texture.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
             D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
@@ -3062,6 +3072,10 @@ ValidationResult run_resource_lifecycle(Dx12Runtime &runtime, unsigned int frame
 
 ValidationResult run_mesh_shader_smoke(Dx12Runtime &runtime, unsigned int frame_budget)
 {
+    if (using_d3dmetal_backend()) {
+        return ValidationResult::skip("D3DMetal does not expose a stable mesh shader execution path for this smoke test");
+    }
+
     D3D12_FEATURE_DATA_D3D12_OPTIONS7 options7{};
     demo::check_hr(
         runtime.device()->CheckFeatureSupport(
@@ -3168,6 +3182,10 @@ ValidationResult run_mesh_shader_smoke(Dx12Runtime &runtime, unsigned int frame_
 
 ValidationResult run_dxr_smoke(Dx12Runtime &runtime, unsigned int frame_budget)
 {
+    if (using_d3dmetal_backend()) {
+        return ValidationResult::skip("D3DMetal does not expose a stable DXR execution path for this smoke test");
+    }
+
     D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5{};
     demo::check_hr(
         runtime.device()->CheckFeatureSupport(

@@ -12,14 +12,14 @@ DEMO_BIN_DIR="$DEMO_PREFIX/bin"
 TRACE_ROOT_DIR="$DEMO_BIN_DIR/dx11-core-scene-traces"
 RUN_LOG_DIR="$DEMO_BIN_DIR/dx11-core-scene-logs"
 ROOT_TOOLCHAIN="$ROOT_DIR/test/toolchains/windows-x86_64-mingw.cmake"
-DOWNSTREAM_DLL="$ROOT_DIR/../wine-enviroment/lib/wine/x86_64-windows/d3d11.dll"
 WINE_PREFIX="$ROOT_DIR/test/artifacts/wineprefix-d3d11"
-DXMT_D3D11_DLL="$ROOT_DIR/../dxmt/build-gs-native-builtin/src/d3d11/d3d11.dll"
-DXMT_DXGI_DLL="$ROOT_DIR/../dxmt/build-gs-native-builtin/src/dxgi/dxgi.dll"
-DXMT_WINEMETAL_DLL="$ROOT_DIR/../dxmt/build-gs-native-builtin/src/winemetal/winemetal.dll"
-DXMT_UNIX_DIR="$ROOT_DIR/../dxmt/build-gs-native-builtin/src/winemetal/unix"
-DXMT_PACKAGE_ROOT="$HOME/Library/Application Support/com.gamemac.test/wine-engine/downloads/dxmt-v0.80"
-DXMT_WINE_ROOT=""
+D3DMETAL_ROOT="${APITRACE_D3DMETAL_ROOT:-$ROOT_DIR/../wine-enviroment/D3DMetal}"
+D3DMETAL_D3D11_DLL="$D3DMETAL_ROOT/wine/x86_64-windows/d3d11.dll"
+D3DMETAL_DXGI_DLL="$D3DMETAL_ROOT/wine/x86_64-windows/dxgi.dll"
+D3DMETAL_WINE_ROOT="$D3DMETAL_ROOT/wine"
+D3DMETAL_UNIX_DIR="$D3DMETAL_ROOT/wine/x86_64-unix"
+D3DMETAL_EXTERNAL_DIR="$D3DMETAL_ROOT/external"
+D3D_COMPILER_DLL="$ROOT_DIR/../wine-enviroment/lib/wine/x86_64-windows/d3dcompiler_47.dll"
 VISUAL_WINDOW_TITLE="${APITRACE_VISUAL_WINDOW_TITLE:-apitrace test demo}"
 VISUAL_DESKTOP="${APITRACE_WINE_VIRTUAL_DESKTOP:-apitrace,1400x900}"
 
@@ -186,26 +186,18 @@ if [ ! -x "$WINE_BIN" ]; then
     exit 1
 fi
 
-if [ -d "$DXMT_PACKAGE_ROOT/wine" ]; then
-    DXMT_WINE_ROOT="$DXMT_PACKAGE_ROOT/wine"
-    DXMT_D3D11_DLL="$DXMT_PACKAGE_ROOT/wine/x86_64-windows/d3d11.dll"
-    DXMT_DXGI_DLL="$DXMT_PACKAGE_ROOT/wine/x86_64-windows/dxgi.dll"
-    DXMT_WINEMETAL_DLL="$DXMT_PACKAGE_ROOT/wine/x86_64-windows/winemetal.dll"
-    DXMT_UNIX_DIR="$DXMT_PACKAGE_ROOT/wine/x86_64-unix"
-fi
-
-if [ ! -f "$DXMT_D3D11_DLL" ]; then
-    echo "missing DXMT d3d11.dll: $DXMT_D3D11_DLL" >&2
+if [ ! -f "$D3DMETAL_D3D11_DLL" ]; then
+    echo "missing D3DMetal d3d11.dll: $D3DMETAL_D3D11_DLL" >&2
     exit 1
 fi
 
-if [ ! -f "$DXMT_DXGI_DLL" ]; then
-    echo "missing DXMT dxgi.dll: $DXMT_DXGI_DLL" >&2
+if [ ! -f "$D3DMETAL_DXGI_DLL" ]; then
+    echo "missing D3DMetal dxgi.dll: $D3DMETAL_DXGI_DLL" >&2
     exit 1
 fi
 
-if [ ! -f "$DXMT_WINEMETAL_DLL" ]; then
-    echo "missing DXMT winemetal.dll: $DXMT_WINEMETAL_DLL" >&2
+if [ ! -f "$D3D_COMPILER_DLL" ]; then
+    echo "missing d3dcompiler_47.dll: $D3D_COMPILER_DLL" >&2
     exit 1
 fi
 
@@ -228,8 +220,8 @@ cmake --build "$TEST_BUILD_DIR"
 cmake --install "$TEST_BUILD_DIR" --prefix "$DEMO_PREFIX"
 
 cp "$APITRACE_PREFIX/bin/d3d11.dll" "$DEMO_BIN_DIR/d3d11.dll"
-cp "$DXMT_DXGI_DLL" "$DEMO_BIN_DIR/dxgi.dll"
-cp "$DXMT_WINEMETAL_DLL" "$DEMO_BIN_DIR/winemetal.dll"
+cp "$D3DMETAL_DXGI_DLL" "$DEMO_BIN_DIR/dxgi.dll"
+cp "$D3D_COMPILER_DLL" "$DEMO_BIN_DIR/d3dcompiler_47.dll"
 for runtime_dll in libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
     runtime_path="$(resolve_mingw_runtime "$runtime_dll" || true)"
     if [ -z "$runtime_path" ] || [ ! -f "$runtime_path" ]; then
@@ -239,22 +231,18 @@ for runtime_dll in libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
     cp "$runtime_path" "$DEMO_BIN_DIR/$runtime_dll"
 done
 
-export APITRACE_DOWNSTREAM_D3D11="$(wine_path "$DXMT_D3D11_DLL")"
+export APITRACE_DOWNSTREAM_D3D11="$(wine_path "$D3DMETAL_D3D11_DLL")"
 if [ "$VISUAL_CHECK" != "0" ]; then
     export APITRACE_TRIANGLE_MAX_FRAMES=300
 else
     export APITRACE_TRIANGLE_MAX_FRAMES=36
 fi
-export WINEDLLOVERRIDES="mscoree,mshtml=d;d3d11,dxgi,winemetal=n,b"
+export WINEDLLOVERRIDES="mscoree,mshtml=d;d3d11,dxgi=n,b"
 export WINEDEBUG="-all"
 export WINEARCH="win64"
 export WINEPREFIX="$WINE_PREFIX"
-if [ -n "$DXMT_WINE_ROOT" ]; then
-    export WINEDLLPATH="$DXMT_WINE_ROOT:$ROOT_DIR/../wine-enviroment/lib/wine"
-else
-    export WINEDLLPATH="$ROOT_DIR/../wine-enviroment/lib/wine"
-fi
-export DYLD_FALLBACK_LIBRARY_PATH="$DXMT_UNIX_DIR:$ROOT_DIR/../wine-enviroment/lib:$ROOT_DIR/../wine-enviroment/lib/wine/x86_64-unix:/opt/homebrew/lib:/usr/local/lib"
+export WINEDLLPATH="$D3DMETAL_WINE_ROOT:$ROOT_DIR/../wine-enviroment/lib/wine"
+export DYLD_FALLBACK_LIBRARY_PATH="$D3DMETAL_EXTERNAL_DIR:$D3DMETAL_UNIX_DIR:$ROOT_DIR/../wine-enviroment/lib:$ROOT_DIR/../wine-enviroment/lib/wine/x86_64-unix:/opt/homebrew/lib:/usr/local/lib"
 
 if [ ! -f "$WINE_PREFIX/system.reg" ]; then
     "$WINE_BIN" wineboot -u >/dev/null 2>&1 || true
