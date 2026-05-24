@@ -67,6 +67,7 @@ constexpr std::size_t kContextCopyResourceIndex = 47;
 constexpr std::size_t kContextUpdateSubresourceIndex = 48;
 constexpr std::size_t kContextClearRenderTargetViewIndex = 50;
 constexpr std::size_t kContextClearDepthStencilViewIndex = 53;
+constexpr std::size_t kContextResolveSubresourceIndex = 57;
 
 constexpr std::size_t kSwapChainPresentIndex = 8;
 constexpr std::size_t kSwapChainGetBufferIndex = 9;
@@ -219,6 +220,8 @@ using ContextUpdateSubresourceFn =
 using ContextClearRenderTargetViewFn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11RenderTargetView *, const FLOAT[4]);
 using ContextClearDepthStencilViewFn =
     void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11DepthStencilView *, UINT, FLOAT, UINT8);
+using ContextResolveSubresourceFn =
+    void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *, UINT, ID3D11Resource *, UINT, DXGI_FORMAT);
 
 using SwapChainPresentFn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT);
 using SwapChainGetBufferFn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, REFIID, void **);
@@ -275,6 +278,7 @@ struct ContextHookState {
   ContextUpdateSubresourceFn update_subresource = nullptr;
   ContextClearRenderTargetViewFn clear_render_target_view = nullptr;
   ContextClearDepthStencilViewFn clear_depth_stencil_view = nullptr;
+  ContextResolveSubresourceFn resolve_subresource = nullptr;
 };
 
 struct SwapChainHookState {
@@ -2567,6 +2571,41 @@ void STDMETHODCALLTYPE hook_update_subresource(
   record_call_locked("ID3D11DeviceContext::UpdateSubresource", S_OK, {context, dst_resource}, blob_refs, payload.str());
 }
 
+void STDMETHODCALLTYPE hook_resolve_subresource(
+    ID3D11DeviceContext *context,
+    ID3D11Resource *dst_resource,
+    UINT dst_subresource,
+    ID3D11Resource *src_resource,
+    UINT src_subresource,
+    DXGI_FORMAT format)
+{
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = context_hook_locked(context);
+  hook.resolve_subresource(context, dst_resource, dst_subresource, src_resource, src_subresource, format);
+
+  std::ostringstream payload;
+  payload << "{\"dst_subresource\":" << dst_subresource << ",\"src_subresource\":" << src_subresource
+          << ",\"format\":" << static_cast<unsigned int>(format);
+  if (const auto *dst_info = lookup_resource_info_locked(dst_resource)) {
+    payload << ",\"dst_resource_class\":\"" << resource_class_name(dst_info->resource_class) << "\"";
+  } else {
+    payload << ",\"dst_resource_class\":\"unknown\"";
+  }
+  if (const auto *src_info = lookup_resource_info_locked(src_resource)) {
+    payload << ",\"src_resource_class\":\"" << resource_class_name(src_info->resource_class) << "\"";
+  } else {
+    payload << ",\"src_resource_class\":\"unknown\"";
+  }
+  payload << "}";
+  record_call_locked(
+      "ID3D11DeviceContext::ResolveSubresource",
+      S_OK,
+      {context, dst_resource, src_resource},
+      {},
+      payload.str());
+}
+
 void STDMETHODCALLTYPE hook_clear_render_target_view(
     ID3D11DeviceContext *context,
     ID3D11RenderTargetView *render_target_view,
@@ -2768,6 +2807,8 @@ void patch_context(ID3D11DeviceContext *context)
       reinterpret_cast<ContextClearRenderTargetViewFn>(vtable[kContextClearRenderTargetViewIndex]);
   hook.clear_depth_stencil_view =
       reinterpret_cast<ContextClearDepthStencilViewFn>(vtable[kContextClearDepthStencilViewIndex]);
+  hook.resolve_subresource =
+      reinterpret_cast<ContextResolveSubresourceFn>(vtable[kContextResolveSubresourceIndex]);
 
   state.context_hooks.emplace(vtable, hook);
   patch_vtable_entry(vtable, kContextVSSetConstantBuffersIndex, reinterpret_cast<void *>(hook_vs_set_constant_buffers));
@@ -2813,6 +2854,7 @@ void patch_context(ID3D11DeviceContext *context)
       vtable,
       kContextClearDepthStencilViewIndex,
       reinterpret_cast<void *>(hook_clear_depth_stencil_view));
+  patch_vtable_entry(vtable, kContextResolveSubresourceIndex, reinterpret_cast<void *>(hook_resolve_subresource));
   proxy_debug_logf("patch_context installed object=%p vtable=%p", context, vtable);
 }
 
