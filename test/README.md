@@ -44,6 +44,13 @@ wine apitrace_test_demo.exe --list-scenes --dx dx12
 | `offscreen_copy_composite` | core | offscreen `RT` / `CopyResource` / `SRV`-`RTV` 复用 / 二次合成 | 离屏内容被复制并回合成到 swapchain，颜色分层保持稳定 | 已实现 | 已实现 |
 | `mip_sampling` | extended | mip chain / mip sampling / mip view and sampling path | 不同区域命中不同 mip 级别，并呈现可预测的颜色过渡 | 已实现 | 已实现 |
 | `msaa_resolve` | extended | `MSAA RT` / resolve / MSAA 到单采样输出链路 | resolve 后边缘保持抗锯齿，覆盖区与背景区稳定 | 已实现 | 已实现 |
+| `barrier_state_transitions` | core | `ResourceBarrier` / split barrier / render-target to SRV transition coverage | split barrier keeps two cleared offscreen targets visible as stable left/right colors in the final composite | N/A | 已实现 |
+| `descriptor_root_signature_rebind` | core | descriptor heap / root signature / CBV and SRV rebinding | the same pipeline rebinds two SRVs and two tint constants to produce distinct left/right quads | N/A | 已实现 |
+| `indirect_draw` | core | `ExecuteIndirect` / draw argument buffer / count buffer | indirect command submission draws two distinct quads with stable left/right colors | N/A | 已实现 |
+| `compute_uav_writeback` | core | compute dispatch / UAV writeback / SRV sampling after state transition | compute writes a four-quadrant texture that survives the UAV-to-SRV transition into the final quad | N/A | 已实现 |
+| `resource_lifecycle` | core | resource create / release / recreate / descriptor refresh | recreated texture resources keep producing the final solid color after repeated lifetime churn | N/A | 已实现 |
+| `dxr_smoke` | extended | raytracing tier probe / AS build-update / SBT / DispatchRays smoke entry | raytracing support is probed explicitly and the scene stays skip-safe when the device or compiler path is unavailable | N/A | 已实现 |
+| `mesh_shader_smoke` | extended | mesh shader tier probe / task-mesh PSO switch / DispatchMesh smoke entry | mesh shader support is probed explicitly and the scene stays skip-safe when the device or compiler path is unavailable | N/A | 已实现 |
 
 ## CLI 契约
 
@@ -85,7 +92,7 @@ wine apitrace_test_demo.exe --list-scenes --dx dx12
 当前代码行为：
 
 - `dx11`：在一个 `Dx11Runtime` 上顺序执行所有已实现 scene，场景末尾调用 `clear_state()` 清理状态。
-- `dx12`：在一个 `Dx12Runtime` 上顺序执行全部 7 个 scene，场景末尾调用 `clear_state()` 清理状态。
+- `dx12`：在一个 `Dx12Runtime` 上顺序执行全部 scene，场景末尾调用 `clear_state()` 清理状态；特性不支持时允许显式 skip。
 
 ## DX11 现状
 
@@ -113,9 +120,9 @@ wine apitrace_test_demo.exe --list-scenes --dx dx12
 - 单场景执行入口
 - `--scene all` 单窗口顺序执行骨架
 - 真实 runtime：`device` / `queue` / `allocator` / `command list` / `swapchain` / `fence` / backbuffer readback
-- 已实装 scene：`smoke_triangle`、`indexed_instancing`、`textured_quad`、`depth_blend_scissor`、`offscreen_copy_composite`、`mip_sampling`、`msaa_resolve`
+- 已实装 scene：`smoke_triangle`、`indexed_instancing`、`textured_quad`、`depth_blend_scissor`、`offscreen_copy_composite`、`mip_sampling`、`msaa_resolve`、`barrier_state_transitions`、`descriptor_root_signature_rebind`、`indirect_draw`、`compute_uav_writeback`、`resource_lifecycle`、`dxr_smoke`、`mesh_shader_smoke`
 - 与 `dx11` 对齐的像素断言和 API 覆盖断言
-- `CopyResource`、mip upload 与采样、MSAA resolve、depth/blend/scissor 的实装路径
+- `CopyResource`、mip upload 与采样、MSAA resolve、depth/blend/scissor、split barrier、descriptor rebinding、ExecuteIndirect、compute/UAV、resource lifecycle、mesh shader 的实装路径
 
 最小验证脚本预留为：
 

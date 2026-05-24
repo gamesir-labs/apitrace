@@ -309,12 +309,13 @@ void Dx12Runtime::clear_back_buffer(const float clear_color[4]) const
 void Dx12Runtime::transition_resource(
     ID3D12Resource *resource,
     D3D12_RESOURCE_STATES before,
-    D3D12_RESOURCE_STATES after
+    D3D12_RESOURCE_STATES after,
+    D3D12_RESOURCE_BARRIER_FLAGS flags
 ) const
 {
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier.Flags = flags;
     barrier.Transition.pResource = resource;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     barrier.Transition.StateBefore = before;

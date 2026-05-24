@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <d3dcompiler.h>
+#include <dxcapi.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -333,6 +334,84 @@ inline ComPtr<ID3DBlob> compile_shader(const char *source, const char *entry, co
         fail("shader compilation failed", hr);
     }
 
+    return blob;
+}
+
+inline std::wstring widen_ascii(const char *text)
+{
+    std::wstring wide;
+    if (!text) {
+        return wide;
+    }
+    while (*text) {
+        wide.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*text++)));
+    }
+    return wide;
+}
+
+inline ComPtr<IDxcBlob> compile_shader_dxc(const char *source, const char *entry, const char *profile)
+{
+    static HMODULE dxc_module = LoadLibraryA("dxcompiler.dll");
+    if (!dxc_module) {
+        return {};
+    }
+
+    auto create_instance = reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(dxc_module, "DxcCreateInstance"));
+    if (!create_instance) {
+        return {};
+    }
+
+    ComPtr<IDxcUtils> utils;
+    ComPtr<IDxcCompiler3> compiler;
+    check_hr(create_instance(CLSID_DxcUtils, IID_PPV_ARGS(utils.put())), "DxcCreateInstance(CLSID_DxcUtils) failed");
+    check_hr(
+        create_instance(CLSID_DxcCompiler, IID_PPV_ARGS(compiler.put())),
+        "DxcCreateInstance(CLSID_DxcCompiler) failed"
+    );
+
+    ComPtr<IDxcIncludeHandler> include_handler;
+    check_hr(utils->CreateDefaultIncludeHandler(include_handler.put()), "CreateDefaultIncludeHandler failed");
+
+    const std::wstring wide_entry = widen_ascii(entry);
+    const std::wstring wide_profile = widen_ascii(profile);
+    const wchar_t *arguments[] = {
+        L"-E",
+        wide_entry.c_str(),
+        L"-T",
+        wide_profile.c_str(),
+        L"-HV",
+        L"2021",
+    };
+
+    DxcBuffer buffer{};
+    buffer.Ptr = source;
+    buffer.Size = std::strlen(source);
+    buffer.Encoding = DXC_CP_UTF8;
+
+    ComPtr<IDxcResult> result;
+    check_hr(
+        compiler->Compile(
+            &buffer,
+            arguments,
+            static_cast<UINT32>(ARRAYSIZE(arguments)),
+            include_handler.get(),
+            IID_PPV_ARGS(result.put())
+        ),
+        "IDxcCompiler3::Compile failed"
+    );
+
+    HRESULT status = E_FAIL;
+    check_hr(result->GetStatus(&status), "IDxcResult::GetStatus failed");
+    if (FAILED(status)) {
+        ComPtr<IDxcBlobUtf8> errors;
+        if (SUCCEEDED(result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(errors.put()), nullptr)) && errors) {
+            std::fprintf(stderr, "%s\n", static_cast<const char *>(errors->GetBufferPointer()));
+        }
+        fail("shader compilation failed", status);
+    }
+
+    ComPtr<IDxcBlob> blob;
+    check_hr(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(blob.put()), nullptr), "IDxcResult::GetOutput failed");
     return blob;
 }
 

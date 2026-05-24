@@ -17,7 +17,7 @@ struct SceneMatrixEntry {
     const char *visual_assertion;
 };
 
-const std::array<SceneMatrixEntry, 7> &scene_matrix();
+const std::array<SceneMatrixEntry, 14> &scene_matrix();
 const SceneMatrixEntry *find_scene_matrix_entry(std::string_view name);
 
 } // namespace demo::scenes::shared

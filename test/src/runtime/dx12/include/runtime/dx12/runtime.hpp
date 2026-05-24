@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace demo::runtime::dx12 {
@@ -28,7 +29,23 @@ struct PixelExpectation {
 
 struct ValidationResult {
     bool passed = true;
+    bool skipped = false;
     std::string reason;
+
+    ValidationResult() = default;
+    ValidationResult(bool passed, std::string reason)
+        : passed(passed), reason(std::move(reason))
+    {
+    }
+
+    static ValidationResult skip(std::string reason)
+    {
+        ValidationResult result;
+        result.passed = false;
+        result.skipped = true;
+        result.reason = std::move(reason);
+        return result;
+    }
 };
 
 class Dx12Runtime {
@@ -59,7 +76,12 @@ public:
     void begin_frame();
     void bind_back_buffer() const;
     void clear_back_buffer(const float clear_color[4]) const;
-    void transition_resource(ID3D12Resource *resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) const;
+    void transition_resource(
+        ID3D12Resource *resource,
+        D3D12_RESOURCE_STATES before,
+        D3D12_RESOURCE_STATES after,
+        D3D12_RESOURCE_BARRIER_FLAGS flags = D3D12_RESOURCE_BARRIER_FLAG_NONE
+    ) const;
     void clear_state();
     void present();
     ValidationResult present_and_validate(

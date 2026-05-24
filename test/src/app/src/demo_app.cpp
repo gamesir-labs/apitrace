@@ -125,6 +125,9 @@ int run_dx11(const CliOptions &options)
         if (result.passed) {
             std::printf("scene pass: %s\n", scene->name);
             ++passed;
+        } else if (result.skipped) {
+            std::printf("scene skip: %s reason=%s\n", scene->name, result.reason.c_str());
+            ++skipped;
         } else {
             std::printf("scene fail: %s reason=%s\n", scene->name, result.reason.c_str());
             ++failed;
@@ -171,6 +174,9 @@ int run_dx12(const CliOptions &options)
         if (result.passed) {
             std::printf("scene pass: %s\n", scene->name);
             ++passed;
+        } else if (result.skipped) {
+            std::printf("scene skip: %s reason=%s\n", scene->name, result.reason.c_str());
+            ++skipped;
         } else {
             std::printf("scene fail: %s reason=%s\n", scene->name, result.reason.c_str());
             ++failed;

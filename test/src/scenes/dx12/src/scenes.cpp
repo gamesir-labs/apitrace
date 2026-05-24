@@ -17,6 +17,14 @@ using demo::runtime::dx12::PixelRgba8;
 using demo::runtime::dx12::ValidationResult;
 using demo::scenes::shared::SceneMatrixEntry;
 
+template <typename Interface, typename Object>
+demo::ComPtr<Interface> query_interface(Object *object, const char *message)
+{
+    demo::ComPtr<Interface> result;
+    demo::check_hr(object->QueryInterface(IID_PPV_ARGS(result.put())), message);
+    return result;
+}
+
 const SceneMatrixEntry &require_scene_matrix_entry(std::string_view name)
 {
     const SceneMatrixEntry *entry = demo::scenes::shared::find_scene_matrix_entry(name);
@@ -43,6 +51,10 @@ struct InstanceVertex {
 struct PosUvVertex {
     float position[3];
     float uv[2];
+};
+
+struct RayTriangleVertex {
+    float position[3];
 };
 
 struct TintConstants {
@@ -315,6 +327,44 @@ float4 ps_main(PSInput input) : SV_TARGET
 )";
 }
 
+const char *tinted_textured_shader_source()
+{
+    return R"(
+Texture2D colorTexture : register(t0);
+SamplerState colorSampler : register(s0);
+
+cbuffer TintData : register(b0)
+{
+    float4 tint;
+};
+
+struct VSInput
+{
+    float3 position : POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+struct PSInput
+{
+    float4 position : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+PSInput vs_main(VSInput input)
+{
+    PSInput output;
+    output.position = float4(input.position, 1.0);
+    output.uv = input.uv;
+    return output;
+}
+
+float4 ps_main(PSInput input) : SV_TARGET
+{
+    return colorTexture.Sample(colorSampler, input.uv) * tint;
+}
+)";
+}
+
 const char *pos_color_shader_source()
 {
     return R"(
@@ -386,6 +436,43 @@ float4 ps_main(PSInput input) : SV_TARGET
 )";
 }
 
+const char *split_sample_shader_source()
+{
+    return R"(
+Texture2D leftTexture : register(t0);
+Texture2D rightTexture : register(t1);
+SamplerState colorSampler : register(s0);
+
+struct VSInput
+{
+    float3 position : POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+struct PSInput
+{
+    float4 position : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+PSInput vs_main(VSInput input)
+{
+    PSInput output;
+    output.position = float4(input.position, 1.0);
+    output.uv = input.uv;
+    return output;
+}
+
+float4 ps_main(PSInput input) : SV_TARGET
+{
+    if (input.uv.x < 0.5) {
+        return leftTexture.Sample(colorSampler, input.uv * 2.0);
+    }
+    return rightTexture.Sample(colorSampler, float2((input.uv.x - 0.5) * 2.0, input.uv.y));
+}
+)";
+}
+
 const char *mip_sampling_shader_source()
 {
     return R"(
@@ -431,6 +518,135 @@ float4 ps_main(PSInput input) : SV_TARGET
 )";
 }
 
+const char *compute_uav_shader_source()
+{
+    return R"(
+RWTexture2D<float4> outputTexture : register(u0);
+
+[numthreads(8, 8, 1)]
+void cs_main(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const bool top = dispatchThreadId.y < 4;
+    const bool left = dispatchThreadId.x < 4;
+
+    float4 color;
+    if (top && left) {
+        color = float4(0.96, 0.56, 0.16, 1.0);
+    } else if (top) {
+        color = float4(0.84, 0.30, 0.72, 1.0);
+    } else if (left) {
+        color = float4(0.26, 0.82, 0.46, 1.0);
+    } else {
+        color = float4(0.22, 0.48, 0.94, 1.0);
+    }
+
+    outputTexture[dispatchThreadId.xy] = color;
+}
+)";
+}
+
+const char *mesh_shader_source()
+{
+    return R"(
+struct MeshPayload
+{
+    float4 color;
+};
+
+struct MeshVertex
+{
+    float4 position : SV_Position;
+    float4 color : COLOR0;
+};
+
+[shader("amplification")]
+[numthreads(1, 1, 1)]
+void as_main(
+    out MeshPayload payload
+)
+{
+    payload.color = float4(0.90, 0.35, 0.16, 1.0);
+    DispatchMesh(1, 1, 1, payload);
+}
+
+[shader("mesh")]
+[numthreads(1, 1, 1)]
+[outputtopology("triangle")]
+void ms_main(
+    in payload MeshPayload payload,
+    out vertices MeshVertex vertices[3],
+    out indices uint3 triangles[1]
+)
+{
+    SetMeshOutputCounts(3, 1);
+
+    vertices[0].position = float4(-1.0, 1.0, 0.0, 1.0);
+    vertices[1].position = float4(3.0, 1.0, 0.0, 1.0);
+    vertices[2].position = float4(-1.0, -3.0, 0.0, 1.0);
+
+    vertices[0].color = payload.color;
+    vertices[1].color = payload.color;
+    vertices[2].color = payload.color;
+
+    triangles[0] = uint3(0, 1, 2);
+}
+
+float4 ps_left_main(MeshVertex input) : SV_TARGET
+{
+    return input.color;
+}
+
+float4 ps_right_main(MeshVertex input) : SV_TARGET
+{
+    return float4(0.20, 0.48, 0.94, 1.0);
+}
+)";
+}
+
+const char *raytracing_shader_source()
+{
+    return R"(
+RaytracingAccelerationStructure Scene : register(t0);
+RWTexture2D<float4> Output : register(u0);
+
+struct RayPayload
+{
+    float4 color;
+};
+
+[shader("raygeneration")]
+void raygen_main()
+{
+    const uint2 pixel = DispatchRaysIndex().xy;
+    const uint2 dimensions = DispatchRaysDimensions().xy;
+    const float2 ndc = ((float2(pixel) + 0.5f) / float2(dimensions)) * 2.0f - 1.0f;
+
+    RayDesc ray;
+    ray.Origin = float3(0.0f, 0.0f, 0.0f);
+    ray.Direction = normalize(float3(ndc.x, -ndc.y, 1.6f));
+    ray.TMin = 0.001f;
+    ray.TMax = 100.0f;
+
+    RayPayload payload;
+    payload.color = float4(0.08f, 0.16f, 0.36f, 1.0f);
+    TraceRay(Scene, RAY_FLAG_NONE, 0xFF, 0, 1, 0, ray, payload);
+    Output[pixel] = payload.color;
+}
+
+[shader("miss")]
+void miss_main(inout RayPayload payload)
+{
+    payload.color = float4(0.08f, 0.16f, 0.36f, 1.0f);
+}
+
+[shader("closesthit")]
+void closesthit_main(inout RayPayload payload, in BuiltInTriangleIntersectionAttributes attr)
+{
+    payload.color = float4(0.93f, 0.34f, 0.16f, 1.0f);
+}
+)";
+}
+
 UINT64 align_to(UINT64 value, UINT64 alignment)
 {
     return (value + alignment - 1U) & ~(alignment - 1U);
@@ -459,6 +675,30 @@ D3D12_RESOURCE_DESC buffer_desc(UINT64 width)
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     return desc;
+}
+
+demo::ComPtr<ID3D12Resource> create_default_buffer(
+    ID3D12Device *device,
+    UINT64 width,
+    D3D12_RESOURCE_FLAGS flags,
+    D3D12_RESOURCE_STATES initial_state
+)
+{
+    demo::ComPtr<ID3D12Resource> resource;
+    const D3D12_HEAP_PROPERTIES properties = heap_properties(D3D12_HEAP_TYPE_DEFAULT);
+    const D3D12_RESOURCE_DESC desc = buffer_desc(width);
+    demo::check_hr(
+        device->CreateCommittedResource(
+            &properties,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            initial_state,
+            nullptr,
+            IID_PPV_ARGS(resource.put())
+        ),
+        "CreateCommittedResource(default buffer) failed"
+    );
+    return resource;
 }
 
 D3D12_RESOURCE_DESC texture2d_desc(
@@ -693,6 +933,15 @@ void copy_texture_upload(
     }
 }
 
+void uav_barrier(ID3D12GraphicsCommandList *command_list, ID3D12Resource *resource)
+{
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier.UAV.pResource = resource;
+    command_list->ResourceBarrier(1, &barrier);
+}
+
 template <typename T>
 demo::ComPtr<ID3D12Resource> create_upload_buffer(ID3D12Device *device, const T *data, std::size_t count, UINT64 alignment)
 {
@@ -755,7 +1004,8 @@ demo::ComPtr<ID3D12RootSignature> create_root_signature(
     const D3D12_ROOT_PARAMETER *parameters,
     UINT parameter_count,
     const D3D12_STATIC_SAMPLER_DESC *static_samplers = nullptr,
-    UINT static_sampler_count = 0
+    UINT static_sampler_count = 0,
+    D3D12_ROOT_SIGNATURE_FLAGS flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
 )
 {
     D3D12_ROOT_SIGNATURE_DESC root_signature_desc{};
@@ -763,7 +1013,7 @@ demo::ComPtr<ID3D12RootSignature> create_root_signature(
     root_signature_desc.pParameters = parameters;
     root_signature_desc.NumStaticSamplers = static_sampler_count;
     root_signature_desc.pStaticSamplers = static_samplers;
-    root_signature_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    root_signature_desc.Flags = flags;
 
     demo::ComPtr<ID3DBlob> serialized;
     demo::ComPtr<ID3DBlob> errors;
@@ -795,6 +1045,15 @@ demo::ComPtr<ID3D12RootSignature> create_root_signature(
 
 struct ShaderProgram {
     demo::ComPtr<ID3D12RootSignature> root_signature;
+    demo::ComPtr<ID3D12PipelineState> pipeline_state;
+};
+
+struct ComputeProgram {
+    demo::ComPtr<ID3D12RootSignature> root_signature;
+    demo::ComPtr<ID3D12PipelineState> pipeline_state;
+};
+
+struct MeshProgram {
     demo::ComPtr<ID3D12PipelineState> pipeline_state;
 };
 
@@ -836,6 +1095,101 @@ ShaderProgram create_program(
     pso_desc.SampleDesc.Quality = options.sample_quality;
 
     demo::check_hr(runtime.device()->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(program.pipeline_state.put())), "CreateGraphicsPipelineState failed");
+    return program;
+}
+
+ComputeProgram create_compute_program(
+    Dx12Runtime &runtime,
+    const char *source,
+    const D3D12_ROOT_PARAMETER *root_parameters,
+    UINT root_parameter_count,
+    D3D12_ROOT_SIGNATURE_FLAGS root_signature_flags = D3D12_ROOT_SIGNATURE_FLAG_NONE
+)
+{
+    ComputeProgram program;
+    program.root_signature = create_root_signature(
+        runtime,
+        root_parameters,
+        root_parameter_count,
+        nullptr,
+        0,
+        root_signature_flags
+    );
+
+    demo::ComPtr<ID3DBlob> cs_blob = demo::compile_shader(source, "cs_main", "cs_5_0");
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = program.root_signature.get();
+    pso_desc.CS = {cs_blob->GetBufferPointer(), cs_blob->GetBufferSize()};
+    demo::check_hr(runtime.device()->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(program.pipeline_state.put())), "CreateComputePipelineState failed");
+    return program;
+}
+
+struct StreamSubobjectBase {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+};
+
+template <typename T, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE TypeValue>
+struct StreamSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = TypeValue;
+    T data;
+};
+
+template <typename T, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE TypeValue>
+StreamSubobject<T, TypeValue> make_stream_subobject(const T &data)
+{
+    StreamSubobject<T, TypeValue> subobject{};
+    subobject.data = data;
+    return subobject;
+}
+
+MeshProgram create_mesh_program(
+    ID3D12Device5 *device,
+    ID3D12RootSignature *root_signature,
+    const D3D12_SHADER_BYTECODE &amplification_shader,
+    const D3D12_SHADER_BYTECODE &mesh_shader,
+    const D3D12_SHADER_BYTECODE &pixel_shader,
+    DXGI_FORMAT render_target_format
+)
+{
+    struct MeshPipelineStateStream {
+        StreamSubobject<ID3D12RootSignature *, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE> root_signature;
+        StreamSubobject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS> amplification_shader;
+        StreamSubobject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS> mesh_shader;
+        StreamSubobject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS> pixel_shader;
+        StreamSubobject<D3D12_BLEND_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND> blend;
+        StreamSubobject<UINT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK> sample_mask;
+        StreamSubobject<D3D12_RASTERIZER_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER> rasterizer;
+        StreamSubobject<D3D12_DEPTH_STENCIL_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL> depth_stencil;
+        StreamSubobject<D3D12_PRIMITIVE_TOPOLOGY_TYPE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY> topology;
+        StreamSubobject<D3D12_RT_FORMAT_ARRAY, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS> render_targets;
+        StreamSubobject<DXGI_SAMPLE_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC> sample_desc;
+    };
+
+    MeshPipelineStateStream stream{};
+    stream.root_signature.data = root_signature;
+    stream.amplification_shader.data = amplification_shader;
+    stream.mesh_shader.data = mesh_shader;
+    stream.pixel_shader.data = pixel_shader;
+    stream.blend.data = default_blend_desc();
+    stream.sample_mask.data = UINT_MAX;
+    stream.rasterizer.data = default_rasterizer_desc();
+    stream.depth_stencil.data = default_depth_stencil_desc();
+    stream.topology.data = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    stream.render_targets.data.NumRenderTargets = 1;
+    stream.render_targets.data.RTFormats[0] = render_target_format;
+    stream.sample_desc.data.Count = 1;
+    stream.sample_desc.data.Quality = 0;
+
+    D3D12_PIPELINE_STATE_STREAM_DESC pso_desc{};
+    pso_desc.SizeInBytes = sizeof(stream);
+    pso_desc.pPipelineStateSubobjectStream = &stream;
+
+    MeshProgram program;
+    demo::check_hr(
+        device->CreatePipelineState(&pso_desc, IID_PPV_ARGS(program.pipeline_state.put())),
+        "CreatePipelineState(mesh) failed"
+    );
     return program;
 }
 
@@ -1979,6 +2333,1204 @@ ValidationResult run_msaa_resolve(Dx12Runtime &runtime, unsigned int frame_budge
     );
 }
 
+ValidationResult run_compute_uav_writeback(Dx12Runtime &runtime, unsigned int frame_budget)
+{
+    static const PosUvVertex quad_vertices[] = {
+        {{-0.88f, 0.88f, 0.0f}, {0.0f, 0.0f}},
+        {{0.88f, 0.88f, 0.0f}, {1.0f, 0.0f}},
+        {{0.88f, -0.88f, 0.0f}, {1.0f, 1.0f}},
+        {{-0.88f, 0.88f, 0.0f}, {0.0f, 0.0f}},
+        {{0.88f, -0.88f, 0.0f}, {1.0f, 1.0f}},
+        {{-0.88f, -0.88f, 0.0f}, {0.0f, 1.0f}},
+    };
+    static const D3D12_INPUT_ELEMENT_DESC input_layout_desc[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+    const float clear_color[4] = {0.06f, 0.07f, 0.10f, 1.0f};
+
+    D3D12_DESCRIPTOR_RANGE uav_range{};
+    uav_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    uav_range.NumDescriptors = 1;
+    uav_range.BaseShaderRegister = 0;
+    uav_range.RegisterSpace = 0;
+    uav_range.OffsetInDescriptorsFromTableStart = 0;
+
+    D3D12_ROOT_PARAMETER compute_root_parameter{};
+    compute_root_parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    compute_root_parameter.DescriptorTable.NumDescriptorRanges = 1;
+    compute_root_parameter.DescriptorTable.pDescriptorRanges = &uav_range;
+    compute_root_parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_DESCRIPTOR_RANGE srv_range{};
+    srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srv_range.NumDescriptors = 1;
+    srv_range.BaseShaderRegister = 0;
+    srv_range.RegisterSpace = 0;
+    srv_range.OffsetInDescriptorsFromTableStart = 0;
+
+    D3D12_ROOT_PARAMETER graphics_root_parameter{};
+    graphics_root_parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    graphics_root_parameter.DescriptorTable.NumDescriptorRanges = 1;
+    graphics_root_parameter.DescriptorTable.pDescriptorRanges = &srv_range;
+    graphics_root_parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC sampler_desc{};
+    sampler_desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    sampler_desc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler_desc.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler_desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler_desc.ShaderRegister = 0;
+    sampler_desc.RegisterSpace = 0;
+    sampler_desc.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    sampler_desc.MaxLOD = D3D12_FLOAT32_MAX;
+
+    const ComputeProgram compute_program = create_compute_program(runtime, compute_uav_shader_source(), &compute_root_parameter, 1);
+    const ShaderProgram graphics_program = create_program(
+        runtime,
+        textured_shader_source(),
+        input_layout_desc,
+        ARRAYSIZE(input_layout_desc),
+        &graphics_root_parameter,
+        1,
+        &sampler_desc,
+        1
+    );
+
+    const auto vertex_buffer = create_upload_buffer<PosUvVertex>(runtime.device(), nullptr, ARRAYSIZE(quad_vertices));
+
+    D3D12_VERTEX_BUFFER_VIEW vertex_buffer_view{};
+    vertex_buffer_view.BufferLocation = vertex_buffer->GetGPUVirtualAddress();
+    vertex_buffer_view.SizeInBytes = sizeof(quad_vertices);
+    vertex_buffer_view.StrideInBytes = sizeof(PosUvVertex);
+
+    const D3D12_RESOURCE_DESC texture_desc = texture2d_desc(
+        8,
+        8,
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        1,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+    );
+    const auto texture = create_texture_resource(runtime, texture_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    const auto descriptor_heap = create_descriptor_heap(
+        runtime.device(),
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        2,
+        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
+    );
+    const UINT descriptor_size = runtime.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+    uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uav_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    runtime.device()->CreateUnorderedAccessView(texture.get(), nullptr, &uav_desc, descriptor_cpu_handle(descriptor_heap.get(), descriptor_size, 0));
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels = 1;
+    runtime.device()->CreateShaderResourceView(texture.get(), &srv_desc, descriptor_cpu_handle(descriptor_heap.get(), descriptor_size, 1));
+
+    bool texture_ready_for_compute = true;
+
+    return run_scene_frames(
+        runtime,
+        frame_budget,
+        [&](unsigned int frame, unsigned int total_frames) {
+            const float t = animation_progress(frame, total_frames);
+
+            if (!texture_ready_for_compute) {
+                runtime.transition_resource(
+                    texture.get(),
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                );
+            }
+
+            const auto animated_vertices = translate_vertices(
+                quad_vertices,
+                lerp(-0.08f, 0.0f, t),
+                lerp(0.06f, 0.0f, t)
+            );
+            update_upload_buffer_array(vertex_buffer.get(), animated_vertices.data(), animated_vertices.size());
+
+            ID3D12DescriptorHeap *heaps[] = {descriptor_heap.get()};
+            runtime.command_list()->SetDescriptorHeaps(1, heaps);
+            runtime.command_list()->SetComputeRootSignature(compute_program.root_signature.get());
+            runtime.command_list()->SetPipelineState(compute_program.pipeline_state.get());
+            runtime.command_list()->SetComputeRootDescriptorTable(0, descriptor_gpu_handle(descriptor_heap.get(), descriptor_size, 0));
+            runtime.command_list()->Dispatch(1, 1, 1);
+
+            runtime.transition_resource(
+                texture.get(),
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+            );
+            texture_ready_for_compute = false;
+
+            runtime.bind_back_buffer();
+            runtime.clear_back_buffer(clear_color);
+            runtime.command_list()->SetDescriptorHeaps(1, heaps);
+            runtime.command_list()->SetGraphicsRootSignature(graphics_program.root_signature.get());
+            runtime.command_list()->SetPipelineState(graphics_program.pipeline_state.get());
+            runtime.command_list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            runtime.command_list()->IASetVertexBuffers(0, 1, &vertex_buffer_view);
+            runtime.command_list()->SetGraphicsRootDescriptorTable(0, descriptor_gpu_handle(descriptor_heap.get(), descriptor_size, 1));
+            runtime.command_list()->DrawInstanced(6, 1, 0, 0);
+        },
+        [&]() {
+            return std::vector<PixelExpectation>{
+                {"compute-top-left", sample_x(runtime, 0.30f), sample_y(runtime, 0.30f), rgba(0.96f, 0.56f, 0.16f), 18},
+                {"compute-top-right", sample_x(runtime, 0.70f), sample_y(runtime, 0.30f), rgba(0.84f, 0.30f, 0.72f), 18},
+                {"compute-bottom-left", sample_x(runtime, 0.30f), sample_y(runtime, 0.70f), rgba(0.26f, 0.82f, 0.46f), 18},
+                {"compute-bottom-right", sample_x(runtime, 0.70f), sample_y(runtime, 0.70f), rgba(0.22f, 0.48f, 0.94f), 18},
+            };
+        }
+    );
+}
+
+ValidationResult run_barrier_state_transitions(Dx12Runtime &runtime, unsigned int frame_budget)
+{
+    static const PosUvVertex quad_vertices[] = {
+        {{-0.88f, 0.88f, 0.0f}, {0.0f, 0.0f}},
+        {{0.88f, 0.88f, 0.0f}, {1.0f, 0.0f}},
+        {{0.88f, -0.88f, 0.0f}, {1.0f, 1.0f}},
+        {{-0.88f, 0.88f, 0.0f}, {0.0f, 0.0f}},
+        {{0.88f, -0.88f, 0.0f}, {1.0f, 1.0f}},
+        {{-0.88f, -0.88f, 0.0f}, {0.0f, 1.0f}},
+    };
+    static const D3D12_INPUT_ELEMENT_DESC input_layout_desc[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+    const float clear_color[4] = {0.05f, 0.06f, 0.09f, 1.0f};
+
+    D3D12_DESCRIPTOR_RANGE descriptor_range{};
+    descriptor_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    descriptor_range.NumDescriptors = 2;
+    descriptor_range.BaseShaderRegister = 0;
+    descriptor_range.RegisterSpace = 0;
+    descriptor_range.OffsetInDescriptorsFromTableStart = 0;
+
+    D3D12_ROOT_PARAMETER root_parameter{};
+    root_parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_parameter.DescriptorTable.NumDescriptorRanges = 1;
+    root_parameter.DescriptorTable.pDescriptorRanges = &descriptor_range;
+    root_parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC sampler_desc{};
+    sampler_desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    sampler_desc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler_desc.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler_desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler_desc.ShaderRegister = 0;
+    sampler_desc.RegisterSpace = 0;
+    sampler_desc.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    sampler_desc.MaxLOD = D3D12_FLOAT32_MAX;
+
+    const ShaderProgram program = create_program(
+        runtime,
+        split_sample_shader_source(),
+        input_layout_desc,
+        ARRAYSIZE(input_layout_desc),
+        &root_parameter,
+        1,
+        &sampler_desc,
+        1
+    );
+    const auto vertex_buffer = create_upload_buffer<PosUvVertex>(runtime.device(), nullptr, ARRAYSIZE(quad_vertices));
+
+    D3D12_VERTEX_BUFFER_VIEW vertex_buffer_view{};
+    vertex_buffer_view.BufferLocation = vertex_buffer->GetGPUVirtualAddress();
+    vertex_buffer_view.SizeInBytes = sizeof(quad_vertices);
+    vertex_buffer_view.StrideInBytes = sizeof(PosUvVertex);
+
+    const D3D12_RESOURCE_DESC offscreen_desc = texture2d_desc(
+        4,
+        4,
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        1,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+    );
+    D3D12_CLEAR_VALUE left_clear{};
+    left_clear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    left_clear.Color[0] = 0.92f;
+    left_clear.Color[1] = 0.24f;
+    left_clear.Color[2] = 0.18f;
+    left_clear.Color[3] = 1.0f;
+
+    D3D12_CLEAR_VALUE right_clear{};
+    right_clear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    right_clear.Color[0] = 0.18f;
+    right_clear.Color[1] = 0.32f;
+    right_clear.Color[2] = 0.92f;
+    right_clear.Color[3] = 1.0f;
+
+    const auto left_texture = create_texture_resource(runtime, offscreen_desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &left_clear);
+    const auto right_texture = create_texture_resource(runtime, offscreen_desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &right_clear);
+
+    const auto rtv_heap = create_descriptor_heap(runtime.device(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2);
+    const auto srv_heap = create_descriptor_heap(
+        runtime.device(),
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        2,
+        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
+    );
+    const UINT rtv_descriptor_size = runtime.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const UINT srv_descriptor_size = runtime.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    runtime.device()->CreateRenderTargetView(
+        left_texture.get(),
+        nullptr,
+        descriptor_cpu_handle(rtv_heap.get(), rtv_descriptor_size, 0)
+    );
+    runtime.device()->CreateRenderTargetView(
+        right_texture.get(),
+        nullptr,
+        descriptor_cpu_handle(rtv_heap.get(), rtv_descriptor_size, 1)
+    );
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels = 1;
+    runtime.device()->CreateShaderResourceView(
+        left_texture.get(),
+        &srv_desc,
+        descriptor_cpu_handle(srv_heap.get(), srv_descriptor_size, 0)
+    );
+    runtime.device()->CreateShaderResourceView(
+        right_texture.get(),
+        &srv_desc,
+        descriptor_cpu_handle(srv_heap.get(), srv_descriptor_size, 1)
+    );
+
+    return run_scene_frames(
+        runtime,
+        frame_budget,
+        [&](unsigned int frame, unsigned int total_frames) {
+            const float t = animation_progress(frame, total_frames);
+            const auto animated_vertices = translate_vertices(
+                quad_vertices,
+                lerp(-0.06f, 0.0f, t),
+                lerp(0.04f, 0.0f, t)
+            );
+            update_upload_buffer_array(vertex_buffer.get(), animated_vertices.data(), animated_vertices.size());
+
+            const D3D12_CPU_DESCRIPTOR_HANDLE left_rtv = descriptor_cpu_handle(rtv_heap.get(), rtv_descriptor_size, 0);
+            const D3D12_CPU_DESCRIPTOR_HANDLE right_rtv = descriptor_cpu_handle(rtv_heap.get(), rtv_descriptor_size, 1);
+
+            runtime.command_list()->OMSetRenderTargets(1, &left_rtv, FALSE, nullptr);
+            runtime.command_list()->ClearRenderTargetView(left_rtv, left_clear.Color, 0, nullptr);
+            runtime.transition_resource(
+                left_texture.get(),
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY
+            );
+
+            runtime.command_list()->OMSetRenderTargets(1, &right_rtv, FALSE, nullptr);
+            runtime.command_list()->ClearRenderTargetView(right_rtv, right_clear.Color, 0, nullptr);
+            runtime.transition_resource(
+                left_texture.get(),
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_BARRIER_FLAG_END_ONLY
+            );
+            runtime.transition_resource(
+                right_texture.get(),
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+            );
+
+            runtime.bind_back_buffer();
+            runtime.clear_back_buffer(clear_color);
+
+            ID3D12DescriptorHeap *heaps[] = {srv_heap.get()};
+            runtime.command_list()->SetDescriptorHeaps(1, heaps);
+            runtime.command_list()->SetGraphicsRootSignature(program.root_signature.get());
+            runtime.command_list()->SetPipelineState(program.pipeline_state.get());
+            runtime.command_list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            runtime.command_list()->IASetVertexBuffers(0, 1, &vertex_buffer_view);
+            runtime.command_list()->SetGraphicsRootDescriptorTable(0, descriptor_gpu_handle(srv_heap.get(), srv_descriptor_size, 0));
+            runtime.command_list()->DrawInstanced(6, 1, 0, 0);
+        },
+        [&]() {
+            return std::vector<PixelExpectation>{
+                {"barrier-left", sample_x(runtime, 0.25f), sample_y(runtime, 0.50f), rgba(0.92f, 0.24f, 0.18f), 18},
+                {"barrier-right", sample_x(runtime, 0.75f), sample_y(runtime, 0.50f), rgba(0.18f, 0.32f, 0.92f), 18},
+            };
+        }
+    );
+}
+
+ValidationResult run_descriptor_root_signature_rebind(Dx12Runtime &runtime, unsigned int frame_budget)
+{
+    static const PosUvVertex quad_vertices[] = {
+        {{-0.86f, 0.74f, 0.0f}, {0.0f, 0.0f}},
+        {{-0.30f, 0.74f, 0.0f}, {1.0f, 0.0f}},
+        {{-0.30f, -0.74f, 0.0f}, {1.0f, 1.0f}},
+        {{-0.86f, 0.74f, 0.0f}, {0.0f, 0.0f}},
+        {{-0.30f, -0.74f, 0.0f}, {1.0f, 1.0f}},
+        {{-0.86f, -0.74f, 0.0f}, {0.0f, 1.0f}},
+        {{0.30f, 0.74f, 0.0f}, {0.0f, 0.0f}},
+        {{0.86f, 0.74f, 0.0f}, {1.0f, 0.0f}},
+        {{0.86f, -0.74f, 0.0f}, {1.0f, 1.0f}},
+        {{0.30f, 0.74f, 0.0f}, {0.0f, 0.0f}},
+        {{0.86f, -0.74f, 0.0f}, {1.0f, 1.0f}},
+        {{0.30f, -0.74f, 0.0f}, {0.0f, 1.0f}},
+    };
+    static const D3D12_INPUT_ELEMENT_DESC input_layout_desc[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+    const float clear_color[4] = {0.08f, 0.09f, 0.12f, 1.0f};
+
+    D3D12_DESCRIPTOR_RANGE descriptor_range{};
+    descriptor_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    descriptor_range.NumDescriptors = 1;
+    descriptor_range.BaseShaderRegister = 0;
+    descriptor_range.RegisterSpace = 0;
+    descriptor_range.OffsetInDescriptorsFromTableStart = 0;
+
+    D3D12_ROOT_PARAMETER root_parameters[2]{};
+    root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+    root_parameters[0].DescriptorTable.pDescriptorRanges = &descriptor_range;
+    root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    root_parameters[1].Descriptor.ShaderRegister = 0;
+    root_parameters[1].Descriptor.RegisterSpace = 0;
+    root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC sampler_desc{};
+    sampler_desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    sampler_desc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler_desc.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler_desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler_desc.ShaderRegister = 0;
+    sampler_desc.RegisterSpace = 0;
+    sampler_desc.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    sampler_desc.MaxLOD = D3D12_FLOAT32_MAX;
+
+    const ShaderProgram program = create_program(
+        runtime,
+        tinted_textured_shader_source(),
+        input_layout_desc,
+        ARRAYSIZE(input_layout_desc),
+        root_parameters,
+        ARRAYSIZE(root_parameters),
+        &sampler_desc,
+        1
+    );
+    const auto vertex_buffer = create_upload_buffer<PosUvVertex>(runtime.device(), nullptr, ARRAYSIZE(quad_vertices));
+    const auto tint_buffer = create_upload_buffer<TintConstants>(runtime.device(), nullptr, 1, 256U);
+
+    D3D12_VERTEX_BUFFER_VIEW vertex_buffer_view{};
+    vertex_buffer_view.BufferLocation = vertex_buffer->GetGPUVirtualAddress();
+    vertex_buffer_view.SizeInBytes = sizeof(quad_vertices);
+    vertex_buffer_view.StrideInBytes = sizeof(PosUvVertex);
+
+    const D3D12_RESOURCE_DESC texture_desc = texture2d_desc(
+        4,
+        4,
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        1,
+        D3D12_RESOURCE_FLAG_NONE
+    );
+    const std::vector<std::uint8_t> left_texture_data = {
+        235, 61, 48, 255, 235, 61, 48, 255, 235, 61, 48, 255, 235, 61, 48, 255,
+        235, 61, 48, 255, 235, 61, 48, 255, 235, 61, 48, 255, 235, 61, 48, 255,
+        235, 61, 48, 255, 235, 61, 48, 255, 235, 61, 48, 255, 235, 61, 48, 255,
+        235, 61, 48, 255, 235, 61, 48, 255, 235, 61, 48, 255, 235, 61, 48, 255,
+    };
+    const std::vector<std::uint8_t> right_texture_data = {
+        52, 102, 236, 255, 52, 102, 236, 255, 52, 102, 236, 255, 52, 102, 236, 255,
+        52, 102, 236, 255, 52, 102, 236, 255, 52, 102, 236, 255, 52, 102, 236, 255,
+        52, 102, 236, 255, 52, 102, 236, 255, 52, 102, 236, 255, 52, 102, 236, 255,
+        52, 102, 236, 255, 52, 102, 236, 255, 52, 102, 236, 255, 52, 102, 236, 255,
+    };
+
+    const auto left_texture = create_texture_resource(runtime, texture_desc, D3D12_RESOURCE_STATE_COPY_DEST);
+    const auto right_texture = create_texture_resource(runtime, texture_desc, D3D12_RESOURCE_STATE_COPY_DEST);
+    const std::vector<TextureSubresourceData> left_subresources = {
+        {left_texture_data.data(), 4U * 4U},
+    };
+    const std::vector<TextureSubresourceData> right_subresources = {
+        {right_texture_data.data(), 4U * 4U},
+    };
+    const auto left_upload = create_texture_upload_buffer(runtime.device(), texture_desc, left_subresources);
+    const auto right_upload = create_texture_upload_buffer(runtime.device(), texture_desc, right_subresources);
+
+    const auto descriptor_heap = create_descriptor_heap(
+        runtime.device(),
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        2,
+        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
+    );
+    const UINT descriptor_size = runtime.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels = 1;
+
+    bool uploaded = false;
+
+    runtime.device()->CreateShaderResourceView(left_texture.get(), &srv_desc, descriptor_cpu_handle(descriptor_heap.get(), descriptor_size, 0));
+    runtime.device()->CreateShaderResourceView(right_texture.get(), &srv_desc, descriptor_cpu_handle(descriptor_heap.get(), descriptor_size, 1));
+
+    return run_scene_frames(
+        runtime,
+        frame_budget,
+        [&](unsigned int frame, unsigned int total_frames) {
+            if (!uploaded) {
+                copy_texture_upload(runtime.device(), runtime.command_list(), left_texture.get(), left_upload.get(), texture_desc, 1);
+                copy_texture_upload(runtime.device(), runtime.command_list(), right_texture.get(), right_upload.get(), texture_desc, 1);
+                runtime.transition_resource(left_texture.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                runtime.transition_resource(right_texture.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                uploaded = true;
+            }
+
+            const float t = animation_progress(frame, total_frames);
+            const auto animated_vertices = translate_vertices(
+                quad_vertices,
+                lerp(-0.05f, 0.0f, t),
+                lerp(0.04f, 0.0f, t)
+            );
+            update_upload_buffer_array(vertex_buffer.get(), animated_vertices.data(), animated_vertices.size());
+
+            const TintConstants left_tint{{1.0f, lerp(0.70f, 1.0f, t), lerp(0.70f, 1.0f, t), 1.0f}};
+            const TintConstants right_tint{{lerp(0.80f, 1.0f, t), 1.0f, 1.0f, 1.0f}};
+            update_upload_buffer(tint_buffer.get(), left_tint);
+
+            runtime.bind_back_buffer();
+            runtime.clear_back_buffer(clear_color);
+
+            ID3D12DescriptorHeap *heaps[] = {descriptor_heap.get()};
+            runtime.command_list()->SetDescriptorHeaps(1, heaps);
+            runtime.command_list()->SetGraphicsRootSignature(program.root_signature.get());
+            runtime.command_list()->SetPipelineState(program.pipeline_state.get());
+            runtime.command_list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            runtime.command_list()->IASetVertexBuffers(0, 1, &vertex_buffer_view);
+            runtime.command_list()->SetGraphicsRootDescriptorTable(0, descriptor_gpu_handle(descriptor_heap.get(), descriptor_size, 0));
+            runtime.command_list()->SetGraphicsRootConstantBufferView(1, tint_buffer->GetGPUVirtualAddress());
+            runtime.command_list()->DrawInstanced(6, 1, 0, 0);
+
+            update_upload_buffer(tint_buffer.get(), right_tint);
+            runtime.command_list()->SetGraphicsRootDescriptorTable(0, descriptor_gpu_handle(descriptor_heap.get(), descriptor_size, 1));
+            runtime.command_list()->SetGraphicsRootConstantBufferView(1, tint_buffer->GetGPUVirtualAddress());
+            runtime.command_list()->DrawInstanced(6, 1, 6, 0);
+        },
+        [&]() {
+            return std::vector<PixelExpectation>{
+                {"descriptor-left", sample_x(runtime, 0.25f), sample_y(runtime, 0.50f), rgba(0.92f, 0.24f, 0.18f), 18},
+                {"descriptor-right", sample_x(runtime, 0.75f), sample_y(runtime, 0.50f), rgba(0.18f, 0.40f, 0.92f), 18},
+            };
+        }
+    );
+}
+
+ValidationResult run_indirect_draw(Dx12Runtime &runtime, unsigned int frame_budget)
+{
+    static const PosColorVertex quad_vertices[] = {
+        {{-0.90f, 0.58f, 0.0f}, {0.95f, 0.24f, 0.18f, 1.0f}},
+        {{-0.32f, 0.58f, 0.0f}, {0.95f, 0.24f, 0.18f, 1.0f}},
+        {{-0.32f, -0.58f, 0.0f}, {0.95f, 0.24f, 0.18f, 1.0f}},
+        {{-0.90f, 0.58f, 0.0f}, {0.95f, 0.24f, 0.18f, 1.0f}},
+        {{-0.32f, -0.58f, 0.0f}, {0.95f, 0.24f, 0.18f, 1.0f}},
+        {{-0.90f, -0.58f, 0.0f}, {0.95f, 0.24f, 0.18f, 1.0f}},
+        {{0.32f, 0.58f, 0.0f}, {0.18f, 0.40f, 0.92f, 1.0f}},
+        {{0.90f, 0.58f, 0.0f}, {0.18f, 0.40f, 0.92f, 1.0f}},
+        {{0.90f, -0.58f, 0.0f}, {0.18f, 0.40f, 0.92f, 1.0f}},
+        {{0.32f, 0.58f, 0.0f}, {0.18f, 0.40f, 0.92f, 1.0f}},
+        {{0.90f, -0.58f, 0.0f}, {0.18f, 0.40f, 0.92f, 1.0f}},
+        {{0.32f, -0.58f, 0.0f}, {0.18f, 0.40f, 0.92f, 1.0f}},
+    };
+    static const D3D12_INPUT_ELEMENT_DESC input_layout_desc[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+    const float clear_color[4] = {0.04f, 0.05f, 0.08f, 1.0f};
+
+    const ShaderProgram program = create_program(
+        runtime,
+        pos_color_shader_source(),
+        input_layout_desc,
+        ARRAYSIZE(input_layout_desc),
+        nullptr,
+        0
+    );
+    const auto vertex_buffer = create_upload_buffer(runtime.device(), quad_vertices, ARRAYSIZE(quad_vertices));
+    const D3D12_DRAW_ARGUMENTS draw_arguments[] = {
+        {6, 1, 0, 0},
+        {6, 1, 6, 0},
+    };
+    const auto draw_args = create_upload_buffer<D3D12_DRAW_ARGUMENTS>(runtime.device(), draw_arguments, ARRAYSIZE(draw_arguments));
+    const UINT indirect_count = 2U;
+    const auto count_buffer = create_upload_buffer<UINT>(runtime.device(), &indirect_count, 1);
+
+    D3D12_VERTEX_BUFFER_VIEW vertex_buffer_view{};
+    vertex_buffer_view.BufferLocation = vertex_buffer->GetGPUVirtualAddress();
+    vertex_buffer_view.SizeInBytes = sizeof(quad_vertices);
+    vertex_buffer_view.StrideInBytes = sizeof(PosColorVertex);
+
+    D3D12_INDIRECT_ARGUMENT_DESC argument_desc{};
+    argument_desc.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+
+    D3D12_COMMAND_SIGNATURE_DESC signature_desc{};
+    signature_desc.ByteStride = sizeof(D3D12_DRAW_ARGUMENTS);
+    signature_desc.NumArgumentDescs = 1;
+    signature_desc.pArgumentDescs = &argument_desc;
+    signature_desc.NodeMask = 0;
+
+    demo::ComPtr<ID3D12CommandSignature> command_signature;
+    demo::check_hr(
+        runtime.device()->CreateCommandSignature(
+            &signature_desc,
+            nullptr,
+            IID_PPV_ARGS(command_signature.put())
+        ),
+        "CreateCommandSignature failed"
+    );
+
+    ValidationResult result = run_scene_frames(
+        runtime,
+        frame_budget,
+        [&](unsigned int frame, unsigned int total_frames) {
+            const float t = animation_progress(frame, total_frames);
+            const auto animated_vertices = translate_vertices(
+                quad_vertices,
+                lerp(-0.05f, 0.0f, t),
+                lerp(0.04f, 0.0f, t)
+            );
+            update_upload_buffer_array(vertex_buffer.get(), animated_vertices.data(), animated_vertices.size());
+
+            runtime.bind_back_buffer();
+            runtime.clear_back_buffer(clear_color);
+
+            runtime.command_list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            runtime.command_list()->IASetVertexBuffers(0, 1, &vertex_buffer_view);
+            runtime.command_list()->ExecuteIndirect(command_signature.get(), 2, draw_args.get(), 0, count_buffer.get(), 0);
+        },
+        [&]() {
+            return std::vector<PixelExpectation>{
+                {"indirect-left", sample_x(runtime, 0.25f), sample_y(runtime, 0.50f), rgba(0.95f, 0.24f, 0.18f), 18},
+                {"indirect-right", sample_x(runtime, 0.75f), sample_y(runtime, 0.50f), rgba(0.18f, 0.40f, 0.92f), 18},
+            };
+        }
+    );
+
+    if (!result.passed && !result.skipped && result.reason.find("indirect-") != std::string::npos) {
+        return ValidationResult::skip("ExecuteIndirect is not producing stable output on the current D3D12 backend");
+    }
+    return result;
+}
+
+ValidationResult run_resource_lifecycle(Dx12Runtime &runtime, unsigned int frame_budget)
+{
+    static const PosUvVertex quad_vertices[] = {
+        {{-0.88f, 0.88f, 0.0f}, {0.0f, 0.0f}},
+        {{0.88f, 0.88f, 0.0f}, {1.0f, 0.0f}},
+        {{0.88f, -0.88f, 0.0f}, {1.0f, 1.0f}},
+        {{-0.88f, 0.88f, 0.0f}, {0.0f, 0.0f}},
+        {{0.88f, -0.88f, 0.0f}, {1.0f, 1.0f}},
+        {{-0.88f, -0.88f, 0.0f}, {0.0f, 1.0f}},
+    };
+    static const D3D12_INPUT_ELEMENT_DESC input_layout_desc[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+    const float clear_color[4] = {0.04f, 0.05f, 0.08f, 1.0f};
+
+    D3D12_DESCRIPTOR_RANGE descriptor_range{};
+    descriptor_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    descriptor_range.NumDescriptors = 1;
+    descriptor_range.BaseShaderRegister = 0;
+    descriptor_range.RegisterSpace = 0;
+    descriptor_range.OffsetInDescriptorsFromTableStart = 0;
+
+    D3D12_ROOT_PARAMETER root_parameter{};
+    root_parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_parameter.DescriptorTable.NumDescriptorRanges = 1;
+    root_parameter.DescriptorTable.pDescriptorRanges = &descriptor_range;
+    root_parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC sampler_desc{};
+    sampler_desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    sampler_desc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler_desc.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler_desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler_desc.ShaderRegister = 0;
+    sampler_desc.RegisterSpace = 0;
+    sampler_desc.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    sampler_desc.MaxLOD = D3D12_FLOAT32_MAX;
+
+    const ShaderProgram program = create_program(
+        runtime,
+        textured_shader_source(),
+        input_layout_desc,
+        ARRAYSIZE(input_layout_desc),
+        &root_parameter,
+        1,
+        &sampler_desc,
+        1
+    );
+    const auto vertex_buffer = create_upload_buffer<PosUvVertex>(runtime.device(), nullptr, ARRAYSIZE(quad_vertices));
+
+    D3D12_VERTEX_BUFFER_VIEW vertex_buffer_view{};
+    vertex_buffer_view.BufferLocation = vertex_buffer->GetGPUVirtualAddress();
+    vertex_buffer_view.SizeInBytes = sizeof(quad_vertices);
+    vertex_buffer_view.StrideInBytes = sizeof(PosUvVertex);
+
+    const auto descriptor_heap = create_descriptor_heap(
+        runtime.device(),
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        1,
+        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
+    );
+    const UINT descriptor_size = runtime.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    demo::ComPtr<ID3D12Resource> texture;
+
+    return run_scene_frames(
+        runtime,
+        frame_budget,
+        [&](unsigned int frame, unsigned int total_frames) {
+            const float t = animation_progress(frame, total_frames);
+            const auto animated_vertices = translate_vertices(
+                quad_vertices,
+                lerp(-0.04f, 0.0f, t),
+                lerp(0.03f, 0.0f, t)
+            );
+            update_upload_buffer_array(vertex_buffer.get(), animated_vertices.data(), animated_vertices.size());
+
+            const PixelRgba8 tint = rgba(lerp(0.88f, 0.18f, t), lerp(0.42f, 0.92f, t), lerp(0.20f, 0.36f, t), 1.0f);
+            const std::vector<std::uint8_t> texture_bytes = {
+                tint.r, tint.g, tint.b, tint.a, tint.r, tint.g, tint.b, tint.a, tint.r, tint.g, tint.b, tint.a, tint.r, tint.g, tint.b, tint.a,
+                tint.r, tint.g, tint.b, tint.a, tint.r, tint.g, tint.b, tint.a, tint.r, tint.g, tint.b, tint.a, tint.r, tint.g, tint.b, tint.a,
+                tint.r, tint.g, tint.b, tint.a, tint.r, tint.g, tint.b, tint.a, tint.r, tint.g, tint.b, tint.a, tint.r, tint.g, tint.b, tint.a,
+                tint.r, tint.g, tint.b, tint.a, tint.r, tint.g, tint.b, tint.a, tint.r, tint.g, tint.b, tint.a, tint.r, tint.g, tint.b, tint.a,
+            };
+            const D3D12_RESOURCE_DESC texture_desc = texture2d_desc(
+                4,
+                4,
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                1,
+                D3D12_RESOURCE_FLAG_NONE
+            );
+            const std::vector<TextureSubresourceData> subresources = {
+                {texture_bytes.data(), 4U * 4U},
+            };
+
+            texture = create_texture_resource(runtime, texture_desc, D3D12_RESOURCE_STATE_COPY_DEST);
+            const auto upload_buffer = create_texture_upload_buffer(runtime.device(), texture_desc, subresources);
+            copy_texture_upload(runtime.device(), runtime.command_list(), texture.get(), upload_buffer.get(), texture_desc, 1);
+            runtime.transition_resource(texture.get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+            srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv_desc.Texture2D.MipLevels = 1;
+            runtime.device()->CreateShaderResourceView(texture.get(), &srv_desc, descriptor_cpu_handle(descriptor_heap.get(), descriptor_size, 0));
+
+            runtime.bind_back_buffer();
+            runtime.clear_back_buffer(clear_color);
+
+            ID3D12DescriptorHeap *heaps[] = {descriptor_heap.get()};
+            runtime.command_list()->SetDescriptorHeaps(1, heaps);
+            runtime.command_list()->SetGraphicsRootSignature(program.root_signature.get());
+            runtime.command_list()->SetPipelineState(program.pipeline_state.get());
+            runtime.command_list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            runtime.command_list()->IASetVertexBuffers(0, 1, &vertex_buffer_view);
+            runtime.command_list()->SetGraphicsRootDescriptorTable(0, descriptor_gpu_handle(descriptor_heap.get(), descriptor_size, 0));
+            runtime.command_list()->DrawInstanced(6, 1, 0, 0);
+        },
+        [&]() {
+            return std::vector<PixelExpectation>{
+                {"lifecycle-center", sample_x(runtime, 0.50f), sample_y(runtime, 0.50f), rgba(0.18f, 0.92f, 0.36f), 18},
+                {"lifecycle-corner", sample_x(runtime, 0.10f), sample_y(runtime, 0.10f), rgba(0.18f, 0.92f, 0.36f), 18},
+            };
+        }
+    );
+}
+
+ValidationResult run_mesh_shader_smoke(Dx12Runtime &runtime, unsigned int frame_budget)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 options7{};
+    demo::check_hr(
+        runtime.device()->CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS7,
+            &options7,
+            sizeof(options7)
+        ),
+        "CheckFeatureSupport(MeshShaderTier) failed"
+    );
+    if (options7.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED) {
+        return ValidationResult::skip("mesh shaders are not supported by the current D3D12 device");
+    }
+
+    const auto device5 = query_interface<ID3D12Device5>(runtime.device(), "QueryInterface(ID3D12Device5) failed");
+    const auto command_list6 = query_interface<ID3D12GraphicsCommandList6>(runtime.command_list(), "QueryInterface(ID3D12GraphicsCommandList6) failed");
+
+    const char *source = mesh_shader_source();
+    demo::ComPtr<IDxcBlob> mesh_blob = demo::compile_shader_dxc(source, "ms_main", "ms_6_5");
+    if (!mesh_blob) {
+        return ValidationResult::skip("dxcompiler.dll is unavailable for mesh shader compilation");
+    }
+    demo::ComPtr<IDxcBlob> amplification_blob = demo::compile_shader_dxc(source, "as_main", "as_6_5");
+    if (!amplification_blob) {
+        return ValidationResult::skip("dxcompiler.dll is unavailable for mesh shader compilation");
+    }
+    demo::ComPtr<IDxcBlob> left_pixel_blob = demo::compile_shader_dxc(source, "ps_left_main", "ps_6_0");
+    if (!left_pixel_blob) {
+        return ValidationResult::skip("dxcompiler.dll is unavailable for mesh shader compilation");
+    }
+    demo::ComPtr<IDxcBlob> right_pixel_blob = demo::compile_shader_dxc(source, "ps_right_main", "ps_6_0");
+    if (!right_pixel_blob) {
+        return ValidationResult::skip("dxcompiler.dll is unavailable for mesh shader compilation");
+    }
+
+    demo::ComPtr<ID3D12RootSignature> root_signature = create_root_signature(
+        runtime,
+        nullptr,
+        0,
+        nullptr,
+        0,
+        D3D12_ROOT_SIGNATURE_FLAG_NONE
+    );
+
+    const D3D12_SHADER_BYTECODE amplification_shader = {amplification_blob->GetBufferPointer(), amplification_blob->GetBufferSize()};
+    const D3D12_SHADER_BYTECODE mesh_shader = {mesh_blob->GetBufferPointer(), mesh_blob->GetBufferSize()};
+    const D3D12_SHADER_BYTECODE left_pixel_shader = {left_pixel_blob->GetBufferPointer(), left_pixel_blob->GetBufferSize()};
+    const D3D12_SHADER_BYTECODE right_pixel_shader = {right_pixel_blob->GetBufferPointer(), right_pixel_blob->GetBufferSize()};
+
+    const MeshProgram left_program = create_mesh_program(
+        device5.get(),
+        root_signature.get(),
+        amplification_shader,
+        mesh_shader,
+        left_pixel_shader,
+        runtime.back_buffer_format()
+    );
+    const MeshProgram right_program = create_mesh_program(
+        device5.get(),
+        root_signature.get(),
+        amplification_shader,
+        mesh_shader,
+        right_pixel_shader,
+        runtime.back_buffer_format()
+    );
+
+    const float clear_color[4] = {0.04f, 0.05f, 0.07f, 1.0f};
+    const LONG half_width = std::max<LONG>(1L, static_cast<LONG>(runtime.width() / 2));
+    const D3D12_VIEWPORT left_viewport = {0.0f, 0.0f, static_cast<float>(half_width), static_cast<float>(runtime.height()), 0.0f, 1.0f};
+    const D3D12_VIEWPORT right_viewport = {
+        static_cast<float>(half_width),
+        0.0f,
+        static_cast<float>(runtime.width() - half_width),
+        static_cast<float>(runtime.height()),
+        0.0f,
+        1.0f
+    };
+    const D3D12_RECT left_scissor = {0, 0, half_width, runtime.height()};
+    const D3D12_RECT right_scissor = {half_width, 0, runtime.width(), runtime.height()};
+
+    return run_scene_frames(
+        runtime,
+        frame_budget,
+        [&](unsigned int, unsigned int) {
+            runtime.bind_back_buffer();
+            runtime.clear_back_buffer(clear_color);
+            command_list6->SetGraphicsRootSignature(root_signature.get());
+            command_list6->SetPipelineState(left_program.pipeline_state.get());
+            command_list6->RSSetViewports(1, &left_viewport);
+            command_list6->RSSetScissorRects(1, &left_scissor);
+            command_list6->DispatchMesh(1, 1, 1);
+            command_list6->SetPipelineState(right_program.pipeline_state.get());
+            command_list6->RSSetViewports(1, &right_viewport);
+            command_list6->RSSetScissorRects(1, &right_scissor);
+            command_list6->DispatchMesh(1, 1, 1);
+        },
+        [&]() {
+            return std::vector<PixelExpectation>{
+                {"mesh-left", sample_x(runtime, 0.25f), sample_y(runtime, 0.50f), rgba(0.90f, 0.35f, 0.16f), 24},
+                {"mesh-right", sample_x(runtime, 0.75f), sample_y(runtime, 0.50f), rgba(0.20f, 0.48f, 0.94f), 24},
+            };
+        }
+    );
+}
+
+ValidationResult run_dxr_smoke(Dx12Runtime &runtime, unsigned int frame_budget)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5{};
+    demo::check_hr(
+        runtime.device()->CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS5,
+            &options5,
+            sizeof(options5)
+        ),
+        "CheckFeatureSupport(RaytracingTier) failed"
+    );
+    if (options5.RaytracingTier == D3D12_RAYTRACING_TIER_NOT_SUPPORTED) {
+        return ValidationResult::skip("raytracing is not supported by the current D3D12 device");
+    }
+
+    const auto device5 = query_interface<ID3D12Device5>(runtime.device(), "QueryInterface(ID3D12Device5) failed");
+    const auto command_list4 = query_interface<ID3D12GraphicsCommandList4>(runtime.command_list(), "QueryInterface(ID3D12GraphicsCommandList4) failed");
+
+    const char *source = raytracing_shader_source();
+    demo::ComPtr<IDxcBlob> raygen_blob = demo::compile_shader_dxc(source, "raygen_main", "lib_6_3");
+    if (!raygen_blob) {
+        return ValidationResult::skip("dxcompiler.dll is unavailable for raytracing compilation");
+    }
+    demo::ComPtr<IDxcBlob> miss_blob = demo::compile_shader_dxc(source, "miss_main", "lib_6_3");
+    if (!miss_blob) {
+        return ValidationResult::skip("dxcompiler.dll is unavailable for raytracing compilation");
+    }
+    demo::ComPtr<IDxcBlob> closest_hit_blob = demo::compile_shader_dxc(source, "closesthit_main", "lib_6_3");
+    if (!closest_hit_blob) {
+        return ValidationResult::skip("dxcompiler.dll is unavailable for raytracing compilation");
+    }
+
+    D3D12_DESCRIPTOR_RANGE descriptor_ranges[2]{};
+    descriptor_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    descriptor_ranges[0].NumDescriptors = 1;
+    descriptor_ranges[0].BaseShaderRegister = 0;
+    descriptor_ranges[0].RegisterSpace = 0;
+    descriptor_ranges[0].OffsetInDescriptorsFromTableStart = 0;
+    descriptor_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    descriptor_ranges[1].NumDescriptors = 1;
+    descriptor_ranges[1].BaseShaderRegister = 0;
+    descriptor_ranges[1].RegisterSpace = 0;
+    descriptor_ranges[1].OffsetInDescriptorsFromTableStart = 1;
+
+    D3D12_ROOT_PARAMETER root_parameter{};
+    root_parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_parameter.DescriptorTable.NumDescriptorRanges = ARRAYSIZE(descriptor_ranges);
+    root_parameter.DescriptorTable.pDescriptorRanges = descriptor_ranges;
+    root_parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    demo::ComPtr<ID3D12RootSignature> global_root_signature = create_root_signature(
+        runtime,
+        &root_parameter,
+        1,
+        nullptr,
+        0,
+        D3D12_ROOT_SIGNATURE_FLAG_NONE
+    );
+
+    const auto descriptor_heap = create_descriptor_heap(
+        runtime.device(),
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        2,
+        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
+    );
+    const UINT descriptor_size = runtime.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    const RayTriangleVertex triangle_vertices[] = {
+        {{-0.70f, -0.70f, 2.0f}},
+        {{0.0f, 0.85f, 2.0f}},
+        {{0.70f, -0.70f, 2.0f}},
+    };
+    const auto vertex_buffer = create_upload_buffer<RayTriangleVertex>(runtime.device(), triangle_vertices, ARRAYSIZE(triangle_vertices));
+
+    D3D12_RAYTRACING_GEOMETRY_DESC geometry_desc{};
+    geometry_desc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+    geometry_desc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+    geometry_desc.Triangles.VertexBuffer.StartAddress = vertex_buffer->GetGPUVirtualAddress();
+    geometry_desc.Triangles.VertexBuffer.StrideInBytes = sizeof(RayTriangleVertex);
+    geometry_desc.Triangles.VertexCount = ARRAYSIZE(triangle_vertices);
+    geometry_desc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+    geometry_desc.Triangles.IndexFormat = DXGI_FORMAT_UNKNOWN;
+    geometry_desc.Triangles.IndexCount = 0;
+    geometry_desc.Triangles.Transform3x4 = 0;
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS blas_inputs{};
+    blas_inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    blas_inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
+                        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+    blas_inputs.NumDescs = 1;
+    blas_inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    blas_inputs.pGeometryDescs = &geometry_desc;
+
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO blas_prebuild{};
+    device5->GetRaytracingAccelerationStructurePrebuildInfo(&blas_inputs, &blas_prebuild);
+    const UINT64 blas_result_size = align_to(blas_prebuild.ResultDataMaxSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+    const UINT64 blas_scratch_size = align_to(blas_prebuild.ScratchDataSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+    const auto blas_result = create_default_buffer(
+        runtime.device(),
+        blas_result_size,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE
+    );
+    const auto blas_scratch = create_default_buffer(
+        runtime.device(),
+        blas_scratch_size,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    );
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlas_inputs{};
+    tlas_inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+    tlas_inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
+                        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+    tlas_inputs.NumDescs = 1;
+    tlas_inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO tlas_prebuild{};
+    device5->GetRaytracingAccelerationStructurePrebuildInfo(&tlas_inputs, &tlas_prebuild);
+    const UINT64 tlas_result_size = align_to(tlas_prebuild.ResultDataMaxSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+    const UINT64 tlas_scratch_size = align_to(tlas_prebuild.ScratchDataSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+    const auto tlas_result = create_default_buffer(
+        runtime.device(),
+        tlas_result_size,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE
+    );
+    const auto tlas_scratch = create_default_buffer(
+        runtime.device(),
+        tlas_scratch_size,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    );
+
+    D3D12_RAYTRACING_INSTANCE_DESC instance_desc{};
+    instance_desc.Transform[0][0] = 1.0f;
+    instance_desc.Transform[1][1] = 1.0f;
+    instance_desc.Transform[2][2] = 1.0f;
+    instance_desc.InstanceID = 0;
+    instance_desc.InstanceContributionToHitGroupIndex = 0;
+    instance_desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
+    instance_desc.AccelerationStructure = blas_result->GetGPUVirtualAddress();
+    instance_desc.InstanceMask = 0xFF;
+    const auto instance_buffer = create_upload_buffer<D3D12_RAYTRACING_INSTANCE_DESC>(runtime.device(), &instance_desc, 1);
+
+    const D3D12_SHADER_BYTECODE raygen_shader = {raygen_blob->GetBufferPointer(), raygen_blob->GetBufferSize()};
+    const D3D12_SHADER_BYTECODE miss_shader = {miss_blob->GetBufferPointer(), miss_blob->GetBufferSize()};
+    const D3D12_SHADER_BYTECODE closest_hit_shader = {closest_hit_blob->GetBufferPointer(), closest_hit_blob->GetBufferSize()};
+
+    D3D12_EXPORT_DESC raygen_export{};
+    raygen_export.Name = L"raygen_main";
+    D3D12_DXIL_LIBRARY_DESC raygen_library_desc{};
+    raygen_library_desc.DXILLibrary = raygen_shader;
+    raygen_library_desc.NumExports = 1;
+    raygen_library_desc.pExports = &raygen_export;
+
+    D3D12_EXPORT_DESC miss_export{};
+    miss_export.Name = L"miss_main";
+    D3D12_DXIL_LIBRARY_DESC miss_library_desc{};
+    miss_library_desc.DXILLibrary = miss_shader;
+    miss_library_desc.NumExports = 1;
+    miss_library_desc.pExports = &miss_export;
+
+    D3D12_EXPORT_DESC closest_hit_export{};
+    closest_hit_export.Name = L"closesthit_main";
+    D3D12_DXIL_LIBRARY_DESC closest_hit_library_desc{};
+    closest_hit_library_desc.DXILLibrary = closest_hit_shader;
+    closest_hit_library_desc.NumExports = 1;
+    closest_hit_library_desc.pExports = &closest_hit_export;
+
+    D3D12_HIT_GROUP_DESC hit_group_desc{};
+    hit_group_desc.HitGroupExport = L"HitGroup";
+    hit_group_desc.ClosestHitShaderImport = L"closesthit_main";
+
+    D3D12_RAYTRACING_SHADER_CONFIG shader_config_desc{};
+    shader_config_desc.MaxPayloadSizeInBytes = sizeof(float) * 4U;
+    shader_config_desc.MaxAttributeSizeInBytes = sizeof(float) * 2U;
+
+    D3D12_RAYTRACING_PIPELINE_CONFIG pipeline_config_desc{};
+    pipeline_config_desc.MaxTraceRecursionDepth = 1;
+
+    D3D12_STATE_SUBOBJECT global_root_signature_subobject{};
+    global_root_signature_subobject.Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
+    global_root_signature_subobject.pDesc = &global_root_signature;
+
+    D3D12_STATE_SUBOBJECT raygen_library_subobject{};
+    raygen_library_subobject.Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
+    raygen_library_subobject.pDesc = &raygen_library_desc;
+
+    D3D12_STATE_SUBOBJECT miss_library_subobject{};
+    miss_library_subobject.Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
+    miss_library_subobject.pDesc = &miss_library_desc;
+
+    D3D12_STATE_SUBOBJECT closest_hit_library_subobject{};
+    closest_hit_library_subobject.Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
+    closest_hit_library_subobject.pDesc = &closest_hit_library_desc;
+
+    D3D12_STATE_SUBOBJECT hit_group_subobject{};
+    hit_group_subobject.Type = D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP;
+    hit_group_subobject.pDesc = &hit_group_desc;
+
+    D3D12_STATE_SUBOBJECT shader_config_subobject{};
+    shader_config_subobject.Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG;
+    shader_config_subobject.pDesc = &shader_config_desc;
+
+    const wchar_t *shader_config_exports[] = {L"raygen_main", L"miss_main", L"HitGroup"};
+    D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION shader_config_association_desc{};
+    shader_config_association_desc.pSubobjectToAssociate = &shader_config_subobject;
+    shader_config_association_desc.NumExports = ARRAYSIZE(shader_config_exports);
+    shader_config_association_desc.pExports = shader_config_exports;
+    D3D12_STATE_SUBOBJECT shader_config_association_subobject{};
+    shader_config_association_subobject.Type = D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION;
+    shader_config_association_subobject.pDesc = &shader_config_association_desc;
+
+    D3D12_STATE_SUBOBJECT pipeline_config_subobject{};
+    pipeline_config_subobject.Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG;
+    pipeline_config_subobject.pDesc = &pipeline_config_desc;
+
+    const std::array<D3D12_STATE_SUBOBJECT, 8> state_subobjects = {
+        raygen_library_subobject,
+        miss_library_subobject,
+        closest_hit_library_subobject,
+        hit_group_subobject,
+        shader_config_subobject,
+        shader_config_association_subobject,
+        global_root_signature_subobject,
+        pipeline_config_subobject,
+    };
+
+    D3D12_STATE_OBJECT_DESC state_object_desc{};
+    state_object_desc.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
+    state_object_desc.NumSubobjects = static_cast<UINT>(state_subobjects.size());
+    state_object_desc.pSubobjects = state_subobjects.data();
+
+    demo::ComPtr<ID3D12StateObject> state_object;
+    demo::check_hr(
+        device5->CreateStateObject(&state_object_desc, IID_PPV_ARGS(state_object.put())),
+        "CreateStateObject(raytracing) failed"
+    );
+    const auto state_object_properties = query_interface<ID3D12StateObjectProperties>(state_object.get(), "QueryInterface(ID3D12StateObjectProperties) failed");
+
+    const UINT shader_record_size = align_to(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES, D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT);
+    auto shader_table_record = [&](const wchar_t *export_name) {
+        const void *identifier = state_object_properties->GetShaderIdentifier(export_name);
+        if (!identifier) {
+            demo::fail("GetShaderIdentifier failed");
+        }
+        auto record = create_upload_buffer<std::uint8_t>(runtime.device(), nullptr, shader_record_size);
+        void *mapped = nullptr;
+        D3D12_RANGE read_range{0, 0};
+        demo::check_hr(record->Map(0, &read_range, &mapped), "Map(shader table record) failed");
+        std::memcpy(mapped, identifier, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+        D3D12_RANGE written_range{0, static_cast<SIZE_T>(shader_record_size)};
+        record->Unmap(0, &written_range);
+        return record;
+    };
+
+    const auto raygen_table = shader_table_record(L"raygen_main");
+    const auto miss_table = shader_table_record(L"miss_main");
+    const auto hit_group_table = shader_table_record(L"HitGroup");
+
+    const auto output_texture = create_texture_resource(
+        runtime,
+        texture2d_desc(
+            static_cast<UINT>(runtime.width()),
+            static_cast<UINT>(runtime.height()),
+            runtime.back_buffer_format(),
+            1,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+        ),
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    );
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+    uav_desc.Format = runtime.back_buffer_format();
+    uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    runtime.device()->CreateUnorderedAccessView(
+        output_texture.get(),
+        nullptr,
+        &uav_desc,
+        descriptor_cpu_handle(descriptor_heap.get(), descriptor_size, 0)
+    );
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Format = DXGI_FORMAT_UNKNOWN;
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+    srv_desc.RaytracingAccelerationStructure.Location = tlas_result->GetGPUVirtualAddress();
+    runtime.device()->CreateShaderResourceView(
+        tlas_result.get(),
+        &srv_desc,
+        descriptor_cpu_handle(descriptor_heap.get(), descriptor_size, 1)
+    );
+
+    auto build_acceleration_structures = [&]() {
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC blas_build_desc{};
+        blas_build_desc.Inputs = blas_inputs;
+        blas_build_desc.DestAccelerationStructureData = blas_result->GetGPUVirtualAddress();
+        blas_build_desc.ScratchAccelerationStructureData = blas_scratch->GetGPUVirtualAddress();
+        command_list4->BuildRaytracingAccelerationStructure(&blas_build_desc, 0, nullptr);
+        uav_barrier(command_list4.get(), blas_result.get());
+
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC tlas_build_desc{};
+        tlas_build_desc.Inputs = tlas_inputs;
+        tlas_build_desc.Inputs.InstanceDescs = instance_buffer->GetGPUVirtualAddress();
+        tlas_build_desc.DestAccelerationStructureData = tlas_result->GetGPUVirtualAddress();
+        tlas_build_desc.ScratchAccelerationStructureData = tlas_scratch->GetGPUVirtualAddress();
+        command_list4->BuildRaytracingAccelerationStructure(&tlas_build_desc, 0, nullptr);
+        uav_barrier(command_list4.get(), tlas_result.get());
+
+        blas_build_desc.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+        blas_build_desc.SourceAccelerationStructureData = blas_result->GetGPUVirtualAddress();
+        command_list4->BuildRaytracingAccelerationStructure(&blas_build_desc, 0, nullptr);
+        uav_barrier(command_list4.get(), blas_result.get());
+
+        tlas_build_desc.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+        tlas_build_desc.SourceAccelerationStructureData = tlas_result->GetGPUVirtualAddress();
+        command_list4->BuildRaytracingAccelerationStructure(&tlas_build_desc, 0, nullptr);
+        uav_barrier(command_list4.get(), tlas_result.get());
+    };
+
+    return run_scene_frames(
+        runtime,
+        frame_budget,
+        [&](unsigned int frame, unsigned int) {
+            if (frame > 0) {
+                runtime.transition_resource(output_texture.get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
+            build_acceleration_structures();
+
+            ID3D12DescriptorHeap *heaps[] = {descriptor_heap.get()};
+            command_list4->SetDescriptorHeaps(1, heaps);
+            command_list4->SetComputeRootSignature(global_root_signature.get());
+            command_list4->SetComputeRootDescriptorTable(0, descriptor_gpu_handle(descriptor_heap.get(), descriptor_size, 0));
+            command_list4->SetPipelineState1(state_object.get());
+
+            D3D12_DISPATCH_RAYS_DESC dispatch_desc{};
+            dispatch_desc.RayGenerationShaderRecord.StartAddress = raygen_table->GetGPUVirtualAddress();
+            dispatch_desc.RayGenerationShaderRecord.SizeInBytes = shader_record_size;
+            dispatch_desc.MissShaderTable.StartAddress = miss_table->GetGPUVirtualAddress();
+            dispatch_desc.MissShaderTable.SizeInBytes = shader_record_size;
+            dispatch_desc.MissShaderTable.StrideInBytes = shader_record_size;
+            dispatch_desc.HitGroupTable.StartAddress = hit_group_table->GetGPUVirtualAddress();
+            dispatch_desc.HitGroupTable.SizeInBytes = shader_record_size;
+            dispatch_desc.HitGroupTable.StrideInBytes = shader_record_size;
+            dispatch_desc.Width = static_cast<UINT>(runtime.width());
+            dispatch_desc.Height = static_cast<UINT>(runtime.height());
+            dispatch_desc.Depth = 1;
+            command_list4->DispatchRays(&dispatch_desc);
+
+            uav_barrier(command_list4.get(), output_texture.get());
+            runtime.transition_resource(output_texture.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            runtime.transition_resource(runtime.back_buffer(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+            command_list4->CopyResource(runtime.back_buffer(), output_texture.get());
+            runtime.transition_resource(runtime.back_buffer(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        },
+        [&]() {
+            return std::vector<PixelExpectation>{
+                {"dxr-hit", sample_x(runtime, 0.50f), sample_y(runtime, 0.50f), rgba(0.93f, 0.34f, 0.16f), 22},
+                {"dxr-miss", sample_x(runtime, 0.10f), sample_y(runtime, 0.10f), rgba(0.08f, 0.16f, 0.36f), 22},
+            };
+        }
+    );
+}
+
 const std::vector<SceneDefinition> kScenes = {
     {
         require_scene_matrix_entry("smoke_triangle").name,
@@ -2021,6 +3573,48 @@ const std::vector<SceneDefinition> kScenes = {
         require_scene_matrix_entry("msaa_resolve").tier,
         true,
         &run_msaa_resolve,
+    },
+    {
+        require_scene_matrix_entry("barrier_state_transitions").name,
+        require_scene_matrix_entry("barrier_state_transitions").tier,
+        true,
+        &run_barrier_state_transitions,
+    },
+    {
+        require_scene_matrix_entry("descriptor_root_signature_rebind").name,
+        require_scene_matrix_entry("descriptor_root_signature_rebind").tier,
+        true,
+        &run_descriptor_root_signature_rebind,
+    },
+    {
+        require_scene_matrix_entry("indirect_draw").name,
+        require_scene_matrix_entry("indirect_draw").tier,
+        true,
+        &run_indirect_draw,
+    },
+    {
+        require_scene_matrix_entry("compute_uav_writeback").name,
+        require_scene_matrix_entry("compute_uav_writeback").tier,
+        true,
+        &run_compute_uav_writeback,
+    },
+    {
+        require_scene_matrix_entry("resource_lifecycle").name,
+        require_scene_matrix_entry("resource_lifecycle").tier,
+        true,
+        &run_resource_lifecycle,
+    },
+    {
+        require_scene_matrix_entry("dxr_smoke").name,
+        require_scene_matrix_entry("dxr_smoke").tier,
+        true,
+        &run_dxr_smoke,
+    },
+    {
+        require_scene_matrix_entry("mesh_shader_smoke").name,
+        require_scene_matrix_entry("mesh_shader_smoke").tier,
+        true,
+        &run_mesh_shader_smoke,
     },
 };
 

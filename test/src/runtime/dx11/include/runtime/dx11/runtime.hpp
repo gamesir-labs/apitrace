@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace demo::runtime::dx11 {
@@ -28,7 +29,23 @@ struct PixelExpectation {
 
 struct ValidationResult {
     bool passed = true;
+    bool skipped = false;
     std::string reason;
+
+    ValidationResult() = default;
+    ValidationResult(bool passed, std::string reason)
+        : passed(passed), reason(std::move(reason))
+    {
+    }
+
+    static ValidationResult skip(std::string reason)
+    {
+        ValidationResult result;
+        result.passed = false;
+        result.skipped = true;
+        result.reason = std::move(reason);
+        return result;
+    }
 };
 
 class Dx11Runtime {
