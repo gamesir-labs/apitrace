@@ -145,18 +145,19 @@ scripts/validate-d3d11-wine.sh
 
 它会：
 
-- 构建 apitrace 的 Windows `d3d11.dll`
 - 构建 `apitrace_test_demo.exe`
-- 把 proxy DLL 和 DXMT 运行时放到同一目录
-- 在 Wine 下启动 `--dx dx11 --scene smoke_triangle`
-- 校验 trace bundle 内的 `callstream.jsonl` / `checksums.json` / `objects.json` / `pipelines/`
-- 校验 shader / buffer 资产引用存在且非空
+- 把 D3DMetal 的 `d3d11.dll` / `d3d12.dll` / `dxgi.dll` 和 Wine 的 `d3d12core.dll` / `d3dcompiler_47.dll` 放到同一目录
+- 在 Wine 下逐个启动 `dx11` scene matrix 中的已实现场景
+- 校验每个 scene 的运行日志包含 `scene pass: <name>` 和 `summary: ... failed=0`
+- 依赖 demo 内部的像素断言和 API 断言确认 D3D11 场景语义
 
-在 macOS 桌面环境下，脚本默认还会：
+显式设置 `APITRACE_VISUAL_CHECK=1` 时，脚本还会：
 
 - 用 Wine 虚拟桌面承载 demo，避免前台窗口被其他应用遮挡
-- 生成 `test/artifacts/windows-x86_64/demo/bin/triangle-d3d11-visual.png`
+- 为每个 scene 生成 `test/artifacts/windows-x86_64/demo/bin/dx11-core-scene-logs/<scene>-visual.png`
 - 对截图做最小像素检查，确认窗口里出现了彩色三角形，而不是纯黑或空白窗口
+
+当前 D3D11 Wine smoke 脚本只验证 demo 自身，不在 D3DMetal 后端下强制捕获 trace bundle。D3D11 capture / retrace fixture 刷新仍应使用专门的 capture / retrace 路径，避免把转译层 hook 限制误判成 scene matrix 回归。
 
 ## retrace fixture
 
@@ -176,6 +177,6 @@ scripts/validate-d3d11-wine.sh
 
 刷新 fixture 时：
 
-- 先重新跑 `scripts/validate-d3d11-wine.sh`，把 `test/artifacts/windows-x86_64/demo/bin/dx11-core-scene-traces/` 下对应 scene 的 bundle 同步到 fixture 目录。
+- 先用专门的 D3D11 capture 验证路径生成对应 scene 的 bundle，再同步到 fixture 目录；`scripts/validate-d3d11-wine.sh` 只负责 D3DMetal 下的 demo scene smoke。
 - 如果需要刷新 retrace visual reference，再显式执行 `APITRACE_VISUAL_CHECK=1 APITRACE_ACCEPT_VISUAL_SNAPSHOT=1 scripts/validate-d3d11-retrace-wine.sh`，把 `test/artifacts/windows-x86_64/retrace/bin/retrace-d3d11-logs/` 下对应 scene 的 `*-visual.png` 同步到 fixture 目录。
 - `scripts/validate-d3d11-retrace-wine.sh` 默认只校验 replay 统计、bundle 资产引用和运行成功；visual compare 作为显式 opt-in，避免 macOS 上 Wine 窗口截图抖动把常规回归跑挂。
