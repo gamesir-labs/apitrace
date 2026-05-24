@@ -31,7 +31,7 @@ else
     VISUAL_CHECK=0
 fi
 
-SCENES="smoke_triangle indexed_instancing textured_quad depth_blend_scissor offscreen_copy_composite"
+SCENES="${APITRACE_D3D11_SCENES:-smoke_triangle indexed_instancing textured_quad depth_blend_scissor offscreen_copy_composite mip_sampling msaa_resolve}"
 
 wine_path() {
     printf 'Z:%s' "$(printf '%s' "$1" | sed 's|/|\\\\|g')"
@@ -402,6 +402,27 @@ scene_required_functions = {
         "ID3D11DeviceContext::PSSetSamplers",
         "IDXGISwapChain::Present",
     ],
+    "mip_sampling": [
+        "D3D11CreateDeviceAndSwapChain",
+        "ID3D11Device::CreateTexture2D",
+        "ID3D11DeviceContext::UpdateSubresource",
+        "ID3D11Device::CreateShaderResourceView",
+        "ID3D11Device::CreateSamplerState",
+        "ID3D11DeviceContext::PSSetShaderResources",
+        "ID3D11DeviceContext::PSSetSamplers",
+        "IDXGISwapChain::Present",
+    ],
+    "msaa_resolve": [
+        "D3D11CreateDeviceAndSwapChain",
+        "ID3D11Device::CreateTexture2D",
+        "ID3D11Device::CreateRenderTargetView",
+        "ID3D11Device::CreateShaderResourceView",
+        "ID3D11Device::CreateSamplerState",
+        "ID3D11DeviceContext::ResolveSubresource",
+        "ID3D11DeviceContext::PSSetShaderResources",
+        "ID3D11DeviceContext::PSSetSamplers",
+        "IDXGISwapChain::Present",
+    ],
 }
 
 required_functions = scene_required_functions.get(scene_name)
@@ -411,6 +432,46 @@ if required_functions is None:
 missing = [name for name in required_functions if name not in seen_functions]
 if missing:
     raise SystemExit(f"{scene_name}: missing required call records: {missing}")
+
+if scene_name == "mip_sampling":
+    texture_creates = [
+        record for record in records
+        if record.get("record_kind") == "call" and record.get("function") == "ID3D11Device::CreateTexture2D"
+    ]
+    if not any(
+        isinstance(record.get("payload"), dict)
+        and isinstance(record["payload"].get("desc"), dict)
+        and record["payload"]["desc"].get("mip_levels", 0) > 1
+        for record in texture_creates
+    ):
+        raise SystemExit("mip_sampling: expected a texture with mip_levels > 1")
+
+    shader_resource_views = [
+        record for record in records
+        if record.get("record_kind") == "call" and record.get("function") == "ID3D11Device::CreateShaderResourceView"
+    ]
+    if not any(
+        isinstance(record.get("payload"), dict)
+        and isinstance(record["payload"].get("desc"), dict)
+        and isinstance(record["payload"]["desc"].get("texture2d"), dict)
+        and record["payload"]["desc"]["texture2d"].get("mip_levels", 0) == 1
+        and record["payload"]["desc"]["texture2d"].get("most_detailed_mip", 0) > 0
+        for record in shader_resource_views
+    ):
+        raise SystemExit("mip_sampling: expected a mip-slice shader resource view")
+
+if scene_name == "msaa_resolve":
+    texture_creates = [
+        record for record in records
+        if record.get("record_kind") == "call" and record.get("function") == "ID3D11Device::CreateTexture2D"
+    ]
+    if not any(
+        isinstance(record.get("payload"), dict)
+        and isinstance(record["payload"].get("desc"), dict)
+        and record["payload"]["desc"].get("sample_count", 1) > 1
+        for record in texture_creates
+    ):
+        raise SystemExit("msaa_resolve: expected an MSAA texture with sample_count > 1")
 
 def first_call(function_name: str):
     for record in records:

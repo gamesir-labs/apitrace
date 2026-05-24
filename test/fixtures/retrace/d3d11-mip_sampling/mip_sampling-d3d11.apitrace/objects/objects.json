@@ -1,0 +1,88 @@
+{
+  "objects": [
+    {
+      "object_id": 1001,
+      "object_kind": "Device",
+      "parent_object_id": 0,
+      "debug_name": "ID3D11Device"
+    },
+    {
+      "object_id": 1002,
+      "object_kind": "Context",
+      "parent_object_id": 1001,
+      "debug_name": "ID3D11DeviceContext"
+    },
+    {
+      "object_id": 1003,
+      "object_kind": "SwapChain",
+      "parent_object_id": 1001,
+      "debug_name": "IDXGISwapChain"
+    },
+    {
+      "object_id": 1004,
+      "object_kind": "Resource",
+      "parent_object_id": 1003,
+      "debug_name": "IDXGISwapChain::Buffer"
+    },
+    {
+      "object_id": 1005,
+      "object_kind": "View",
+      "parent_object_id": 1004,
+      "debug_name": "ID3D11RenderTargetView"
+    },
+    {
+      "object_id": 1006,
+      "object_kind": "Shader",
+      "parent_object_id": 1001,
+      "debug_name": "ID3D11VertexShader"
+    },
+    {
+      "object_id": 1007,
+      "object_kind": "Shader",
+      "parent_object_id": 1001,
+      "debug_name": "ID3D11PixelShader"
+    },
+    {
+      "object_id": 1008,
+      "object_kind": "PipelineState",
+      "parent_object_id": 1001,
+      "debug_name": "ID3D11InputLayout"
+    },
+    {
+      "object_id": 1009,
+      "object_kind": "Resource",
+      "parent_object_id": 1001,
+      "debug_name": "ID3D11Buffer"
+    },
+    {
+      "object_id": 1010,
+      "object_kind": "Resource",
+      "parent_object_id": 1001,
+      "debug_name": "ID3D11Texture2D"
+    },
+    {
+      "object_id": 1011,
+      "object_kind": "View",
+      "parent_object_id": 1010,
+      "debug_name": "ID3D11ShaderResourceView"
+    },
+    {
+      "object_id": 1012,
+      "object_kind": "View",
+      "parent_object_id": 1010,
+      "debug_name": "ID3D11ShaderResourceView"
+    },
+    {
+      "object_id": 1013,
+      "object_kind": "PipelineState",
+      "parent_object_id": 1001,
+      "debug_name": "ID3D11SamplerState"
+    },
+    {
+      "object_id": 1014,
+      "object_kind": "Resource",
+      "parent_object_id": 1001,
+      "debug_name": "ID3D11Texture2D"
+    }
+  ]
+}

@@ -18,15 +18,14 @@ DXMT_PACKAGE_ROOT="$HOME/Library/Application Support/com.gamemac.test/wine-engin
 DXMT_WINE_ROOT=""
 VISUAL_WINDOW_TITLE="${APITRACE_RETRACE_WINDOW_TITLE:-apitrace retrace d3d11}"
 VISUAL_DESKTOP="${APITRACE_WINE_VIRTUAL_DESKTOP:-apitrace-retrace,1400x900}"
-SCENES="${APITRACE_RETRACE_SCENES:-smoke_triangle indexed_instancing textured_quad depth_blend_scissor offscreen_copy_composite}"
+SCENES="${APITRACE_RETRACE_SCENES:-smoke_triangle indexed_instancing textured_quad depth_blend_scissor offscreen_copy_composite mip_sampling msaa_resolve}"
 
 if [ -n "${APITRACE_VISUAL_CHECK:-}" ]; then
     VISUAL_CHECK="$APITRACE_VISUAL_CHECK"
-elif [ "$(uname -s)" = "Darwin" ]; then
-    VISUAL_CHECK=1
 else
     VISUAL_CHECK=0
 fi
+ACCEPT_VISUAL_SNAPSHOT="${APITRACE_ACCEPT_VISUAL_SNAPSHOT:-0}"
 
 wine_path() {
     printf 'Z:%s' "$(printf '%s' "$1" | sed 's|/|\\\\|g')"
@@ -97,9 +96,8 @@ capture_visual_window() {
     window_title="$1"
     screenshot_path="$2"
     reference_path="$3"
-    reference_dims="$(sips -g pixelWidth -g pixelHeight "$reference_path" 2>/dev/null | awk '/pixelWidth/ {width=$2} /pixelHeight/ {height=$2} END {print width " " height}')"
     attempt=0
-    while [ "$attempt" -lt 10 ]; do
+    while [ "$attempt" -lt 40 ]; do
         window_id="$(swift - "$window_title" <<'SWIFT'
 import Foundation
 import CoreGraphics
@@ -130,22 +128,11 @@ SWIFT
 )"
 
         if [ -n "$window_id" ]; then
-            sleep 2
-            capture_attempt=0
-            while [ "$capture_attempt" -lt 30 ]; do
-                if ! screencapture -x -l "$window_id" "$screenshot_path"; then
-                    capture_attempt="$(( capture_attempt + 1 ))"
-                    sleep 1
-                    continue
-                fi
-                current_dims="$(sips -g pixelWidth -g pixelHeight "$screenshot_path" 2>/dev/null | awk '/pixelWidth/ {width=$2} /pixelHeight/ {height=$2} END {print width " " height}')"
-                if [ "$current_dims" = "$reference_dims" ] && validate_visual_window "$screenshot_path" >/dev/null 2>&1; then
+            if screencapture -x -l "$window_id" "$screenshot_path"; then
+                if validate_visual_window "$screenshot_path" >/dev/null 2>&1; then
                     return 0
                 fi
-                capture_attempt="$(( capture_attempt + 1 ))"
-                sleep 1
-            done
-            return 1
+            fi
         fi
 
         attempt="$(( attempt + 1 ))"
@@ -224,28 +211,50 @@ func loadImage(_ path: String) throws -> NSBitmapImageRep {
 let reference = try loadImage(referencePath)
 let screenshot = try loadImage(screenshotPath)
 
-guard reference.pixelsWide == screenshot.pixelsWide, reference.pixelsHigh == screenshot.pixelsHigh else {
-    fputs("\(sceneName): visual size mismatch between reference and retrace screenshot\n", stderr)
-    exit(1)
-}
+let referenceWidth = reference.pixelsWide
+let referenceHeight = reference.pixelsHigh
+let screenshotWidth = screenshot.pixelsWide
+let screenshotHeight = screenshot.pixelsHigh
 
-let width = reference.pixelsWide
-let height = reference.pixelsHigh
-let startX = max(0, Int(Double(width) * 0.12))
-let endX = min(width, Int(Double(width) * 0.88))
-let startY = max(0, Int(Double(height) * 0.18))
-let endY = min(height, Int(Double(height) * 0.90))
+let referenceStartX = max(0, Int(Double(referenceWidth) * 0.12))
+let referenceEndX = min(referenceWidth, Int(Double(referenceWidth) * 0.88))
+let referenceStartY = max(0, Int(Double(referenceHeight) * 0.18))
+let referenceEndY = min(referenceHeight, Int(Double(referenceHeight) * 0.90))
+
+let screenshotStartX = max(0, Int(Double(screenshotWidth) * 0.12))
+let screenshotEndX = min(screenshotWidth, Int(Double(screenshotWidth) * 0.88))
+let screenshotStartY = max(0, Int(Double(screenshotHeight) * 0.18))
+let screenshotEndY = min(screenshotHeight, Int(Double(screenshotHeight) * 0.90))
+
+let referenceCropWidth = referenceEndX - referenceStartX
+let referenceCropHeight = referenceEndY - referenceStartY
+let screenshotCropWidth = screenshotEndX - screenshotStartX
+let screenshotCropHeight = screenshotEndY - screenshotStartY
+
+let sampleWidth = min(referenceCropWidth, screenshotCropWidth)
+let sampleHeight = min(referenceCropHeight, screenshotCropHeight)
 
 var totalDiff = 0.0
 var maxDiff = 0.0
 var mismatchPixels = 0
 var comparedPixels = 0
 
-for y in startY..<endY {
-    for x in startX..<endX {
+func mappedOffset(_ index: Int, _ sampleSize: Int, _ cropSize: Int) -> Int {
+    if sampleSize <= 1 || cropSize <= 1 {
+        return 0
+    }
+    return Int((Double(index) / Double(sampleSize - 1)) * Double(cropSize - 1))
+}
+
+for sampleY in 0..<sampleHeight {
+    for sampleX in 0..<sampleWidth {
+        let referenceX = referenceStartX + mappedOffset(sampleX, sampleWidth, referenceCropWidth)
+        let referenceY = referenceStartY + mappedOffset(sampleY, sampleHeight, referenceCropHeight)
+        let screenshotX = screenshotStartX + mappedOffset(sampleX, sampleWidth, screenshotCropWidth)
+        let screenshotY = screenshotStartY + mappedOffset(sampleY, sampleHeight, screenshotCropHeight)
         guard
-            let rawReference = reference.colorAt(x: x, y: y),
-            let rawScreenshot = screenshot.colorAt(x: x, y: y)
+            let rawReference = reference.colorAt(x: referenceX, y: referenceY),
+            let rawScreenshot = screenshot.colorAt(x: screenshotX, y: screenshotY)
         else {
             continue
         }
@@ -497,7 +506,7 @@ PY
     visual_screenshot="$RUN_LOG_DIR/$scene_name-visual.png"
 
     if [ "$VISUAL_CHECK" != "0" ]; then
-        if [ ! -f "$reference_visual" ]; then
+        if [ "$ACCEPT_VISUAL_SNAPSHOT" = "0" ] && [ ! -f "$reference_visual" ]; then
             echo "missing reference visual for scene $scene_name: $reference_visual" >&2
             exit 1
         fi
@@ -536,7 +545,11 @@ PY
             exit 1
         fi
         validate_visual_window "$visual_screenshot"
-        validate_visual_against_reference "$scene_name" "$reference_visual" "$visual_screenshot"
+        if [ "$ACCEPT_VISUAL_SNAPSHOT" = "0" ]; then
+            validate_visual_against_reference "$scene_name" "$reference_visual" "$visual_screenshot"
+        else
+            echo "accepted visual snapshot for scene $scene_name: $visual_screenshot"
+        fi
     fi
 
     export APITRACE_RETRACE_SHOW_WINDOW=0

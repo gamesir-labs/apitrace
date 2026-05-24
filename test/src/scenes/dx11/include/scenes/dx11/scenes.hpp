@@ -1,16 +1,14 @@
 #pragma once
 
 #include "runtime/dx11/runtime.hpp"
+#include "scenes/shared/scene_matrix.hpp"
 
 #include <string_view>
 #include <vector>
 
 namespace demo::scenes::dx11 {
 
-enum class SceneTier {
-    core,
-    extended,
-};
+using SceneTier = demo::scenes::shared::SceneTier;
 
 struct SceneDefinition {
     const char *name;

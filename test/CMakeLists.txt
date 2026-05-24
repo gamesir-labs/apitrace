@@ -21,6 +21,8 @@ set(APITRACE_TEST_DEMO_SOURCES
     src/scenes/dx11/src/scenes.cpp
     src/scenes/dx12/include/scenes/dx12/scenes.hpp
     src/scenes/dx12/src/scenes.cpp
+    src/scenes/shared/include/scenes/shared/scene_matrix.hpp
+    src/scenes/shared/src/scene_matrix.cpp
 )
 
 if(APITRACE_BUILD_TEST_DEMO)
@@ -34,10 +36,13 @@ if(APITRACE_BUILD_TEST_DEMO)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/dx12/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/scenes/dx11/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/scenes/dx12/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/scenes/shared/include
     )
     target_link_libraries(apitrace_test_demo PRIVATE
+        d3d12
         d3d11
         dxgi
+        dxguid
         user32
         gdi32
         ole32
