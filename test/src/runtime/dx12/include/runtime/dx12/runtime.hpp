@@ -64,7 +64,9 @@ public:
     int height() const noexcept { return height_; }
     ID3D12Device *device() const noexcept { return device_.get(); }
     ID3D12CommandQueue *queue() const noexcept { return queue_.get(); }
+    ID3D12CommandAllocator *command_allocator() const noexcept { return command_allocator_.get(); }
     ID3D12GraphicsCommandList *command_list() const noexcept { return command_list_.get(); }
+    ID3D12Fence *fence() const noexcept { return fence_.get(); }
     IDXGISwapChain3 *swap_chain() const noexcept { return swap_chain_.get(); }
     ID3D12Resource *back_buffer() const noexcept { return back_buffers_[frame_index_].get(); }
     D3D12_CPU_DESCRIPTOR_HANDLE current_back_buffer_rtv() const;

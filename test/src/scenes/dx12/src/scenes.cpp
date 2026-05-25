@@ -41,6 +41,90 @@ bool using_d3dmetal_backend()
     return backend && std::strcmp(backend, "d3dmetal") == 0;
 }
 
+bool use_capture_bridge()
+{
+    const char *value = std::getenv("APITRACE_D3D12_CAPTURE_BRIDGE");
+    if (!value || !*value) {
+        return false;
+    }
+    return std::strcmp(value, "1") == 0 ||
+        std::strcmp(value, "true") == 0 ||
+        std::strcmp(value, "TRUE") == 0;
+}
+
+using RecordGraphicsPipelineFn = void (WINAPI *)(
+    ID3D12Device *,
+    ID3D12PipelineState *,
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC *
+);
+using RecordComputePipelineFn = void (WINAPI *)(
+    ID3D12Device *,
+    ID3D12PipelineState *,
+    const D3D12_COMPUTE_PIPELINE_STATE_DESC *
+);
+using RecordDescriptorHeapFn = void (WINAPI *)(ID3D12Device *, ID3D12DescriptorHeap *, const D3D12_DESCRIPTOR_HEAP_DESC *);
+
+template <typename Fn>
+Fn resolve_d3d12_export(const char *name)
+{
+    HMODULE module = GetModuleHandleA("d3d12.dll");
+    if (!module) {
+        return nullptr;
+    }
+    return reinterpret_cast<Fn>(GetProcAddress(module, name));
+}
+
+void record_graphics_pipeline(
+    ID3D12Device *device,
+    ID3D12PipelineState *pipeline_state,
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc
+)
+{
+    if (!use_capture_bridge()) {
+        return;
+    }
+    static RecordGraphicsPipelineFn record = resolve_d3d12_export<RecordGraphicsPipelineFn>(
+        "apitrace_d3d12_record_graphics_pipeline"
+    );
+    if (record) {
+        record(device, pipeline_state, &desc);
+    }
+}
+
+void record_compute_pipeline(
+    ID3D12Device *device,
+    ID3D12PipelineState *pipeline_state,
+    const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc
+)
+{
+    if (!use_capture_bridge()) {
+        return;
+    }
+    static RecordComputePipelineFn record = resolve_d3d12_export<RecordComputePipelineFn>(
+        "apitrace_d3d12_record_compute_pipeline"
+    );
+    if (record) {
+        record(device, pipeline_state, &desc);
+    }
+}
+
+void record_descriptor_heap(
+    ID3D12Device *device,
+    ID3D12DescriptorHeap *descriptor_heap,
+    const D3D12_DESCRIPTOR_HEAP_DESC &desc
+)
+{
+    if (!use_capture_bridge()) {
+        return;
+    }
+    static RecordDescriptorHeapFn record = resolve_d3d12_export<RecordDescriptorHeapFn>(
+        "apitrace_d3d12_record_descriptor_heap"
+    );
+    if (record) {
+        record(device, descriptor_heap, &desc);
+    }
+}
+
 struct PosColorVertex {
     float position[3];
     float color[4];
@@ -794,6 +878,7 @@ demo::ComPtr<ID3D12DescriptorHeap> create_descriptor_heap(
 
     demo::ComPtr<ID3D12DescriptorHeap> heap;
     demo::check_hr(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(heap.put())), "CreateDescriptorHeap failed");
+    record_descriptor_heap(device, heap.get(), desc);
     return heap;
 }
 
@@ -1101,6 +1186,7 @@ ShaderProgram create_program(
     pso_desc.SampleDesc.Quality = options.sample_quality;
 
     demo::check_hr(runtime.device()->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(program.pipeline_state.put())), "CreateGraphicsPipelineState failed");
+    record_graphics_pipeline(runtime.device(), program.pipeline_state.get(), pso_desc);
     return program;
 }
 
@@ -1128,6 +1214,7 @@ ComputeProgram create_compute_program(
     pso_desc.pRootSignature = program.root_signature.get();
     pso_desc.CS = {cs_blob->GetBufferPointer(), cs_blob->GetBufferSize()};
     demo::check_hr(runtime.device()->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(program.pipeline_state.put())), "CreateComputePipelineState failed");
+    record_compute_pipeline(runtime.device(), program.pipeline_state.get(), pso_desc);
     return program;
 }
 
@@ -1464,6 +1551,7 @@ ValidationResult run_textured_quad(Dx12Runtime &runtime, unsigned int frame_budg
     heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     demo::ComPtr<ID3D12DescriptorHeap> descriptor_heap;
     demo::check_hr(runtime.device()->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(descriptor_heap.put())), "CreateDescriptorHeap(SRV) failed");
+    record_descriptor_heap(runtime.device(), descriptor_heap.get(), heap_desc);
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
     srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;

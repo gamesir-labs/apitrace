@@ -39,6 +39,112 @@ bool within_tolerance(std::uint8_t actual, std::uint8_t expected, std::uint8_t t
     return delta >= -static_cast<int>(tolerance) && delta <= static_cast<int>(tolerance);
 }
 
+using RecordRuntimeObjectsFn = void (WINAPI *)(
+    ID3D12Device *,
+    ID3D12CommandQueue *,
+    ID3D12CommandAllocator *,
+    ID3D12GraphicsCommandList *,
+    ID3D12Fence *
+);
+using RecordExecuteCommandListsFn = void (WINAPI *)(ID3D12CommandQueue *, ID3D12GraphicsCommandList *);
+using RecordDescriptorHeapFn = void (WINAPI *)(ID3D12Device *, ID3D12DescriptorHeap *, const D3D12_DESCRIPTOR_HEAP_DESC *);
+using RecordResourceBarrierFn = void (WINAPI *)(
+    ID3D12GraphicsCommandList *,
+    ID3D12Resource *,
+    D3D12_RESOURCE_STATES,
+    D3D12_RESOURCE_STATES,
+    UINT
+);
+
+bool use_capture_bridge()
+{
+    const char *value = std::getenv("APITRACE_D3D12_CAPTURE_BRIDGE");
+    if (!value || !*value) {
+        return false;
+    }
+    return std::strcmp(value, "1") == 0 ||
+        std::strcmp(value, "true") == 0 ||
+        std::strcmp(value, "TRUE") == 0;
+}
+
+template <typename Fn>
+Fn resolve_d3d12_export(const char *name)
+{
+    HMODULE module = GetModuleHandleA("d3d12.dll");
+    if (!module) {
+        return nullptr;
+    }
+    return reinterpret_cast<Fn>(GetProcAddress(module, name));
+}
+
+void record_runtime_objects(Dx12Runtime &runtime)
+{
+    if (!use_capture_bridge()) {
+        return;
+    }
+    static RecordRuntimeObjectsFn record = resolve_d3d12_export<RecordRuntimeObjectsFn>(
+        "apitrace_d3d12_record_runtime_objects"
+    );
+    if (record) {
+        record(
+            runtime.device(),
+            runtime.queue(),
+            runtime.command_allocator(),
+            runtime.command_list(),
+            runtime.fence()
+        );
+    }
+}
+
+void record_execute_command_lists(ID3D12CommandQueue *queue, ID3D12GraphicsCommandList *command_list)
+{
+    if (!use_capture_bridge()) {
+        return;
+    }
+    static RecordExecuteCommandListsFn record = resolve_d3d12_export<RecordExecuteCommandListsFn>(
+        "apitrace_d3d12_record_execute_command_lists"
+    );
+    if (record) {
+        record(queue, command_list);
+    }
+}
+
+void record_descriptor_heap(
+    ID3D12Device *device,
+    ID3D12DescriptorHeap *descriptor_heap,
+    const D3D12_DESCRIPTOR_HEAP_DESC &desc
+)
+{
+    if (!use_capture_bridge()) {
+        return;
+    }
+    static RecordDescriptorHeapFn record = resolve_d3d12_export<RecordDescriptorHeapFn>(
+        "apitrace_d3d12_record_descriptor_heap"
+    );
+    if (record) {
+        record(device, descriptor_heap, &desc);
+    }
+}
+
+void record_resource_barrier(
+    ID3D12GraphicsCommandList *command_list,
+    ID3D12Resource *resource,
+    D3D12_RESOURCE_STATES before,
+    D3D12_RESOURCE_STATES after,
+    UINT subresource
+)
+{
+    if (!use_capture_bridge()) {
+        return;
+    }
+    static RecordResourceBarrierFn record = resolve_d3d12_export<RecordResourceBarrierFn>(
+        "apitrace_d3d12_record_resource_barrier"
+    );
+    if (record) {
+        record(command_list, resource, before, after, subresource);
+    }
+}
+
 bool use_warp_adapter()
 {
     const char *value = std::getenv("APITRACE_D3D12_DRIVER");
@@ -168,6 +274,7 @@ Dx12Runtime Dx12Runtime::create(int width, int height, const char *class_name, c
     rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     rtv_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     demo::check_hr(runtime.device_->CreateDescriptorHeap(&rtv_heap_desc, IID_PPV_ARGS(runtime.rtv_heap_.put())), "CreateDescriptorHeap(RTV) failed");
+    record_descriptor_heap(runtime.device_.get(), runtime.rtv_heap_.get(), rtv_heap_desc);
     runtime.rtv_descriptor_size_ = runtime.device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = runtime.rtv_heap_->GetCPUDescriptorHandleForHeapStart();
@@ -239,6 +346,8 @@ Dx12Runtime Dx12Runtime::create(int width, int height, const char *class_name, c
     runtime.scissor_rect_.top = 0;
     runtime.scissor_rect_.right = width;
     runtime.scissor_rect_.bottom = height;
+
+    record_runtime_objects(runtime);
 
     return runtime;
 }
@@ -321,6 +430,7 @@ void Dx12Runtime::transition_resource(
     barrier.Transition.StateBefore = before;
     barrier.Transition.StateAfter = after;
     command_list_->ResourceBarrier(1, &barrier);
+    record_resource_barrier(command_list_.get(), resource, before, after, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
 }
 
 void Dx12Runtime::clear_state()
@@ -330,6 +440,7 @@ void Dx12Runtime::clear_state()
         demo::check_hr(command_list_->Close(), "ID3D12GraphicsCommandList::Close(clear_state) failed");
         ID3D12CommandList *lists[] = {command_list_.get()};
         queue_->ExecuteCommandLists(1, lists);
+        record_execute_command_lists(queue_.get(), command_list_.get());
         frame_open_ = false;
     }
     wait_for_gpu();
@@ -345,6 +456,7 @@ void Dx12Runtime::present()
     demo::check_hr(command_list_->Close(), "ID3D12GraphicsCommandList::Close failed");
     ID3D12CommandList *lists[] = {command_list_.get()};
     queue_->ExecuteCommandLists(1, lists);
+    record_execute_command_lists(queue_.get(), command_list_.get());
     demo::check_hr(swap_chain_->Present(1, 0), "IDXGISwapChain::Present failed");
     frame_open_ = false;
     wait_for_gpu();
@@ -384,6 +496,7 @@ ValidationResult Dx12Runtime::present_and_validate(
 
     ID3D12CommandList *lists[] = {command_list_.get()};
     queue_->ExecuteCommandLists(1, lists);
+    record_execute_command_lists(queue_.get(), command_list_.get());
     demo::check_hr(swap_chain_->Present(1, 0), "IDXGISwapChain::Present(validate) failed");
     frame_open_ = false;
     wait_for_gpu();

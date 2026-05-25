@@ -53,20 +53,41 @@ std::vector<const demo::scenes::dx12::SceneDefinition *> dx12_scene_order()
     return ordered;
 }
 
-void emit_scene_marker(const char *scene_name, const char *phase)
+const char *dx_mode_name(DxMode mode)
 {
-    static EmitSceneMarkerFn emit_marker = []() -> EmitSceneMarkerFn {
-        HMODULE d3d11_module = GetModuleHandleA("d3d11.dll");
-        if (!d3d11_module) {
+    return mode == DxMode::dx12 ? "dx12" : "dx11";
+}
+
+EmitSceneMarkerFn resolve_scene_marker(DxMode mode)
+{
+    static EmitSceneMarkerFn d3d11_marker = []() -> EmitSceneMarkerFn {
+        HMODULE module = GetModuleHandleA("d3d11.dll");
+        if (!module) {
             return nullptr;
         }
         return reinterpret_cast<EmitSceneMarkerFn>(
-            GetProcAddress(d3d11_module, "apitrace_d3d11_emit_scene_marker")
+            GetProcAddress(module, "apitrace_d3d11_emit_scene_marker")
         );
     }();
 
+    static EmitSceneMarkerFn d3d12_marker = []() -> EmitSceneMarkerFn {
+        HMODULE module = GetModuleHandleA("d3d12.dll");
+        if (!module) {
+            return nullptr;
+        }
+        return reinterpret_cast<EmitSceneMarkerFn>(
+            GetProcAddress(module, "apitrace_d3d12_emit_scene_marker")
+        );
+    }();
+
+    return mode == DxMode::dx12 ? d3d12_marker : d3d11_marker;
+}
+
+void emit_scene_marker(DxMode mode, const char *scene_name, const char *phase)
+{
+    EmitSceneMarkerFn emit_marker = resolve_scene_marker(mode);
     if (emit_marker && scene_name && phase) {
-        emit_marker(scene_name, "dx11", phase);
+        emit_marker(scene_name, dx_mode_name(mode), phase);
     }
 }
 
@@ -123,9 +144,9 @@ int run_dx11(const CliOptions &options)
 
     for (const demo::scenes::dx11::SceneDefinition *scene : selected_scenes) {
         std::printf("scene start: %s\n", scene->name);
-        emit_scene_marker(scene->name, "start");
+        emit_scene_marker(DxMode::dx11, scene->name, "start");
         const demo::runtime::dx11::ValidationResult result = scene->run(runtime, frame_budget);
-        emit_scene_marker(scene->name, "end");
+        emit_scene_marker(DxMode::dx11, scene->name, "end");
         if (result.passed) {
             std::printf("scene pass: %s\n", scene->name);
             ++passed;
@@ -174,7 +195,9 @@ int run_dx12(const CliOptions &options)
 
     for (const demo::scenes::dx12::SceneDefinition *scene : selected_scenes) {
         std::printf("scene start: %s\n", scene->name);
+        emit_scene_marker(DxMode::dx12, scene->name, "start");
         const demo::runtime::dx12::ValidationResult result = scene->run(runtime, frame_budget);
+        emit_scene_marker(DxMode::dx12, scene->name, "end");
         if (result.passed) {
             std::printf("scene pass: %s\n", scene->name);
             ++passed;
