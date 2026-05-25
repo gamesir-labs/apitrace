@@ -198,6 +198,11 @@ float animation_progress(unsigned int frame, unsigned int total_frames, unsigned
         return 1.0f;
     }
 
+    settle_limit = demo::read_env_u32("APITRACE_ANIMATION_SETTLE_FRAMES", settle_limit);
+    if (settle_limit == 0U) {
+        settle_limit = total_frames;
+    }
+
     const unsigned int settle_frames = std::min(total_frames, settle_limit);
     const unsigned int denominator = settle_frames > 1U ? settle_frames - 1U : 1U;
     return static_cast<float>(std::min(frame, denominator)) / static_cast<float>(denominator);
@@ -2751,6 +2756,17 @@ ValidationResult run_barrier_state_transitions(Dx12Runtime &runtime, unsigned in
             runtime.command_list()->IASetVertexBuffers(0, 1, &vertex_buffer_view);
             runtime.command_list()->SetGraphicsRootDescriptorTable(0, descriptor_gpu_handle(srv_heap.get(), srv_descriptor_size, 0));
             runtime.command_list()->DrawInstanced(6, 1, 0, 0);
+
+            runtime.transition_resource(
+                left_texture.get(),
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_RENDER_TARGET
+            );
+            runtime.transition_resource(
+                right_texture.get(),
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_RENDER_TARGET
+            );
         },
         [&]() {
             return std::vector<PixelExpectation>{
@@ -3007,6 +3023,8 @@ ValidationResult run_indirect_draw(Dx12Runtime &runtime, unsigned int frame_budg
             runtime.bind_back_buffer();
             runtime.clear_back_buffer(clear_color);
 
+            runtime.command_list()->SetPipelineState(program.pipeline_state.get());
+            runtime.command_list()->SetGraphicsRootSignature(program.root_signature.get());
             runtime.command_list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             runtime.command_list()->IASetVertexBuffers(0, 1, &vertex_buffer_view);
             runtime.command_list()->ExecuteIndirect(command_signature.get(), 2, draw_args.get(), 0, count_buffer.get(), 0);
