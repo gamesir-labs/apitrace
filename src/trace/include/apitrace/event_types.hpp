@@ -40,6 +40,10 @@ struct EventRecord {
   BoundaryKind boundary = BoundaryKind::Frame;
   std::vector<ObjectId> object_refs;
   std::vector<BlobId> blob_refs;
+  ObjectId object_id = 0;
+  ObjectKind object_kind = ObjectKind::Unknown;
+  ObjectId parent_object_id = 0;
+  std::string object_debug_name;
   std::string payload;
 
   // TODO: replace payload string with typed readable event payloads when callstream schema settles.

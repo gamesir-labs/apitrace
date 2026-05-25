@@ -296,6 +296,14 @@ std::string object_kind_name(ObjectKind kind)
     return "Context";
   case ObjectKind::CommandQueue:
     return "CommandQueue";
+  case ObjectKind::CommandAllocator:
+    return "CommandAllocator";
+  case ObjectKind::CommandList:
+    return "CommandList";
+  case ObjectKind::CommandSignature:
+    return "CommandSignature";
+  case ObjectKind::Fence:
+    return "Fence";
   case ObjectKind::SwapChain:
     return "SwapChain";
   case ObjectKind::Resource:
@@ -418,6 +426,27 @@ std::string event_record_json(const EventRecord &event)
            << ",\"boundary\":\"" << boundary_name(event.boundary) << "\""
            << ",\"payload\":" << normalize_payload(event.payload)
            << "}";
+    return output.str();
+  }
+
+  if (event.kind == EventKind::ObjectCreate || event.kind == EventKind::ObjectDestroy || event.kind == EventKind::ResourceBlob) {
+    output << "{\"record_kind\":\""
+           << (event.kind == EventKind::ObjectCreate ? "object_create" :
+               event.kind == EventKind::ObjectDestroy ? "object_destroy" : "resource_blob")
+           << "\""
+           << ",\"sequence\":" << event.callsite.sequence
+           << ",\"object_id\":" << event.object_id
+           << ",\"object_kind\":\"" << object_kind_name(event.object_kind) << "\""
+           << ",\"parent_object_id\":" << event.parent_object_id
+           << ",\"debug_name\":\"" << json_escape(event.object_debug_name) << "\""
+           << ",\"object_refs\":" << encode_integer_array(
+                  std::vector<std::uint64_t>(event.object_refs.begin(), event.object_refs.end()))
+           << ",\"blob_refs\":" << encode_integer_array(
+                  std::vector<std::uint64_t>(event.blob_refs.begin(), event.blob_refs.end()));
+    if (!event.payload.empty() && event.payload != "{}") {
+      output << ",\"payload\":" << normalize_payload(event.payload);
+    }
+    output << "}";
     return output.str();
   }
 

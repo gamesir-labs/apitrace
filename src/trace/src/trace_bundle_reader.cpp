@@ -220,6 +220,18 @@ std::optional<ObjectKind> object_kind_from_name(std::string_view name)
   if (name == "CommandQueue") {
     return ObjectKind::CommandQueue;
   }
+  if (name == "CommandAllocator") {
+    return ObjectKind::CommandAllocator;
+  }
+  if (name == "CommandList") {
+    return ObjectKind::CommandList;
+  }
+  if (name == "CommandSignature") {
+    return ObjectKind::CommandSignature;
+  }
+  if (name == "Fence") {
+    return ObjectKind::Fence;
+  }
   if (name == "SwapChain") {
     return ObjectKind::SwapChain;
   }
@@ -507,6 +519,73 @@ bool parse_event_record(
     return true;
   }
 
+  if (record_kind == "object_create" || record_kind == "object_destroy" || record_kind == "resource_blob") {
+    event.kind = record_kind == "object_create" ? EventKind::ObjectCreate :
+                 record_kind == "object_destroy" ? EventKind::ObjectDestroy :
+                                                   EventKind::ResourceBlob;
+    event.callsite.sequence = record.value("sequence", 0ull);
+    if (event.callsite.sequence == 0) {
+      std::ostringstream message;
+      message << file_label(callstream_path) << ": " << record_kind << " record missing sequence";
+      error = message.str();
+      return false;
+    }
+    event.callsite.function_name = record_kind;
+    event.object_id = record.value("object_id", 0ull);
+    event.parent_object_id = record.value("parent_object_id", 0ull);
+    event.object_debug_name = record.value("debug_name", std::string());
+
+    const auto kind_name = record.value("object_kind", std::string("Unknown"));
+    const auto kind = object_kind_from_name(kind_name);
+    if (!kind.has_value()) {
+      std::ostringstream message;
+      message << file_label(callstream_path) << ": sequence " << event.callsite.sequence
+              << " has unknown object_kind " << kind_name;
+      error = message.str();
+      return false;
+    }
+    event.object_kind = *kind;
+
+    if (event.kind != EventKind::ResourceBlob && event.object_id == 0) {
+      std::ostringstream message;
+      message << file_label(callstream_path) << ": sequence " << event.callsite.sequence
+              << " missing object_id";
+      error = message.str();
+      return false;
+    }
+
+    if (!append_integer_array<ObjectId>(
+            record.value("object_refs", json::array()),
+            event.object_refs,
+            callstream_path,
+            event.callsite.sequence,
+            "object_refs",
+            error)) {
+      return false;
+    }
+    if (!append_integer_array<BlobId>(
+            record.value("blob_refs", json::array()),
+            event.blob_refs,
+            callstream_path,
+            event.callsite.sequence,
+            "blob_refs",
+            error)) {
+      return false;
+    }
+
+    json payload = record;
+    payload.erase("record_kind");
+    payload.erase("sequence");
+    payload.erase("object_id");
+    payload.erase("object_kind");
+    payload.erase("parent_object_id");
+    payload.erase("debug_name");
+    payload.erase("object_refs");
+    payload.erase("blob_refs");
+    event.payload = payload.empty() ? std::string("{}") : payload.dump();
+    return true;
+  }
+
   if (record_kind == "boundary") {
     event.kind = EventKind::Boundary;
     event.callsite.sequence = record.value("sequence", 0ull);
@@ -657,7 +736,7 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
     }
     impl_->events.push_back(event);
 
-    json payload = json::parse(event.payload, nullptr, false);
+    json payload = json::parse(event.payload.empty() ? std::string("{}") : event.payload, nullptr, false);
     if (payload.is_discarded()) {
       std::ostringstream message;
       message << file_label(impl_->layout.callstream_path) << ": sequence " << event.callsite.sequence
@@ -667,7 +746,7 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
     }
 
     std::vector<std::string> referenced_paths;
-    collect_asset_paths(payload, referenced_paths);
+    collect_asset_paths(record, referenced_paths);
     for (std::size_t index = 0; index < referenced_paths.size(); ++index) {
       AssetRecord asset;
       if (index < event.blob_refs.size()) {
