@@ -13,8 +13,8 @@ public:
   void install_submission_hooks(runtime::CaptureRuntime &runtime);
 
 private:
-  // TODO: split descriptor, command list, and queue hook groups once interception points are enumerated.
-  // TODO: report hook coverage per surface so D3D12 capture planning can be inspected independently.
+  // The Wine app-local d3d12.dll proxy owns the concrete COM vtable capture surface.
+  // This planner keeps shared capture runtime setup scoped to that existing entry.
 };
 
 } // namespace apitrace::d3d12

@@ -6,20 +6,18 @@ D3D12CaptureHooks::D3D12CaptureHooks() = default;
 
 void D3D12CaptureHooks::install_proxy_hooks(runtime::CaptureRuntime &runtime)
 {
-  // TODO: attach D3D12 proxy-surface hooks through runtime bootstrap.
-  (void)runtime;
+  runtime.install_hooks();
+  runtime.extend_hooks_for_module("d3d12.dll");
 }
 
 void D3D12CaptureHooks::install_device_hooks(runtime::CaptureRuntime &runtime)
 {
-  // TODO: intercept D3D12CreateDevice and device-owned object creation surfaces.
-  (void)runtime;
+  runtime.extend_hooks_for_module("d3d12.dll");
 }
 
 void D3D12CaptureHooks::install_submission_hooks(runtime::CaptureRuntime &runtime)
 {
-  // TODO: intercept queue submission, command list close, fence, and present surfaces.
-  (void)runtime;
+  runtime.extend_hooks_for_module("d3d12.dll");
 }
 
 } // namespace apitrace::d3d12
