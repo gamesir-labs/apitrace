@@ -10,6 +10,7 @@ namespace apitrace::d3d12 {
 struct D3D12TrackedObject {
   trace::ObjectId object_id = 0;
   trace::ObjectKind kind = trace::ObjectKind::Unknown;
+  trace::ObjectId parent_object_id = 0;
   std::string debug_name;
 
   // TODO: add queue/list/descriptor/root-signature payloads once D3D12 state reconstruction begins.
@@ -19,8 +20,10 @@ class D3D12ObjectRegistry {
 public:
   void track(const D3D12TrackedObject &object);
   void forget(trace::ObjectId object_id);
+  void clear();
 
   bool contains(trace::ObjectId object_id) const noexcept;
+  const D3D12TrackedObject *find(trace::ObjectId object_id) const noexcept;
 
 private:
   std::unordered_map<trace::ObjectId, D3D12TrackedObject> objects_;

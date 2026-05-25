@@ -1,5 +1,7 @@
 #include "apitrace/replay_session.hpp"
 
+#include "apitrace/d3d12_replay.hpp"
+
 #include "d3d11/src/d3d11_replay_internal.hpp"
 #include "retrace/src/d3d11_replay_parser.hpp"
 
@@ -58,31 +60,74 @@ bool ReplaySession::run()
     return false;
   }
 
-  if (impl_->options.backend != BackendKind::TranslationLayer) {
-    impl_->last_error = std::string("backend ") + backend_name(impl_->options.backend) +
-                        " is unsupported for the D3D11 retrace MVP";
-    return false;
-  }
-
 #ifndef _WIN32
-  impl_->last_error = "Translation-layer D3D11 replay is only implemented for Windows retrace.exe.";
+  impl_->last_error = "retrace backends are only implemented for Windows retrace.exe in the current MVP.";
   return false;
 #else
-  if (impl_->reader.metadata().api != trace::ApiKind::D3D11) {
-    impl_->last_error = "only D3D11 bundles are supported by the retrace MVP";
-    return false;
+  if (impl_->reader.metadata().api == trace::ApiKind::D3D11) {
+    if (impl_->options.backend != BackendKind::TranslationLayer) {
+      impl_->last_error = std::string("backend ") + backend_name(impl_->options.backend) +
+                          " is unsupported for the D3D11 retrace MVP";
+      return false;
+    }
+
+    internal::D3D11ReplayPlan plan;
+    if (!internal::build_d3d11_replay_plan(impl_->reader, plan, impl_->last_error)) {
+      return false;
+    }
+
+    if (!d3d11::internal::replay_translation_layer_plan(plan, impl_->statistics, impl_->last_error)) {
+      return false;
+    }
+    return true;
   }
 
-  internal::D3D11ReplayPlan plan;
-  if (!internal::build_d3d11_replay_plan(impl_->reader, plan, impl_->last_error)) {
-    return false;
+  if (impl_->reader.metadata().api == trace::ApiKind::D3D12) {
+    if (impl_->options.backend == BackendKind::NativeD3D11) {
+      impl_->last_error = "backend NativeD3D11 is unsupported for D3D12 bundles";
+      return false;
+    }
+
+    d3d12::D3D12ReplayBackend backend;
+    if (!backend.initialize(impl_->reader)) {
+      impl_->last_error = backend.last_error().empty() ? "failed to initialize D3D12 replay backend" : backend.last_error();
+      return false;
+    }
+
+    impl_->statistics.backend_name = "bundle-d3d12";
+    for (const auto &event : impl_->reader.events()) {
+      if (!backend.replay_event(event)) {
+        if (!backend.last_error().empty()) {
+          impl_->last_error = "sequence " + std::to_string(event.callsite.sequence) + " " +
+                              event.callsite.function_name + ": " + backend.last_error();
+        } else {
+          impl_->last_error = "sequence " + std::to_string(event.callsite.sequence) + " " +
+                              event.callsite.function_name + ": D3D12 replay failed";
+        }
+        return false;
+      }
+
+      if (event.kind == trace::EventKind::Boundary) {
+        switch (event.boundary) {
+        case trace::BoundaryKind::Frame:
+          ++impl_->statistics.frames_seen;
+          break;
+        case trace::BoundaryKind::Present:
+          ++impl_->statistics.presents_seen;
+          break;
+        default:
+          break;
+        }
+      } else {
+        ++impl_->statistics.calls_replayed;
+      }
+    }
+    backend.shutdown();
+    return true;
   }
 
-  if (!d3d11::internal::replay_translation_layer_plan(plan, impl_->statistics, impl_->last_error)) {
-    return false;
-  }
-
-  return true;
+  impl_->last_error = "only D3D11 and D3D12 bundles are supported by the retrace MVP";
+  return false;
 #endif
 }
 
