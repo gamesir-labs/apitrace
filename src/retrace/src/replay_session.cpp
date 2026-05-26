@@ -122,6 +122,10 @@ bool ReplaySession::run()
         ++impl_->statistics.calls_replayed;
       }
     }
+    if (!backend.finalize_replay()) {
+      impl_->last_error = backend.last_error().empty() ? "D3D12 replay finalization failed" : backend.last_error();
+      return false;
+    }
     backend.shutdown();
     return true;
   }

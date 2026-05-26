@@ -50,6 +50,15 @@ void write_stderr(const std::string &message)
   std::cerr << message;
 }
 
+std::string format_statistics(const apitrace::replay::ReplayStatistics &statistics)
+{
+  return "retrace " + std::string(apitrace::version_string()) + "\n" +
+      "backend: " + statistics.backend_name + "\n" +
+      "calls_replayed: " + std::to_string(statistics.calls_replayed) + "\n" +
+      "frames_seen: " + std::to_string(statistics.frames_seen) + "\n" +
+      "presents_seen: " + std::to_string(statistics.presents_seen) + "\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -64,16 +73,16 @@ int main(int argc, char **argv)
 
   apitrace::replay::ReplaySession session(options);
   if (!session.run()) {
+    const auto &statistics = session.statistics();
+    if (!statistics.backend_name.empty() || statistics.calls_replayed != 0 ||
+        statistics.frames_seen != 0 || statistics.presents_seen != 0) {
+      write_stdout(format_statistics(statistics));
+    }
     write_stderr("retrace failed: " + session.last_error() + "\n");
     return 1;
   }
 
   const auto &statistics = session.statistics();
-  write_stdout(
-      "retrace " + std::string(apitrace::version_string()) + "\n" +
-      "backend: " + statistics.backend_name + "\n" +
-      "calls_replayed: " + std::to_string(statistics.calls_replayed) + "\n" +
-      "frames_seen: " + std::to_string(statistics.frames_seen) + "\n" +
-      "presents_seen: " + std::to_string(statistics.presents_seen) + "\n");
+  write_stdout(format_statistics(statistics));
   return 0;
 }

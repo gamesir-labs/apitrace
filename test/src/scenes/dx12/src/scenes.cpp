@@ -213,6 +213,13 @@ float lerp(float from, float to, float t)
     return from + (to - from) * t;
 }
 
+UINT float_root_constant(float value)
+{
+    UINT bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
 template <typename Vertex>
 std::vector<Vertex> require_struct_count(const char *asset_path, const std::vector<float> &scalars, std::size_t component_count)
 {
@@ -1314,7 +1321,6 @@ ValidationResult run_scene_frames(
             result = runtime.present_and_validate(expectations.data(), expectations.size());
         } else {
             runtime.present();
-            Sleep(16);
         }
     }
 
@@ -1764,7 +1770,7 @@ ValidationResult run_depth_blend_scissor(Dx12Runtime &runtime, unsigned int fram
 
             runtime.command_list()->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
             runtime.clear_back_buffer(clear_color);
-            runtime.command_list()->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            runtime.command_list()->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 1, &animated_scissor_rect);
             runtime.command_list()->RSSetScissorRects(1, &animated_scissor_rect);
             runtime.command_list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
@@ -1816,7 +1822,7 @@ ValidationResult run_offscreen_copy_composite(Dx12Runtime &runtime, unsigned int
     descriptor_range.RegisterSpace = 0;
     descriptor_range.OffsetInDescriptorsFromTableStart = 0;
 
-    D3D12_ROOT_PARAMETER root_parameters[2]{};
+    D3D12_ROOT_PARAMETER root_parameters[3]{};
     root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     root_parameters[0].DescriptorTable.NumDescriptorRanges = 1;
     root_parameters[0].DescriptorTable.pDescriptorRanges = &descriptor_range;
@@ -1825,6 +1831,11 @@ ValidationResult run_offscreen_copy_composite(Dx12Runtime &runtime, unsigned int
     root_parameters[1].Descriptor.ShaderRegister = 0;
     root_parameters[1].Descriptor.RegisterSpace = 0;
     root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    root_parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    root_parameters[2].Constants.ShaderRegister = 1;
+    root_parameters[2].Constants.RegisterSpace = 0;
+    root_parameters[2].Constants.Num32BitValues = 4;
+    root_parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_STATIC_SAMPLER_DESC sampler_desc{};
     sampler_desc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -1966,8 +1977,9 @@ ValidationResult run_offscreen_copy_composite(Dx12Runtime &runtime, unsigned int
             }
 
             const D3D12_CPU_DESCRIPTOR_HANDLE offscreen_rtv = descriptor_cpu_handle(rtv_heap.get(), rtv_descriptor_size, 0);
+            const D3D12_RECT offscreen_clear_rect = {0, 0, runtime.width(), runtime.height()};
             runtime.command_list()->OMSetRenderTargets(1, &offscreen_rtv, FALSE, nullptr);
-            runtime.command_list()->ClearRenderTargetView(offscreen_rtv, clear_color, 0, nullptr);
+            runtime.command_list()->ClearRenderTargetView(offscreen_rtv, clear_color, 1, &offscreen_clear_rect);
             runtime.command_list()->SetGraphicsRootSignature(offscreen_program.root_signature.get());
             runtime.command_list()->SetPipelineState(offscreen_program.pipeline_state.get());
             runtime.command_list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -2377,8 +2389,9 @@ ValidationResult run_msaa_resolve(Dx12Runtime &runtime, unsigned int frame_budge
             }
 
             const D3D12_CPU_DESCRIPTOR_HANDLE msaa_rtv = descriptor_cpu_handle(rtv_heap.get(), rtv_descriptor_size, 0);
+            const D3D12_RECT msaa_clear_rect = {0, 0, runtime.width(), runtime.height()};
             runtime.command_list()->OMSetRenderTargets(1, &msaa_rtv, FALSE, nullptr);
-            runtime.command_list()->ClearRenderTargetView(msaa_rtv, clear_color, 0, nullptr);
+            runtime.command_list()->ClearRenderTargetView(msaa_rtv, clear_color, 1, &msaa_clear_rect);
             runtime.command_list()->SetGraphicsRootSignature(offscreen_program.root_signature.get());
             runtime.command_list()->SetPipelineState(offscreen_program.pipeline_state.get());
             runtime.command_list()->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -2721,9 +2734,11 @@ ValidationResult run_barrier_state_transitions(Dx12Runtime &runtime, unsigned in
 
             const D3D12_CPU_DESCRIPTOR_HANDLE left_rtv = descriptor_cpu_handle(rtv_heap.get(), rtv_descriptor_size, 0);
             const D3D12_CPU_DESCRIPTOR_HANDLE right_rtv = descriptor_cpu_handle(rtv_heap.get(), rtv_descriptor_size, 1);
+            const D3D12_RECT left_clear_rect = {0, 0, runtime.width(), runtime.height()};
+            const D3D12_RECT right_clear_rect = {0, 0, runtime.width(), runtime.height()};
 
             runtime.command_list()->OMSetRenderTargets(1, &left_rtv, FALSE, nullptr);
-            runtime.command_list()->ClearRenderTargetView(left_rtv, left_clear.Color, 0, nullptr);
+            runtime.command_list()->ClearRenderTargetView(left_rtv, left_clear.Color, 1, &left_clear_rect);
             runtime.transition_resource(
                 left_texture.get(),
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -2732,7 +2747,7 @@ ValidationResult run_barrier_state_transitions(Dx12Runtime &runtime, unsigned in
             );
 
             runtime.command_list()->OMSetRenderTargets(1, &right_rtv, FALSE, nullptr);
-            runtime.command_list()->ClearRenderTargetView(right_rtv, right_clear.Color, 0, nullptr);
+            runtime.command_list()->ClearRenderTargetView(right_rtv, right_clear.Color, 1, &right_clear_rect);
             runtime.transition_resource(
                 left_texture.get(),
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -2878,11 +2893,14 @@ ValidationResult run_descriptor_root_signature_rebind(Dx12Runtime &runtime, unsi
     const auto descriptor_heap = create_descriptor_heap(
         runtime.device(),
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-        2,
+        3,
         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
     );
     const UINT descriptor_size = runtime.device()->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
+    D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc{};
+    cbv_desc.BufferLocation = tint_buffer->GetGPUVirtualAddress();
+    cbv_desc.SizeInBytes = 256U;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
     srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -2891,6 +2909,7 @@ ValidationResult run_descriptor_root_signature_rebind(Dx12Runtime &runtime, unsi
 
     bool uploaded = false;
 
+    runtime.device()->CreateConstantBufferView(&cbv_desc, descriptor_cpu_handle(descriptor_heap.get(), descriptor_size, 2));
     runtime.device()->CreateShaderResourceView(left_texture.get(), &srv_desc, descriptor_cpu_handle(descriptor_heap.get(), descriptor_size, 0));
     runtime.device()->CreateShaderResourceView(right_texture.get(), &srv_desc, descriptor_cpu_handle(descriptor_heap.get(), descriptor_size, 1));
 
@@ -2914,9 +2933,9 @@ ValidationResult run_descriptor_root_signature_rebind(Dx12Runtime &runtime, unsi
             );
             update_upload_buffer_array(vertex_buffer.get(), animated_vertices.data(), animated_vertices.size());
 
-            const TintConstants left_tint{{1.0f, lerp(0.70f, 1.0f, t), lerp(0.70f, 1.0f, t), 1.0f}};
-            const TintConstants right_tint{{lerp(0.80f, 1.0f, t), 1.0f, 1.0f, 1.0f}};
-            update_upload_buffer(tint_buffer.get(), left_tint);
+            const float left_tint[4] = {1.0f, lerp(0.70f, 1.0f, t), lerp(0.70f, 1.0f, t), 1.0f};
+            const float right_tint[4] = {lerp(0.80f, 1.0f, t), 1.0f, 1.0f, 1.0f};
+            update_upload_buffer(tint_buffer.get(), TintConstants{{left_tint[0], left_tint[1], left_tint[2], left_tint[3]}});
 
             runtime.bind_back_buffer();
             runtime.clear_back_buffer(clear_color);
@@ -2929,11 +2948,15 @@ ValidationResult run_descriptor_root_signature_rebind(Dx12Runtime &runtime, unsi
             runtime.command_list()->IASetVertexBuffers(0, 1, &vertex_buffer_view);
             runtime.command_list()->SetGraphicsRootDescriptorTable(0, descriptor_gpu_handle(descriptor_heap.get(), descriptor_size, 0));
             runtime.command_list()->SetGraphicsRootConstantBufferView(1, tint_buffer->GetGPUVirtualAddress());
+            runtime.command_list()->SetGraphicsRoot32BitConstants(2, 3, left_tint, 0);
+            runtime.command_list()->SetGraphicsRoot32BitConstant(2, float_root_constant(left_tint[3]), 3);
             runtime.command_list()->DrawInstanced(6, 1, 0, 0);
 
-            update_upload_buffer(tint_buffer.get(), right_tint);
+            update_upload_buffer(tint_buffer.get(), TintConstants{{right_tint[0], right_tint[1], right_tint[2], right_tint[3]}});
             runtime.command_list()->SetGraphicsRootDescriptorTable(0, descriptor_gpu_handle(descriptor_heap.get(), descriptor_size, 1));
             runtime.command_list()->SetGraphicsRootConstantBufferView(1, tint_buffer->GetGPUVirtualAddress());
+            runtime.command_list()->SetGraphicsRoot32BitConstants(2, 3, right_tint, 0);
+            runtime.command_list()->SetGraphicsRoot32BitConstant(2, float_root_constant(right_tint[3]), 3);
             runtime.command_list()->DrawInstanced(6, 1, 6, 0);
         },
         [&]() {

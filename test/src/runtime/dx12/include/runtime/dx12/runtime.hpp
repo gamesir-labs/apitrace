@@ -100,6 +100,8 @@ public:
 
 private:
     void wait_for_gpu();
+    void copy_current_back_buffer_to_readback();
+    void record_current_present_frame(UINT sync_interval, UINT flags) const;
 
     HWND hwnd_ = nullptr;
     int width_ = 0;

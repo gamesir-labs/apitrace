@@ -128,7 +128,7 @@ if(APITRACE_BUILD_TOOLS)
 endif()
 
 if(WIN32)
-    target_link_libraries(apitrace_core PRIVATE d3d11 dxgi user32)
+    target_link_libraries(apitrace_core PRIVATE d3d11 d3d12 dxgi user32)
     target_link_libraries(apitrace_platform_windows_d3d12 PRIVATE uuid)
 endif()
 

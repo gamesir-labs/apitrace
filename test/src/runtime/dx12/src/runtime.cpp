@@ -48,6 +48,13 @@ using RecordRuntimeObjectsFn = void (WINAPI *)(
 );
 using RecordExecuteCommandListsFn = void (WINAPI *)(ID3D12CommandQueue *, ID3D12GraphicsCommandList *);
 using RecordDescriptorHeapFn = void (WINAPI *)(ID3D12Device *, ID3D12DescriptorHeap *, const D3D12_DESCRIPTOR_HEAP_DESC *);
+using RecordSwapChainBackBufferFn = void (WINAPI *)(
+    ID3D12Device *,
+    IDXGISwapChain *,
+    ID3D12Resource *,
+    UINT,
+    const D3D12_RESOURCE_DESC *
+);
 using RecordResourceBarrierFn = void (WINAPI *)(
     ID3D12GraphicsCommandList *,
     ID3D12Resource *,
@@ -55,10 +62,23 @@ using RecordResourceBarrierFn = void (WINAPI *)(
     D3D12_RESOURCE_STATES,
     UINT
 );
+using RecordPresentFrameFn = void (WINAPI *)(UINT, UINT, UINT, UINT, UINT, const void *, SIZE_T);
+using RecordPresentSemanticsFn = void (WINAPI *)(UINT, UINT, HRESULT);
 
 bool use_capture_bridge()
 {
     const char *value = std::getenv("APITRACE_D3D12_CAPTURE_BRIDGE");
+    if (!value || !*value) {
+        return false;
+    }
+    return std::strcmp(value, "1") == 0 ||
+        std::strcmp(value, "true") == 0 ||
+        std::strcmp(value, "TRUE") == 0;
+}
+
+bool capture_present_frames()
+{
+    const char *value = std::getenv("APITRACE_D3D12_CAPTURE_PRESENT_FRAMES");
     if (!value || !*value) {
         return false;
     }
@@ -126,6 +146,22 @@ void record_descriptor_heap(
     }
 }
 
+void record_swapchain_back_buffer(
+    ID3D12Device *device,
+    IDXGISwapChain *swap_chain,
+    ID3D12Resource *back_buffer,
+    UINT index,
+    const D3D12_RESOURCE_DESC &desc
+)
+{
+    static RecordSwapChainBackBufferFn record = resolve_d3d12_export<RecordSwapChainBackBufferFn>(
+        "apitrace_d3d12_record_swapchain_back_buffer"
+    );
+    if (record) {
+        record(device, swap_chain, back_buffer, index, &desc);
+    }
+}
+
 void record_resource_barrier(
     ID3D12GraphicsCommandList *command_list,
     ID3D12Resource *resource,
@@ -142,6 +178,43 @@ void record_resource_barrier(
     );
     if (record) {
         record(command_list, resource, before, after, subresource);
+    }
+}
+
+void record_present_frame(
+    unsigned int width,
+    unsigned int height,
+    UINT sync_interval,
+    UINT flags,
+    const std::vector<std::uint8_t> &pixels
+)
+{
+    if (!capture_present_frames() || pixels.empty()) {
+        return;
+    }
+    static RecordPresentFrameFn record = resolve_d3d12_export<RecordPresentFrameFn>(
+        "apitrace_d3d12_record_present_frame"
+    );
+    if (record) {
+        record(
+            static_cast<UINT>(width),
+            static_cast<UINT>(height),
+            static_cast<UINT>(width * 4U),
+            sync_interval,
+            flags,
+            pixels.data(),
+            static_cast<SIZE_T>(pixels.size())
+        );
+    }
+}
+
+void record_present_semantics(UINT sync_interval, UINT flags, HRESULT result)
+{
+    static RecordPresentSemanticsFn record = resolve_d3d12_export<RecordPresentSemanticsFn>(
+        "apitrace_d3d12_record_present_semantics"
+    );
+    if (record) {
+        record(sync_interval, flags, result);
     }
 }
 
@@ -280,6 +353,14 @@ Dx12Runtime Dx12Runtime::create(int width, int height, const char *class_name, c
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = runtime.rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     for (UINT index = 0; index < 2; ++index) {
         demo::check_hr(runtime.swap_chain_->GetBuffer(index, IID_PPV_ARGS(runtime.back_buffers_[index].put())), "GetBuffer(back buffer) failed");
+        const D3D12_RESOURCE_DESC desc = runtime.back_buffers_[index]->GetDesc();
+        record_swapchain_back_buffer(
+            runtime.device_.get(),
+            runtime.swap_chain_.get(),
+            runtime.back_buffers_[index].get(),
+            index,
+            desc
+        );
         runtime.device_->CreateRenderTargetView(runtime.back_buffers_[index].get(), nullptr, rtv_handle);
         rtv_handle.ptr += runtime.rtv_descriptor_size_;
     }
@@ -371,6 +452,10 @@ void Dx12Runtime::wait_for_gpu()
         return;
     }
 
+    const UINT64 cpu_ready_value = ++fence_value_;
+    demo::check_hr(fence_->Signal(cpu_ready_value), "ID3D12Fence::Signal failed");
+    demo::check_hr(queue_->Wait(fence_.get(), cpu_ready_value), "ID3D12CommandQueue::Wait failed");
+
     const UINT64 signal_value = ++fence_value_;
     demo::check_hr(queue_->Signal(fence_.get(), signal_value), "ID3D12CommandQueue::Signal failed");
     if (fence_->GetCompletedValue() < signal_value) {
@@ -412,7 +497,7 @@ void Dx12Runtime::bind_back_buffer() const
 
 void Dx12Runtime::clear_back_buffer(const float clear_color[4]) const
 {
-    command_list_->ClearRenderTargetView(current_back_buffer_rtv(), clear_color, 0, nullptr);
+    command_list_->ClearRenderTargetView(current_back_buffer_rtv(), clear_color, 1, &scissor_rect_);
 }
 
 void Dx12Runtime::transition_resource(
@@ -452,14 +537,27 @@ void Dx12Runtime::present()
         demo::fail("Dx12Runtime::present called without begin_frame");
     }
 
-    transition_resource(back_buffers_[frame_index_].get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    if (capture_present_frames()) {
+        transition_resource(back_buffers_[frame_index_].get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        copy_current_back_buffer_to_readback();
+        transition_resource(back_buffers_[frame_index_].get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+    } else {
+        transition_resource(back_buffers_[frame_index_].get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    }
     demo::check_hr(command_list_->Close(), "ID3D12GraphicsCommandList::Close failed");
     ID3D12CommandList *lists[] = {command_list_.get()};
     queue_->ExecuteCommandLists(1, lists);
     record_execute_command_lists(queue_.get(), command_list_.get());
-    demo::check_hr(swap_chain_->Present(1, 0), "IDXGISwapChain::Present failed");
+    constexpr UINT sync_interval = 1;
+    constexpr UINT present_flags = 0;
+    const HRESULT present_hr = swap_chain_->Present(sync_interval, present_flags);
+    demo::check_hr(present_hr, "IDXGISwapChain::Present failed");
     frame_open_ = false;
     wait_for_gpu();
+    if (capture_present_frames()) {
+        record_current_present_frame(sync_interval, present_flags);
+    }
+    record_present_semantics(sync_interval, present_flags, present_hr);
 }
 
 ValidationResult Dx12Runtime::present_and_validate(
@@ -473,33 +571,23 @@ ValidationResult Dx12Runtime::present_and_validate(
 
     transition_resource(back_buffers_[frame_index_].get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
 
-    D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = back_buffers_[frame_index_].get();
-    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src.SubresourceIndex = 0;
-
-    D3D12_RESOURCE_DESC back_buffer_desc = back_buffers_[frame_index_]->GetDesc();
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-    UINT num_rows = 0;
-    UINT64 row_size = 0;
-    UINT64 total_size = 0;
-    device_->GetCopyableFootprints(&back_buffer_desc, 0, 1, 0, &footprint, &num_rows, &row_size, &total_size);
-
-    D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = readback_buffer_.get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint = footprint;
-    command_list_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-
+    copy_current_back_buffer_to_readback();
     transition_resource(back_buffers_[frame_index_].get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
     demo::check_hr(command_list_->Close(), "ID3D12GraphicsCommandList::Close(validate) failed");
 
     ID3D12CommandList *lists[] = {command_list_.get()};
     queue_->ExecuteCommandLists(1, lists);
     record_execute_command_lists(queue_.get(), command_list_.get());
-    demo::check_hr(swap_chain_->Present(1, 0), "IDXGISwapChain::Present(validate) failed");
+    constexpr UINT sync_interval = 1;
+    constexpr UINT present_flags = 0;
+    const HRESULT present_hr = swap_chain_->Present(sync_interval, present_flags);
+    demo::check_hr(present_hr, "IDXGISwapChain::Present(validate) failed");
     frame_open_ = false;
     wait_for_gpu();
+    if (capture_present_frames()) {
+        record_current_present_frame(sync_interval, present_flags);
+    }
+    record_present_semantics(sync_interval, present_flags, present_hr);
     return validate_pixels(expectations, expectation_count);
 }
 
@@ -524,6 +612,38 @@ std::vector<std::uint8_t> Dx12Runtime::readback_rgba() const
     D3D12_RANGE written_range{0, 0};
     readback_buffer_->Unmap(0, &written_range);
     return pixels;
+}
+
+void Dx12Runtime::copy_current_back_buffer_to_readback()
+{
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = back_buffers_[frame_index_].get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+
+    D3D12_RESOURCE_DESC back_buffer_desc = back_buffers_[frame_index_]->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT num_rows = 0;
+    UINT64 row_size = 0;
+    UINT64 total_size = 0;
+    device_->GetCopyableFootprints(&back_buffer_desc, 0, 1, 0, &footprint, &num_rows, &row_size, &total_size);
+
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = readback_buffer_.get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = footprint;
+    command_list_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+}
+
+void Dx12Runtime::record_current_present_frame(UINT sync_interval, UINT flags) const
+{
+    record_present_frame(
+        static_cast<unsigned int>(width_),
+        static_cast<unsigned int>(height_),
+        sync_interval,
+        flags,
+        readback_rgba()
+    );
 }
 
 ValidationResult Dx12Runtime::validate_pixels(

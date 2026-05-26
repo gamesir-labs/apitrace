@@ -57,7 +57,11 @@
 ## 当前阶段说明
 
 - 这里已经从单一 proxy 文件扩成了 capture / replay / state / submission 四条骨架
+- proxy 当前保留 Wine app-local `d3d12.dll` override 作为 capture 入口，不新增 launcher / injector / CLI 模式
+- capture 默认记录 D3D12 对象、pipeline、resource Map/Unmap、descriptor、command list 状态、提交边界和 Present 语义；`D3D12PresentFrame` 只保留为显式 debug 资产
+- replay backend 会读取 bundle，校验 pipeline / resource / descriptor / command list 语义，把 Map/Unmap buffer 写入挂回 replay resource，并在默认路径重新录制 D3D12 command list / submission；未覆盖的原生语义必须明确失败，不能用 present-frame playback 冒充成功
 - 后续如果增加 command queue、descriptor、barrier 等 D3D12 专属逻辑，应继续在本模块内部细拆，不要塞回通用模块
+- 任意第三方 D3D12 app 的自动 swapchain frame 捕获仍需要单独设计 DXGI/swapchain 拦截；不要把它混成新的 capture 入口
 
 ## 相关文档
 
