@@ -60,6 +60,19 @@ bool require_object_ref_count(const trace::EventRecord &event, std::size_t expec
   return true;
 }
 
+bool require_payload_key(
+    const trace::EventRecord &event,
+    const json &payload,
+    std::string_view key,
+    std::string &error)
+{
+  if (payload.find(std::string(key)) != payload.end()) {
+    return true;
+  }
+  error = record_prefix(event) + ": missing payload key " + std::string(key);
+  return false;
+}
+
 std::filesystem::path resolve_asset_path(
     const trace::TraceBundleReader &reader,
     const trace::EventRecord &event,
@@ -1336,10 +1349,25 @@ bool parse_present(
   if (!require_object_ref_count(event, 1, error)) {
     return false;
   }
+  if (!require_payload_key(event, payload, "sync_interval", error) ||
+      !require_payload_key(event, payload, "flags", error)) {
+    return false;
+  }
   auto command = make_command_header<PresentCommand>(event);
   command.swap_chain_id = event.object_refs[0];
   command.sync_interval = payload.value("sync_interval", 0u);
   command.flags = payload.value("flags", 0u);
+  if (!require_payload_key(event, payload, "frame_index", error)) {
+    return false;
+  }
+  command.frame_index = parse_frame_index(payload).value_or(0);
+  if (command.frame_index != plan.present_call_count) {
+    error = record_prefix(event) + ": IDXGISwapChain::Present frame_index is not contiguous";
+    return false;
+  }
+  plan.present_sync_intervals.push_back(command.sync_interval);
+  plan.present_flags.push_back(command.flags);
+  ++plan.present_call_count;
   plan.commands.emplace_back(std::move(command));
   return true;
 }
@@ -1399,7 +1427,42 @@ bool parse_boundary_event(const trace::EventRecord &event, const json &payload, 
     auto command = make_command_header<FrameBoundaryCommand>(event);
     command.header.label = "Frame";
     command.label = payload.value("label", std::string());
+    if (!require_payload_key(event, payload, "frame_index", error)) {
+      return false;
+    }
     command.frame_index = parse_frame_index(payload).value_or(0);
+    if (command.label == "FrameBegin") {
+      if (command.frame_index != plan.frame_begin_count) {
+        error = record_prefix(event) + ": FrameBegin frame_index is not contiguous";
+        return false;
+      }
+      if (plan.open_frames.find(command.frame_index) != plan.open_frames.end()) {
+        error = record_prefix(event) + ": duplicate FrameBegin for frame_index";
+        return false;
+      }
+      plan.open_frames.emplace(command.frame_index, true);
+      ++plan.frame_begin_count;
+    } else if (command.label == "FrameEnd") {
+      if (command.frame_index != plan.frame_end_count) {
+        error = record_prefix(event) + ": FrameEnd frame_index is not contiguous";
+        return false;
+      }
+      const auto open_frame = plan.open_frames.find(command.frame_index);
+      if (open_frame == plan.open_frames.end()) {
+        error = record_prefix(event) + ": FrameEnd is missing matching FrameBegin";
+        return false;
+      }
+      if (plan.presented_frames.find(command.frame_index) == plan.presented_frames.end()) {
+        error = record_prefix(event) + ": FrameEnd is missing matching Present boundary";
+        return false;
+      }
+      plan.open_frames.erase(open_frame);
+      plan.presented_frames.erase(command.frame_index);
+      ++plan.frame_end_count;
+    } else {
+      error = record_prefix(event) + ": unsupported Frame boundary label";
+      return false;
+    }
     plan.commands.emplace_back(std::move(command));
     return true;
   }
@@ -1407,7 +1470,39 @@ bool parse_boundary_event(const trace::EventRecord &event, const json &payload, 
     auto command = make_command_header<PresentBoundaryCommand>(event);
     command.header.label = "Present";
     command.label = payload.value("label", std::string());
+    if (!require_payload_key(event, payload, "frame_index", error)) {
+      return false;
+    }
+    if (!require_payload_key(event, payload, "sync_interval", error) ||
+        !require_payload_key(event, payload, "flags", error)) {
+      return false;
+    }
     command.frame_index = parse_frame_index(payload).value_or(0);
+    if (command.frame_index != plan.present_boundary_count) {
+      error = record_prefix(event) + ": Present boundary frame_index is not contiguous";
+      return false;
+    }
+    if (command.frame_index >= plan.present_call_count) {
+      error = record_prefix(event) + ": Present boundary is missing matching IDXGISwapChain::Present call";
+      return false;
+    }
+    command.sync_interval = payload.value("sync_interval", 0u);
+    command.flags = payload.value("flags", 0u);
+    if (plan.present_sync_intervals[command.frame_index] != command.sync_interval ||
+        plan.present_flags[command.frame_index] != command.flags) {
+      error = record_prefix(event) + ": Present boundary does not match captured IDXGISwapChain::Present parameters";
+      return false;
+    }
+    if (plan.open_frames.find(command.frame_index) == plan.open_frames.end()) {
+      error = record_prefix(event) + ": Present boundary is missing matching FrameBegin";
+      return false;
+    }
+    if (plan.presented_frames.find(command.frame_index) != plan.presented_frames.end()) {
+      error = record_prefix(event) + ": duplicate Present boundary for frame_index";
+      return false;
+    }
+    plan.presented_frames.emplace(command.frame_index, true);
+    ++plan.present_boundary_count;
     plan.commands.emplace_back(std::move(command));
     return true;
   }
@@ -1435,6 +1530,14 @@ bool build_d3d11_replay_plan(
     std::string &error)
 {
   plan.commands.clear();
+  plan.present_call_count = 0;
+  plan.present_boundary_count = 0;
+  plan.frame_begin_count = 0;
+  plan.frame_end_count = 0;
+  plan.present_sync_intervals.clear();
+  plan.present_flags.clear();
+  plan.open_frames.clear();
+  plan.presented_frames.clear();
   plan.commands.reserve(reader.events().size());
 
   for (const auto &event : reader.events()) {
@@ -1458,6 +1561,23 @@ bool build_d3d11_replay_plan(
     if (!handler->second(reader, event, payload, plan, error)) {
       return false;
     }
+  }
+
+  if (plan.present_call_count != plan.present_boundary_count) {
+    error = "D3D11 present boundary count does not match captured IDXGISwapChain::Present calls";
+    return false;
+  }
+  if (plan.frame_begin_count != plan.frame_end_count) {
+    error = "D3D11 frame boundary count does not match";
+    return false;
+  }
+  if (plan.frame_begin_count != plan.present_call_count) {
+    error = "D3D11 frame boundary count does not match captured IDXGISwapChain::Present calls";
+    return false;
+  }
+  if (!plan.open_frames.empty() || !plan.presented_frames.empty()) {
+    error = "D3D11 frame boundaries are not fully closed";
+    return false;
   }
 
   error.clear();

@@ -33,6 +33,15 @@ else
 fi
 
 SCENES="${APITRACE_D3D11_SCENES:-smoke_triangle indexed_instancing textured_quad depth_blend_scissor offscreen_copy_composite mip_sampling msaa_resolve}"
+GENERATED_TRACE_BUNDLES=""
+
+cleanup_generated_trace_bundles() {
+    for bundle in $GENERATED_TRACE_BUNDLES; do
+        rm -rf "$bundle"
+    done
+}
+
+trap cleanup_generated_trace_bundles EXIT INT TERM
 
 capture_visual_window() {
     window_title="$1"
@@ -287,18 +296,20 @@ run_scene() {
     scene="$1"
     run_log="$RUN_LOG_DIR/$scene-run.log"
     visual_screenshot="$RUN_LOG_DIR/$scene-visual.png"
+    trace_bundle="$RUN_LOG_DIR/$scene.apitrace"
+    GENERATED_TRACE_BUNDLES="$GENERATED_TRACE_BUNDLES $trace_bundle"
 
-    rm -rf "$run_log" "$visual_screenshot"
+    rm -rf "$run_log" "$visual_screenshot" "$trace_bundle"
 
     if [ "$VISUAL_CHECK" != "0" ]; then
-        "$WINE_BIN" explorer "/desktop=$VISUAL_DESKTOP" "$DEMO_BIN_DIR/apitrace_test_demo.exe" --dx dx11 --scene "$scene" >"$run_log" 2>&1 &
+        APITRACE_TRACE_BUNDLE="$trace_bundle" "$WINE_BIN" explorer "/desktop=$VISUAL_DESKTOP" "$DEMO_BIN_DIR/apitrace_test_demo.exe" --dx dx11 --scene "$scene" >"$run_log" 2>&1 &
         wine_pid="$!"
         (
             capture_visual_window "$VISUAL_WINDOW_TITLE" "$visual_screenshot"
         ) &
         capture_pid="$!"
     else
-        "$WINE_BIN" "$DEMO_BIN_DIR/apitrace_test_demo.exe" --dx dx11 --scene "$scene" 2>&1 | tee "$run_log"
+        APITRACE_TRACE_BUNDLE="$trace_bundle" "$WINE_BIN" "$DEMO_BIN_DIR/apitrace_test_demo.exe" --dx dx11 --scene "$scene" 2>&1 | tee "$run_log"
         wine_pid=""
         capture_pid=""
     fi
@@ -342,7 +353,28 @@ run_scene() {
         exit 1
     fi
 
+    if [ -z "$trace_bundle" ] || [ ! -f "$trace_bundle/callstream.jsonl" ]; then
+        echo "$scene: missing D3D11 trace bundle" >&2
+        exit 1
+    fi
+
+    present_call_count="$(grep -c '"function":"IDXGISwapChain::Present"' "$trace_bundle/callstream.jsonl" || true)"
+    present_boundary_count="$(grep -c '"boundary":"Present"' "$trace_bundle/callstream.jsonl" || true)"
+    if [ "$present_call_count" -ne "$APITRACE_TRIANGLE_MAX_FRAMES" ] || [ "$present_boundary_count" -ne "$APITRACE_TRIANGLE_MAX_FRAMES" ]; then
+        echo "$scene: D3D11 present semantic count mismatch calls=$present_call_count boundaries=$present_boundary_count expected=$APITRACE_TRIANGLE_MAX_FRAMES" >&2
+        exit 1
+    fi
+    if ! grep -F '"function":"IDXGISwapChain::Present"' "$trace_bundle/callstream.jsonl" | grep -F '"frame_index":0' >/dev/null || \
+       ! grep -F '"function":"IDXGISwapChain::Present"' "$trace_bundle/callstream.jsonl" | grep -F '"sync_interval":' >/dev/null || \
+       ! grep -F '"function":"IDXGISwapChain::Present"' "$trace_bundle/callstream.jsonl" | grep -F '"flags":' >/dev/null || \
+       ! grep -F '"boundary":"Present"' "$trace_bundle/callstream.jsonl" | grep -F '"sync_interval":' >/dev/null || \
+       ! grep -F '"boundary":"Present"' "$trace_bundle/callstream.jsonl" | grep -F '"flags":' >/dev/null; then
+        echo "$scene: missing D3D11 present semantic payloads" >&2
+        exit 1
+    fi
+
     echo "scene run log: $run_log"
+    echo "scene trace bundle: $trace_bundle"
     if [ "$VISUAL_CHECK" != "0" ]; then
         echo "scene visual screenshot: $visual_screenshot"
     fi

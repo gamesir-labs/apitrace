@@ -482,12 +482,39 @@ def collect_paths(value):
     return paths
 
 referenced_paths = []
+presents = []
+boundaries = []
 with callstream.open("r", encoding="utf-8") as stream:
     for line in stream:
         line = line.strip()
         if not line:
             continue
-        referenced_paths.extend(collect_paths(json.loads(line).get("payload")))
+        record = json.loads(line)
+        payload = record.get("payload") or {}
+        referenced_paths.extend(collect_paths(payload))
+        if record.get("record_kind") == "call" and record.get("function") == "IDXGISwapChain::Present":
+            missing = [key for key in ("frame_index", "sync_interval", "flags") if key not in payload]
+            if missing:
+                raise SystemExit(f"{scene_name}: Present call is missing semantic keys: {', '.join(missing)}")
+            frame_index = payload["frame_index"]
+            if frame_index != len(presents):
+                raise SystemExit(f"{scene_name}: Present call frame_index is not contiguous")
+            presents.append((payload["sync_interval"], payload["flags"]))
+        elif record.get("record_kind") == "boundary" and record.get("boundary") == "Present":
+            missing = [key for key in ("frame_index", "sync_interval", "flags") if key not in payload]
+            if missing:
+                raise SystemExit(f"{scene_name}: Present boundary is missing semantic keys: {', '.join(missing)}")
+            frame_index = payload["frame_index"]
+            if frame_index != len(boundaries):
+                raise SystemExit(f"{scene_name}: Present boundary frame_index is not contiguous")
+            if frame_index >= len(presents):
+                raise SystemExit(f"{scene_name}: Present boundary has no matching Present call")
+            if presents[frame_index] != (payload["sync_interval"], payload["flags"]):
+                raise SystemExit(f"{scene_name}: Present boundary does not match Present call parameters")
+            boundaries.append((payload["sync_interval"], payload["flags"]))
+
+if len(presents) != len(boundaries):
+    raise SystemExit(f"{scene_name}: Present call/boundary count mismatch: calls={len(presents)} boundaries={len(boundaries)}")
 
 if not any(path.startswith("pipelines/") for path in referenced_paths):
     raise SystemExit(f"{scene_name}: fixture trace is missing referenced pipeline assets")

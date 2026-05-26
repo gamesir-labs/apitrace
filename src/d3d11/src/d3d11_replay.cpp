@@ -86,21 +86,6 @@ std::string env_string(const char *primary, const char *fallback, const char *de
   return default_value;
 }
 
-DWORD env_millis(const char *name, DWORD fallback)
-{
-  const char *value = std::getenv(name);
-  if (!value || !*value) {
-    return fallback;
-  }
-
-  char *end = nullptr;
-  const unsigned long parsed = std::strtoul(value, &end, 10);
-  if (end == value || (end && *end != '\0')) {
-    return fallback;
-  }
-  return static_cast<DWORD>(parsed);
-}
-
 std::string format_hresult(const char *operation, HRESULT hr)
 {
   std::ostringstream message;
@@ -283,13 +268,13 @@ public:
       }
     }
 
-    if (show_window_) {
-      const DWORD deadline = GetTickCount() + env_millis("APITRACE_RETRACE_WINDOW_HOLD_MS", 2000);
-      while (GetTickCount() < deadline) {
-        pump_messages();
-        Sleep(15);
-      }
+    if (!present_calls_.empty() || !open_frames_.empty() ||
+        next_present_call_frame_index_ != next_present_boundary_frame_index_ ||
+        next_frame_begin_index_ != next_frame_end_index_) {
+      error = "D3D11 present boundary count does not match replayed IDXGISwapChain::Present calls";
+      return false;
     }
+
     return true;
   }
 
@@ -304,6 +289,8 @@ public:
     devices_.clear();
     contexts_.clear();
     swapchains_.clear();
+    present_calls_.clear();
+    open_frames_.clear();
     resource_states_.clear();
     render_target_views_.clear();
     shader_resource_views_.clear();
@@ -315,6 +302,10 @@ public:
     blend_states_.clear();
     depth_stencil_states_.clear();
     rasterizer_states_.clear();
+    next_frame_begin_index_ = 0;
+    next_frame_end_index_ = 0;
+    next_present_call_frame_index_ = 0;
+    next_present_boundary_frame_index_ = 0;
 
     if (window_) {
       DestroyWindow(window_);
@@ -1701,6 +1692,14 @@ private:
     if (!lookup_object(swapchains_, command.swap_chain_id, "swapchain", swapchain, error)) {
       return false;
     }
+    if (command.frame_index != next_present_call_frame_index_) {
+      error = "IDXGISwapChain::Present frame_index is not contiguous";
+      return false;
+    }
+    if (present_calls_.find(command.frame_index) != present_calls_.end()) {
+      error = "duplicate IDXGISwapChain::Present frame_index";
+      return false;
+    }
 
     const HRESULT hr = swapchain->Present(command.sync_interval, command.flags);
     if (FAILED(hr)) {
@@ -1708,10 +1707,9 @@ private:
       return false;
     }
 
+    present_calls_.emplace(command.frame_index, std::make_pair(command.sync_interval, command.flags));
+    ++next_present_call_frame_index_;
     pump_messages();
-    if (show_window_) {
-      Sleep(5);
-    }
     return true;
   }
 
@@ -1720,11 +1718,40 @@ private:
       replay::ReplayStatistics &statistics,
       std::string &error)
   {
-    (void)error;
     if (command.label == "FrameBegin") {
+      if (command.frame_index != next_frame_begin_index_) {
+        error = "FrameBegin frame_index is not contiguous";
+        return false;
+      }
+      if (open_frames_.find(command.frame_index) != open_frames_.end()) {
+        error = "duplicate FrameBegin for frame_index";
+        return false;
+      }
+      open_frames_.emplace(command.frame_index, false);
+      ++next_frame_begin_index_;
       ++statistics.frames_seen;
+      return true;
     }
-    return true;
+    if (command.label == "FrameEnd") {
+      if (command.frame_index != next_frame_end_index_) {
+        error = "FrameEnd frame_index is not contiguous";
+        return false;
+      }
+      const auto frame = open_frames_.find(command.frame_index);
+      if (frame == open_frames_.end()) {
+        error = "FrameEnd is missing matching FrameBegin";
+        return false;
+      }
+      if (!frame->second) {
+        error = "FrameEnd is missing matching Present boundary";
+        return false;
+      }
+      open_frames_.erase(frame);
+      ++next_frame_end_index_;
+      return true;
+    }
+    error = "unsupported Frame boundary label";
+    return false;
   }
 
   bool execute_command(
@@ -1732,8 +1759,31 @@ private:
       replay::ReplayStatistics &statistics,
       std::string &error)
   {
-    (void)command;
-    (void)error;
+    if (command.frame_index != next_present_boundary_frame_index_) {
+      error = "Present boundary frame_index is not contiguous";
+      return false;
+    }
+    const auto present = present_calls_.find(command.frame_index);
+    if (present == present_calls_.end()) {
+      error = "Present boundary is missing matching IDXGISwapChain::Present call";
+      return false;
+    }
+    const auto frame = open_frames_.find(command.frame_index);
+    if (frame == open_frames_.end()) {
+      error = "Present boundary is missing matching FrameBegin";
+      return false;
+    }
+    if (frame->second) {
+      error = "duplicate Present boundary for frame_index";
+      return false;
+    }
+    if (present->second.first != command.sync_interval || present->second.second != command.flags) {
+      error = "Present boundary does not match replayed IDXGISwapChain::Present parameters";
+      return false;
+    }
+    frame->second = true;
+    present_calls_.erase(present);
+    ++next_present_boundary_frame_index_;
     ++statistics.presents_seen;
     return true;
   }
@@ -1756,6 +1806,8 @@ private:
   std::unordered_map<trace::ObjectId, ID3D11Device *> devices_;
   std::unordered_map<trace::ObjectId, ID3D11DeviceContext *> contexts_;
   std::unordered_map<trace::ObjectId, IDXGISwapChain *> swapchains_;
+  std::unordered_map<std::uint64_t, std::pair<UINT, UINT>> present_calls_;
+  std::unordered_map<std::uint64_t, bool> open_frames_;
   std::unordered_map<trace::ObjectId, ReplayResourceState> resource_states_;
   std::unordered_map<trace::ObjectId, ID3D11RenderTargetView *> render_target_views_;
   std::unordered_map<trace::ObjectId, ID3D11ShaderResourceView *> shader_resource_views_;
@@ -1770,6 +1822,10 @@ private:
   std::array<ID3D11ShaderResourceView *, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> ps_shader_resources_{};
   std::array<ID3D11SamplerState *, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT> ps_samplers_{};
   std::optional<BoundIndexBufferState> bound_index_buffer_;
+  std::uint64_t next_frame_begin_index_ = 0;
+  std::uint64_t next_frame_end_index_ = 0;
+  std::uint64_t next_present_call_frame_index_ = 0;
+  std::uint64_t next_present_boundary_frame_index_ = 0;
   ID3D11DepthStencilState *bound_depth_stencil_state_ = nullptr;
   UINT bound_stencil_ref_ = 0;
   ID3D11BlendState *bound_blend_state_ = nullptr;

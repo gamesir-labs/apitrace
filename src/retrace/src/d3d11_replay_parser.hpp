@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -462,6 +463,7 @@ struct PresentCommand {
   trace::ObjectId swap_chain_id = 0;
   std::uint32_t sync_interval = 0;
   std::uint32_t flags = 0;
+  std::uint64_t frame_index = 0;
 };
 
 struct FrameBoundaryCommand {
@@ -474,6 +476,8 @@ struct PresentBoundaryCommand {
   ReplayCommandHeader header;
   std::string label;
   std::uint64_t frame_index = 0;
+  std::uint32_t sync_interval = 0;
+  std::uint32_t flags = 0;
 };
 
 struct DebugMarkerCommand {
@@ -529,6 +533,14 @@ using ReplayCommand = std::variant<
 
 struct D3D11ReplayPlan {
   std::vector<ReplayCommand> commands;
+  std::uint64_t present_call_count = 0;
+  std::uint64_t present_boundary_count = 0;
+  std::uint64_t frame_begin_count = 0;
+  std::uint64_t frame_end_count = 0;
+  std::vector<std::uint32_t> present_sync_intervals;
+  std::vector<std::uint32_t> present_flags;
+  std::unordered_map<std::uint64_t, bool> open_frames;
+  std::unordered_map<std::uint64_t, bool> presented_frames;
 };
 
 bool build_d3d11_replay_plan(

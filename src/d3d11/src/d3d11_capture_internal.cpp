@@ -2653,11 +2653,15 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain *swapchain, UINT sync_inte
   ensure_frame_begin_locked();
 
   std::ostringstream call_payload;
-  call_payload << "{\"sync_interval\":" << sync_interval << ",\"flags\":" << flags << "}";
+  call_payload << "{\"sync_interval\":" << sync_interval
+               << ",\"flags\":" << flags
+               << ",\"frame_index\":" << state.frame_index << "}";
   record_call_locked("IDXGISwapChain::Present", hr, {swapchain}, {}, call_payload.str());
 
   std::ostringstream present_payload;
-  present_payload << "{\"label\":\"Present\",\"frame_index\":" << state.frame_index << "}";
+  present_payload << "{\"label\":\"Present\",\"frame_index\":" << state.frame_index
+                  << ",\"sync_interval\":" << sync_interval
+                  << ",\"flags\":" << flags << "}";
   record_boundary_locked(trace::BoundaryKind::Present, present_payload.str());
 
   std::ostringstream frame_end_payload;
