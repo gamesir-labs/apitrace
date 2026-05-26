@@ -172,6 +172,7 @@ scripts/validate-d3d11-wine.sh
 - `test/fixtures/retrace/d3d11-offscreen_copy_composite/`
 - `test/fixtures/retrace/d3d11-mip_sampling/`
 - `test/fixtures/retrace/d3d11-msaa_resolve/`
+- `test/fixtures/retrace/d3d12-scene-all-pixel/`
 
 兼容保留的早期 smoke fixture：
 
@@ -182,3 +183,17 @@ scripts/validate-d3d11-wine.sh
 - 先用专门的 D3D11 capture 验证路径生成对应 scene 的 bundle，再同步到 fixture 目录；`scripts/validate-d3d11-wine.sh` 只负责 D3DMetal 下的 demo scene smoke。
 - 如果需要刷新 retrace visual reference，再显式执行 `APITRACE_VISUAL_CHECK=1 APITRACE_ACCEPT_VISUAL_SNAPSHOT=1 scripts/validate-d3d11-retrace-wine.sh`，把 `test/artifacts/windows-x86_64/retrace/bin/retrace-d3d11-logs/` 下对应 scene 的 `*-visual.png` 同步到 fixture 目录。
 - `scripts/validate-d3d11-retrace-wine.sh` 默认只校验 replay 统计、bundle 资产引用和运行成功；visual compare 作为显式 opt-in，避免 macOS 上 Wine 窗口截图抖动把常规回归跑挂。
+
+D3D12 的 `d3d12-scene-all-pixel` fixture 是逐帧像素对比基准。`scripts/validate-d3d12-wine.sh` 默认会：
+
+- 先生成一份不含 `D3D12PresentFrame` 的普通 trace，确认默认 trace 不会记录 debug 帧；
+- 再使用 fixture 进行真实 retrace，并在 retrace 进程中显式开启 `APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES=1` 读回实际 backbuffer；
+- 最后调用 `scripts/compare-d3d12-present-frames.py` 按 `frame_index` 对比 fixture 帧和 retrace 帧，要求 `mismatched_frames=0`、`mismatched_pixels=0`、`max_channel_delta=0`。
+
+刷新 D3D12 pixel fixture 时执行：
+
+```sh
+APITRACE_D3D12_UPDATE_PIXEL_FIXTURE=1 scripts/validate-d3d12-wine.sh
+```
+
+可用 `APITRACE_D3D12_PIXEL_COMPARE_FRAMES` 调整每个 scene 的记录帧数，默认是 `3`。这条路径只把 `D3D12PresentFrame` 作为 debug / diff 资产，不能把 retrace 退化成录制帧播放。
