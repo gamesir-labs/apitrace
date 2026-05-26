@@ -71,6 +71,9 @@ IR 只能在内部帮助：
 - 先恢复 device/context
 - 再恢复资源和状态对象
 - 最后按事件流提交 `draw` / `dispatch` / `present`
+- `IDXGISwapChain::Present` call 与 Present boundary 必须携带同一个连续递增的
+  `frame_index`，并校验 `sync_interval` / `flags` 一致；D3D11 replay 使用原始 Present
+  参数调用 swapchain，不插入额外帧间隔
 
 ## D3D12 replay 重点
 
@@ -78,6 +81,77 @@ IR 只能在内部帮助：
 - 恢复 PSO、root signature、descriptor 绑定关系
 - 复原每一段 command list 的边界
 - 尽量保持和捕获时一致的提交节奏
+
+D3D12 replay 的主路径必须重新发出记录到的 D3D12 调用和 command stream，不能把捕获时读回的
+RGBA 帧贴回 swapchain 来冒充重渲染。默认 trace 只记录 `IDXGISwapChain::Present` call、
+Present boundary、FrameBegin / FrameEnd、`sync_interval`、`flags` 和 `frame_index`。
+
+`D3D12PresentFrame` 仅是显式 debug 资产：
+
+- 只有设置 `APITRACE_D3D12_CAPTURE_PRESENT_FRAMES=1` 时，测试 runtime 才会在 Present 前读回
+  RGBA 帧并写入 `textures/*.texture`
+- 设置 `APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES=1` 时，D3D12 retrace 可以在真实 command
+  replay 后、Present 前读回自己的 back buffer，并把结果写成同类 `D3D12PresentFrame`
+- retrace 不允许使用 trace 内的 `D3D12PresentFrame` 做画面播放；这些帧只能用于预览、像素级对比
+  和 bug 诊断
+- `APITRACE_D3D12_RETRACE_PRESENT_DELAY_MS` 只用于人工观察窗口播放，默认值为 `0`；它不是 trace
+  输入语义，也不参与逐帧像素对比验收
+
+默认 D3D12 retrace 会按收集到的语义重建 replay-side device、swapchain back buffer、resource、
+descriptor heap、root signature、PSO、command signature 和 command list，然后按
+`ExecuteCommandLists` submission batch 重新提交。遇到尚未覆盖的 native D3D12 语义时必须明确失败，
+并报告 `D3D12 native command replay incomplete`，不能回退到 present-frame playback。
+
+逐帧验收路径应当是：第一次 trace 打开 `APITRACE_D3D12_CAPTURE_PRESENT_FRAMES=1` 生成参考帧；
+再对 retrace 进程进行 trace，并打开 `APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES=1` 生成
+retrace 实际渲染帧；最后用 `scripts/compare-d3d12-present-frames.py` 按 `frame_index` 做
+raw RGBA 像素对比。这个流程验证 retrace 真实渲染结果，不改变 retrace 的 replay 语义。
+
+为靠近 D3D11 当前进度，D3D12 retrace 已开始消费并校验这些语义记录：
+
+- resource / root signature / PSO 创建记录及其资产引用
+- device 创建记录，包括 device object id 和 `minimum_feature_level`
+- root signature object id 到 serialized root signature asset、blob_refs 和 bytecode bytes 的映射
+- PSO object id 到 pipeline asset path、blob_refs 和可重建 graphics/compute PSO metadata 的映射；
+  graphics pipeline asset 必须包含 root signature、input layout、blend/rasterizer/depth-stencil、
+  sample、RTV/DSV 和 shader 资产引用
+- resource 创建参数，包括完整 resource desc、optimized clear value、Map 状态、Unmap 写入区间、buffer asset bytes 与 blob 引用的资源数据表
+- GPU virtual address 到 resource object id / offset 的重定位，用于 VB/IB/root CBV/root SRV/root UAV/indirect buffer 等绑定
+- descriptor heap 元数据、descriptor view 创建记录、结构化 view desc，以及 raw descriptor handle 到
+  heap/index 的重定位；CBV 的 `buffer_location` 和 RTAS SRV 的 `location` 会按 GPU VA 规则重定位
+- descriptor heap shader-visible 约束、`SetDescriptorHeaps` 数量/类型一致性，以及 root descriptor
+  table 是否引用当前 command list 已绑定 heap
+- command list 的 Reset / Close、root signature、PSO、descriptor heap、root table、RTV/DSV、viewport/scissor、barrier 绑定
+- graphics / compute root 绑定，包括 32-bit constants、root CBV、root SRV 和 root UAV
+- RTV / DSV clear 的 descriptor、颜色、depth/stencil、clear flags 和 rect 数量
+- fence 创建、queue signal / wait、CPU fence signal、GetCompletedValue 和 SetEventOnCompletion
+  的同步语义；retrace 只记录并校验应用自身同步顺序，不用 timestamp 或固定 sleep 重造帧间隔
+- command allocator reset 会结合前一次提交关联的 queue signal 和后续 `SetEventOnCompletion` /
+  CPU fence signal，校验应用已经表达了提交完成语义；retrace 不自行插入等待
+- 多槽 VB 和多 RTV 绑定数组；旧的 `first` / `first_rtv` 只作为旧 bundle 兼容输入
+- `CopyTextureRegion` 的结构化 dst/src copy location，包括 subresource index 和 placed footprint
+- `CopyResource` 的 dst/src resource 关系，以及 `ResolveSubresource` 的 dst/src resource、
+  subresource index 和 format
+- command signature 的 indirect argument schema，以及 `ExecuteIndirect` 的 command signature、
+  argument buffer、可选 count buffer 和 offset 语义
+- draw / indexed draw 的完整参数，以及 dispatch / indirect / copy / resolve 调用；dispatch
+  会保留 thread group 三元组，DXR `DispatchRays` 会把 shader table GPU VA 重定位到 replay
+  resource 语义
+- `ID3D12Resource::Map` / `Unmap` 的范围和可落盘 buffer 资产
+
+这些语义会进入 D3D12 replay 状态跟踪与校验；Map/Unmap 写入资产会挂回对应 replay
+resource，native replay 重新创建资源和 descriptor 后按原始 command stream 录制 GPU 命令。
+当前覆盖默认 D3D12 验证矩阵所需的 draw / indexed draw / dispatch / indirect / copy /
+resolve 路径；DXR、mesh shader 和更多 descriptor 维度仍应在扩展覆盖时按相同规则补齐。
+
+D3D12 retrace 内部会按原始 sequence 构建 replay command stream，并把每条 command-list
+语义挂回对应的 command list 状态。`ExecuteCommandLists` 会形成 completed submission batch，
+并校验被提交的 command list 已经 Close，同时把 command list 的 allocator 和 descriptor heap
+依赖快照并入 batch。queue wait 会作为对应 queue 下一次 submission 的前置 fence 依赖保存；
+后续的 queue signal 和 Present boundary 会继续标注到对应 queue 最近一次 submission batch 上。
+这些字段只保存应用 API 顺序语义，不引入 retrace 自己的时间控制。这样后续 native D3D12 command
+re-emit 可以直接消费已整理好的 command stream 和 submission batch，而不是重新扫描
+`callstream.jsonl`。
 
 ## 与转译层的关系
 
