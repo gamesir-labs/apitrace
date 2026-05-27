@@ -579,6 +579,9 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root)
 
   impl_->callstream_stream.open(impl_->layout.callstream_path, std::ios::binary | std::ios::trunc);
   impl_->open = impl_->callstream_stream.is_open();
+  if (impl_->open) {
+    write_object_index({});
+  }
   return impl_->open;
 }
 
@@ -689,8 +692,13 @@ void TraceBundleWriter::write_object_index(const std::vector<ObjectRecord> &obje
     return;
   }
 
+  std::filesystem::create_directories(impl_->layout.object_index_path.parent_path());
   std::ofstream output(impl_->layout.object_index_path, std::ios::binary | std::ios::trunc);
+  if (!output.is_open()) {
+    return;
+  }
   output << object_index_json(objects);
+  output.flush();
 }
 
 void TraceBundleWriter::declare_analysis_stream(std::string_view stream_name)
@@ -772,7 +780,7 @@ void TraceBundleWriter::close()
         relative_paths.push_back(asset.relative_path);
       }
     }
-    if (!impl_->objects.empty()) {
+    if (std::filesystem::exists(impl_->layout.object_index_path)) {
       relative_paths.push_back(std::filesystem::path(kObjectsDirectoryName) / kObjectIndexFileName);
     }
     for (const auto &stream_name : impl_->analysis_streams) {

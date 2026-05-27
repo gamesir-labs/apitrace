@@ -22,6 +22,10 @@ std::mutex &registry_mutex()
 
 } // namespace
 
+#ifdef APITRACE_HAVE_METAL_BACKEND
+void register_native_metal_replay_backend();
+#endif
+
 void register_metal_replay_backend(std::string name, MetalReplayBackendFactory factory)
 {
   if (name.empty() || !factory) {
@@ -39,8 +43,17 @@ const MetalReplayBackendFactory *find_metal_replay_backend(std::string_view name
   return it == registry().end() ? nullptr : &it->second;
 }
 
-void __attribute__((weak)) register_builtin_metal_replay_backends()
+void register_builtin_metal_replay_backends()
 {
+  static bool registered = false;
+  if (registered) {
+    return;
+  }
+
+#ifdef APITRACE_HAVE_METAL_BACKEND
+  register_native_metal_replay_backend();
+#endif
+  registered = true;
 }
 
 } // namespace apitrace::replay

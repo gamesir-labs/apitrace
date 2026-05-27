@@ -30,6 +30,7 @@ public:
   bool contains(trace::ObjectId object_id) const noexcept;
   const MetalTrackedObject *find(trace::ObjectId object_id) const noexcept;
   std::vector<MetalTrackedObject> find_by_asset_kind(trace::MetalAssetKind asset_kind) const;
+  std::vector<trace::ObjectRecord> snapshot_object_records() const;
 
 private:
   std::unordered_map<trace::ObjectId, MetalTrackedObject> objects_;

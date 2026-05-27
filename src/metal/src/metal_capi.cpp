@@ -100,6 +100,7 @@ void track_object(
   tracked.blob_refs = blob_refs_for_asset(asset);
   tracked.asset_relative_path = asset.relative_path;
   tracked.payload = std::move(payload);
+  tracked.debug_label = asset.debug_name.empty() ? asset.relative_path.filename().generic_string() : asset.debug_name;
   state.object_registry.track(tracked);
 }
 
@@ -239,6 +240,7 @@ APITRACE_METAL_API void apitrace_metal_session_close(apitrace_metal_session_t *s
     std::lock_guard<std::mutex> lock(state.mutex);
     if (state.open) {
       state.recorder.close();
+      state.writer.write_object_index(state.object_registry.snapshot_object_records());
       state.bridge.shutdown();
       state.writer.close();
       state.open = false;

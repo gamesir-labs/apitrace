@@ -490,7 +490,10 @@ private:
       return fail("render encoder references missing command buffer");
     }
 
-    const auto pass = parse_nested_json(payload, "render_pass_info");
+    auto pass = parse_nested_json(payload, "render_pass_info");
+    if (pass.contains("render_pass_info")) {
+      pass = parse_nested_json(pass, "render_pass_info");
+    }
     auto *descriptor = [MTLRenderPassDescriptor renderPassDescriptor];
     const auto color_texture_id = pass.value("color_texture_id", pass.value("drawable_id", 0ull));
     if (color_texture_id == 0) {
@@ -832,17 +835,11 @@ private:
 
 } // namespace
 
-void register_builtin_metal_replay_backends()
+void register_native_metal_replay_backend()
 {
-  static bool registered = false;
-  if (registered) {
-    return;
-  }
-
   register_metal_replay_backend("native", [] {
     return std::make_unique<NativeMetalReplayBackend>();
   });
-  registered = true;
 }
 
 } // namespace apitrace::replay

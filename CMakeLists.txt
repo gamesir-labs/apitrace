@@ -123,6 +123,7 @@ endif()
 
 if(APPLE AND APITRACE_BUILD_METAL_BACKEND)
     enable_language(OBJCXX)
+    target_compile_definitions(apitrace_core PRIVATE APITRACE_HAVE_METAL_BACKEND=1)
     target_sources(apitrace_platform_apple_metal PRIVATE
         src/metal/src/metal_replay_native.mm
     )

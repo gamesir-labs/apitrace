@@ -1,5 +1,7 @@
 #include "apitrace/metal_state.hpp"
 
+#include <algorithm>
+
 namespace apitrace::metal {
 
 void MetalObjectRegistry::track(const MetalTrackedObject &object)
@@ -33,6 +35,24 @@ std::vector<MetalTrackedObject> MetalObjectRegistry::find_by_asset_kind(trace::M
     }
   }
   return matches;
+}
+
+std::vector<trace::ObjectRecord> MetalObjectRegistry::snapshot_object_records() const
+{
+  std::vector<trace::ObjectRecord> records;
+  records.reserve(objects_.size());
+  for (const auto &[object_id, object] : objects_) {
+    trace::ObjectRecord record;
+    record.object_id = object_id;
+    record.kind = object.kind;
+    record.debug_name = object.debug_label;
+    records.push_back(std::move(record));
+  }
+
+  std::sort(records.begin(), records.end(), [](const trace::ObjectRecord &lhs, const trace::ObjectRecord &rhs) {
+    return lhs.object_id < rhs.object_id;
+  });
+  return records;
 }
 
 } // namespace apitrace::metal
