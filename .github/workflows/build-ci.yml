@@ -70,8 +70,8 @@ jobs:
             apitrace_retrace \
             apitrace_platform_apple_metal
 
-      - name: Run validate-metal-native
-        run: scripts/validate-metal-native.sh
+      - name: Run metal test
+        run: scripts/test-metal.sh
 
       - name: Assemble artifact
         run: |

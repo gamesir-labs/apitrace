@@ -66,4 +66,4 @@ WINEDLLOVERRIDES="d3d11,dxgi,winemetal=n,b;mscoree,mshtml=d" \
 wine retrace.exe path/to/scene.apitrace
 ```
 
-For the validation flow of `retrace.exe`, see [scripts/validate-d3d11-retrace-wine.sh](scripts/validate-d3d11-retrace-wine.sh).
+For the D3D11 trace / retrace validation flow, see [scripts/test-d3d11.sh](scripts/test-d3d11.sh).

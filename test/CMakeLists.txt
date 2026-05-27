@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(apitrace_test_demo LANGUAGES CXX)
+project(apitrace_test LANGUAGES CXX)
 
 include(GNUInstallDirs)
 

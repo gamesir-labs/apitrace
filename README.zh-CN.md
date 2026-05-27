@@ -46,4 +46,4 @@ WINEDLLOVERRIDES="d3d11,dxgi,winemetal=n,b;mscoree,mshtml=d" \
 wine retrace.exe path/to/scene.apitrace
 ```
 
-`retrace.exe` 的验证流程可参考 [scripts/validate-d3d11-retrace-wine.sh](scripts/validate-d3d11-retrace-wine.sh)。
+D3D11 trace / retrace 验证流程可参考 [scripts/test-d3d11.sh](scripts/test-d3d11.sh)。

@@ -187,6 +187,60 @@ PY
     grep -F "failed_frames=0" "$METAL_COMPARE_LOG" >/dev/null || fail "d3d12-to-metal compare failed"
 }
 
+check_metal_link_coverage() {
+    python3 - "$LINK_TRACE/analysis/translation-links.jsonl" <<'PY'
+import json
+import pathlib
+import sys
+
+required_scope_kinds = {"encoder", "draw_to_metal_calls"}
+
+
+def fail(message):
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+path = pathlib.Path(sys.argv[1])
+if not path.is_file():
+    fail(f"missing translation-links file: {path}")
+
+coverage = {}
+with path.open("r", encoding="utf-8") as stream:
+    for line_number, line in enumerate(stream, 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            fail(f"{path}:{line_number}: invalid JSON: {exc}")
+        if record.get("record_type") != "scope":
+            continue
+        d3d_sequence = int(record.get("d3d_sequence", 0))
+        if d3d_sequence == 0:
+            continue
+        scope_kind = str(record.get("scope_kind", ""))
+        coverage.setdefault(d3d_sequence, set()).add(scope_kind)
+
+if not coverage:
+    fail(f"{path}: no non-zero d3d_sequence scope records found")
+
+missing = []
+for d3d_sequence in sorted(coverage):
+    required_missing = sorted(required_scope_kinds - coverage[d3d_sequence])
+    if required_missing:
+        missing.append(f"{d3d_sequence}:{','.join(required_missing)}")
+
+if missing:
+    print("missing_link_coverage=" + ";".join(missing))
+    raise SystemExit(1)
+
+print(f"d3d_sequences={len(coverage)}")
+print("coverage=PASS")
+PY
+}
+
 [ -n "$WINE_BIN" ] && [ -x "$WINE_BIN" ] || fail "missing wine binary"
 require_file "$NATIVE_RETRACE"
 mkdir -p "$LINK_DIR"
@@ -194,7 +248,7 @@ mkdir -p "$LINK_DIR"
 stage_dxmt_runtime
 prepare_demo_runtime
 trace_d3d12_to_metal
-python3 "$ROOT_DIR/scripts/check-metal-link-coverage.py" "$LINK_TRACE/analysis/translation-links.jsonl"
+check_metal_link_coverage
 retrace_metal
 compare_metal
 

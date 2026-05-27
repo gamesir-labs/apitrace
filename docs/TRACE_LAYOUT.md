@@ -212,9 +212,11 @@ present-frame asset，retrace 只校验它与 Present call / boundary 的 `frame
 `sync_interval` 和 `flags` 一致。present-frame asset 的文件大小必须等于
 `row_pitch * height`。
 
-逐帧画面对比应在 replay 之外完成，例如用 `scripts/compare-d3d12-present-frames.py` 比较第一次
-trace 和“对 retrace 再 trace”得到的两个 bundle。该对比工具按 `frame_index` 读取
-`D3D12PresentFrame` raw RGBA 资产，逐像素报告差异，并可输出 PNG 预览或 diff heatmap 供人工检查。
+逐帧画面对比应在 replay 之外完成，例如用 `scripts/lib/present_frame_compare.py --api d3d12`
+比较第一次 trace 和“对 retrace 再 trace”得到的两个 bundle。该对比工具按 `frame_index`
+读取 `D3D12PresentFrame` raw RGBA 资产，使用 `100` 像素非重叠 tile 做验收；每个 tile
+至少 `95%` 像素完全匹配，任一 tile 不达标则该帧失败。工具可选输出 failed-tile mask PNG
+供人工检查，但 PNG 不作为仓库内静态 fixture。
 
 ### `buffers/`
 
@@ -462,7 +464,7 @@ translation link 现在至少使用这些字段：
 - `draw_to_metal_calls`
 
 每个非零 `d3d_sequence` 至少应能聚合到一条 `encoder` 和一条 `draw_to_metal_calls` 记录，供
-`scripts/check-metal-link-coverage.py` 做覆盖校验。
+`scripts/test-d3d-metal-link.sh` 内置覆盖校验使用。
 
 ## 文件引用规则
 
