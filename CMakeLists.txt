@@ -42,6 +42,7 @@ add_library(apitrace_core
     src/d3d12/src/d3d12_submission.cpp
     src/metal/src/metal_diagnostics.cpp
     src/metal/src/metal_replay.cpp
+    src/metal/src/metal_capi.cpp
     src/metal/src/metal_state.cpp
     src/metal/src/metal_trace.cpp
     src/metal/src/translation_trace_recorder.cpp
