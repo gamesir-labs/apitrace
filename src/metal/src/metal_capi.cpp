@@ -199,15 +199,9 @@ APITRACE_METAL_API apitrace_metal_session_t *apitrace_metal_session_open(const c
 
   auto session = std::make_unique<apitrace_metal_session>();
   auto &state = session->state;
-  if (!state.writer.open(bundle_root)) {
+  if (!state.writer.open(bundle_root, apitrace::trace::TraceBundleOpenMode::SidebandOnly)) {
     return nullptr;
   }
-
-  apitrace::trace::TraceMetadata metadata;
-  metadata.api = apitrace::trace::ApiKind::Unknown;
-  metadata.producer = "apitrace_metal_capi";
-  metadata.has_metal_callstream = true;
-  state.writer.write_metadata(metadata);
 
   if (!state.bridge.initialize()) {
     state.writer.close();
@@ -240,7 +234,6 @@ APITRACE_METAL_API void apitrace_metal_session_close(apitrace_metal_session_t *s
     std::lock_guard<std::mutex> lock(state.mutex);
     if (state.open) {
       state.recorder.close();
-      state.writer.write_object_index(state.object_registry.snapshot_object_records());
       state.bridge.shutdown();
       state.writer.close();
       state.open = false;

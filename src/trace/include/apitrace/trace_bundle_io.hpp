@@ -23,12 +23,19 @@ struct AnalysisRecord {
   // TODO: keep payload readable by default while allowing producers to own their own schema.
 };
 
+enum class TraceBundleOpenMode {
+  Primary,
+  SidebandOnly,
+};
+
 class TraceBundleWriter {
 public:
   TraceBundleWriter();
   ~TraceBundleWriter();
 
-  bool open(const std::filesystem::path &bundle_root);
+  bool open(
+      const std::filesystem::path &bundle_root,
+      TraceBundleOpenMode mode = TraceBundleOpenMode::Primary);
   void write_metadata(const TraceMetadata &metadata);
   void append_call_event(const EventRecord &event);
   void append_metal_event(const MetalEventRecord &event);

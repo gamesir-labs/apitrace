@@ -53,11 +53,29 @@ NSNumber *object_key(std::uint64_t object_id)
 
 MTLPixelFormat pixel_format_from_string(std::string_view name)
 {
+  if (name == "bgra8unorm") {
+    return MTLPixelFormatBGRA8Unorm;
+  }
   if (name == "rgba8unorm") {
     return MTLPixelFormatRGBA8Unorm;
   }
   if (name == "r32uint") {
     return MTLPixelFormatR32Uint;
+  }
+  return MTLPixelFormatBGRA8Unorm;
+}
+
+MTLPixelFormat pixel_format_from_json_field(const json &descriptor, const char *field_name)
+{
+  const auto it = descriptor.find(field_name);
+  if (it == descriptor.end()) {
+    return MTLPixelFormatBGRA8Unorm;
+  }
+  if (it->is_number_unsigned() || it->is_number_integer()) {
+    return static_cast<MTLPixelFormat>(it->get<std::uint32_t>());
+  }
+  if (it->is_string()) {
+    return pixel_format_from_string(it->get_ref<const std::string &>());
   }
   return MTLPixelFormatBGRA8Unorm;
 }
@@ -94,10 +112,40 @@ MTLLoadAction load_action_from_string(std::string_view name)
   return MTLLoadActionClear;
 }
 
+MTLLoadAction load_action_from_json_field(const json &payload, const char *field_name)
+{
+  const auto it = payload.find(field_name);
+  if (it == payload.end()) {
+    return MTLLoadActionClear;
+  }
+  if (it->is_number_unsigned() || it->is_number_integer()) {
+    return static_cast<MTLLoadAction>(it->get<std::uint32_t>());
+  }
+  if (it->is_string()) {
+    return load_action_from_string(it->get_ref<const std::string &>());
+  }
+  return MTLLoadActionClear;
+}
+
 MTLStoreAction store_action_from_string(std::string_view name)
 {
   if (name == "dontcare") {
     return MTLStoreActionDontCare;
+  }
+  return MTLStoreActionStore;
+}
+
+MTLStoreAction store_action_from_json_field(const json &payload, const char *field_name)
+{
+  const auto it = payload.find(field_name);
+  if (it == payload.end()) {
+    return MTLStoreActionStore;
+  }
+  if (it->is_number_unsigned() || it->is_number_integer()) {
+    return static_cast<MTLStoreAction>(it->get<std::uint32_t>());
+  }
+  if (it->is_string()) {
+    return store_action_from_string(it->get_ref<const std::string &>());
   }
   return MTLStoreActionStore;
 }
@@ -358,7 +406,7 @@ private:
   {
     const auto width = static_cast<NSUInteger>(descriptor.value("width", 1u));
     const auto height = static_cast<NSUInteger>(descriptor.value("height", 1u));
-    const auto pixel_format = pixel_format_from_string(descriptor.value("pixel_format", std::string("bgra8unorm")));
+    const auto pixel_format = pixel_format_from_json_field(descriptor, "pixel_format");
     auto *texture_descriptor = [[MTLTextureDescriptor alloc] init];
     texture_descriptor.textureType = MTLTextureType2D;
     texture_descriptor.width = std::max<NSUInteger>(width, 1);
@@ -401,21 +449,26 @@ private:
     const auto library_id = descriptor.value("library_id", 0ull);
     const auto vertex_library_id = descriptor.value("vertex_library_id", library_id);
     const auto fragment_library_id = descriptor.value("fragment_library_id", library_id);
+    const auto vertex_function_name = descriptor.value("vertex_function", std::string());
+    const auto fragment_function_name = descriptor.value("fragment_function", std::string());
+    const auto rasterization_enabled = descriptor.value("rasterization_enabled", true);
     id<MTLLibrary> vertex_library = library_for_id(vertex_library_id);
-    id<MTLLibrary> fragment_library = library_for_id(fragment_library_id);
-    if (vertex_library == nil || fragment_library == nil) {
+    id<MTLLibrary> fragment_library = fragment_function_name.empty() ? nil : library_for_id(fragment_library_id);
+    if (vertex_library == nil || (!fragment_function_name.empty() && fragment_library == nil)) {
       return fail("render pipeline references missing library");
     }
 
     auto *pipeline_descriptor = [[MTLRenderPipelineDescriptor alloc] init];
     pipeline_descriptor.vertexFunction =
-        [vertex_library newFunctionWithName:[NSString stringWithUTF8String:descriptor.value("vertex_function", std::string()).c_str()]];
-    pipeline_descriptor.fragmentFunction =
-        [fragment_library newFunctionWithName:[NSString stringWithUTF8String:descriptor.value("fragment_function", std::string()).c_str()]];
-    pipeline_descriptor.colorAttachments[0].pixelFormat =
-        pixel_format_from_string(descriptor.value("color_pixel_format", std::string("bgra8unorm")));
-    pipeline_descriptor.depthAttachmentPixelFormat = MTLPixelFormatInvalid;
-    pipeline_descriptor.stencilAttachmentPixelFormat = MTLPixelFormatInvalid;
+        [vertex_library newFunctionWithName:[NSString stringWithUTF8String:vertex_function_name.c_str()]];
+    if (!fragment_function_name.empty()) {
+      pipeline_descriptor.fragmentFunction =
+          [fragment_library newFunctionWithName:[NSString stringWithUTF8String:fragment_function_name.c_str()]];
+    }
+    pipeline_descriptor.colorAttachments[0].pixelFormat = pixel_format_from_json_field(descriptor, "color_pixel_format");
+    pipeline_descriptor.rasterizationEnabled = rasterization_enabled;
+    pipeline_descriptor.depthAttachmentPixelFormat = pixel_format_from_json_field(descriptor, "depth_pixel_format");
+    pipeline_descriptor.stencilAttachmentPixelFormat = pixel_format_from_json_field(descriptor, "stencil_pixel_format");
 
     NSError *error = nil;
     id<MTLRenderPipelineState> pipeline = [device_ newRenderPipelineStateWithDescriptor:pipeline_descriptor error:&error];
@@ -495,7 +548,23 @@ private:
       pass = parse_nested_json(pass, "render_pass_info");
     }
     auto *descriptor = [MTLRenderPassDescriptor renderPassDescriptor];
-    const auto color_texture_id = pass.value("color_texture_id", pass.value("drawable_id", 0ull));
+    std::uint64_t color_texture_id = pass.value("color_texture_id", pass.value("drawable_id", 0ull));
+    if (color_texture_id == 0) {
+      const auto colors = pass.find("colors");
+      if (colors != pass.end() && colors->is_array() && !colors->empty()) {
+        const auto &first_color = (*colors)[0];
+        color_texture_id = first_color.value("texture", 0ull);
+        if (color_texture_id == 0) {
+          color_texture_id = first_color.value("resolve_texture", 0ull);
+        }
+        if (color_texture_id != 0) {
+          pass["color_texture_id"] = color_texture_id;
+          pass["load_action"] = first_color.value("load_action", 2u);
+          pass["store_action"] = first_color.value("store_action", 1u);
+          pass["clear_color"] = first_color.value("clear_color", std::array<double, 4>{0.0, 0.0, 0.0, 1.0});
+        }
+      }
+    }
     if (color_texture_id == 0) {
       return fail("render pass is missing color_texture_id");
     }
@@ -509,10 +578,8 @@ private:
     }
 
     descriptor.colorAttachments[0].texture = color_texture;
-    descriptor.colorAttachments[0].loadAction =
-        load_action_from_string(pass.value("load_action", std::string("clear")));
-    descriptor.colorAttachments[0].storeAction =
-        store_action_from_string(pass.value("store_action", std::string("store")));
+    descriptor.colorAttachments[0].loadAction = load_action_from_json_field(pass, "load_action");
+    descriptor.colorAttachments[0].storeAction = store_action_from_json_field(pass, "store_action");
 
     const auto clear = pass.value("clear_color", std::array<double, 4>{0.0, 0.0, 0.0, 1.0});
     descriptor.colorAttachments[0].clearColor =

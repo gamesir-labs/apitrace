@@ -418,6 +418,30 @@ std::string normalize_payload(std::string_view payload)
   return std::string(payload);
 }
 
+std::vector<std::filesystem::path> collect_bundle_relative_paths(const BundleLayout &layout)
+{
+  std::vector<std::filesystem::path> relative_paths;
+  if (!std::filesystem::exists(layout.root_path)) {
+    return relative_paths;
+  }
+
+  for (const auto &entry : std::filesystem::recursive_directory_iterator(layout.root_path)) {
+    if (!entry.is_regular_file()) {
+      continue;
+    }
+
+    const auto relative_path = std::filesystem::relative(entry.path(), layout.root_path);
+    if (relative_path == std::filesystem::path(kChecksumsFileName)) {
+      continue;
+    }
+    relative_paths.push_back(relative_path);
+  }
+
+  std::sort(relative_paths.begin(), relative_paths.end());
+  relative_paths.erase(std::unique(relative_paths.begin(), relative_paths.end()), relative_paths.end());
+  return relative_paths;
+}
+
 std::string event_record_json(const EventRecord &event)
 {
   std::ostringstream output;
@@ -535,6 +559,7 @@ struct TraceBundleWriter::Impl {
   std::unordered_set<std::string> written_files;
   bool open = false;
   bool metadata_written = false;
+  TraceBundleOpenMode open_mode = TraceBundleOpenMode::Primary;
 
   // TODO: split buffered readable indexes from buffered raw asset writes once persistence begins.
   // TODO: add explicit writer-phase state so open/write/close sequencing can be validated.
@@ -544,9 +569,10 @@ TraceBundleWriter::TraceBundleWriter() : impl_(std::make_unique<Impl>()) {}
 
 TraceBundleWriter::~TraceBundleWriter() = default;
 
-bool TraceBundleWriter::open(const std::filesystem::path &bundle_root)
+bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBundleOpenMode mode)
 {
   impl_ = std::make_unique<Impl>();
+  impl_->open_mode = mode;
   impl_->layout.root_path = bundle_root;
   impl_->layout.callstream_path = bundle_root / kCallstreamFileName;
   impl_->layout.metal_callstream_path = bundle_root / kMetalCallstreamFileName;
@@ -577,9 +603,13 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root)
   std::filesystem::create_directories(impl_->layout.metal_buffers_directory_path);
   std::filesystem::create_directories(impl_->layout.metal_textures_directory_path);
 
-  impl_->callstream_stream.open(impl_->layout.callstream_path, std::ios::binary | std::ios::trunc);
-  impl_->open = impl_->callstream_stream.is_open();
-  if (impl_->open) {
+  if (mode == TraceBundleOpenMode::Primary) {
+    impl_->callstream_stream.open(impl_->layout.callstream_path, std::ios::binary | std::ios::trunc);
+    impl_->open = impl_->callstream_stream.is_open();
+  } else {
+    impl_->open = true;
+  }
+  if (impl_->open && mode == TraceBundleOpenMode::Primary) {
     write_object_index({});
   }
   return impl_->open;
@@ -588,7 +618,7 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root)
 void TraceBundleWriter::write_metadata(const TraceMetadata &metadata)
 {
   impl_->metadata = metadata;
-  if (!impl_->open || impl_->metadata_written) {
+  if (!impl_->open || impl_->metadata_written || !impl_->callstream_stream.is_open()) {
     return;
   }
 
@@ -605,7 +635,7 @@ void TraceBundleWriter::write_metadata(const TraceMetadata &metadata)
 void TraceBundleWriter::append_call_event(const EventRecord &event)
 {
   impl_->events.push_back(event);
-  if (!impl_->open) {
+  if (!impl_->open || !impl_->callstream_stream.is_open()) {
     return;
   }
 
@@ -765,31 +795,7 @@ void TraceBundleWriter::close()
   ChecksumIndex checksums = impl_->checksums;
   if (checksums.files.empty()) {
     checksums.format_version = impl_->metadata.format_version;
-    std::vector<std::filesystem::path> relative_paths;
-    relative_paths.push_back(std::filesystem::path(kCallstreamFileName));
-    if (!impl_->metal_events.empty()) {
-      relative_paths.push_back(std::filesystem::path(kMetalCallstreamFileName));
-    }
-    for (const auto &asset : impl_->assets) {
-      if (!asset.relative_path.empty()) {
-        relative_paths.push_back(asset.relative_path);
-      }
-    }
-    for (const auto &asset : impl_->metal_assets) {
-      if (!asset.relative_path.empty()) {
-        relative_paths.push_back(asset.relative_path);
-      }
-    }
-    if (std::filesystem::exists(impl_->layout.object_index_path)) {
-      relative_paths.push_back(std::filesystem::path(kObjectsDirectoryName) / kObjectIndexFileName);
-    }
-    for (const auto &stream_name : impl_->analysis_streams) {
-      relative_paths.push_back(
-          std::filesystem::relative(analysis_path_for_stream(impl_->layout, stream_name), impl_->layout.root_path));
-    }
-
-    std::sort(relative_paths.begin(), relative_paths.end());
-    relative_paths.erase(std::unique(relative_paths.begin(), relative_paths.end()), relative_paths.end());
+    const auto relative_paths = collect_bundle_relative_paths(impl_->layout);
 
     std::string bundle_fingerprint_source;
     for (const auto &relative_path : relative_paths) {

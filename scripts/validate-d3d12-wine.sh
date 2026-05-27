@@ -30,6 +30,10 @@ RETRACE_EXE="$ROOT_BUILD_DIR/retrace.exe"
 DXMT_REPO_ROOT="${APITRACE_DXMT_REPO_ROOT:-$ROOT_DIR/../dxmt}"
 DXMT_BUILD_DIR="${APITRACE_DXMT_BUILD_DIR:-$DXMT_REPO_ROOT/build-gs-native-builtin}"
 DXMT_STAGE_DIR="${APITRACE_DXMT_STAGE_DIR:-$ROOT_DIR/test/artifacts/dxmt-runtime-d3d12}"
+DXMT_APITRACE_HOST_BUILD_DIR="${APITRACE_DXMT_APITRACE_BUILD_DIR:-$ROOT_DIR/build/macos-dxmt-x86_64}"
+DXMT_VALIDATE_METAL_LINKS="${APITRACE_DXMT_VALIDATE_METAL_LINKS:-1}"
+DXMT_METAL_BUNDLE="${APITRACE_METAL_BUNDLE:-$TRACE_BUNDLE}"
+DXMT_METAL_RETRACE_BIN="$DXMT_APITRACE_HOST_BUILD_DIR/retrace"
 DXMT_RUNTIME_ROOT=""
 DXMT_D3D12_DLL=""
 DXMT_D3D12CORE_DLL=""
@@ -108,11 +112,35 @@ print(os.path.normpath(sys.argv[1] + prefix))
 ' "$DXMT_STAGE_DIR"
 }
 
+prepare_dxmt_apitrace_host_build() {
+    if [ "$DXMT_VALIDATE_METAL_LINKS" != "1" ]; then
+        return
+    fi
+
+    if [ "$(uname -s)" != "Darwin" ]; then
+        echo "DXMT metal link validation requires macOS host builds" >&2
+        exit 1
+    fi
+
+    cmake -S "$ROOT_DIR" -B "$DXMT_APITRACE_HOST_BUILD_DIR" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+        -DAPITRACE_BUILD_METAL_BACKEND=ON
+    cmake --build "$DXMT_APITRACE_HOST_BUILD_DIR" \
+        --target apitrace_core apitrace_platform_apple_metal apitrace_retrace
+
+    meson configure "$DXMT_BUILD_DIR" \
+        -Dapitrace_source_path="$ROOT_DIR" \
+        -Dapitrace_build_path="$DXMT_APITRACE_HOST_BUILD_DIR"
+}
+
 stage_dxmt_runtime() {
     if [ ! -f "$DXMT_BUILD_DIR/build.ninja" ]; then
         echo "missing DXMT build directory: $DXMT_BUILD_DIR" >&2
         exit 1
     fi
+
+    prepare_dxmt_apitrace_host_build
 
     rm -rf "$DXMT_STAGE_DIR"
     meson compile -C "$DXMT_BUILD_DIR"
@@ -222,9 +250,15 @@ if [ "$list_output" != "$(printf '%s\n' $EXPECTED_LIST_SCENES)" ]; then
 fi
 
 rm -rf "$TRACE_BUNDLE"
+if [ "$DXMT_VALIDATE_METAL_LINKS" = "1" ]; then
+    export APITRACE_METAL_BUNDLE="$DXMT_METAL_BUNDLE"
+fi
 export APITRACE_TRACE_BUNDLE="$TRACE_BUNDLE"
 run_output="$("$WINE_BIN" "$DEMO_EXE" --dx dx12 --scene all | tr -d '\r')"
 unset APITRACE_TRACE_BUNDLE
+if [ "$DXMT_VALIDATE_METAL_LINKS" = "1" ]; then
+    unset APITRACE_METAL_BUNDLE
+fi
 for scene in $EXPECTED_RUN_SCENES; do
     if ! printf '%s\n' "$run_output" | grep -F "scene pass: $scene" >/dev/null && \
        ! printf '%s\n' "$run_output" | grep -F "scene skip: $scene" >/dev/null; then
@@ -343,6 +377,62 @@ require_call_record "ID3D12GraphicsCommandList::Dispatch"
 require_call_record "ID3D12Resource::Map"
 require_call_record "ID3D12Resource::Unmap"
 require_call_record "IDXGISwapChain::Present"
+
+require_metal_call() {
+    function_name="$1"
+    if ! grep -F "\"function\":\"$function_name\"" "$DXMT_METAL_BUNDLE/metal-callstream.jsonl" >/dev/null; then
+        echo "missing dxmt metal call record: $function_name" >&2
+        exit 1
+    fi
+}
+
+if [ "$DXMT_VALIDATE_METAL_LINKS" = "1" ]; then
+    if [ ! -f "$DXMT_METAL_BUNDLE/metal-callstream.jsonl" ]; then
+        echo "missing dxmt metal callstream: $DXMT_METAL_BUNDLE/metal-callstream.jsonl" >&2
+        exit 1
+    fi
+    if [ ! -f "$DXMT_METAL_BUNDLE/analysis/translation-links.jsonl" ]; then
+        echo "missing dxmt translation links: $DXMT_METAL_BUNDLE/analysis/translation-links.jsonl" >&2
+        exit 1
+    fi
+
+    require_metal_call "MTLCommandBuffer.commit"
+    require_metal_call "MTLCommandBuffer.presentDrawable"
+    require_metal_call "MTLCommandBuffer.renderCommandEncoder"
+    require_metal_call "MTLRenderCommandEncoder.drawPrimitives"
+    require_metal_call "MTLRenderCommandEncoder.drawIndexedPrimitives"
+    require_metal_call "MTLCommandBuffer.computeCommandEncoder"
+    require_metal_call "MTLComputeCommandEncoder.dispatchThreadgroups"
+    require_metal_call "MTLCommandBuffer.blitCommandEncoder"
+    require_metal_call "MTLBlitCommandEncoder.copyFromTexture"
+
+    python3 "$ROOT_DIR/scripts/check-metal-link-coverage.py" \
+        "$DXMT_METAL_BUNDLE/analysis/translation-links.jsonl"
+
+    if ! grep -F '"metal-callstream.jsonl":' "$DXMT_METAL_BUNDLE/checksums.json" >/dev/null || \
+       ! grep -F '"analysis/translation-links.jsonl":' "$DXMT_METAL_BUNDLE/checksums.json" >/dev/null; then
+        echo "dxmt metal sideband files missing from checksum index" >&2
+        exit 1
+    fi
+
+    set +e
+    metal_retrace_output="$("$DXMT_METAL_RETRACE_BIN" --metal "$DXMT_METAL_BUNDLE" 2>&1)"
+    metal_retrace_status=$?
+    set -e
+    metal_retrace_output="$(printf '%s' "$metal_retrace_output" | tr -d '\r')"
+    if [ "$metal_retrace_status" -ne 0 ]; then
+        echo "dxmt metal retrace failed" >&2
+        printf '%s\n' "$metal_retrace_output" >&2
+        exit 1
+    fi
+    if ! printf '%s\n' "$metal_retrace_output" | grep -F "backend: metal-" >/dev/null || \
+       ! printf '%s\n' "$metal_retrace_output" | grep -E "metal_calls_replayed: [1-9][0-9]*" >/dev/null || \
+       ! printf '%s\n' "$metal_retrace_output" | grep -E "metal_presents_seen: [1-9][0-9]*" >/dev/null; then
+        echo "unexpected dxmt metal retrace statistics" >&2
+        printf '%s\n' "$metal_retrace_output" >&2
+        exit 1
+    fi
+fi
 
 if ! grep -F '"function":"D3D12CreateDevice"' "$TRACE_BUNDLE/callstream.jsonl" | grep -F '"minimum_feature_level":' >/dev/null || \
    ! grep -F '"function":"ID3D12Device::CreateCommandQueue"' "$TRACE_BUNDLE/callstream.jsonl" | grep -F '"priority":' >/dev/null || \
