@@ -1,4 +1,5 @@
 #include "apitrace/trace_bundle_io.hpp"
+#include "metal_callstream_writer.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -648,7 +649,9 @@ struct TraceBundleReader::Impl {
   BundleLayout layout;
   TraceMetadata metadata;
   std::vector<EventRecord> events;
+  std::vector<MetalEventRecord> metal_events;
   std::vector<AssetRecord> assets;
+  std::vector<AssetRecord> metal_assets;
   std::vector<ObjectRecord> objects;
   ChecksumIndex checksums;
   std::string last_error;
@@ -667,6 +670,7 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
   impl_ = std::make_unique<Impl>();
   impl_->layout.root_path = bundle_root;
   impl_->layout.callstream_path = bundle_root / kCallstreamFileName;
+  impl_->layout.metal_callstream_path = bundle_root / kMetalCallstreamFileName;
   impl_->layout.checksums_path = bundle_root / kChecksumsFileName;
   impl_->layout.analysis_directory_path = bundle_root / kAnalysisDirectoryName;
   impl_->layout.translation_links_path = impl_->layout.analysis_directory_path / kTranslationLinksFileName;
@@ -676,6 +680,11 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
   impl_->layout.textures_directory_path = bundle_root / kTexturesDirectoryName;
   impl_->layout.buffers_directory_path = bundle_root / kBuffersDirectoryName;
   impl_->layout.pipelines_directory_path = bundle_root / kPipelinesDirectoryName;
+  impl_->layout.metal_directory_path = bundle_root / kMetalDirectoryName;
+  impl_->layout.metal_libraries_directory_path = impl_->layout.metal_directory_path / kMetalLibrariesDirectoryName;
+  impl_->layout.metal_pipelines_directory_path = impl_->layout.metal_directory_path / kMetalPipelinesDirectoryName;
+  impl_->layout.metal_buffers_directory_path = impl_->layout.metal_directory_path / kMetalBuffersDirectoryName;
+  impl_->layout.metal_textures_directory_path = impl_->layout.metal_directory_path / kMetalTexturesDirectoryName;
 
   for (const auto &required_path : {impl_->layout.callstream_path, impl_->layout.checksums_path, impl_->layout.object_index_path}) {
     if (!std::filesystem::is_regular_file(required_path)) {
@@ -690,6 +699,11 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
   }
 
   if (!parse_objects(impl_->layout.object_index_path, impl_->objects, impl_->last_error)) {
+    return false;
+  }
+
+  if (std::filesystem::is_regular_file(impl_->layout.metal_callstream_path) &&
+      !detail::parse_metal_callstream(impl_->layout.metal_callstream_path, impl_->metal_events, impl_->last_error)) {
     return false;
   }
 
@@ -793,6 +807,39 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
     }
   }
 
+  for (const auto &entry : impl_->checksums.files) {
+    MetalAssetKind metal_kind = MetalAssetKind::Library;
+    if (!detail::is_metal_asset_path(entry.relative_path, &metal_kind)) {
+      continue;
+    }
+
+    AssetRecord asset;
+    asset.relative_path = entry.relative_path;
+    asset.debug_name = entry.relative_path.filename().generic_string();
+    impl_->metal_assets.push_back(std::move(asset));
+  }
+
+  if (std::filesystem::is_regular_file(impl_->layout.metal_callstream_path) &&
+      !validate_checksum_entry(
+          impl_->layout.root_path,
+          std::filesystem::path(kMetalCallstreamFileName),
+          checksum_lookup,
+          impl_->layout.checksums_path,
+          impl_->last_error)) {
+    return false;
+  }
+
+  for (const auto &asset : impl_->metal_assets) {
+    if (!validate_checksum_entry(
+            impl_->layout.root_path,
+            asset.relative_path,
+            checksum_lookup,
+            impl_->layout.checksums_path,
+            impl_->last_error)) {
+      return false;
+    }
+  }
+
   impl_->last_error.clear();
   impl_->open = true;
   return true;
@@ -823,9 +870,19 @@ const std::vector<EventRecord> &TraceBundleReader::events() const noexcept
   return impl_->events;
 }
 
+const std::vector<MetalEventRecord> &TraceBundleReader::metal_events() const noexcept
+{
+  return impl_->metal_events;
+}
+
 const std::vector<AssetRecord> &TraceBundleReader::assets() const noexcept
 {
   return impl_->assets;
+}
+
+const std::vector<AssetRecord> &TraceBundleReader::metal_assets() const noexcept
+{
+  return impl_->metal_assets;
 }
 
 const std::vector<ObjectRecord> &TraceBundleReader::objects() const noexcept

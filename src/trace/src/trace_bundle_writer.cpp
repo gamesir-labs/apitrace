@@ -1,4 +1,5 @@
 #include "apitrace/trace_bundle_io.hpp"
+#include "metal_callstream_writer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -521,12 +522,15 @@ struct TraceBundleWriter::Impl {
   BundleLayout layout;
   TraceMetadata metadata;
   std::vector<EventRecord> events;
+  std::vector<MetalEventRecord> metal_events;
   std::vector<AssetRecord> assets;
+  std::vector<AssetRecord> metal_assets;
   std::vector<ObjectRecord> objects;
   std::vector<std::string> analysis_streams;
   std::vector<AnalysisRecord> analysis_records;
   ChecksumIndex checksums;
   std::ofstream callstream_stream;
+  std::ofstream metal_callstream_stream;
   std::unordered_map<std::string, std::ofstream> analysis_stream_files;
   std::unordered_set<std::string> written_files;
   bool open = false;
@@ -545,6 +549,7 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root)
   impl_ = std::make_unique<Impl>();
   impl_->layout.root_path = bundle_root;
   impl_->layout.callstream_path = bundle_root / kCallstreamFileName;
+  impl_->layout.metal_callstream_path = bundle_root / kMetalCallstreamFileName;
   impl_->layout.checksums_path = bundle_root / kChecksumsFileName;
   impl_->layout.analysis_directory_path = bundle_root / kAnalysisDirectoryName;
   impl_->layout.translation_links_path = impl_->layout.analysis_directory_path / kTranslationLinksFileName;
@@ -554,6 +559,11 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root)
   impl_->layout.textures_directory_path = bundle_root / kTexturesDirectoryName;
   impl_->layout.buffers_directory_path = bundle_root / kBuffersDirectoryName;
   impl_->layout.pipelines_directory_path = bundle_root / kPipelinesDirectoryName;
+  impl_->layout.metal_directory_path = bundle_root / kMetalDirectoryName;
+  impl_->layout.metal_libraries_directory_path = impl_->layout.metal_directory_path / kMetalLibrariesDirectoryName;
+  impl_->layout.metal_pipelines_directory_path = impl_->layout.metal_directory_path / kMetalPipelinesDirectoryName;
+  impl_->layout.metal_buffers_directory_path = impl_->layout.metal_directory_path / kMetalBuffersDirectoryName;
+  impl_->layout.metal_textures_directory_path = impl_->layout.metal_directory_path / kMetalTexturesDirectoryName;
 
   std::filesystem::create_directories(impl_->layout.root_path);
   std::filesystem::create_directories(impl_->layout.analysis_directory_path);
@@ -562,6 +572,10 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root)
   std::filesystem::create_directories(impl_->layout.textures_directory_path);
   std::filesystem::create_directories(impl_->layout.buffers_directory_path);
   std::filesystem::create_directories(impl_->layout.pipelines_directory_path);
+  std::filesystem::create_directories(impl_->layout.metal_libraries_directory_path);
+  std::filesystem::create_directories(impl_->layout.metal_pipelines_directory_path);
+  std::filesystem::create_directories(impl_->layout.metal_buffers_directory_path);
+  std::filesystem::create_directories(impl_->layout.metal_textures_directory_path);
 
   impl_->callstream_stream.open(impl_->layout.callstream_path, std::ios::binary | std::ios::trunc);
   impl_->open = impl_->callstream_stream.is_open();
@@ -598,6 +612,19 @@ void TraceBundleWriter::append_call_event(const EventRecord &event)
   impl_->callstream_stream << event_record_json(event) << "\n";
 }
 
+void TraceBundleWriter::append_metal_event(const MetalEventRecord &event)
+{
+  impl_->metal_events.push_back(event);
+  if (!impl_->open) {
+    return;
+  }
+
+  if (!impl_->metal_callstream_stream.is_open()) {
+    impl_->metal_callstream_stream.open(impl_->layout.metal_callstream_path, std::ios::binary | std::ios::trunc);
+  }
+  impl_->metal_callstream_stream << detail::metal_event_record_json(event) << "\n";
+}
+
 AssetRecord TraceBundleWriter::register_asset(const AssetRecord &asset)
 {
   AssetRecord finalized = asset;
@@ -622,6 +649,34 @@ AssetRecord TraceBundleWriter::register_asset(const AssetRecord &asset)
   }
 
   impl_->assets.push_back(finalized);
+  finalized.payload_bytes.clear();
+  return finalized;
+}
+
+AssetRecord TraceBundleWriter::register_metal_asset(MetalAssetKind kind, const AssetRecord &asset)
+{
+  AssetRecord finalized = asset;
+  if (finalized.payload_bytes.empty()) {
+    impl_->metal_assets.push_back(finalized);
+    return finalized;
+  }
+
+  const auto digest = sha256_bytes(finalized.payload_bytes);
+  if (finalized.relative_path.empty()) {
+    finalized.relative_path = std::filesystem::path(detail::metal_asset_directory_name(kind)) /
+                              (digest + detail::metal_asset_extension(kind));
+  }
+
+  const auto target_path = impl_->layout.root_path / finalized.relative_path;
+  std::filesystem::create_directories(target_path.parent_path());
+  if (!std::filesystem::exists(target_path)) {
+    std::ofstream output(target_path, std::ios::binary | std::ios::trunc);
+    output.write(
+        reinterpret_cast<const char *>(finalized.payload_bytes.data()),
+        static_cast<std::streamsize>(finalized.payload_bytes.size()));
+  }
+
+  impl_->metal_assets.push_back(finalized);
   finalized.payload_bytes.clear();
   return finalized;
 }
@@ -693,13 +748,25 @@ void TraceBundleWriter::close()
     impl_->callstream_stream.flush();
     impl_->callstream_stream.close();
   }
+  if (impl_->metal_callstream_stream.is_open()) {
+    impl_->metal_callstream_stream.flush();
+    impl_->metal_callstream_stream.close();
+  }
 
   ChecksumIndex checksums = impl_->checksums;
   if (checksums.files.empty()) {
     checksums.format_version = impl_->metadata.format_version;
     std::vector<std::filesystem::path> relative_paths;
     relative_paths.push_back(std::filesystem::path(kCallstreamFileName));
+    if (!impl_->metal_events.empty()) {
+      relative_paths.push_back(std::filesystem::path(kMetalCallstreamFileName));
+    }
     for (const auto &asset : impl_->assets) {
+      if (!asset.relative_path.empty()) {
+        relative_paths.push_back(asset.relative_path);
+      }
+    }
+    for (const auto &asset : impl_->metal_assets) {
       if (!asset.relative_path.empty()) {
         relative_paths.push_back(asset.relative_path);
       }

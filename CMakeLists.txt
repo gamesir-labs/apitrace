@@ -48,6 +48,7 @@ add_library(apitrace_core
     src/capture/src/trace_session_state.cpp
     src/retrace/src/replay_session.cpp
     src/retrace/src/d3d11_replay_parser.cpp
+    src/trace/src/metal_callstream_writer.cpp
     src/trace/src/trace_bundle_reader.cpp
     src/trace/src/trace_bundle_writer.cpp
     src/trace/src/translation_link_writer.cpp

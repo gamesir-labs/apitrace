@@ -15,6 +15,11 @@ struct TranslationLinkStreamOptions {
 
 struct TranslationLinkRecord {
   std::string record_type = "opaque";
+  std::string scope_kind;
+  std::uint64_t d3d_sequence = 0;
+  std::uint64_t metal_sequence_begin = 0;
+  std::uint64_t metal_sequence_end = 0;
+  std::uint64_t frame_id = 0;
   std::string payload;
 
   // TODO: keep payload ownership with the translation layer and avoid normalizing its schema inside apitrace.
