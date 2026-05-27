@@ -56,6 +56,7 @@ constexpr std::size_t kContextIASetInputLayoutIndex = 17;
 constexpr std::size_t kContextIASetVertexBuffersIndex = 18;
 constexpr std::size_t kContextIASetIndexBufferIndex = 19;
 constexpr std::size_t kContextDrawIndexedInstancedIndex = 20;
+constexpr std::size_t kContextClearStateIndex = 110;
 constexpr std::size_t kContextIASetPrimitiveTopologyIndex = 24;
 constexpr std::size_t kContextOMSetRenderTargetsIndex = 33;
 constexpr std::size_t kContextOMSetBlendStateIndex = 35;
@@ -204,6 +205,7 @@ using ContextIASetIndexBufferFn =
     void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Buffer *, DXGI_FORMAT, UINT);
 using ContextDrawIndexedInstancedFn =
     void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT, UINT, INT, UINT);
+using ContextClearStateFn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *);
 using ContextIASetPrimitiveTopologyFn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, D3D11_PRIMITIVE_TOPOLOGY);
 using ContextOMSetRenderTargetsFn =
     void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, ID3D11RenderTargetView *const *, ID3D11DepthStencilView *);
@@ -267,6 +269,7 @@ struct ContextHookState {
   ContextIASetVertexBuffersFn ia_set_vertex_buffers = nullptr;
   ContextIASetIndexBufferFn ia_set_index_buffer = nullptr;
   ContextDrawIndexedInstancedFn draw_indexed_instanced = nullptr;
+  ContextClearStateFn clear_state = nullptr;
   ContextIASetPrimitiveTopologyFn ia_set_primitive_topology = nullptr;
   ContextOMSetRenderTargetsFn om_set_render_targets = nullptr;
   ContextOMSetBlendStateFn om_set_blend_state = nullptr;
@@ -1073,6 +1076,33 @@ ContextPipelineState &context_pipeline_state_locked(ID3D11DeviceContext *context
 void mark_pipeline_dirty_locked(ID3D11DeviceContext *context)
 {
   context_pipeline_state_locked(context).pipeline_dirty = true;
+}
+
+void reset_pipeline_state_locked(ID3D11DeviceContext *context)
+{
+  auto &pipeline = context_pipeline_state_locked(context);
+  pipeline.vertex_shader = nullptr;
+  pipeline.pixel_shader = nullptr;
+  pipeline.input_layout = nullptr;
+  pipeline.primitive_topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  pipeline.vs_constant_buffers.assign(D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, nullptr);
+  pipeline.ps_constant_buffers.assign(D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, nullptr);
+  pipeline.vertex_buffers.assign(D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT, VertexBufferBindingState{});
+  pipeline.index_buffer = IndexBufferBindingState{};
+  pipeline.pixel_shader_resources.assign(D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, nullptr);
+  pipeline.pixel_samplers.assign(D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, nullptr);
+  pipeline.blend_state = nullptr;
+  pipeline.blend_factor = {0.0f, 0.0f, 0.0f, 0.0f};
+  pipeline.sample_mask = 0xffffffffu;
+  pipeline.depth_stencil_state = nullptr;
+  pipeline.stencil_ref = 0;
+  pipeline.rasterizer_state = nullptr;
+  pipeline.viewports.clear();
+  pipeline.scissor_rects.clear();
+  pipeline.render_target_views.assign(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, nullptr);
+  pipeline.depth_stencil_view = nullptr;
+  pipeline.pipeline_dirty = true;
+  pipeline.cached_pipeline_path.clear();
 }
 
 std::string object_id_json(trace::ObjectId object_id)
@@ -2458,6 +2488,16 @@ void STDMETHODCALLTYPE hook_draw_indexed_instanced(
   record_call_locked("ID3D11DeviceContext::DrawIndexedInstanced", S_OK, {context}, {}, payload.str());
 }
 
+void STDMETHODCALLTYPE hook_clear_state(ID3D11DeviceContext *context)
+{
+  auto &state = capture_state();
+  std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  auto &hook = context_hook_locked(context);
+  hook.clear_state(context);
+  reset_pipeline_state_locked(context);
+  record_call_locked("ID3D11DeviceContext::ClearState", S_OK, {context}, {}, "{}");
+}
+
 void STDMETHODCALLTYPE hook_ia_set_primitive_topology(ID3D11DeviceContext *context, D3D11_PRIMITIVE_TOPOLOGY topology)
 {
   auto &state = capture_state();
@@ -2937,6 +2977,7 @@ void patch_context(ID3D11DeviceContext *context)
   hook.ia_set_index_buffer = reinterpret_cast<ContextIASetIndexBufferFn>(vtable[kContextIASetIndexBufferIndex]);
   hook.draw_indexed_instanced =
       reinterpret_cast<ContextDrawIndexedInstancedFn>(vtable[kContextDrawIndexedInstancedIndex]);
+  hook.clear_state = reinterpret_cast<ContextClearStateFn>(vtable[kContextClearStateIndex]);
   hook.ia_set_primitive_topology =
       reinterpret_cast<ContextIASetPrimitiveTopologyFn>(vtable[kContextIASetPrimitiveTopologyIndex]);
   hook.om_set_render_targets =
@@ -2979,6 +3020,7 @@ void patch_context(ID3D11DeviceContext *context)
       vtable,
       kContextDrawIndexedInstancedIndex,
       reinterpret_cast<void *>(hook_draw_indexed_instanced));
+  patch_vtable_entry(vtable, kContextClearStateIndex, reinterpret_cast<void *>(hook_clear_state));
   patch_vtable_entry(vtable, kContextIASetPrimitiveTopologyIndex, reinterpret_cast<void *>(hook_ia_set_primitive_topology));
   patch_vtable_entry(vtable, kContextOMSetRenderTargetsIndex, reinterpret_cast<void *>(hook_om_set_render_targets));
   patch_vtable_entry(vtable, kContextOMSetBlendStateIndex, reinterpret_cast<void *>(hook_om_set_blend_state));

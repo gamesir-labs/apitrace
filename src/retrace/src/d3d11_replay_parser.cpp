@@ -906,6 +906,24 @@ bool parse_update_subresource(
   return true;
 }
 
+bool parse_clear_state(
+    const trace::TraceBundleReader &reader,
+    const trace::EventRecord &event,
+    const json &payload,
+    D3D11ReplayPlan &plan,
+    std::string &error)
+{
+  (void)reader;
+  (void)payload;
+  if (!require_object_ref_count(event, 1, error)) {
+    return false;
+  }
+  auto command = make_command_header<ClearStateCommand>(event);
+  command.context_id = event.object_refs[0];
+  plan.commands.emplace_back(std::move(command));
+  return true;
+}
+
 bool parse_om_set_render_targets(
     const trace::TraceBundleReader &reader,
     const trace::EventRecord &event,
@@ -1456,6 +1474,7 @@ const std::unordered_map<std::string, ParseCallHandler> &call_handlers()
       {"ID3D11DeviceContext::Map", &parse_map},
       {"ID3D11DeviceContext::Unmap", &parse_unmap},
       {"ID3D11DeviceContext::UpdateSubresource", &parse_update_subresource},
+      {"ID3D11DeviceContext::ClearState", &parse_clear_state},
       {"ID3D11DeviceContext::OMSetRenderTargets", &parse_om_set_render_targets},
       {"ID3D11DeviceContext::RSSetViewports", &parse_rs_set_viewports},
       {"ID3D11DeviceContext::ClearRenderTargetView", &parse_clear_render_target_view},

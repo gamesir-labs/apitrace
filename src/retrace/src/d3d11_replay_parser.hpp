@@ -281,6 +281,11 @@ struct UpdateSubresourceCommand {
   std::filesystem::path data_path;
 };
 
+struct ClearStateCommand {
+  ReplayCommandHeader header;
+  trace::ObjectId context_id = 0;
+};
+
 struct SetRenderTargetsCommand {
   ReplayCommandHeader header;
   trace::ObjectId context_id = 0;
@@ -515,6 +520,7 @@ using ReplayCommand = std::variant<
     MapCommand,
     UnmapCommand,
     UpdateSubresourceCommand,
+    ClearStateCommand,
     SetRenderTargetsCommand,
     SetViewportsCommand,
     ClearRenderTargetViewCommand,

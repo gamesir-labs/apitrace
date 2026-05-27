@@ -1192,6 +1192,20 @@ private:
   }
 
   bool execute_command(
+      const replay::internal::ClearStateCommand &command,
+      replay::ReplayStatistics &statistics,
+      std::string &error)
+  {
+    (void)statistics;
+    ID3D11DeviceContext *context = nullptr;
+    if (!lookup_object(contexts_, command.context_id, "context", context, error)) {
+      return false;
+    }
+    context->ClearState();
+    return true;
+  }
+
+  bool execute_command(
       const replay::internal::SetRenderTargetsCommand &command,
       replay::ReplayStatistics &statistics,
       std::string &error)

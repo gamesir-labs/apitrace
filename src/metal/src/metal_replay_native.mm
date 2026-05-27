@@ -65,11 +65,11 @@ MTLPixelFormat pixel_format_from_string(std::string_view name)
   return MTLPixelFormatBGRA8Unorm;
 }
 
-MTLPixelFormat pixel_format_from_json_field(const json &descriptor, const char *field_name)
+MTLPixelFormat pixel_format_from_json_field_or(const json &descriptor, const char *field_name, MTLPixelFormat fallback)
 {
   const auto it = descriptor.find(field_name);
   if (it == descriptor.end()) {
-    return MTLPixelFormatBGRA8Unorm;
+    return fallback;
   }
   if (it->is_number_unsigned() || it->is_number_integer()) {
     return static_cast<MTLPixelFormat>(it->get<std::uint32_t>());
@@ -77,7 +77,12 @@ MTLPixelFormat pixel_format_from_json_field(const json &descriptor, const char *
   if (it->is_string()) {
     return pixel_format_from_string(it->get_ref<const std::string &>());
   }
-  return MTLPixelFormatBGRA8Unorm;
+  return fallback;
+}
+
+MTLPixelFormat pixel_format_from_json_field(const json &descriptor, const char *field_name)
+{
+  return pixel_format_from_json_field_or(descriptor, field_name, MTLPixelFormatBGRA8Unorm);
 }
 
 MTLPrimitiveType primitive_type_from_integer(std::uint32_t value)
@@ -467,8 +472,10 @@ private:
     }
     pipeline_descriptor.colorAttachments[0].pixelFormat = pixel_format_from_json_field(descriptor, "color_pixel_format");
     pipeline_descriptor.rasterizationEnabled = rasterization_enabled;
-    pipeline_descriptor.depthAttachmentPixelFormat = pixel_format_from_json_field(descriptor, "depth_pixel_format");
-    pipeline_descriptor.stencilAttachmentPixelFormat = pixel_format_from_json_field(descriptor, "stencil_pixel_format");
+    pipeline_descriptor.depthAttachmentPixelFormat =
+        pixel_format_from_json_field_or(descriptor, "depth_pixel_format", MTLPixelFormatInvalid);
+    pipeline_descriptor.stencilAttachmentPixelFormat =
+        pixel_format_from_json_field_or(descriptor, "stencil_pixel_format", MTLPixelFormatInvalid);
 
     NSError *error = nil;
     id<MTLRenderPipelineState> pipeline = [device_ newRenderPipelineStateWithDescriptor:pipeline_descriptor error:&error];
