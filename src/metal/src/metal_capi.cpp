@@ -205,6 +205,7 @@ APITRACE_METAL_API apitrace_metal_session_t *apitrace_metal_session_open(const c
   apitrace::trace::TraceMetadata metadata;
   metadata.api = apitrace::trace::ApiKind::Unknown;
   metadata.producer = "apitrace_metal_capi";
+  metadata.has_metal_callstream = true;
   state.writer.write_metadata(metadata);
 
   if (!state.bridge.initialize()) {

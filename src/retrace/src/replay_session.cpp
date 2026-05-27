@@ -1,6 +1,7 @@
 #include "apitrace/replay_session.hpp"
 
 #include "apitrace/d3d12_replay.hpp"
+#include "apitrace/metal_replay_backend_factory.hpp"
 
 #include "d3d11/src/d3d11_replay_internal.hpp"
 #include "retrace/src/d3d11_replay_parser.hpp"
@@ -58,6 +59,53 @@ bool ReplaySession::run()
   if (!impl_->reader.open(impl_->options.bundle_root)) {
     impl_->last_error = impl_->reader.last_error().empty() ? "failed to open trace bundle" : impl_->reader.last_error();
     return false;
+  }
+
+  if (impl_->options.enable_metal_retrace) {
+    if (!impl_->reader.metadata().has_metal_callstream && impl_->reader.metal_events().empty()) {
+      impl_->last_error = "metal retrace requested but bundle has no metal callstream";
+      return false;
+    }
+
+    register_builtin_metal_replay_backends();
+    const auto *factory = find_metal_replay_backend(impl_->options.metal_backend_name);
+    if (factory == nullptr) {
+      impl_->last_error = "unknown metal replay backend: " + impl_->options.metal_backend_name;
+      return false;
+    }
+
+    auto backend = (*factory)();
+    if (!backend || !backend->initialize(impl_->reader, impl_->options)) {
+      impl_->last_error = backend && !backend->last_error().empty() ? backend->last_error()
+                                                                    : "failed to initialize metal replay backend";
+      return false;
+    }
+
+    impl_->statistics.backend_name = "metal-" + impl_->options.metal_backend_name;
+    for (const auto &event : impl_->reader.metal_events()) {
+      if (!backend->replay_metal_event(event)) {
+        if (!backend->last_error().empty()) {
+          impl_->last_error = "metal sequence " + std::to_string(event.metal_sequence) + " " +
+                              event.function_name + ": " + backend->last_error();
+        } else {
+          impl_->last_error = "metal sequence " + std::to_string(event.metal_sequence) + " " +
+                              event.function_name + ": metal replay failed";
+        }
+        return false;
+      }
+
+      ++impl_->statistics.metal_calls_replayed;
+      if (event.call_kind == trace::MetalCallKind::PresentDrawable) {
+        ++impl_->statistics.metal_presents_seen;
+        ++impl_->statistics.presents_seen;
+      }
+    }
+
+    if (!backend->finalize()) {
+      impl_->last_error = backend->last_error().empty() ? "metal replay finalization failed" : backend->last_error();
+      return false;
+    }
+    return true;
   }
 
 #ifndef _WIN32

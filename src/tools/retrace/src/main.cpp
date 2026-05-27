@@ -12,7 +12,8 @@ namespace {
 
 void print_usage(std::string_view argv0)
 {
-  const std::string message = "usage: " + std::string(argv0) + " <trace-path>\n";
+  const std::string message =
+      "usage: " + std::string(argv0) + " [--metal] [--metal-backend <name>] <trace-path>\n";
 #ifdef _WIN32
   DWORD written = 0;
   const HANDLE handle = GetStdHandle(STD_ERROR_HANDLE);
@@ -55,21 +56,48 @@ std::string format_statistics(const apitrace::replay::ReplayStatistics &statisti
   return "retrace " + std::string(apitrace::version_string()) + "\n" +
       "backend: " + statistics.backend_name + "\n" +
       "calls_replayed: " + std::to_string(statistics.calls_replayed) + "\n" +
+      "metal_calls_replayed: " + std::to_string(statistics.metal_calls_replayed) + "\n" +
       "frames_seen: " + std::to_string(statistics.frames_seen) + "\n" +
-      "presents_seen: " + std::to_string(statistics.presents_seen) + "\n";
+      "presents_seen: " + std::to_string(statistics.presents_seen) + "\n" +
+      "metal_presents_seen: " + std::to_string(statistics.metal_presents_seen) + "\n";
 }
 
 } // namespace
 
 int main(int argc, char **argv)
 {
-  if (argc != 2) {
+  std::string trace_path;
+  apitrace::replay::ReplayOptions options;
+
+  for (int index = 1; index < argc; ++index) {
+    const std::string_view arg(argv[index]);
+    if (arg == "--metal") {
+      options.enable_metal_retrace = true;
+      options.backend = apitrace::replay::BackendKind::MetalTranslation;
+      continue;
+    }
+    if (arg == "--metal-backend") {
+      if (index + 1 >= argc) {
+        print_usage(argc > 0 ? argv[0] : "retrace");
+        return 1;
+      }
+      options.metal_backend_name = argv[++index];
+      continue;
+    }
+
+    if (!trace_path.empty()) {
+      print_usage(argc > 0 ? argv[0] : "retrace");
+      return 1;
+    }
+    trace_path = std::string(arg);
+  }
+
+  if (trace_path.empty()) {
     print_usage(argc > 0 ? argv[0] : "retrace");
     return 1;
   }
 
-  apitrace::replay::ReplayOptions options;
-  options.bundle_root = argv[1];
+  options.bundle_root = trace_path;
 
   apitrace::replay::ReplaySession session(options);
   if (!session.run()) {

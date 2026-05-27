@@ -48,6 +48,7 @@ add_library(apitrace_core
     src/metal/src/translation_trace_recorder.cpp
     src/capture/src/trace_session_state.cpp
     src/retrace/src/replay_session.cpp
+    src/retrace/src/metal_replay_backend_factory.cpp
     src/retrace/src/d3d11_replay_parser.cpp
     src/trace/src/metal_callstream_writer.cpp
     src/trace/src/trace_bundle_reader.cpp
@@ -120,6 +121,21 @@ if(NOT APPLE OR NOT APITRACE_BUILD_METAL_BACKEND)
     set_target_properties(apitrace_platform_apple_metal PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
 
+if(APPLE AND APITRACE_BUILD_METAL_BACKEND)
+    enable_language(OBJCXX)
+    target_sources(apitrace_platform_apple_metal PRIVATE
+        src/metal/src/metal_replay_native.mm
+    )
+    set_source_files_properties(src/metal/src/metal_replay_native.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    target_link_libraries(apitrace_platform_apple_metal PRIVATE
+        apitrace_nlohmann_json
+        "-framework Foundation"
+        "-framework Metal"
+        "-framework QuartzCore"
+        "-framework CoreGraphics"
+    )
+endif()
+
 if(APITRACE_BUILD_TOOLS)
     add_executable(apitrace_retrace src/tools/retrace/src/main.cpp)
     set_target_properties(apitrace_retrace PROPERTIES OUTPUT_NAME retrace)
@@ -127,6 +143,9 @@ if(APITRACE_BUILD_TOOLS)
     target_include_directories(apitrace_retrace PRIVATE ${APITRACE_PUBLIC_INCLUDE_DIRS})
     target_include_directories(apitrace_retrace PRIVATE ${APITRACE_PRIVATE_INCLUDE_DIRS})
     target_compile_features(apitrace_retrace PRIVATE cxx_std_17)
+    if(APPLE AND APITRACE_BUILD_METAL_BACKEND)
+        target_link_libraries(apitrace_retrace PRIVATE apitrace_platform_apple_metal)
+    endif()
 endif()
 
 if(WIN32)

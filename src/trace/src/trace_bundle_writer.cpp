@@ -593,6 +593,7 @@ void TraceBundleWriter::write_metadata(const TraceMetadata &metadata)
                            << ",\"format_version\":" << metadata.format_version
                            << ",\"api\":\"" << api_name(metadata.api) << "\""
                            << ",\"producer\":\"" << json_escape(metadata.producer) << "\""
+                           << ",\"has_metal_callstream\":" << (metadata.has_metal_callstream ? "true" : "false")
                            << ",\"entry_file\":\"" << kCallstreamFileName << "\""
                            << "}\n";
   impl_->metadata_written = true;

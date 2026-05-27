@@ -454,6 +454,7 @@ bool parse_bundle_header(
 
   metadata.format_version = record.value("format_version", kFormatVersion);
   metadata.producer = record.value("producer", "");
+  metadata.has_metal_callstream = record.value("has_metal_callstream", false);
   const auto api_name = record.value("api", std::string("Unknown"));
   const auto api = api_kind_from_name(api_name);
   if (!api.has_value()) {

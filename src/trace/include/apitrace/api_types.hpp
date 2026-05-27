@@ -17,6 +17,7 @@ struct TraceMetadata {
   ApiKind api = ApiKind::Unknown;
   std::uint32_t format_version = kFormatVersion;
   std::string producer;
+  bool has_metal_callstream = false;
 
   // TODO: add bundle schema metadata once readable root indexes are versioned independently.
 };

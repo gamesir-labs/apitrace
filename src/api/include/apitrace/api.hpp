@@ -16,6 +16,7 @@
 #include "apitrace/d3d12_state.hpp"
 #include "apitrace/d3d12_submission.hpp"
 #include "apitrace/metal_diagnostics.hpp"
+#include "apitrace/metal_replay_backend_factory.hpp"
 #include "apitrace/metal_bridge.hpp"
 #include "apitrace/metal_replay.hpp"
 #include "apitrace/metal_state.hpp"
