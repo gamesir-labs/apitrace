@@ -526,23 +526,16 @@ translation link 现在至少使用这些字段：
 - `checksums.json` 提供完整性校验
 - 资产目录提供 shader、纹理、buffer 等真实载荷
 
-## 第一版实施建议
+## 最小可用 bundle
 
-第一版先不要把所有东西都做复杂。
-
-建议优先固定这几部分：
+最小可用 bundle 必须包含：
 
 1. `callstream.jsonl`
 2. `checksums.json`
-3. `shaders/`
-4. `textures/`
-5. `buffers/`
+3. `callstream.jsonl` 直接引用到的资产文件
 
-等 retrace 链路跑通后，再逐步补：
-
-- `pipelines/`
-- `objects/`
-- `analysis/`
+`pipelines/`、`objects/` 和 `analysis/` 可以按 bundle 实际内容出现。它们提供可读的结构化资产、
+对象关系索引和辅助分析流，但不能替代 `callstream.jsonl` 里的原始调用语义。
 
 ## 与现有代码命名的关系
 

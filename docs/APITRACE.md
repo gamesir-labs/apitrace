@@ -89,4 +89,4 @@ retrace 的核心实现应当放在库层，命令行工具只是薄封装。
 - 分层和数据模型见 [ARCHITECTURE.md](ARCHITECTURE.md)
 - capture 入口策略见 [CAPTURE.md](CAPTURE.md)
 - retrace 设计约束见 [RETRACE.md](RETRACE.md)
-- 实施顺序见 [PLAN.md](PLAN.md)
+- 当前功能和验证方式见 [TECHNICAL_DETAILS.md](TECHNICAL_DETAILS.md)
