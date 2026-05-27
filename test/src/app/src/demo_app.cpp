@@ -1,6 +1,4 @@
 #include "app/demo_app.hpp"
-
-#include "app/cli.hpp"
 #include "runtime/dx11/runtime.hpp"
 #include "runtime/dx12/runtime.hpp"
 #include "scenes/dx11/scenes.hpp"
@@ -9,7 +7,6 @@
 #include <windows.h>
 
 #include <cstdio>
-#include <string>
 #include <string_view>
 #include <vector>
 
@@ -23,12 +20,7 @@ constexpr const char *kWindowClassName = "apitrace-test-demo";
 constexpr const char *kWindowTitle = "apitrace test demo";
 
 using EmitSceneMarkerFn = void (WINAPI *)(const char *, const char *, const char *);
-
-unsigned int resolve_frame_budget()
-{
-    const unsigned int budget = demo::read_env_u32("APITRACE_TRIANGLE_MAX_FRAMES", 0);
-    return budget == 0 ? 1U : budget;
-}
+constexpr unsigned int kFrameBudget = 1;
 
 std::vector<const demo::scenes::dx11::SceneDefinition *> dx11_scene_order()
 {
@@ -53,12 +45,17 @@ std::vector<const demo::scenes::dx12::SceneDefinition *> dx12_scene_order()
     return ordered;
 }
 
-const char *dx_mode_name(DxMode mode)
+enum class DemoMode {
+    d3d11,
+    d3d12,
+};
+
+const char *dx_mode_name(DemoMode mode)
 {
-    return mode == DxMode::dx12 ? "dx12" : "dx11";
+    return mode == DemoMode::d3d12 ? "dx12" : "dx11";
 }
 
-EmitSceneMarkerFn resolve_scene_marker(DxMode mode)
+EmitSceneMarkerFn resolve_scene_marker(DemoMode mode)
 {
     static EmitSceneMarkerFn d3d11_marker = []() -> EmitSceneMarkerFn {
         HMODULE module = GetModuleHandleA("d3d11.dll");
@@ -80,10 +77,10 @@ EmitSceneMarkerFn resolve_scene_marker(DxMode mode)
         );
     }();
 
-    return mode == DxMode::dx12 ? d3d12_marker : d3d11_marker;
+    return mode == DemoMode::d3d12 ? d3d12_marker : d3d11_marker;
 }
 
-void emit_scene_marker(DxMode mode, const char *scene_name, const char *phase)
+void emit_scene_marker(DemoMode mode, const char *scene_name, const char *phase)
 {
     EmitSceneMarkerFn emit_marker = resolve_scene_marker(mode);
     if (emit_marker && scene_name && phase) {
@@ -91,24 +88,7 @@ void emit_scene_marker(DxMode mode, const char *scene_name, const char *phase)
     }
 }
 
-int list_scenes(DxMode mode)
-{
-    if (mode == DxMode::dx12) {
-        for (const demo::scenes::dx12::SceneDefinition &scene : demo::scenes::dx12::registered_scenes()) {
-            std::printf("%s\n", scene.name);
-        }
-        return 0;
-    }
-
-    for (const demo::scenes::dx11::SceneDefinition &scene : demo::scenes::dx11::registered_scenes()) {
-        if (scene.implemented) {
-            std::printf("%s\n", scene.name);
-        }
-    }
-    return 0;
-}
-
-int run_dx11(const CliOptions &options)
+int run_dx11()
 {
     std::printf("dx mode: dx11\n");
 
@@ -118,25 +98,7 @@ int run_dx11(const CliOptions &options)
         kWindowClassName,
         kWindowTitle
     );
-    const unsigned int frame_budget = resolve_frame_budget();
-
-    std::vector<const demo::scenes::dx11::SceneDefinition *> selected_scenes;
-    if (options.scene == "all") {
-        selected_scenes = dx11_scene_order();
-    } else {
-        const demo::scenes::dx11::SceneDefinition *scene = demo::scenes::dx11::find_scene(options.scene);
-        if (!scene) {
-            std::printf("scene fail: %s reason=unknown scene\n", options.scene.c_str());
-            std::printf("summary: passed=0 failed=1 skipped=0\n");
-            return 1;
-        }
-        if (!scene->implemented) {
-            std::printf("scene fail: %s reason=scene is reserved but not implemented\n", options.scene.c_str());
-            std::printf("summary: passed=0 failed=1 skipped=0\n");
-            return 1;
-        }
-        selected_scenes.push_back(scene);
-    }
+    const std::vector<const demo::scenes::dx11::SceneDefinition *> selected_scenes = dx11_scene_order();
 
     unsigned int passed = 0;
     unsigned int failed = 0;
@@ -144,9 +106,9 @@ int run_dx11(const CliOptions &options)
 
     for (const demo::scenes::dx11::SceneDefinition *scene : selected_scenes) {
         std::printf("scene start: %s\n", scene->name);
-        emit_scene_marker(DxMode::dx11, scene->name, "start");
-        const demo::runtime::dx11::ValidationResult result = scene->run(runtime, frame_budget);
-        emit_scene_marker(DxMode::dx11, scene->name, "end");
+        emit_scene_marker(DemoMode::d3d11, scene->name, "start");
+        const demo::runtime::dx11::ValidationResult result = scene->run(runtime, kFrameBudget);
+        emit_scene_marker(DemoMode::d3d11, scene->name, "end");
         if (result.passed) {
             std::printf("scene pass: %s\n", scene->name);
             ++passed;
@@ -164,22 +126,9 @@ int run_dx11(const CliOptions &options)
     return failed == 0 ? 0 : 1;
 }
 
-int run_dx12(const CliOptions &options)
+int run_dx12()
 {
     std::printf("dx mode: dx12\n");
-
-    std::vector<const demo::scenes::dx12::SceneDefinition *> selected_scenes;
-    if (options.scene == "all") {
-        selected_scenes = dx12_scene_order();
-    } else {
-        const demo::scenes::dx12::SceneDefinition *scene = demo::scenes::dx12::find_scene(options.scene);
-        if (!scene) {
-            std::printf("scene fail: %s reason=unknown scene\n", options.scene.c_str());
-            std::printf("summary: passed=0 failed=1 skipped=0\n");
-            return 1;
-        }
-        selected_scenes.push_back(scene);
-    }
 
     auto runtime = demo::runtime::dx12::Dx12Runtime::create(
         kWindowWidth,
@@ -187,7 +136,7 @@ int run_dx12(const CliOptions &options)
         kWindowClassName,
         kWindowTitle
     );
-    const unsigned int frame_budget = resolve_frame_budget();
+    const std::vector<const demo::scenes::dx12::SceneDefinition *> selected_scenes = dx12_scene_order();
 
     unsigned int passed = 0;
     unsigned int failed = 0;
@@ -195,9 +144,9 @@ int run_dx12(const CliOptions &options)
 
     for (const demo::scenes::dx12::SceneDefinition *scene : selected_scenes) {
         std::printf("scene start: %s\n", scene->name);
-        emit_scene_marker(DxMode::dx12, scene->name, "start");
-        const demo::runtime::dx12::ValidationResult result = scene->run(runtime, frame_budget);
-        emit_scene_marker(DxMode::dx12, scene->name, "end");
+        emit_scene_marker(DemoMode::d3d12, scene->name, "start");
+        const demo::runtime::dx12::ValidationResult result = scene->run(runtime, kFrameBudget);
+        emit_scene_marker(DemoMode::d3d12, scene->name, "end");
         if (result.passed) {
             std::printf("scene pass: %s\n", scene->name);
             ++passed;
@@ -217,23 +166,14 @@ int run_dx12(const CliOptions &options)
 
 } // namespace
 
-int run_demo_app(int argc, char **argv)
+int run_d3d11_demo()
 {
-    const CliOptions options = parse_cli(argc, argv);
+    return run_dx11();
+}
 
-    if (options.list_scenes) {
-        return list_scenes(options.dx_mode);
-    }
-
-    switch (options.dx_mode) {
-    case DxMode::dx11:
-        return run_dx11(options);
-    case DxMode::dx12:
-        return run_dx12(options);
-    default:
-        std::fprintf(stderr, "unsupported dx mode\n");
-        return 1;
-    }
+int run_d3d12_demo()
+{
+    return run_dx12();
 }
 
 } // namespace demo::app

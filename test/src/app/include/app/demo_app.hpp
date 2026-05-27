@@ -2,6 +2,7 @@
 
 namespace demo::app {
 
-int run_demo_app(int argc, char **argv);
+int run_d3d11_demo();
+int run_d3d12_demo();
 
 } // namespace demo::app

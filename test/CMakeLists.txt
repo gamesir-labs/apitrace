@@ -13,12 +13,9 @@ set(APITRACE_ROOT_BUILD_DIR
     "Path to the root apitrace build directory that provides libapitrace_core.a and libapitrace_platform_apple_metal.a"
 )
 
-set(APITRACE_TEST_DEMO_SOURCES
+set(APITRACE_D3D_DEMO_COMMON_SOURCES
     src/demo_common.hpp
-    src/main.cpp
-    src/app/include/app/cli.hpp
     src/app/include/app/demo_app.hpp
-    src/app/src/cli.cpp
     src/app/src/demo_app.cpp
     src/runtime/dx11/include/runtime/dx11/runtime.hpp
     src/runtime/dx11/src/runtime.cpp
@@ -32,6 +29,16 @@ set(APITRACE_TEST_DEMO_SOURCES
     src/scenes/shared/src/scene_matrix.cpp
 )
 
+set(APITRACE_D3D11_DEMO_SOURCES
+    src/d3d11_main.cpp
+    ${APITRACE_D3D_DEMO_COMMON_SOURCES}
+)
+
+set(APITRACE_D3D12_DEMO_SOURCES
+    src/d3d12_main.cpp
+    ${APITRACE_D3D_DEMO_COMMON_SOURCES}
+)
+
 set(APITRACE_METAL_DEMO_SOURCES
     src/metal_main.mm
     src/runtime/metal/include/runtime/metal/runtime.hpp
@@ -41,32 +48,37 @@ set(APITRACE_METAL_DEMO_SOURCES
 )
 
 if(APITRACE_BUILD_TEST_DEMO AND WIN32)
-    add_executable(apitrace_test_demo ${APITRACE_TEST_DEMO_SOURCES})
-    target_compile_features(apitrace_test_demo PRIVATE cxx_std_17)
-    target_compile_definitions(apitrace_test_demo PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-    target_include_directories(apitrace_test_demo PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/app/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/dx11/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/dx12/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/scenes/dx11/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/scenes/dx12/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/scenes/shared/include
-    )
-    target_link_libraries(apitrace_test_demo PRIVATE
-        d3d12
-        d3d11
-        dxgi
-        dxguid
-        user32
-        gdi32
-        ole32
-        uuid
-    )
-    if(MINGW)
-        target_link_options(apitrace_test_demo PRIVATE -static-libgcc -static-libstdc++)
-    endif()
-    install(TARGETS apitrace_test_demo RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    function(apitrace_configure_d3d_demo target_name source_list)
+        add_executable(${target_name} ${${source_list}})
+        target_compile_features(${target_name} PRIVATE cxx_std_17)
+        target_compile_definitions(${target_name} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+        target_include_directories(${target_name} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/app/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/dx11/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/dx12/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/scenes/dx11/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/scenes/dx12/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/scenes/shared/include
+        )
+        target_link_libraries(${target_name} PRIVATE
+            d3d12
+            d3d11
+            dxgi
+            dxguid
+            user32
+            gdi32
+            ole32
+            uuid
+        )
+        if(MINGW)
+            target_link_options(${target_name} PRIVATE -static-libgcc -static-libstdc++)
+        endif()
+        install(TARGETS ${target_name} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endfunction()
+
+    apitrace_configure_d3d_demo(apitrace_test_d3d11 APITRACE_D3D11_DEMO_SOURCES)
+    apitrace_configure_d3d_demo(apitrace_test_d3d12 APITRACE_D3D12_DEMO_SOURCES)
     install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/assets/ DESTINATION ${CMAKE_INSTALL_BINDIR}/assets)
 endif()
 
@@ -85,21 +97,22 @@ if(APITRACE_BUILD_METAL_DEMO)
         endif()
     endforeach()
 
-    add_executable(apitrace_metal_demo ${APITRACE_METAL_DEMO_SOURCES})
-    target_compile_features(apitrace_metal_demo PRIVATE cxx_std_17)
-    target_include_directories(apitrace_metal_demo PRIVATE
+    add_executable(apitrace_test_metal ${APITRACE_METAL_DEMO_SOURCES})
+    target_compile_features(apitrace_test_metal PRIVATE cxx_std_17)
+    target_include_directories(apitrace_test_metal PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/metal/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/scenes/metal/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/metal/include
     )
-    target_link_libraries(apitrace_metal_demo PRIVATE
+    target_link_libraries(apitrace_test_metal PRIVATE
         "${APITRACE_CORE_STATIC}"
         "${APITRACE_METAL_STATIC}"
+        "-framework Cocoa"
         "-framework Foundation"
         "-framework Metal"
         "-framework QuartzCore"
         "-framework CoreGraphics"
     )
-    install(TARGETS apitrace_metal_demo RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(TARGETS apitrace_test_metal RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
