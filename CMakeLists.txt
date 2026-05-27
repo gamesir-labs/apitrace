@@ -28,7 +28,7 @@ target_include_directories(apitrace_nlohmann_json
         ${PROJECT_SOURCE_DIR}/third_party/nlohmann_json/include
 )
 
-add_library(apitrace_core
+set(APITRACE_CORE_SOURCES
     src/api/src/version.cpp
     src/capture/src/capture_hook_plan.cpp
     src/capture/src/capture_runtime.cpp
@@ -40,12 +40,6 @@ add_library(apitrace_core
     src/d3d12/src/d3d12_replay.cpp
     src/d3d12/src/d3d12_state.cpp
     src/d3d12/src/d3d12_submission.cpp
-    src/metal/src/metal_diagnostics.cpp
-    src/metal/src/metal_replay.cpp
-    src/metal/src/metal_capi.cpp
-    src/metal/src/metal_state.cpp
-    src/metal/src/metal_trace.cpp
-    src/metal/src/translation_trace_recorder.cpp
     src/capture/src/trace_session_state.cpp
     src/retrace/src/replay_session.cpp
     src/retrace/src/metal_replay_backend_factory.cpp
@@ -56,6 +50,19 @@ add_library(apitrace_core
     src/trace/src/translation_link_writer.cpp
     src/capture/src/trace_session.cpp
 )
+
+if(APPLE AND APITRACE_BUILD_METAL_BACKEND)
+    list(APPEND APITRACE_CORE_SOURCES
+        src/metal/src/metal_diagnostics.cpp
+        src/metal/src/metal_replay.cpp
+        src/metal/src/metal_capi.cpp
+        src/metal/src/metal_state.cpp
+        src/metal/src/metal_trace.cpp
+        src/metal/src/translation_trace_recorder.cpp
+    )
+endif()
+
+add_library(apitrace_core ${APITRACE_CORE_SOURCES})
 
 target_include_directories(apitrace_core
     PUBLIC
@@ -112,6 +119,10 @@ target_compile_features(apitrace_platform_apple_metal PUBLIC cxx_std_17)
 if(WIN32 AND APITRACE_BUILD_WINDOWS_DLLS)
     set_target_properties(apitrace_platform_windows_d3d11 PROPERTIES OUTPUT_NAME d3d11 PREFIX "")
     set_target_properties(apitrace_platform_windows_d3d12 PROPERTIES OUTPUT_NAME d3d12 PREFIX "")
+    if(MINGW AND CMAKE_SIZEOF_VOID_P EQUAL 4)
+        target_link_options(apitrace_platform_windows_d3d11 PRIVATE -Wl,--add-stdcall-alias)
+        target_link_options(apitrace_platform_windows_d3d12 PRIVATE -Wl,--add-stdcall-alias)
+    endif()
 else()
     set_target_properties(apitrace_platform_windows_d3d11 PROPERTIES EXCLUDE_FROM_ALL TRUE)
     set_target_properties(apitrace_platform_windows_d3d12 PROPERTIES EXCLUDE_FROM_ALL TRUE)

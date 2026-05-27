@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 
-#ifdef _WIN32
+#if defined(_WIN32) && defined(APITRACE_METAL_SHARED)
 #define APITRACE_METAL_IMPORT __declspec(dllimport)
 #else
 #define APITRACE_METAL_IMPORT

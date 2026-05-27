@@ -46,3 +46,44 @@ jobs:
           name: apitrace-windows-retrace-and-override-${{ github.sha }}
           path: dist/
           if-no-files-found: error
+
+  macos-native-metal:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ninja
+        run: brew install ninja
+
+      - name: Configure
+        run: |
+          cmake -S . -B build/macos-native -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAPITRACE_BUILD_METAL_BACKEND=ON \
+            -DAPITRACE_BUILD_TOOLS=ON
+
+      - name: Build
+        run: |
+          cmake --build build/macos-native --target \
+            apitrace_retrace \
+            apitrace_platform_apple_metal
+
+      - name: Run validate-metal-native
+        run: scripts/validate-metal-native.sh
+
+      - name: Assemble artifact
+        run: |
+          rm -rf dist
+          mkdir -p dist/metal
+          cp build/macos-native/retrace dist/metal/
+          cp build/macos-native/libapitrace_platform_apple_metal.a dist/metal/
+          cp src/metal/include/apitrace/metal_capi.h dist/metal/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apitrace-macos-native-metal-${{ github.sha }}
+          path: dist/metal/
+          if-no-files-found: error
