@@ -50,64 +50,97 @@ struct SessionState {
   trace::TraceBundleWriter writer;
   MetalBridge bridge{MetalBridgeOptions{}};
   TranslationTraceRecorder recorder;
-  std::uint64_t last_metal_sequence = 0;
+  MetalObjectRegistry object_registry;
   bool open = false;
-
-  std::uint64_t next_sequence()
-  {
-    return ++last_metal_sequence;
-  }
 };
 
-trace::MetalEventRecord make_event(
-    SessionState &state,
-    trace::MetalCallKind call_kind,
-    std::string function_name,
-    std::uint64_t object_id,
-    std::vector<std::uint64_t> object_refs,
-    std::vector<trace::BlobId> blob_refs,
-    const json &payload)
+std::vector<trace::BlobId> blob_refs_for_asset(const trace::AssetRecord &asset)
 {
-  trace::MetalEventRecord event;
-  event.call_kind = call_kind;
-  event.metal_sequence = state.next_sequence();
-  event.d3d_sequence = g_current_d3d_sequence;
-  event.object_id = object_id;
-  event.object_refs = std::move(object_refs);
-  event.blob_refs = std::move(blob_refs);
-  event.function_name = std::move(function_name);
-  event.payload = dump_json(payload);
-  return event;
+  if (asset.blob_id == 0) {
+    return {};
+  }
+
+  return {asset.blob_id};
 }
 
-std::uint64_t append_event(
+trace::ObjectKind object_kind_for_asset(trace::MetalAssetKind kind)
+{
+  switch (kind) {
+  case trace::MetalAssetKind::Buffer:
+  case trace::MetalAssetKind::Texture:
+  case trace::MetalAssetKind::Heap:
+    return trace::ObjectKind::Resource;
+  case trace::MetalAssetKind::RenderPipeline:
+  case trace::MetalAssetKind::ComputePipeline:
+  case trace::MetalAssetKind::DepthStencilState:
+  case trace::MetalAssetKind::SamplerState:
+  case trace::MetalAssetKind::ArgumentEncoder:
+    return trace::ObjectKind::PipelineState;
+  case trace::MetalAssetKind::Library:
+  default:
+    return trace::ObjectKind::Shader;
+  }
+}
+
+void track_object(
+    SessionState &state,
+    std::uint64_t object_id,
+    trace::MetalAssetKind asset_kind,
+    const trace::AssetRecord &asset,
+    std::string payload)
+{
+  if (object_id == 0) {
+    return;
+  }
+
+  MetalTrackedObject tracked;
+  tracked.object_id = object_id;
+  tracked.kind = object_kind_for_asset(asset_kind);
+  tracked.asset_kind = asset_kind;
+  tracked.blob_refs = blob_refs_for_asset(asset);
+  tracked.asset_relative_path = asset.relative_path;
+  tracked.payload = std::move(payload);
+  state.object_registry.track(tracked);
+}
+
+std::uint64_t record_metal_call(
     SessionState &state,
     trace::MetalCallKind call_kind,
     std::string function_name,
     std::uint64_t object_id,
     std::vector<std::uint64_t> object_refs,
     std::vector<trace::BlobId> blob_refs,
+    const json &payload,
+    std::uint64_t frame_id = 0)
+{
+  MetalTraceRecord trace_record;
+  trace_record.call_kind = call_kind;
+  trace_record.d3d_sequence = g_current_d3d_sequence;
+  trace_record.frame_id = frame_id;
+  trace_record.object_id = object_id;
+  trace_record.object_refs = std::move(object_refs);
+  trace_record.blob_refs = std::move(blob_refs);
+  trace_record.translated_call_name = std::move(function_name);
+  trace_record.translation_link_payload = dump_json(payload);
+  state.recorder.record_metal_call(trace_record);
+  return state.recorder.current_metal_sequence();
+}
+
+std::uint64_t record_metal_call(
+    SessionState &state,
+    trace::MetalCallKind call_kind,
+    std::string function_name,
+    std::uint64_t object_id,
     const json &payload)
 {
-  auto event = make_event(
+  return record_metal_call(
       state,
       call_kind,
       std::move(function_name),
       object_id,
-      std::move(object_refs),
-      std::move(blob_refs),
+      {},
+      {},
       payload);
-  const auto sequence = event.metal_sequence;
-  state.writer.append_metal_event(event);
-  return sequence;
-}
-
-void append_translated_call(SessionState &state, std::string_view call_name, std::string payload)
-{
-  MetalTraceRecord trace_record;
-  trace_record.translated_call_name = std::string(call_name);
-  trace_record.translation_link_payload = std::move(payload);
-  state.recorder.record_metal_call(trace_record);
 }
 
 std::vector<std::uint8_t> copy_bytes(const void *bytes, std::uint64_t size)
@@ -180,6 +213,7 @@ APITRACE_METAL_API apitrace_metal_session_t *apitrace_metal_session_open(const c
   }
 
   apitrace::metal::TranslationTraceRecorderOptions recorder_options;
+  recorder_options.enable_metal_trace = true;
   recorder_options.trace_label = "metal_capi";
   apitrace::trace::TranslationLinkStreamOptions link_options;
   link_options.producer_name = "apitrace_metal_capi";
@@ -227,36 +261,27 @@ APITRACE_METAL_API uint64_t apitrace_metal_current_metal_sequence(apitrace_metal
   }
 
   std::lock_guard<std::mutex> lock(session->state.mutex);
-  return session->state.last_metal_sequence;
+  return session->state.recorder.current_metal_sequence();
 }
 
-#define APITRACE_METAL_RECORD_JSON(function_name_literal, call_kind_value, object_id_value, ...)                      \
-  do {                                                                                                                 \
-    if (session == nullptr) {                                                                                          \
-      return;                                                                                                          \
-    }                                                                                                                  \
-    std::lock_guard<std::mutex> lock(session->state.mutex);                                                            \
-    const auto payload = (__VA_ARGS__);                                                                                \
-    apitrace::metal::detail::append_translated_call(                                              \
-        session->state,                                                                            \
-        function_name_literal,                                                                     \
-        apitrace::metal::detail::dump_json(payload));                                              \
-    apitrace::metal::detail::append_event(session->state, call_kind_value, function_name_literal, object_id_value, {}, {}, payload); \
+#define APITRACE_METAL_RECORD_JSON(function_name_literal, call_kind_value, object_id_value, ...)                     \
+  do {                                                                                                                \
+    if (session == nullptr) {                                                                                         \
+      return;                                                                                                         \
+    }                                                                                                                 \
+    std::lock_guard<std::mutex> lock(session->state.mutex);                                                           \
+    const auto payload = (__VA_ARGS__);                                                                               \
+    apitrace::metal::detail::record_metal_call(session->state, call_kind_value, function_name_literal, object_id_value, payload); \
   } while (false)
 
-#define APITRACE_METAL_RECORD_JSON_RET(function_name_literal, call_kind_value, object_id_value, ...)                  \
-  do {                                                                                                                 \
-    if (session == nullptr) {                                                                                          \
-      return 0;                                                                                                        \
-    }                                                                                                                  \
-    std::lock_guard<std::mutex> lock(session->state.mutex);                                                            \
-    const auto payload = (__VA_ARGS__);                                                                                \
-    apitrace::metal::detail::append_translated_call(                                             \
-        session->state,                                                                           \
-        function_name_literal,                                                                    \
-        apitrace::metal::detail::dump_json(payload));                                             \
-    return apitrace::metal::detail::append_event(                                                 \
-        session->state, call_kind_value, function_name_literal, object_id_value, {}, {}, payload);                    \
+#define APITRACE_METAL_RECORD_JSON_RET(function_name_literal, call_kind_value, object_id_value, ...)                 \
+  do {                                                                                                                \
+    if (session == nullptr) {                                                                                         \
+      return 0;                                                                                                       \
+    }                                                                                                                 \
+    std::lock_guard<std::mutex> lock(session->state.mutex);                                                           \
+    const auto payload = (__VA_ARGS__);                                                                               \
+    return apitrace::metal::detail::record_metal_call(session->state, call_kind_value, function_name_literal, object_id_value, payload); \
   } while (false)
 
 APITRACE_METAL_API uint64_t apitrace_metal_command_buffer_begin(
@@ -265,22 +290,32 @@ APITRACE_METAL_API uint64_t apitrace_metal_command_buffer_begin(
     uint64_t frame_id,
     const char *label_utf8)
 {
-  APITRACE_METAL_RECORD_JSON_RET(
-      "MTLCommandBuffer.begin",
-      apitrace::trace::MetalCallKind::CommandBufferBegin,
-      command_buffer_object_id,
-      json{{"frame_id", frame_id}, {"label", apitrace::metal::detail::copy_c_string(label_utf8)}});
+  if (session == nullptr) {
+    return 0;
+  }
+
+  std::lock_guard<std::mutex> lock(session->state.mutex);
+  apitrace::metal::TranslationCommandBufferInfo info;
+  info.frame_id = frame_id;
+  info.command_buffer_id = command_buffer_object_id;
+  info.d3d_sequence = apitrace::metal::detail::g_current_d3d_sequence;
+  info.label = apitrace::metal::detail::copy_c_string(label_utf8);
+  info.payload = json{{"frame_id", frame_id}, {"label", info.label}}.dump();
+  session->state.recorder.begin_command_buffer(info);
+  return session->state.recorder.current_metal_sequence();
 }
 
 APITRACE_METAL_API void apitrace_metal_command_buffer_commit(
     apitrace_metal_session_t *session,
     uint64_t command_buffer_object_id)
 {
-  APITRACE_METAL_RECORD_JSON(
-      "MTLCommandBuffer.commit",
-      apitrace::trace::MetalCallKind::CommandBufferCommit,
-      command_buffer_object_id,
-      json::object());
+  (void)command_buffer_object_id;
+  if (session == nullptr) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(session->state.mutex);
+  session->state.recorder.end_command_buffer();
 }
 
 APITRACE_METAL_API uint64_t apitrace_metal_render_encoder_begin(
@@ -289,23 +324,34 @@ APITRACE_METAL_API uint64_t apitrace_metal_render_encoder_begin(
     uint64_t command_buffer_object_id,
     const char *render_pass_info_json)
 {
-  APITRACE_METAL_RECORD_JSON_RET(
-      "MTLCommandBuffer.renderCommandEncoder",
-      apitrace::trace::MetalCallKind::RenderEncoderBegin,
-      encoder_object_id,
-      json{{"command_buffer_id", command_buffer_object_id},
-           {"render_pass_info", apitrace::metal::detail::copy_c_string(render_pass_info_json)}});
+  if (session == nullptr) {
+    return 0;
+  }
+
+  std::lock_guard<std::mutex> lock(session->state.mutex);
+  apitrace::metal::TranslationEncoderInfo info;
+  info.encoder_id = encoder_object_id;
+  info.command_buffer_id = command_buffer_object_id;
+  info.d3d_sequence = apitrace::metal::detail::g_current_d3d_sequence;
+  info.pass_kind = apitrace::metal::TranslationPassKind::Render;
+  info.payload = json{{"command_buffer_id", command_buffer_object_id},
+                      {"render_pass_info", apitrace::metal::detail::copy_c_string(render_pass_info_json)}}
+                     .dump();
+  session->state.recorder.begin_encoder(info);
+  return session->state.recorder.current_metal_sequence();
 }
 
 APITRACE_METAL_API void apitrace_metal_render_encoder_end(
     apitrace_metal_session_t *session,
     uint64_t encoder_object_id)
 {
-  APITRACE_METAL_RECORD_JSON(
-      "MTLRenderCommandEncoder.endEncoding",
-      apitrace::trace::MetalCallKind::RenderEncoderEnd,
-      encoder_object_id,
-      json::object());
+  (void)encoder_object_id;
+  if (session == nullptr) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(session->state.mutex);
+  session->state.recorder.end_encoder();
 }
 
 APITRACE_METAL_API uint64_t apitrace_metal_compute_encoder_begin(
@@ -314,22 +360,34 @@ APITRACE_METAL_API uint64_t apitrace_metal_compute_encoder_begin(
     uint64_t command_buffer_object_id,
     const char *payload_json)
 {
-  APITRACE_METAL_RECORD_JSON_RET(
-      "MTLCommandBuffer.computeCommandEncoder",
-      apitrace::trace::MetalCallKind::ComputeEncoderBegin,
-      encoder_object_id,
-      json{{"command_buffer_id", command_buffer_object_id}, {"payload", apitrace::metal::detail::copy_c_string(payload_json)}});
+  if (session == nullptr) {
+    return 0;
+  }
+
+  std::lock_guard<std::mutex> lock(session->state.mutex);
+  apitrace::metal::TranslationEncoderInfo info;
+  info.encoder_id = encoder_object_id;
+  info.command_buffer_id = command_buffer_object_id;
+  info.d3d_sequence = apitrace::metal::detail::g_current_d3d_sequence;
+  info.pass_kind = apitrace::metal::TranslationPassKind::Compute;
+  info.payload = json{{"command_buffer_id", command_buffer_object_id},
+                      {"payload", apitrace::metal::detail::copy_c_string(payload_json)}}
+                     .dump();
+  session->state.recorder.begin_encoder(info);
+  return session->state.recorder.current_metal_sequence();
 }
 
 APITRACE_METAL_API void apitrace_metal_compute_encoder_end(
     apitrace_metal_session_t *session,
     uint64_t encoder_object_id)
 {
-  APITRACE_METAL_RECORD_JSON(
-      "MTLComputeCommandEncoder.endEncoding",
-      apitrace::trace::MetalCallKind::ComputeEncoderEnd,
-      encoder_object_id,
-      json::object());
+  (void)encoder_object_id;
+  if (session == nullptr) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(session->state.mutex);
+  session->state.recorder.end_encoder();
 }
 
 APITRACE_METAL_API uint64_t apitrace_metal_blit_encoder_begin(
@@ -338,22 +396,34 @@ APITRACE_METAL_API uint64_t apitrace_metal_blit_encoder_begin(
     uint64_t command_buffer_object_id,
     const char *payload_json)
 {
-  APITRACE_METAL_RECORD_JSON_RET(
-      "MTLCommandBuffer.blitCommandEncoder",
-      apitrace::trace::MetalCallKind::BlitEncoderBegin,
-      encoder_object_id,
-      json{{"command_buffer_id", command_buffer_object_id}, {"payload", apitrace::metal::detail::copy_c_string(payload_json)}});
+  if (session == nullptr) {
+    return 0;
+  }
+
+  std::lock_guard<std::mutex> lock(session->state.mutex);
+  apitrace::metal::TranslationEncoderInfo info;
+  info.encoder_id = encoder_object_id;
+  info.command_buffer_id = command_buffer_object_id;
+  info.d3d_sequence = apitrace::metal::detail::g_current_d3d_sequence;
+  info.pass_kind = apitrace::metal::TranslationPassKind::Blit;
+  info.payload = json{{"command_buffer_id", command_buffer_object_id},
+                      {"payload", apitrace::metal::detail::copy_c_string(payload_json)}}
+                     .dump();
+  session->state.recorder.begin_encoder(info);
+  return session->state.recorder.current_metal_sequence();
 }
 
 APITRACE_METAL_API void apitrace_metal_blit_encoder_end(
     apitrace_metal_session_t *session,
     uint64_t encoder_object_id)
 {
-  APITRACE_METAL_RECORD_JSON(
-      "MTLBlitCommandEncoder.endEncoding",
-      apitrace::trace::MetalCallKind::BlitEncoderEnd,
-      encoder_object_id,
-      json::object());
+  (void)encoder_object_id;
+  if (session == nullptr) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(session->state.mutex);
+  session->state.recorder.end_encoder();
 }
 
 APITRACE_METAL_API void apitrace_metal_set_render_pipeline_state(
@@ -686,16 +756,25 @@ APITRACE_METAL_API void apitrace_metal_wait_for_fence(apitrace_metal_session_t *
 
 APITRACE_METAL_API void apitrace_metal_present_drawable(apitrace_metal_session_t *session, uint64_t command_buffer_id, uint64_t drawable_id, uint64_t frame_index, uint32_t width, uint32_t height, uint32_t sync_interval, uint32_t flags)
 {
-  APITRACE_METAL_RECORD_JSON(
-      "MTLCommandBuffer.presentDrawable",
+  if (session == nullptr) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(session->state.mutex);
+  apitrace::metal::detail::record_metal_call(
+      session->state,
       apitrace::trace::MetalCallKind::PresentDrawable,
+      "MTLCommandBuffer.presentDrawable",
       command_buffer_id,
+      {drawable_id},
+      {},
       json{{"drawable_id", drawable_id},
            {"frame_index", frame_index},
            {"width", width},
            {"height", height},
            {"sync_interval", sync_interval},
-           {"flags", flags}});
+           {"flags", flags}},
+      frame_index);
 }
 
 APITRACE_METAL_API void apitrace_metal_push_debug_group(apitrace_metal_session_t *session, uint64_t encoder_id, const char *label_utf8)
@@ -733,26 +812,47 @@ APITRACE_METAL_API uint64_t apitrace_metal_register_buffer(apitrace_metal_sessio
   std::lock_guard<std::mutex> lock(session->state.mutex);
   auto asset = apitrace::metal::detail::make_asset_record(object_id, "buffer", initial_bytes, initial_bytes_size);
   asset = session->state.writer.register_metal_asset(apitrace::trace::MetalAssetKind::Buffer, asset);
-  return apitrace::metal::detail::append_event(
+  const auto payload = json{{"length", length},
+                            {"storage_mode", storage_mode},
+                            {"initial_bytes_size", initial_bytes_size},
+                            {"buffer_path", asset.relative_path.generic_string()}};
+  apitrace::metal::detail::track_object(
+      session->state,
+      object_id,
+      apitrace::trace::MetalAssetKind::Buffer,
+      asset,
+      payload.dump());
+  return apitrace::metal::detail::record_metal_call(
       session->state,
       apitrace::trace::MetalCallKind::DeviceCreate,
       "MTLDevice.newBuffer",
       object_id,
       {},
-      asset.blob_id == 0 ? std::vector<apitrace::trace::BlobId>{} : std::vector<apitrace::trace::BlobId>{asset.blob_id},
-      json{{"length", length},
-           {"storage_mode", storage_mode},
-           {"initial_bytes_size", initial_bytes_size},
-           {"buffer_path", asset.relative_path.generic_string()}});
+      apitrace::metal::detail::blob_refs_for_asset(asset),
+      payload);
 }
 
 APITRACE_METAL_API uint64_t apitrace_metal_register_texture(apitrace_metal_session_t *session, uint64_t object_id, const char *descriptor_json)
 {
-  APITRACE_METAL_RECORD_JSON_RET(
-      "MTLDevice.newTexture",
-      apitrace::trace::MetalCallKind::DeviceCreate,
+  if (session == nullptr) {
+    return 0;
+  }
+
+  std::lock_guard<std::mutex> lock(session->state.mutex);
+  const auto payload = json{{"descriptor", apitrace::metal::detail::copy_c_string(descriptor_json)}};
+  apitrace::trace::AssetRecord asset;
+  apitrace::metal::detail::track_object(
+      session->state,
       object_id,
-      json{{"descriptor", apitrace::metal::detail::copy_c_string(descriptor_json)}});
+      apitrace::trace::MetalAssetKind::Texture,
+      asset,
+      payload.dump());
+  return apitrace::metal::detail::record_metal_call(
+      session->state,
+      apitrace::trace::MetalCallKind::DeviceCreate,
+      "MTLDevice.newTexture",
+      object_id,
+      payload);
 }
 
 APITRACE_METAL_API uint64_t apitrace_metal_register_library(apitrace_metal_session_t *session, uint64_t object_id, const void *metallib_bytes, uint64_t size)
@@ -763,34 +863,85 @@ APITRACE_METAL_API uint64_t apitrace_metal_register_library(apitrace_metal_sessi
   std::lock_guard<std::mutex> lock(session->state.mutex);
   auto asset = apitrace::metal::detail::make_asset_record(object_id, "library", metallib_bytes, size);
   asset = session->state.writer.register_metal_asset(apitrace::trace::MetalAssetKind::Library, asset);
-  return apitrace::metal::detail::append_event(
+  const auto payload = json{{"library_path", asset.relative_path.generic_string()}, {"size", size}};
+  apitrace::metal::detail::track_object(
+      session->state,
+      object_id,
+      apitrace::trace::MetalAssetKind::Library,
+      asset,
+      payload.dump());
+  return apitrace::metal::detail::record_metal_call(
       session->state,
       apitrace::trace::MetalCallKind::DeviceCreate,
       "MTLDevice.newLibrary",
       object_id,
       {},
-      asset.blob_id == 0 ? std::vector<apitrace::trace::BlobId>{} : std::vector<apitrace::trace::BlobId>{asset.blob_id},
-      json{{"library_path", asset.relative_path.generic_string()}, {"size", size}});
+      apitrace::metal::detail::blob_refs_for_asset(asset),
+      payload);
 }
 
 APITRACE_METAL_API uint64_t apitrace_metal_register_render_pipeline(apitrace_metal_session_t *session, uint64_t object_id, const char *descriptor_json, uint64_t vs_function_id, uint64_t fs_function_id)
 {
-  APITRACE_METAL_RECORD_JSON_RET(
-      "MTLDevice.newRenderPipelineState",
-      apitrace::trace::MetalCallKind::DeviceCreate,
+  if (session == nullptr) {
+    return 0;
+  }
+
+  std::lock_guard<std::mutex> lock(session->state.mutex);
+  const auto descriptor = apitrace::metal::detail::copy_c_string(descriptor_json);
+  auto asset = apitrace::metal::detail::make_asset_record(
       object_id,
-      json{{"descriptor", apitrace::metal::detail::copy_c_string(descriptor_json)},
-           {"vs_function_id", vs_function_id},
-           {"fs_function_id", fs_function_id}});
+      "render_pipeline",
+      descriptor.data(),
+      static_cast<std::uint64_t>(descriptor.size()));
+  asset = session->state.writer.register_metal_asset(apitrace::trace::MetalAssetKind::RenderPipeline, asset);
+  const auto payload = json{{"descriptor_path", asset.relative_path.generic_string()},
+                            {"vs_function_id", vs_function_id},
+                            {"fs_function_id", fs_function_id}};
+  apitrace::metal::detail::track_object(
+      session->state,
+      object_id,
+      apitrace::trace::MetalAssetKind::RenderPipeline,
+      asset,
+      payload.dump());
+  return apitrace::metal::detail::record_metal_call(
+      session->state,
+      apitrace::trace::MetalCallKind::DeviceCreate,
+      "MTLDevice.newRenderPipelineState",
+      object_id,
+      {vs_function_id, fs_function_id},
+      apitrace::metal::detail::blob_refs_for_asset(asset),
+      payload);
 }
 
 APITRACE_METAL_API uint64_t apitrace_metal_register_compute_pipeline(apitrace_metal_session_t *session, uint64_t object_id, const char *descriptor_json, uint64_t cs_function_id)
 {
-  APITRACE_METAL_RECORD_JSON_RET(
-      "MTLDevice.newComputePipelineState",
-      apitrace::trace::MetalCallKind::DeviceCreate,
+  if (session == nullptr) {
+    return 0;
+  }
+
+  std::lock_guard<std::mutex> lock(session->state.mutex);
+  const auto descriptor = apitrace::metal::detail::copy_c_string(descriptor_json);
+  auto asset = apitrace::metal::detail::make_asset_record(
       object_id,
-      json{{"descriptor", apitrace::metal::detail::copy_c_string(descriptor_json)}, {"cs_function_id", cs_function_id}});
+      "compute_pipeline",
+      descriptor.data(),
+      static_cast<std::uint64_t>(descriptor.size()));
+  asset = session->state.writer.register_metal_asset(apitrace::trace::MetalAssetKind::ComputePipeline, asset);
+  const auto payload = json{{"descriptor_path", asset.relative_path.generic_string()}, {"cs_function_id", cs_function_id}};
+  apitrace::metal::detail::track_object(
+      session->state,
+      object_id,
+      apitrace::trace::MetalAssetKind::ComputePipeline,
+      asset,
+      payload.dump());
+  return apitrace::metal::detail::record_metal_call(
+      session->state,
+      apitrace::trace::MetalCallKind::DeviceCreate,
+      "MTLDevice.newComputePipelineState",
+      object_id,
+      {cs_function_id},
+      apitrace::metal::detail::blob_refs_for_asset(asset),
+      payload);
 }
 
 APITRACE_METAL_API void apitrace_metal_emit_link(

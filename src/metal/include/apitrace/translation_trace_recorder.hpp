@@ -1,6 +1,7 @@
 #pragma once
 
 #include "apitrace/metal_bridge.hpp"
+#include "apitrace/metal_state.hpp"
 #include "apitrace/metal_trace.hpp"
 #include "apitrace/trace_bundle_io.hpp"
 #include "apitrace/translation_link_writer.hpp"
@@ -32,6 +33,7 @@ struct TranslationCommandBufferInfo {
   std::uint64_t frame_id = 0;
   std::uint64_t command_buffer_id = 0;
   std::uint64_t submission_id = 0;
+  std::uint64_t d3d_sequence = 0;
   std::string label;
   std::string payload;
 
@@ -40,6 +42,9 @@ struct TranslationCommandBufferInfo {
 
 struct TranslationEncoderInfo {
   std::uint64_t encoder_id = 0;
+  std::uint64_t command_buffer_id = 0;
+  std::uint64_t frame_id = 0;
+  std::uint64_t d3d_sequence = 0;
   TranslationPassKind pass_kind = TranslationPassKind::Unknown;
   std::string label;
   std::string payload;
@@ -73,6 +78,7 @@ public:
   void close();
 
   bool is_open() const noexcept;
+  std::uint64_t current_metal_sequence() const noexcept;
   const std::string &last_error() const noexcept;
 
 private:
