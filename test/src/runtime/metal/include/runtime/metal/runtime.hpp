@@ -1,6 +1,8 @@
 #pragma once
 
+#import <Cocoa/Cocoa.h>
 #import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
 
 #include "apitrace/metal_capi.h"
 
@@ -149,6 +151,10 @@ private:
     std::uint64_t next_frame_id_ = 1;
     id<MTLDevice> device_ = nil;
     id<MTLCommandQueue> queue_ = nil;
+    NSWindow *window_ = nil;
+    NSView *content_view_ = nil;
+    CAMetalLayer *metal_layer_ = nil;
+    id<CAMetalDrawable> current_drawable_ = nil;
     id<MTLTexture> drawable_texture_ = nil;
     std::uint64_t drawable_object_id_ = 0;
     apitrace_metal_session_t *trace_session_ = nullptr;

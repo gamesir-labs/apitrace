@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace apitrace::metal {
 
@@ -71,5 +72,15 @@ public:
 private:
   apitrace_metal_session_t *session_ = nullptr;
 };
+
+void record_present_frame(
+    apitrace_metal_session_t *session,
+    std::uint64_t frame_index,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t row_pitch,
+    std::uint32_t sync_interval,
+    std::uint32_t flags,
+    const std::vector<std::uint8_t> &bgra_bytes);
 
 } // namespace apitrace::metal

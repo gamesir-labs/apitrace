@@ -607,9 +607,17 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
     impl_->callstream_stream.open(impl_->layout.callstream_path, std::ios::binary | std::ios::trunc);
     impl_->open = impl_->callstream_stream.is_open();
   } else {
+    if (std::filesystem::is_regular_file(impl_->layout.callstream_path)) {
+      impl_->callstream_stream.open(impl_->layout.callstream_path, std::ios::binary | std::ios::app);
+      impl_->metadata_written = impl_->callstream_stream.is_open() && std::filesystem::file_size(impl_->layout.callstream_path) > 0;
+    } else {
+      impl_->callstream_stream.open(impl_->layout.callstream_path, std::ios::binary | std::ios::trunc);
+    }
     impl_->open = true;
   }
   if (impl_->open && mode == TraceBundleOpenMode::Primary) {
+    write_object_index({});
+  } else if (impl_->open && !std::filesystem::exists(impl_->layout.object_index_path)) {
     write_object_index({});
   }
   return impl_->open;

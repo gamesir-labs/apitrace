@@ -164,6 +164,46 @@ trace::AssetRecord make_asset_record(std::uint64_t object_id, std::string debug_
   return asset;
 }
 
+void record_present_frame_locked(
+    SessionState &state,
+    std::uint64_t frame_index,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t row_pitch,
+    std::uint32_t sync_interval,
+    std::uint32_t flags,
+    const std::vector<std::uint8_t> &bgra_bytes)
+{
+  if (bgra_bytes.empty()) {
+    return;
+  }
+
+  trace::AssetRecord asset;
+  asset.blob_id = state.recorder.current_metal_sequence() + 1;
+  asset.kind = trace::AssetKind::Texture;
+  asset.debug_name = "metal-present-frame";
+  asset.payload_bytes = bgra_bytes;
+  asset = state.writer.register_asset(asset);
+
+  trace::EventRecord event;
+  event.kind = trace::EventKind::ResourceBlob;
+  event.callsite.sequence = state.recorder.current_metal_sequence() + 1;
+  event.callsite.function_name = "resource_blob";
+  event.object_kind = trace::ObjectKind::Unknown;
+  event.object_debug_name = "MetalPresentFrame";
+  event.blob_refs = {asset.blob_id};
+  event.payload = json{{"frame_index", frame_index},
+                       {"width", width},
+                       {"height", height},
+                       {"row_pitch", row_pitch},
+                       {"sync_interval", sync_interval},
+                       {"flags", flags},
+                       {"format", "bgra8"},
+                       {"frame_path", asset.relative_path.generic_string()}}
+                      .dump();
+  state.writer.append_call_event(event);
+}
+
 void append_link(
     SessionState &state,
     apitrace_metal_scope_kind scope,
@@ -191,6 +231,36 @@ struct apitrace_metal_session {
   apitrace::metal::detail::SessionState state;
 };
 
+namespace apitrace::metal {
+
+void record_present_frame(
+    apitrace_metal_session_t *session,
+    std::uint64_t frame_index,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t row_pitch,
+    std::uint32_t sync_interval,
+    std::uint32_t flags,
+    const std::vector<std::uint8_t> &bgra_bytes)
+{
+  if (session == nullptr) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(session->state.mutex);
+  detail::record_present_frame_locked(
+      session->state,
+      frame_index,
+      width,
+      height,
+      row_pitch,
+      sync_interval,
+      flags,
+      bgra_bytes);
+}
+
+} // namespace apitrace::metal
+
 APITRACE_METAL_API apitrace_metal_session_t *apitrace_metal_session_open(const char *bundle_root)
 {
   if (bundle_root == nullptr || *bundle_root == '\0') {
@@ -202,6 +272,11 @@ APITRACE_METAL_API apitrace_metal_session_t *apitrace_metal_session_open(const c
   if (!state.writer.open(bundle_root, apitrace::trace::TraceBundleOpenMode::SidebandOnly)) {
     return nullptr;
   }
+  apitrace::trace::TraceMetadata metadata;
+  metadata.api = apitrace::trace::ApiKind::Unknown;
+  metadata.producer = "apitrace_metal_capi";
+  metadata.has_metal_callstream = true;
+  state.writer.write_metadata(metadata);
 
   if (!state.bridge.initialize()) {
     state.writer.close();

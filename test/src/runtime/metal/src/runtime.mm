@@ -1,5 +1,9 @@
 #include "runtime/metal/runtime.hpp"
 
+#include "apitrace/metal_capi.hpp"
+
+#import <QuartzCore/CAMetalLayer.h>
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -23,6 +27,74 @@ namespace {
     std::fprintf(stderr, "%s\n", message.c_str());
     std::fflush(stderr);
     std::exit(EXIT_FAILURE);
+}
+
+void pump_window_events()
+{
+    while (true) {
+        NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                            untilDate:[NSDate dateWithTimeIntervalSinceNow:0.0]
+                                               inMode:NSDefaultRunLoopMode
+                                              dequeue:YES];
+        if (event == nil) {
+            break;
+        }
+        [NSApp sendEvent:event];
+    }
+}
+
+void ensure_application_started()
+{
+    [NSApplication sharedApplication];
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [NSApp finishLaunching];
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
+NSWindow *create_window(std::uint32_t width, std::uint32_t height)
+{
+    const NSRect frame = NSMakeRect(0.0, 0.0, static_cast<CGFloat>(width), static_cast<CGFloat>(height));
+    NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
+                                                   styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable)
+                                                     backing:NSBackingStoreBuffered
+                                                       defer:NO];
+    if (window == nil) {
+        fail_with_message("failed to create NSWindow");
+    }
+    [window setTitle:@"apitrace_test_metal"];
+    [window center];
+    [window makeKeyAndOrderFront:nil];
+    return window;
+}
+
+CAMetalLayer *create_metal_layer(id<MTLDevice> device, NSView *view, std::uint32_t width, std::uint32_t height)
+{
+    if (view == nil) {
+        fail_with_message("failed to create Metal host view");
+    }
+    [view setWantsLayer:YES];
+    CAMetalLayer *layer = [[CAMetalLayer layer] retain];
+    if (layer == nil) {
+        fail_with_message("failed to create CAMetalLayer");
+    }
+    layer.device = device;
+    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    layer.framebufferOnly = NO;
+    layer.opaque = YES;
+    layer.drawableSize = CGSizeMake(static_cast<CGFloat>(width), static_cast<CGFloat>(height));
+    layer.contentsScale = view.window ? view.window.backingScaleFactor : NSScreen.mainScreen.backingScaleFactor;
+    layer.frame = view.bounds;
+    view.layer = layer;
+    return layer;
+}
+
+id<CAMetalDrawable> next_drawable_or_fail(CAMetalLayer *layer)
+{
+    id<CAMetalDrawable> drawable = [layer nextDrawable];
+    if (drawable == nil) {
+        fail_with_message("CAMetalLayer nextDrawable returned nil");
+    }
+    return [drawable retain];
 }
 
 std::string format_texture_descriptor_json(std::uint32_t width, std::uint32_t height)
@@ -146,6 +218,10 @@ MetalRuntime::MetalRuntime(MetalRuntime &&other) noexcept
       next_frame_id_(other.next_frame_id_),
       device_(other.device_),
       queue_(other.queue_),
+      window_(other.window_),
+      content_view_(other.content_view_),
+      metal_layer_(other.metal_layer_),
+      current_drawable_(other.current_drawable_),
       drawable_texture_(other.drawable_texture_),
       drawable_object_id_(other.drawable_object_id_),
       trace_session_(other.trace_session_)
@@ -154,6 +230,10 @@ MetalRuntime::MetalRuntime(MetalRuntime &&other) noexcept
     other.height_ = 0;
     other.device_ = nil;
     other.queue_ = nil;
+    other.window_ = nil;
+    other.content_view_ = nil;
+    other.metal_layer_ = nil;
+    other.current_drawable_ = nil;
     other.drawable_texture_ = nil;
     other.drawable_object_id_ = 0;
     other.trace_session_ = nullptr;
@@ -170,6 +250,10 @@ MetalRuntime &MetalRuntime::operator=(MetalRuntime &&other) noexcept
         next_frame_id_ = other.next_frame_id_;
         device_ = other.device_;
         queue_ = other.queue_;
+        window_ = other.window_;
+        content_view_ = other.content_view_;
+        metal_layer_ = other.metal_layer_;
+        current_drawable_ = other.current_drawable_;
         drawable_texture_ = other.drawable_texture_;
         drawable_object_id_ = other.drawable_object_id_;
         trace_session_ = other.trace_session_;
@@ -178,6 +262,10 @@ MetalRuntime &MetalRuntime::operator=(MetalRuntime &&other) noexcept
         other.height_ = 0;
         other.device_ = nil;
         other.queue_ = nil;
+        other.window_ = nil;
+        other.content_view_ = nil;
+        other.metal_layer_ = nil;
+        other.current_drawable_ = nil;
         other.drawable_texture_ = nil;
         other.drawable_object_id_ = 0;
         other.trace_session_ = nullptr;
@@ -206,21 +294,14 @@ MetalRuntime MetalRuntime::create(std::uint32_t width, std::uint32_t height)
         fail_with_message("failed to create Metal command queue");
     }
 
-    auto *descriptor = [[MTLTextureDescriptor alloc] init];
-    descriptor.textureType = MTLTextureType2D;
-    descriptor.width = width;
-    descriptor.height = height;
-    descriptor.depth = 1;
-    descriptor.mipmapLevelCount = 1;
-    descriptor.arrayLength = 1;
-    descriptor.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    descriptor.sampleCount = 1;
-    descriptor.storageMode = MTLStorageModeShared;
-    descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-    runtime.drawable_texture_ = [runtime.device_ newTextureWithDescriptor:descriptor];
-    if (runtime.drawable_texture_ == nil) {
-        fail_with_message("failed to create offscreen drawable texture");
+    ensure_application_started();
+    runtime.window_ = create_window(width, height);
+    runtime.content_view_ = [[runtime.window_ contentView] retain];
+    if (runtime.content_view_ == nil) {
+        fail_with_message("failed to create Metal content view");
     }
+    [runtime.content_view_ setFrame:NSMakeRect(0.0, 0.0, static_cast<CGFloat>(width), static_cast<CGFloat>(height))];
+    runtime.metal_layer_ = create_metal_layer(runtime.device_, runtime.content_view_, width, height);
 
     const char *bundle_root = std::getenv("APITRACE_METAL_BUNDLE");
     if (bundle_root && *bundle_root) {
@@ -233,6 +314,7 @@ MetalRuntime MetalRuntime::create(std::uint32_t width, std::uint32_t height)
         apitrace_metal_register_texture(runtime.trace_session_, runtime.drawable_object_id_, descriptor_json.c_str());
     }
 
+    pump_window_events();
     return runtime;
 }
 
@@ -283,6 +365,12 @@ CompiledLibrary MetalRuntime::compile_library(std::string_view name, std::string
 
 TracedCommandBuffer MetalRuntime::begin_command_buffer(std::uint64_t d3d_sequence, std::uint64_t frame_id, const char *label)
 {
+    if (current_drawable_ == nil) {
+        current_drawable_ = next_drawable_or_fail(metal_layer_);
+        [drawable_texture_ release];
+        drawable_texture_ = [current_drawable_.texture retain];
+    }
+
     TracedCommandBuffer command_buffer;
     command_buffer.handle = [queue_ commandBuffer];
     if (command_buffer.handle == nil) {
@@ -326,6 +414,7 @@ void MetalRuntime::commit_command_buffer(
             flags);
     }
 
+    [command_buffer.handle presentDrawable:current_drawable_];
     [command_buffer.handle commit];
     [command_buffer.handle waitUntilCompleted];
     if (command_buffer.handle.status != MTLCommandBufferStatusCompleted) {
@@ -344,8 +433,21 @@ void MetalRuntime::commit_command_buffer(
             command_buffer.trace_begin,
             apitrace_metal_current_metal_sequence(trace_session_),
             link_payload ? link_payload : "{}");
+        const std::vector<std::uint8_t> bgra = readback_rgba(drawable_texture_);
+        apitrace::metal::record_present_frame(
+            trace_session_,
+            command_buffer.frame_id,
+            width_,
+            height_,
+            width_ * 4U,
+            sync_interval,
+            flags,
+            bgra);
     }
 
+    [current_drawable_ release];
+    current_drawable_ = nil;
+    pump_window_events();
     command_buffer.handle = nil;
 }
 
@@ -579,7 +681,20 @@ void MetalRuntime::close_trace_session() noexcept
 
 void MetalRuntime::release_runtime_objects() noexcept
 {
+    [current_drawable_ release];
+    current_drawable_ = nil;
+    [drawable_texture_ release];
     drawable_texture_ = nil;
+    [metal_layer_ release];
+    metal_layer_ = nil;
+    if (window_ != nil) {
+        [window_ orderOut:nil];
+        [window_ close];
+    }
+    [content_view_ release];
+    content_view_ = nil;
+    [window_ release];
+    window_ = nil;
     queue_ = nil;
     device_ = nil;
 }
