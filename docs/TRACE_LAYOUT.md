@@ -386,6 +386,84 @@ compute pipeline 至少保留 `root_signature_object_id`、`node_mask`、`flags`
 - 由 `apitrace` 提供的库 API 写入
 - `apitrace` 不解释其中的链接语义，只负责保存
 
+## Metal callstream 与资产
+
+当 bundle 同时携带转译后的 Metal 辅助 trace 时，根目录额外包含：
+
+- `metal-callstream.jsonl`
+- `metal/`
+- `analysis/translation-links.jsonl`
+
+### `metal-callstream.jsonl`
+
+这是转译层显式调用 Metal facade 后落下的逐行事件流，推荐字段如下：
+
+- `metal_sequence`
+- `d3d_sequence`
+- `frame_id`
+- `call_kind`
+- `function`
+- `object_id`
+- `object_refs`
+- `blob_refs`
+- `payload`
+
+其中：
+
+- `command_buffer_begin` / `command_buffer_commit` 表示 command buffer 生命周期
+- `render_encoder_begin` / `compute_encoder_begin` / `blit_encoder_begin` 表示 encoder 生命周期
+- `draw_*` / `dispatch_*` / `copy_*` / `present_*` 表示真实转译后的 Metal 调用
+
+### `metal/` 目录命名规则
+
+`metal/` 下的资产按类型拆目录：
+
+- `metal/libraries/*.metallib`
+- `metal/pipelines/*.pipeline.json`
+- `metal/buffers/*.buffer`
+- `metal/textures/*.texture`
+
+约束与主 bundle 保持一致：
+
+- 文件名优先使用内容哈希
+- 行语义文件只引用路径，不内嵌二进制资产本体
+- pipeline JSON 必须能独立提供函数引用、像素格式、sample count 等 replay 所需字段
+
+### `MetalPresentFrame` resource blob
+
+如果 Metal trace 或 Metal retrace 显式打开 present-frame 读回，`callstream.jsonl` /
+`metal-callstream.jsonl` 中允许出现 `debug_name = "MetalPresentFrame"` 的 resource blob。推荐字段：
+
+- `frame_index`
+- `width`
+- `height`
+- `row_pitch`
+- `format`
+- `frame_path`
+
+其文件大小必须等于 `row_pitch * height`，且只用于像素级对比，不替代 replay 输入语义。
+
+### `analysis/translation-links.jsonl`
+
+translation link 现在至少使用这些字段：
+
+- `d3d_sequence`
+- `frame_id`
+- `metal_sequence_begin`
+- `metal_sequence_end`
+- `scope_kind`
+- `record_type`
+- `payload`
+
+`scope_kind` 约束为：
+
+- `command_buffer`
+- `encoder`
+- `draw_to_metal_calls`
+
+每个非零 `d3d_sequence` 至少应能聚合到一条 `encoder` 和一条 `draw_to_metal_calls` 记录，供
+`scripts/check-metal-link-coverage.py` 做覆盖校验。
+
 ## 文件引用规则
 
 `callstream.jsonl` 中不直接内嵌大块资产内容，而是通过稳定 id 或路径引用：

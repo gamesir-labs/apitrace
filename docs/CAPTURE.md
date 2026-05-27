@@ -165,3 +165,24 @@ Metal 侧这里不应再叫 capture frontend。
 - 现有 marker / annotation API，例如 `BeginEvent` / `EndEvent` / `SetMarker`
 
 这样可以尽量复用转译层现有的命令组织方式，而不是强迫它直接感知 trace bundle 的落盘细节。
+
+### 转译层接入流程
+
+DXMT 这类转译层接入 Metal trace 时，建议按下面顺序收口：
+
+1. 在 native `winemetal` / `nativemetal` 一侧静态链接 `libapitrace_platform_apple_metal.a` 与 `libapitrace_core.a`
+2. 在进程或 queue 生命周期开始时，调用 `apitrace_metal_session_open(getenv("APITRACE_METAL_BUNDLE"))`
+3. 每次进入新的 D3D 语义调用前，先用 `apitrace_metal_set_current_d3d_sequence` 写当前 `d3d_sequence`
+4. 在 command buffer begin / commit 边界调用 `apitrace_metal_command_buffer_begin` 与 `apitrace_metal_command_buffer_commit`
+5. 在 render / compute / blit encoder begin / end 边界调用对应 `*_encoder_begin` / `*_encoder_end`
+6. 对每条实际下发的 wmtcmd 或 Metal 调用，调用对应的 `apitrace_metal_*` facade 记录 Metal callstream
+7. encoder 结束后，用 `apitrace_metal_emit_link(..., APITRACE_METAL_SCOPE_ENCODER, ...)` 收口 encoder 级 link
+8. 生命周期结束时调用 `apitrace_metal_session_close`
+
+当前 DXMT 的 5 处推荐植入点可按符号理解为：
+
+- `CommandQueue::CommitCurrentChunk`：command buffer begin / commit 与 `d3d_sequence` 同步
+- `Context` 内 render encoder begin 路径
+- `Context` 内 compute encoder begin 路径
+- `Context` 内 blit encoder begin 路径
+- `winemetal` native wrapper 的具体 Metal API facade：逐条记录 call，并在 encoder end 后补 link
