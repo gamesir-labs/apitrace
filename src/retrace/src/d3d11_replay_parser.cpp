@@ -1372,6 +1372,70 @@ bool parse_present(
   return true;
 }
 
+bool parse_resource_blob(
+    const trace::TraceBundleReader &reader,
+    const trace::EventRecord &event,
+    const json &payload,
+    D3D11ReplayPlan &plan,
+    std::string &error)
+{
+  if (event.object_debug_name != "D3D11PresentFrame") {
+    error = record_prefix(event) + ": unsupported resource blob " + event.object_debug_name;
+    return false;
+  }
+  if (!require_payload_key(event, payload, "frame_index", error) ||
+      !require_payload_key(event, payload, "width", error) ||
+      !require_payload_key(event, payload, "height", error) ||
+      !require_payload_key(event, payload, "row_pitch", error) ||
+      !require_payload_key(event, payload, "sync_interval", error) ||
+      !require_payload_key(event, payload, "flags", error) ||
+      !require_payload_key(event, payload, "format", error)) {
+    return false;
+  }
+
+  PresentFrameRecord frame;
+  frame.frame_index = parse_frame_index(payload).value_or(0);
+  if (frame.frame_index != plan.present_frames.size()) {
+    error = record_prefix(event) + ": D3D11PresentFrame frame_index is not contiguous";
+    return false;
+  }
+  frame.width = payload.value("width", 0u);
+  frame.height = payload.value("height", 0u);
+  frame.row_pitch = payload.value("row_pitch", 0u);
+  frame.sync_interval = payload.value("sync_interval", 0u);
+  frame.flags = payload.value("flags", 0u);
+  if (payload.value("format", std::string()) != "rgba8") {
+    error = record_prefix(event) + ": D3D11PresentFrame format must be rgba8";
+    return false;
+  }
+  frame.frame_path = resolve_asset_path(reader, event, payload, "frame_path", error);
+  if (!error.empty()) {
+    return false;
+  }
+  if (frame.width == 0 || frame.height == 0 || frame.row_pitch < frame.width * 4u) {
+    error = record_prefix(event) + ": D3D11PresentFrame has invalid dimensions";
+    return false;
+  }
+  if (!std::filesystem::is_regular_file(frame.frame_path)) {
+    error = record_prefix(event) + ": missing D3D11PresentFrame asset";
+    return false;
+  }
+
+  std::error_code stat_error;
+  const auto frame_size = std::filesystem::file_size(frame.frame_path, stat_error);
+  if (stat_error) {
+    error = record_prefix(event) + ": failed to stat D3D11PresentFrame asset";
+    return false;
+  }
+  if (frame_size != static_cast<std::uintmax_t>(frame.row_pitch) * static_cast<std::uintmax_t>(frame.height)) {
+    error = record_prefix(event) + ": D3D11PresentFrame asset size does not match row_pitch * height";
+    return false;
+  }
+
+  plan.present_frames.push_back(std::move(frame));
+  return true;
+}
+
 const std::unordered_map<std::string, ParseCallHandler> &call_handlers()
 {
   static const std::unordered_map<std::string, ParseCallHandler> handlers = {
@@ -1532,6 +1596,7 @@ bool build_d3d11_replay_plan(
   plan.commands.clear();
   plan.present_call_count = 0;
   plan.present_boundary_count = 0;
+  plan.present_frames.clear();
   plan.frame_begin_count = 0;
   plan.frame_end_count = 0;
   plan.present_sync_intervals.clear();
@@ -1553,6 +1618,13 @@ bool build_d3d11_replay_plan(
       continue;
     }
 
+    if (event.kind == trace::EventKind::ResourceBlob) {
+      if (!parse_resource_blob(reader, event, payload, plan, error)) {
+        return false;
+      }
+      continue;
+    }
+
     const auto handler = call_handlers().find(event.callsite.function_name);
     if (handler == call_handlers().end()) {
       error = record_prefix(event) + ": unsupported function";
@@ -1566,6 +1638,21 @@ bool build_d3d11_replay_plan(
   if (plan.present_call_count != plan.present_boundary_count) {
     error = "D3D11 present boundary count does not match captured IDXGISwapChain::Present calls";
     return false;
+  }
+  if (!plan.present_frames.empty() && plan.present_frames.size() != plan.present_call_count) {
+    error = "D3D11 present frame asset count does not match captured IDXGISwapChain::Present calls";
+    return false;
+  }
+  for (const auto &frame : plan.present_frames) {
+    if (frame.frame_index >= plan.present_sync_intervals.size()) {
+      error = "D3D11 present frame asset count does not match captured IDXGISwapChain::Present calls";
+      return false;
+    }
+    if (plan.present_sync_intervals[frame.frame_index] != frame.sync_interval ||
+        plan.present_flags[frame.frame_index] != frame.flags) {
+      error = "D3D11 present frame metadata does not match captured IDXGISwapChain::Present parameters";
+      return false;
+    }
   }
   if (plan.frame_begin_count != plan.frame_end_count) {
     error = "D3D11 frame boundary count does not match";

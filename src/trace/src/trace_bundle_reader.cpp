@@ -575,16 +575,8 @@ bool parse_event_record(
       return false;
     }
 
-    json payload = record;
-    payload.erase("record_kind");
-    payload.erase("sequence");
-    payload.erase("object_id");
-    payload.erase("object_kind");
-    payload.erase("parent_object_id");
-    payload.erase("debug_name");
-    payload.erase("object_refs");
-    payload.erase("blob_refs");
-    event.payload = payload.empty() ? std::string("{}") : payload.dump();
+    const auto payload_it = record.find("payload");
+    event.payload = payload_it == record.end() ? std::string("{}") : payload_it->dump();
     return true;
   }
 

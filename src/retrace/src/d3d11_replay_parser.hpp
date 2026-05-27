@@ -480,6 +480,16 @@ struct PresentBoundaryCommand {
   std::uint32_t flags = 0;
 };
 
+struct PresentFrameRecord {
+  std::uint64_t frame_index = 0;
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  std::uint32_t row_pitch = 0;
+  std::uint32_t sync_interval = 0;
+  std::uint32_t flags = 0;
+  std::filesystem::path frame_path;
+};
+
 struct DebugMarkerCommand {
   ReplayCommandHeader header;
   std::string label;
@@ -535,6 +545,7 @@ struct D3D11ReplayPlan {
   std::vector<ReplayCommand> commands;
   std::uint64_t present_call_count = 0;
   std::uint64_t present_boundary_count = 0;
+  std::vector<PresentFrameRecord> present_frames;
   std::uint64_t frame_begin_count = 0;
   std::uint64_t frame_end_count = 0;
   std::vector<std::uint32_t> present_sync_intervals;

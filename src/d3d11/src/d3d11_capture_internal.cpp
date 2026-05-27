@@ -485,6 +485,22 @@ trace::AssetRecord register_asset_text(
   return register_asset_bytes(kind, std::move(debug_name), text.data(), text.size());
 }
 
+void record_resource_blob_locked(
+    std::string debug_name,
+    const std::vector<trace::BlobId> &blob_refs,
+    std::string payload_json)
+{
+  if (auto *session = runtime::ensure_process_trace_session(trace::ApiKind::D3D11)) {
+    trace::EventRecord event;
+    event.kind = trace::EventKind::ResourceBlob;
+    event.callsite.sequence = capture_state().next_sequence++;
+    event.object_debug_name = std::move(debug_name);
+    event.blob_refs = blob_refs;
+    event.payload = std::move(payload_json);
+    session->append_call_event(event);
+  }
+}
+
 std::string json_escape(std::string_view text)
 {
   std::string escaped;
@@ -1393,6 +1409,128 @@ void ensure_frame_begin_locked()
   payload << "{\"label\":\"FrameBegin\",\"frame_index\":" << state.frame_index << "}";
   record_boundary_locked(trace::BoundaryKind::Frame, payload.str());
   state.frame_begin_pending = false;
+}
+
+DeviceHookState &device_hook_locked(ID3D11Device *device);
+ContextHookState &context_hook_locked(ID3D11DeviceContext *context);
+SwapChainHookState &swapchain_hook_locked(IDXGISwapChain *swapchain);
+
+bool capture_present_frame_locked(
+    IDXGISwapChain *swapchain,
+    UINT sync_interval,
+    UINT flags,
+    std::string &error)
+{
+  auto &swapchain_hook = swapchain_hook_locked(swapchain);
+
+  ID3D11Texture2D *back_buffer = nullptr;
+  const HRESULT get_buffer_hr = swapchain_hook.get_buffer(
+      swapchain,
+      0,
+      __uuidof(ID3D11Texture2D),
+      reinterpret_cast<void **>(&back_buffer));
+  if (FAILED(get_buffer_hr) || !back_buffer) {
+    std::ostringstream message;
+    message << "present-frame GetBuffer failed (0x" << std::hex << static_cast<unsigned long>(get_buffer_hr) << ")";
+    error = message.str();
+    return false;
+  }
+
+  D3D11_TEXTURE2D_DESC desc{};
+  back_buffer->GetDesc(&desc);
+  if (desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM) {
+    back_buffer->Release();
+    error = "present-frame capture currently requires an RGBA8 swapchain";
+    return false;
+  }
+  if (desc.Width == 0 || desc.Height == 0) {
+    back_buffer->Release();
+    error = "present-frame capture found invalid back-buffer dimensions";
+    return false;
+  }
+
+  ID3D11Device *device = nullptr;
+  back_buffer->GetDevice(&device);
+  if (!device) {
+    back_buffer->Release();
+    error = "present-frame capture could not resolve swapchain device";
+    return false;
+  }
+
+  auto &device_hook = device_hook_locked(device);
+  ID3D11DeviceContext *context = nullptr;
+  device_hook.get_immediate_context(device, &context);
+  if (!context) {
+    device->Release();
+    back_buffer->Release();
+    error = "present-frame capture could not resolve immediate context";
+    return false;
+  }
+
+  auto &context_hook = context_hook_locked(context);
+  D3D11_TEXTURE2D_DESC staging_desc = desc;
+  staging_desc.BindFlags = 0;
+  staging_desc.MiscFlags = 0;
+  staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  staging_desc.Usage = D3D11_USAGE_STAGING;
+
+  ID3D11Texture2D *staging = nullptr;
+  const HRESULT create_staging_hr = device_hook.create_texture2d(device, &staging_desc, nullptr, &staging);
+  if (FAILED(create_staging_hr) || !staging) {
+    std::ostringstream message;
+    message << "present-frame CreateTexture2D(staging) failed (0x" << std::hex
+            << static_cast<unsigned long>(create_staging_hr) << ")";
+    error = message.str();
+    context->Release();
+    device->Release();
+    back_buffer->Release();
+    return false;
+  }
+
+  context_hook.copy_resource(context, staging, back_buffer);
+
+  D3D11_MAPPED_SUBRESOURCE mapped{};
+  const HRESULT map_hr = context_hook.map(context, staging, 0, D3D11_MAP_READ, 0, &mapped);
+  if (FAILED(map_hr) || mapped.pData == nullptr) {
+    std::ostringstream message;
+    message << "present-frame Map(staging) failed (0x" << std::hex << static_cast<unsigned long>(map_hr) << ")";
+    error = message.str();
+    staging->Release();
+    context->Release();
+    device->Release();
+    back_buffer->Release();
+    return false;
+  }
+
+  const UINT row_pitch = desc.Width * 4u;
+  std::vector<std::uint8_t> rgba(static_cast<std::size_t>(row_pitch) * static_cast<std::size_t>(desc.Height));
+  for (UINT row = 0; row < desc.Height; ++row) {
+    const auto *src = static_cast<const std::uint8_t *>(mapped.pData) + static_cast<std::size_t>(row) * mapped.RowPitch;
+    auto *dst = rgba.data() + static_cast<std::size_t>(row) * row_pitch;
+    std::memcpy(dst, src, row_pitch);
+  }
+  context_hook.unmap(context, staging, 0);
+
+  staging->Release();
+  context->Release();
+  device->Release();
+  back_buffer->Release();
+
+  const auto asset = register_asset_bytes(trace::AssetKind::Texture, "d3d11-present-frame", rgba.data(), rgba.size());
+  std::ostringstream payload;
+  payload << "{"
+          << "\"frame_index\":" << capture_state().frame_index << ","
+          << "\"width\":" << desc.Width << ","
+          << "\"height\":" << desc.Height << ","
+          << "\"row_pitch\":" << row_pitch << ","
+          << "\"sync_interval\":" << sync_interval << ","
+          << "\"flags\":" << flags << ","
+          << "\"format\":\"rgba8\","
+          << "\"frame_path\":\"" << asset.relative_path.generic_string() << "\""
+          << "}";
+  record_resource_blob_locked("D3D11PresentFrame", {asset.blob_id}, payload.str());
+  error.clear();
+  return true;
 }
 
 std::string downstream_path()
@@ -2647,10 +2785,16 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain *swapchain, UINT sync_inte
   proxy_debug_log("hook_present");
   auto &state = capture_state();
   std::lock_guard<std::recursive_mutex> lock(state.mutex);
+  ensure_frame_begin_locked();
+  if (runtime::current_process_trace_session() != nullptr) {
+    std::string present_frame_error;
+    if (!capture_present_frame_locked(swapchain, sync_interval, flags, present_frame_error)) {
+      proxy_debug_logf("present-frame capture skipped: %s", present_frame_error.c_str());
+    }
+  }
+
   auto &hook = swapchain_hook_locked(swapchain);
   const HRESULT hr = hook.present(swapchain, sync_interval, flags);
-
-  ensure_frame_begin_locked();
 
   std::ostringstream call_payload;
   call_payload << "{\"sync_interval\":" << sync_interval
