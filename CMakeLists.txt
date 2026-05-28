@@ -8,6 +8,32 @@ option(APITRACE_BUILD_TOOLS "Build command-line tools" ON)
 option(APITRACE_BUILD_WINDOWS_DLLS "Build Windows proxy DLLs when supported" ON)
 option(APITRACE_BUILD_METAL_BACKEND "Build Metal backend sources when supported" ON)
 
+# Native macOS D3D retrace via DXMT dylibs. Disabled by default; turn ON
+# together with APITRACE_DXMT_NATIVE_BUILD_DIR pointing at dxmt/build-gs-native.
+option(APITRACE_BUILD_D3D_NATIVE_RETRACE "Enable native macOS D3D retrace via DXMT" OFF)
+set(APITRACE_DXMT_NATIVE_BUILD_DIR "" CACHE PATH "DXMT build-gs-native directory")
+
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
+
+# Standalone D3D / DXGI headers vendored under third_party/d3d-headers/.
+add_library(apitrace_d3d_headers INTERFACE)
+target_include_directories(apitrace_d3d_headers
+    INTERFACE
+        ${PROJECT_SOURCE_DIR}/third_party/d3d-headers/directx
+        ${PROJECT_SOURCE_DIR}/third_party/d3d-headers/windows
+)
+
+if(APITRACE_BUILD_D3D_NATIVE_RETRACE)
+    if(NOT APPLE)
+        message(FATAL_ERROR "APITRACE_BUILD_D3D_NATIVE_RETRACE is currently only supported on Apple platforms.")
+    endif()
+    include(find_dxmt_native)
+    if(NOT APITRACE_DXMT_NATIVE_FOUND)
+        message(FATAL_ERROR "APITRACE_BUILD_D3D_NATIVE_RETRACE=ON but DXMT native dylibs were not found. "
+                "Set APITRACE_DXMT_NATIVE_BUILD_DIR to dxmt/build-gs-native.")
+    endif()
+endif()
+
 set(APITRACE_PUBLIC_INCLUDE_DIRS
     ${PROJECT_SOURCE_DIR}/src/api/include
     ${PROJECT_SOURCE_DIR}/src/trace/include
@@ -16,6 +42,7 @@ set(APITRACE_PUBLIC_INCLUDE_DIRS
     ${PROJECT_SOURCE_DIR}/src/d3d11/include
     ${PROJECT_SOURCE_DIR}/src/d3d12/include
     ${PROJECT_SOURCE_DIR}/src/metal/include
+    ${PROJECT_SOURCE_DIR}/src/platform/macos/include
 )
 
 set(APITRACE_PRIVATE_INCLUDE_DIRS
@@ -74,6 +101,21 @@ target_include_directories(apitrace_core
 target_compile_features(apitrace_core PUBLIC cxx_std_17)
 target_link_libraries(apitrace_core PRIVATE apitrace_nlohmann_json)
 
+if(WIN32)
+    target_compile_definitions(apitrace_core PUBLIC APITRACE_HAS_D3D_NATIVE=1)
+endif()
+
+if(APITRACE_BUILD_D3D_NATIVE_RETRACE)
+    target_compile_definitions(apitrace_core PUBLIC APITRACE_HAS_D3D_NATIVE=1)
+    target_link_libraries(apitrace_core PUBLIC
+        apitrace_d3d_headers
+        apitrace_dxmt::winemetal
+        apitrace_dxmt::dxgi
+        apitrace_dxmt::d3d11
+        apitrace_dxmt::d3d12
+    )
+endif()
+
 add_library(apitrace_platform_windows_d3d11 SHARED
     src/d3d11/src/d3d11_proxy.cpp
     src/d3d11/src/d3d11_capture_internal.cpp
@@ -86,6 +128,25 @@ add_library(apitrace_platform_windows_d3d12 SHARED
 add_library(apitrace_platform_apple_metal
     src/metal/src/metal_bridge.cpp
 )
+
+if(APPLE)
+    add_library(apitrace_platform_macos
+        src/platform/macos/src/macos_window.mm
+    )
+    target_include_directories(apitrace_platform_macos
+        PUBLIC
+            ${PROJECT_SOURCE_DIR}/src/platform/macos/include
+        PRIVATE
+            ${APITRACE_PRIVATE_INCLUDE_DIRS}
+    )
+    target_compile_features(apitrace_platform_macos PUBLIC cxx_std_17)
+    set_source_files_properties(src/platform/macos/src/macos_window.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    target_link_libraries(apitrace_platform_macos PRIVATE
+        "-framework Cocoa"
+        "-framework QuartzCore"
+        "-framework Metal"
+    )
+endif()
 
 target_include_directories(apitrace_platform_windows_d3d11
     PUBLIC
@@ -141,6 +202,7 @@ if(APPLE AND APITRACE_BUILD_METAL_BACKEND)
     set_source_files_properties(src/metal/src/metal_replay_native.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
     target_link_libraries(apitrace_platform_apple_metal PRIVATE
         apitrace_nlohmann_json
+        apitrace_platform_macos
         "-framework Foundation"
         "-framework Metal"
         "-framework QuartzCore"
@@ -157,6 +219,18 @@ if(APITRACE_BUILD_TOOLS)
     target_compile_features(apitrace_retrace PRIVATE cxx_std_17)
     if(APPLE AND APITRACE_BUILD_METAL_BACKEND)
         target_link_libraries(apitrace_retrace PRIVATE apitrace_platform_apple_metal)
+    endif()
+    if(APPLE AND APITRACE_BUILD_D3D_NATIVE_RETRACE)
+        target_sources(apitrace_retrace PRIVATE src/platform/macos/src/dxmt_macdrv_shim.mm)
+        set_source_files_properties(src/platform/macos/src/dxmt_macdrv_shim.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+        target_link_libraries(apitrace_retrace PRIVATE apitrace_platform_macos)
+        target_link_options(apitrace_retrace PRIVATE
+            -Wl,-exported_symbol,_get_win_data
+            -Wl,-exported_symbol,_release_win_data
+            -Wl,-exported_symbol,_macdrv_view_create_metal_view
+            -Wl,-exported_symbol,_macdrv_view_get_metal_layer
+            -Wl,-exported_symbol,_macdrv_view_release_metal_view
+        )
     endif()
 endif()
 
@@ -200,3 +274,7 @@ install(DIRECTORY src/retrace/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY src/d3d11/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY src/d3d12/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY src/metal/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+if(APPLE AND APITRACE_BUILD_D3D_NATIVE_RETRACE)
+    add_subdirectory(test/abi-check)
+endif()

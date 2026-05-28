@@ -5,6 +5,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 
 #include "apitrace/metal_capi.h"
+#include "apitrace/platform/macos_window.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -151,6 +152,7 @@ private:
     std::uint64_t next_frame_id_ = 1;
     id<MTLDevice> device_ = nil;
     id<MTLCommandQueue> queue_ = nil;
+    apitrace::platform::macos::WindowHandles window_handles_;
     NSWindow *window_ = nil;
     NSView *content_view_ = nil;
     CAMetalLayer *metal_layer_ = nil;

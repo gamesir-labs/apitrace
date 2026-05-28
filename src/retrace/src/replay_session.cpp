@@ -108,12 +108,18 @@ bool ReplaySession::run()
     return true;
   }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(APITRACE_HAS_D3D_NATIVE)
   impl_->last_error = "retrace backends are only implemented for Windows retrace.exe in the current MVP.";
   return false;
-#else
+#endif
   if (impl_->reader.metadata().api == trace::ApiKind::D3D11) {
-    if (impl_->options.backend != BackendKind::TranslationLayer) {
+#if !defined(APITRACE_HAS_D3D_NATIVE)
+    impl_->last_error = "D3D11 replay backend is only implemented for Windows retrace.exe.";
+    return false;
+#else
+    if (impl_->options.backend != BackendKind::TranslationLayer &&
+        impl_->options.backend != BackendKind::NativeD3D11 &&
+        impl_->options.backend != BackendKind::NativeD3D12) {
       impl_->last_error = std::string("backend ") + backend_name(impl_->options.backend) +
                           " is unsupported for the D3D11 retrace MVP";
       return false;
@@ -127,7 +133,11 @@ bool ReplaySession::run()
     if (!d3d11::internal::replay_translation_layer_plan(plan, impl_->statistics, impl_->last_error)) {
       return false;
     }
+#if !defined(_WIN32)
+    impl_->statistics.backend_name = "native-d3d11";
+#endif
     return true;
+#endif
   }
 
   if (impl_->reader.metadata().api == trace::ApiKind::D3D12) {
@@ -142,7 +152,8 @@ bool ReplaySession::run()
       return false;
     }
 
-    impl_->statistics.backend_name = "bundle-d3d12";
+    impl_->statistics.backend_name =
+        impl_->options.backend == BackendKind::NativeD3D12 ? "native-d3d12" : "bundle-d3d12";
     for (const auto &event : impl_->reader.events()) {
       if (!backend.replay_event(event)) {
         if (!backend.last_error().empty()) {
@@ -180,7 +191,6 @@ bool ReplaySession::run()
 
   impl_->last_error = "only D3D11 and D3D12 bundles are supported by the retrace MVP";
   return false;
-#endif
 }
 
 const ReplayOptions &ReplaySession::options() const noexcept

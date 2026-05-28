@@ -68,6 +68,9 @@ int main(int argc, char **argv)
 {
   std::string trace_path;
   apitrace::replay::ReplayOptions options;
+#if defined(APITRACE_HAS_D3D_NATIVE) && !defined(_WIN32)
+  options.backend = apitrace::replay::BackendKind::NativeD3D12;
+#endif
 
   for (int index = 1; index < argc; ++index) {
     const std::string_view arg(argv[index]);

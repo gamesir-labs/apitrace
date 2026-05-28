@@ -91,7 +91,8 @@ if(APITRACE_BUILD_METAL_DEMO)
 
     set(APITRACE_CORE_STATIC "${APITRACE_ROOT_BUILD_DIR}/libapitrace_core.a")
     set(APITRACE_METAL_STATIC "${APITRACE_ROOT_BUILD_DIR}/libapitrace_platform_apple_metal.a")
-    foreach(required_lib IN ITEMS "${APITRACE_CORE_STATIC}" "${APITRACE_METAL_STATIC}")
+    set(APITRACE_PLATFORM_MACOS_STATIC "${APITRACE_ROOT_BUILD_DIR}/libapitrace_platform_macos.a")
+    foreach(required_lib IN ITEMS "${APITRACE_CORE_STATIC}" "${APITRACE_METAL_STATIC}" "${APITRACE_PLATFORM_MACOS_STATIC}")
         if(NOT EXISTS "${required_lib}")
             message(FATAL_ERROR "missing root build artifact required by APITRACE_BUILD_METAL_DEMO: ${required_lib}")
         endif()
@@ -104,10 +105,12 @@ if(APITRACE_BUILD_METAL_DEMO)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/metal/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/scenes/metal/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/metal/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/platform/macos/include
     )
     target_link_libraries(apitrace_test_metal PRIVATE
         "${APITRACE_CORE_STATIC}"
         "${APITRACE_METAL_STATIC}"
+        "${APITRACE_PLATFORM_MACOS_STATIC}"
         "-framework Cocoa"
         "-framework Foundation"
         "-framework Metal"

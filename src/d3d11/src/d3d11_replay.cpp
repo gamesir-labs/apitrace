@@ -1,4 +1,5 @@
 #include "apitrace/d3d11_replay.hpp"
+#include "apitrace/trace_bundle_io.hpp"
 
 #include "d3d11_replay_internal.hpp"
 
@@ -7,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -14,10 +16,15 @@
 #include <utility>
 #include <vector>
 
-#ifdef _WIN32
+#if defined(APITRACE_HAS_D3D_NATIVE)
 #include <d3d11.h>
 #include <dxgi.h>
+#endif
+
+#ifdef _WIN32
 #include <windows.h>
+#elif defined(APITRACE_HAS_D3D_NATIVE) && defined(__APPLE__)
+#include "apitrace/platform/macos_window.hpp"
 #endif
 
 namespace apitrace::d3d11 {
@@ -26,7 +33,7 @@ D3D11ReplayBackend::D3D11ReplayBackend() = default;
 
 bool D3D11ReplayBackend::initialize()
 {
-#ifdef _WIN32
+#if defined(APITRACE_HAS_D3D_NATIVE)
   last_error_.clear();
   return true;
 #else
@@ -53,7 +60,7 @@ const std::string &D3D11ReplayBackend::last_error() const noexcept
 
 namespace apitrace::d3d11::internal {
 
-#ifdef _WIN32
+#if defined(APITRACE_HAS_D3D_NATIVE)
 
 namespace {
 
@@ -93,6 +100,7 @@ std::string format_hresult(const char *operation, HRESULT hr)
   return message.str();
 }
 
+#ifdef _WIN32
 LRESULT CALLBACK replay_window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 {
   switch (message) {
@@ -103,6 +111,7 @@ LRESULT CALLBACK replay_window_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
     return DefWindowProcA(hwnd, message, wparam, lparam);
   }
 }
+#endif
 
 D3D_DRIVER_TYPE driver_type_from_name(const std::string &driver_type)
 {
@@ -307,6 +316,7 @@ public:
     next_present_call_frame_index_ = 0;
     next_present_boundary_frame_index_ = 0;
 
+#ifdef _WIN32
     if (window_) {
       DestroyWindow(window_);
       window_ = nullptr;
@@ -315,6 +325,16 @@ public:
       UnregisterClassA(kWindowClassName, GetModuleHandleA(nullptr));
       window_class_registered_ = false;
     }
+#elif defined(__APPLE__)
+    window_ = nullptr;
+    apitrace::platform::macos::destroy_window(window_handles_);
+#endif
+#if !defined(_WIN32)
+    if (capture_writer_) {
+      capture_writer_->close();
+      capture_writer_.reset();
+    }
+#endif
   }
 
 private:
@@ -324,6 +344,7 @@ private:
       return true;
     }
 
+#ifdef _WIN32
     WNDCLASSA window_class{};
     window_class.style = CS_HREDRAW | CS_VREDRAW;
     window_class.lpfnWndProc = replay_window_proc;
@@ -367,6 +388,30 @@ private:
     } else {
       ShowWindow(window_, SW_HIDE);
     }
+#elif defined(__APPLE__)
+    show_window_ = env_flag_enabled("APITRACE_RETRACE_SHOW_WINDOW", false);
+    const std::string window_title =
+        env_string("APITRACE_RETRACE_WINDOW_TITLE", "APITRACE_VISUAL_WINDOW_TITLE", kDefaultWindowTitle);
+    apitrace::platform::macos::WindowSpec spec;
+    spec.width = command.swap_chain.width;
+    spec.height = command.swap_chain.height;
+    spec.title = window_title;
+    spec.show = show_window_;
+    if (!apitrace::platform::macos::create_window(spec, window_handles_, error)) {
+      if (error.empty()) {
+        error = "failed to create native macOS D3D11 replay window";
+      }
+      return false;
+    }
+    window_ = static_cast<HWND>(window_handles_.nswindow);
+    if (!window_) {
+      error = "native macOS D3D11 replay window did not produce an HWND token";
+      return false;
+    }
+#else
+    error = "D3D11 native replay has no window bootstrap for this platform";
+    return false;
+#endif
     return true;
   }
 
@@ -428,12 +473,165 @@ private:
 
   void pump_messages() const
   {
+#ifdef _WIN32
     MSG message{};
     while (PeekMessageA(&message, nullptr, 0, 0, PM_REMOVE)) {
       TranslateMessage(&message);
       DispatchMessageA(&message);
     }
+#elif defined(__APPLE__)
+    auto &handles = const_cast<apitrace::platform::macos::WindowHandles &>(window_handles_);
+    apitrace::platform::macos::pump_events(handles);
+#endif
   }
+
+#if !defined(_WIN32)
+  bool ensure_capture_writer(std::string &error)
+  {
+    if (capture_writer_) {
+      return true;
+    }
+    const char *bundle_root = std::getenv("APITRACE_TRACE_BUNDLE");
+    if (bundle_root == nullptr || *bundle_root == '\0') {
+      error = "D3D11 native present capture requires APITRACE_TRACE_BUNDLE";
+      return false;
+    }
+    capture_writer_ = std::make_unique<trace::TraceBundleWriter>();
+    if (!capture_writer_->open(bundle_root)) {
+      capture_writer_.reset();
+      error = "failed to open APITRACE_TRACE_BUNDLE for native D3D11 present capture";
+      return false;
+    }
+    trace::TraceMetadata metadata;
+    metadata.api = trace::ApiKind::D3D11;
+    metadata.producer = "apitrace_d3d11_native_retrace";
+    capture_writer_->write_metadata(metadata);
+    return true;
+  }
+
+  bool capture_present_frame(
+      IDXGISwapChain *swapchain,
+      std::uint64_t frame_index,
+      UINT sync_interval,
+      UINT flags,
+      std::string &error)
+  {
+    if (std::getenv("APITRACE_D3D11_RETRACE_CAPTURE_PRESENT_FRAMES") == nullptr &&
+        std::getenv("APITRACE_TRACE_BUNDLE") == nullptr) {
+      return true;
+    }
+    if (!ensure_capture_writer(error)) {
+      return false;
+    }
+
+    ID3D11Texture2D *back_buffer = nullptr;
+    HRESULT hr = swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&back_buffer));
+    if (FAILED(hr) || back_buffer == nullptr) {
+      error = format_hresult("IDXGISwapChain::GetBuffer(present-capture)", hr);
+      return false;
+    }
+
+    ID3D11Device *device = nullptr;
+    back_buffer->GetDevice(&device);
+    if (device == nullptr) {
+      back_buffer->Release();
+      error = "present-frame capture could not resolve ID3D11Device";
+      return false;
+    }
+
+    ID3D11DeviceContext *context = nullptr;
+    device->GetImmediateContext(&context);
+    if (context == nullptr) {
+      device->Release();
+      back_buffer->Release();
+      error = "present-frame capture could not resolve ID3D11DeviceContext";
+      return false;
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    back_buffer->GetDesc(&desc);
+    if (desc.Width == 0 || desc.Height == 0 || desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM) {
+      context->Release();
+      device->Release();
+      back_buffer->Release();
+      error = "present-frame capture currently requires a non-empty RGBA8 swapchain";
+      return false;
+    }
+
+    D3D11_TEXTURE2D_DESC staging_desc = desc;
+    staging_desc.BindFlags = 0;
+    staging_desc.MiscFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    ID3D11Texture2D *staging = nullptr;
+    hr = device->CreateTexture2D(&staging_desc, nullptr, &staging);
+    if (FAILED(hr) || staging == nullptr) {
+      context->Release();
+      device->Release();
+      back_buffer->Release();
+      error = format_hresult("ID3D11Device::CreateTexture2D(present-capture)", hr);
+      return false;
+    }
+
+    context->CopyResource(staging, back_buffer);
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    hr = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr) || mapped.pData == nullptr) {
+      staging->Release();
+      context->Release();
+      device->Release();
+      back_buffer->Release();
+      error = format_hresult("ID3D11DeviceContext::Map(present-capture)", hr);
+      return false;
+    }
+
+    const UINT row_pitch = desc.Width * 4u;
+    std::vector<std::uint8_t> rgba(static_cast<std::size_t>(row_pitch) * static_cast<std::size_t>(desc.Height));
+    for (UINT row = 0; row < desc.Height; ++row) {
+      const auto *src = static_cast<const std::uint8_t *>(mapped.pData) + static_cast<std::size_t>(row) * mapped.RowPitch;
+      auto *dst = rgba.data() + static_cast<std::size_t>(row) * row_pitch;
+      std::memcpy(dst, src, row_pitch);
+    }
+    context->Unmap(staging, 0);
+    staging->Release();
+    context->Release();
+    device->Release();
+    back_buffer->Release();
+
+    trace::AssetRecord asset;
+    asset.blob_id = ++capture_sequence_;
+    asset.kind = trace::AssetKind::Texture;
+    asset.debug_name = "d3d11-present-frame";
+    asset.payload_bytes = std::move(rgba);
+    asset = capture_writer_->register_asset(asset);
+
+    std::ostringstream payload;
+    payload << "{"
+            << "\"frame_index\":" << frame_index << ","
+            << "\"width\":" << desc.Width << ","
+            << "\"height\":" << desc.Height << ","
+            << "\"row_pitch\":" << row_pitch << ","
+            << "\"sync_interval\":" << sync_interval << ","
+            << "\"flags\":" << flags << ","
+            << "\"format\":\"rgba8\","
+            << "\"frame_path\":\"" << asset.relative_path.generic_string() << "\""
+            << "}";
+
+    trace::EventRecord event;
+    event.kind = trace::EventKind::ResourceBlob;
+    event.callsite.sequence = ++capture_sequence_;
+    event.object_debug_name = "D3D11PresentFrame";
+    event.blob_refs = {asset.blob_id};
+    event.payload = payload.str();
+    capture_writer_->append_call_event(event);
+    return true;
+  }
+#else
+  bool capture_present_frame(IDXGISwapChain *, std::uint64_t, UINT, UINT, std::string &)
+  {
+    return true;
+  }
+#endif
 
   void store_buffer_resource(
       trace::ObjectId object_id,
@@ -1715,6 +1913,10 @@ private:
       return false;
     }
 
+    if (!capture_present_frame(swapchain, command.frame_index, command.sync_interval, command.flags, error)) {
+      return false;
+    }
+
     const HRESULT hr = swapchain->Present(command.sync_interval, command.flags);
     if (FAILED(hr)) {
       error = format_hresult("IDXGISwapChain::Present", hr);
@@ -1814,8 +2016,13 @@ private:
   }
 
   HWND window_ = nullptr;
+#ifdef _WIN32
   bool window_class_registered_ = false;
+#endif
   bool show_window_ = false;
+#if defined(__APPLE__)
+  apitrace::platform::macos::WindowHandles window_handles_;
+#endif
   std::vector<IUnknown *> owned_objects_;
   std::unordered_map<trace::ObjectId, ID3D11Device *> devices_;
   std::unordered_map<trace::ObjectId, ID3D11DeviceContext *> contexts_;
@@ -1846,6 +2053,10 @@ private:
   std::array<float, 4> bound_blend_factor_ = {0.0f, 0.0f, 0.0f, 0.0f};
   UINT bound_sample_mask_ = 0;
   ID3D11RasterizerState *bound_rasterizer_state_ = nullptr;
+#if !defined(_WIN32)
+  std::unique_ptr<trace::TraceBundleWriter> capture_writer_;
+  std::uint64_t capture_sequence_ = 0;
+#endif
 };
 
 } // namespace

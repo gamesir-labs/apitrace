@@ -1,6 +1,7 @@
 #include "runtime/metal/runtime.hpp"
 
 #include "apitrace/metal_capi.hpp"
+#include "apitrace/platform/macos_window.hpp"
 
 #import <QuartzCore/CAMetalLayer.h>
 
@@ -27,65 +28,6 @@ namespace {
     std::fprintf(stderr, "%s\n", message.c_str());
     std::fflush(stderr);
     std::exit(EXIT_FAILURE);
-}
-
-void pump_window_events()
-{
-    while (true) {
-        NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny
-                                            untilDate:[NSDate dateWithTimeIntervalSinceNow:0.0]
-                                               inMode:NSDefaultRunLoopMode
-                                              dequeue:YES];
-        if (event == nil) {
-            break;
-        }
-        [NSApp sendEvent:event];
-    }
-}
-
-void ensure_application_started()
-{
-    [NSApplication sharedApplication];
-    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-    [NSApp finishLaunching];
-    [NSApp activateIgnoringOtherApps:YES];
-}
-
-NSWindow *create_window(std::uint32_t width, std::uint32_t height)
-{
-    const NSRect frame = NSMakeRect(0.0, 0.0, static_cast<CGFloat>(width), static_cast<CGFloat>(height));
-    NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
-                                                   styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable)
-                                                     backing:NSBackingStoreBuffered
-                                                       defer:NO];
-    if (window == nil) {
-        fail_with_message("failed to create NSWindow");
-    }
-    [window setTitle:@"apitrace_test_metal"];
-    [window center];
-    [window makeKeyAndOrderFront:nil];
-    return window;
-}
-
-CAMetalLayer *create_metal_layer(id<MTLDevice> device, NSView *view, std::uint32_t width, std::uint32_t height)
-{
-    if (view == nil) {
-        fail_with_message("failed to create Metal host view");
-    }
-    [view setWantsLayer:YES];
-    CAMetalLayer *layer = [[CAMetalLayer layer] retain];
-    if (layer == nil) {
-        fail_with_message("failed to create CAMetalLayer");
-    }
-    layer.device = device;
-    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    layer.framebufferOnly = NO;
-    layer.opaque = YES;
-    layer.drawableSize = CGSizeMake(static_cast<CGFloat>(width), static_cast<CGFloat>(height));
-    layer.contentsScale = view.window ? view.window.backingScaleFactor : NSScreen.mainScreen.backingScaleFactor;
-    layer.frame = view.bounds;
-    view.layer = layer;
-    return layer;
 }
 
 id<CAMetalDrawable> next_drawable_or_fail(CAMetalLayer *layer)
@@ -218,6 +160,7 @@ MetalRuntime::MetalRuntime(MetalRuntime &&other) noexcept
       next_frame_id_(other.next_frame_id_),
       device_(other.device_),
       queue_(other.queue_),
+      window_handles_(other.window_handles_),
       window_(other.window_),
       content_view_(other.content_view_),
       metal_layer_(other.metal_layer_),
@@ -230,6 +173,7 @@ MetalRuntime::MetalRuntime(MetalRuntime &&other) noexcept
     other.height_ = 0;
     other.device_ = nil;
     other.queue_ = nil;
+    other.window_handles_ = {};
     other.window_ = nil;
     other.content_view_ = nil;
     other.metal_layer_ = nil;
@@ -250,6 +194,7 @@ MetalRuntime &MetalRuntime::operator=(MetalRuntime &&other) noexcept
         next_frame_id_ = other.next_frame_id_;
         device_ = other.device_;
         queue_ = other.queue_;
+        window_handles_ = other.window_handles_;
         window_ = other.window_;
         content_view_ = other.content_view_;
         metal_layer_ = other.metal_layer_;
@@ -262,6 +207,7 @@ MetalRuntime &MetalRuntime::operator=(MetalRuntime &&other) noexcept
         other.height_ = 0;
         other.device_ = nil;
         other.queue_ = nil;
+        other.window_handles_ = {};
         other.window_ = nil;
         other.content_view_ = nil;
         other.metal_layer_ = nil;
@@ -294,14 +240,19 @@ MetalRuntime MetalRuntime::create(std::uint32_t width, std::uint32_t height)
         fail_with_message("failed to create Metal command queue");
     }
 
-    ensure_application_started();
-    runtime.window_ = create_window(width, height);
-    runtime.content_view_ = [[runtime.window_ contentView] retain];
-    if (runtime.content_view_ == nil) {
-        fail_with_message("failed to create Metal content view");
+    apitrace::platform::macos::WindowSpec spec;
+    spec.width = width;
+    spec.height = height;
+    spec.title = "apitrace_test_metal";
+    spec.show = true;
+    std::string window_error;
+    if (!apitrace::platform::macos::create_window(spec, runtime.window_handles_, window_error)) {
+        fail_with_message(window_error.empty() ? "failed to create Metal window" : window_error);
     }
-    [runtime.content_view_ setFrame:NSMakeRect(0.0, 0.0, static_cast<CGFloat>(width), static_cast<CGFloat>(height))];
-    runtime.metal_layer_ = create_metal_layer(runtime.device_, runtime.content_view_, width, height);
+    runtime.window_ = (__bridge NSWindow *)runtime.window_handles_.nswindow;
+    runtime.content_view_ = (__bridge NSView *)runtime.window_handles_.content_view;
+    runtime.metal_layer_ = (__bridge CAMetalLayer *)runtime.window_handles_.cametal_layer;
+    runtime.metal_layer_.device = runtime.device_;
 
     const char *bundle_root = std::getenv("APITRACE_METAL_BUNDLE");
     if (bundle_root && *bundle_root) {
@@ -314,7 +265,7 @@ MetalRuntime MetalRuntime::create(std::uint32_t width, std::uint32_t height)
         apitrace_metal_register_texture(runtime.trace_session_, runtime.drawable_object_id_, descriptor_json.c_str());
     }
 
-    pump_window_events();
+    apitrace::platform::macos::pump_events(runtime.window_handles_);
     return runtime;
 }
 
@@ -447,7 +398,7 @@ void MetalRuntime::commit_command_buffer(
 
     [current_drawable_ release];
     current_drawable_ = nil;
-    pump_window_events();
+    apitrace::platform::macos::pump_events(window_handles_);
     command_buffer.handle = nil;
 }
 
@@ -685,16 +636,10 @@ void MetalRuntime::release_runtime_objects() noexcept
     current_drawable_ = nil;
     [drawable_texture_ release];
     drawable_texture_ = nil;
-    [metal_layer_ release];
     metal_layer_ = nil;
-    if (window_ != nil) {
-        [window_ orderOut:nil];
-        [window_ close];
-    }
-    [content_view_ release];
     content_view_ = nil;
-    [window_ release];
     window_ = nil;
+    apitrace::platform::macos::destroy_window(window_handles_);
     queue_ = nil;
     device_ = nil;
 }

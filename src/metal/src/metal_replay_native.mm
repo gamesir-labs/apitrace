@@ -250,6 +250,22 @@ MTLTextureSwizzleChannels swizzle_channels_from_json_array(const json &value)
       static_cast<MTLTextureSwizzle>(value[3].get<std::uint32_t>()));
 }
 
+const char *present_frame_format_for_texture(id<MTLTexture> texture)
+{
+  if (texture == nil) {
+    return "bgra8";
+  }
+  switch (texture.pixelFormat) {
+  case MTLPixelFormatRGBA8Unorm:
+  case MTLPixelFormatRGBA8Unorm_sRGB:
+    return "rgba8";
+  case MTLPixelFormatBGRA8Unorm:
+  case MTLPixelFormatBGRA8Unorm_sRGB:
+  default:
+    return "bgra8";
+  }
+}
+
 std::vector<std::uint8_t> bytes_from_json_array(const json &payload, const char *field_name)
 {
   const auto it = payload.find(field_name);
@@ -1677,14 +1693,6 @@ private:
       return fail("setFragmentTexture references missing encoder or texture");
     }
     [encoder setFragmentTexture:texture atIndex:static_cast<NSUInteger>(payload.value("index", 0u))];
-    if (payload.value("index", 0u) == 0) {
-      NSNumber *command_buffer_id = [render_encoder_command_buffers_ objectForKey:object_key(encoder_id)];
-      if (command_buffer_id != nil &&
-          [command_buffer_present_sizes_ objectForKey:command_buffer_id] != nil) {
-        [command_buffer_present_textures_ setObject:object_key(payload.value("texture_id", 0ull))
-                                             forKey:command_buffer_id];
-      }
-    }
     return true;
   }
 
@@ -2167,7 +2175,6 @@ private:
     const auto present_texture_id =
         static_cast<std::uint64_t>([present_info[@"present_texture_id"] unsignedLongLongValue]);
     id<MTLTexture> texture = texture_for_id(present_texture_id);
-    bool captured_present_source = texture != nil;
     if (texture == nil) {
       const auto drawable_id = static_cast<std::uint64_t>([present_info[@"drawable_id"] unsignedLongLongValue]);
       texture = texture_for_id(drawable_id);
@@ -2205,7 +2212,7 @@ private:
                          {"row_pitch", row_pitch},
                          {"sync_interval", static_cast<std::uint32_t>([present_info[@"sync_interval"] unsignedIntValue])},
                          {"flags", static_cast<std::uint32_t>([present_info[@"flags"] unsignedIntValue])},
-                         {"format", captured_present_source ? "rgba8" : "bgra8"},
+                         {"format", present_frame_format_for_texture(texture)},
                          {"frame_path", asset.relative_path.generic_string()}}
                             .dump();
     capture_writer_->append_call_event(event);

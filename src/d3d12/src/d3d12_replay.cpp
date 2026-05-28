@@ -1,4 +1,5 @@
 #include "apitrace/d3d12_replay.hpp"
+#include "apitrace/trace_bundle_io.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -13,14 +14,21 @@
 #include <limits>
 #include <sstream>
 #include <string_view>
+#include <chrono>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-#ifdef _WIN32
-#include <windows.h>
+#if defined(APITRACE_HAS_D3D_NATIVE)
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#endif
+
+#ifdef _WIN32
+#include <windows.h>
+#elif defined(APITRACE_HAS_D3D_NATIVE) && defined(__APPLE__)
+#include "apitrace/platform/macos_window.hpp"
 #endif
 
 namespace apitrace::d3d12 {
@@ -54,7 +62,7 @@ std::uint32_t env_u32(const char *name, std::uint32_t fallback = 0)
   return static_cast<std::uint32_t>(parsed);
 }
 
-#ifdef _WIN32
+#if defined(APITRACE_HAS_D3D_NATIVE)
 
 template <typename T>
 class ComPtr {
@@ -107,6 +115,7 @@ private:
   T *ptr_ = nullptr;
 };
 
+#ifdef _WIN32
 LRESULT CALLBACK replay_window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 {
   switch (message) {
@@ -130,6 +139,12 @@ bool pump_messages()
   }
   return true;
 }
+#else
+bool pump_messages()
+{
+  return true;
+}
+#endif
 
 D3D12_RESOURCE_BARRIER transition_barrier(
     ID3D12Resource *resource,
@@ -674,12 +689,13 @@ bool d3d12_retrace_present_frame_capture_enabled()
 
 } // namespace
 
-#ifdef _WIN32
+#if defined(APITRACE_HAS_D3D_NATIVE)
 
 using RecordPresentFrameFn = void(WINAPI *)(UINT, UINT, UINT, UINT, UINT, const void *, SIZE_T);
 using RecordPresentSemanticsFn = void(WINAPI *)(UINT, UINT, HRESULT);
 using CaptureSuppressionFn = void(WINAPI *)();
 
+#ifdef _WIN32
 template <typename Fn>
 Fn resolve_d3d12_export(const char *name)
 {
@@ -717,6 +733,18 @@ private:
   CaptureSuppressionFn end_ = nullptr;
   bool active_ = false;
 };
+#else
+template <typename Fn>
+Fn resolve_d3d12_export(const char *)
+{
+  return nullptr;
+}
+
+class ScopedD3D12CaptureSuppression {
+public:
+  ScopedD3D12CaptureSuppression() = default;
+};
+#endif
 
 class D3D12NativeReplayer {
 public:
@@ -783,10 +811,12 @@ private:
   void shutdown()
   {
     wait_for_gpu();
+#ifdef _WIN32
     if (fence_event_) {
       CloseHandle(fence_event_);
       fence_event_ = nullptr;
     }
+#endif
     command_lists_.clear();
     command_signatures_.clear();
     pipelines_.clear();
@@ -799,10 +829,21 @@ private:
     swap_chain_.reset();
     queue_.reset();
     device_.reset();
+#if !defined(_WIN32)
+    if (capture_writer_) {
+      capture_writer_->close();
+      capture_writer_.reset();
+    }
+#endif
+#ifdef _WIN32
     if (hwnd_) {
       DestroyWindow(hwnd_);
       hwnd_ = nullptr;
     }
+#elif defined(__APPLE__)
+    hwnd_ = nullptr;
+    apitrace::platform::macos::destroy_window(window_handles_);
+#endif
   }
 
   bool infer_window_size(UINT &width, UINT &height) const
@@ -827,6 +868,34 @@ private:
       return fail(error, "trace is missing swapchain back-buffer semantics");
     }
 
+    ComPtr<IDXGIFactory4> factory;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(factory.put()));
+    if (FAILED(hr)) {
+      error = hresult_error("CreateDXGIFactory1", hr);
+      return false;
+    }
+
+    D3D_FEATURE_LEVEL feature_level = D3D_FEATURE_LEVEL_11_0;
+    for (const auto &[object_id, device] : backend_.devices_) {
+      (void)object_id;
+      feature_level = static_cast<D3D_FEATURE_LEVEL>(device.minimum_feature_level);
+      break;
+    }
+    hr = D3D12CreateDevice(nullptr, feature_level, IID_PPV_ARGS(device_.put()));
+    if (FAILED(hr)) {
+      error = hresult_error("D3D12CreateDevice", hr);
+      return false;
+    }
+
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    hr = device_->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(queue_.put()));
+    if (FAILED(hr)) {
+      error = hresult_error("CreateCommandQueue", hr);
+      return false;
+    }
+
+#ifdef _WIN32
     HINSTANCE instance = GetModuleHandleA(nullptr);
     WNDCLASSA wc{};
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -858,33 +927,22 @@ private:
     }
     ShowWindow(hwnd_, SW_SHOWDEFAULT);
     UpdateWindow(hwnd_);
-
-    ComPtr<IDXGIFactory4> factory;
-    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(factory.put()));
-    if (FAILED(hr)) {
-      error = hresult_error("CreateDXGIFactory1", hr);
-      return false;
+#elif defined(__APPLE__)
+    apitrace::platform::macos::WindowSpec spec;
+    spec.width = width;
+    spec.height = height;
+    spec.title = "apitrace D3D12 native retrace";
+    spec.show = true;
+    if (!apitrace::platform::macos::create_window(spec, window_handles_, error)) {
+      return fail(error, error.empty() ? "failed to create native macOS replay window" : error);
     }
-
-    D3D_FEATURE_LEVEL feature_level = D3D_FEATURE_LEVEL_11_0;
-    for (const auto &[object_id, device] : backend_.devices_) {
-      (void)object_id;
-      feature_level = static_cast<D3D_FEATURE_LEVEL>(device.minimum_feature_level);
-      break;
+    hwnd_ = static_cast<HWND>(window_handles_.nswindow);
+    if (!hwnd_) {
+      return fail(error, "native macOS replay window did not produce an HWND token");
     }
-    hr = D3D12CreateDevice(nullptr, feature_level, IID_PPV_ARGS(device_.put()));
-    if (FAILED(hr)) {
-      error = hresult_error("D3D12CreateDevice", hr);
-      return false;
-    }
-
-    D3D12_COMMAND_QUEUE_DESC queue_desc{};
-    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    hr = device_->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(queue_.put()));
-    if (FAILED(hr)) {
-      error = hresult_error("CreateCommandQueue", hr);
-      return false;
-    }
+#else
+    return fail(error, "D3D12 native replay has no window bootstrap for this platform");
+#endif
 
     DXGI_SWAP_CHAIN_DESC1 swap_chain_desc{};
     swap_chain_desc.Width = width;
@@ -921,10 +979,12 @@ private:
       error = hresult_error("CreateFence", hr);
       return false;
     }
+#ifdef _WIN32
     fence_event_ = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     if (!fence_event_) {
       return fail(error, "CreateEventA failed");
     }
+#endif
     return true;
   }
 
@@ -1622,7 +1682,11 @@ private:
           return false;
         }
         if (present_delay_ms_ != 0) {
+#ifdef _WIN32
           Sleep(present_delay_ms_);
+#else
+          std::this_thread::sleep_for(std::chrono::milliseconds(present_delay_ms_));
+#endif
         }
         if (!pump_messages()) {
           return fail(error, "replay window closed");
@@ -1649,11 +1713,13 @@ private:
     if (!d3d12_retrace_present_frame_capture_enabled()) {
       return true;
     }
-    static RecordPresentFrameFn record_present_frame =
+#ifdef _WIN32
+    static RecordPresentFrameFn proxy_record_present_frame =
         resolve_d3d12_export<RecordPresentFrameFn>("apitrace_d3d12_record_present_frame");
-    if (!record_present_frame) {
+    if (!proxy_record_present_frame) {
       return fail(error, "APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES is enabled but the capture export is missing");
     }
+#endif
 
     const UINT back_buffer_index = swap_chain_->GetCurrentBackBufferIndex();
     if (back_buffer_index >= kBufferCount || !back_buffers_[back_buffer_index]) {
@@ -1777,16 +1843,110 @@ private:
       readback->Unmap(0, &written_range);
     }
 
-    record_present_frame(
+    if (!record_present_frame(
         width,
         height,
         row_pitch,
         sync_interval,
         flags,
         rgba.data(),
-        static_cast<SIZE_T>(rgba.size()));
+        static_cast<SIZE_T>(rgba.size()),
+        error)) {
+      return false;
+    }
     return true;
   }
+
+#ifdef _WIN32
+  bool record_present_frame(
+      UINT width,
+      UINT height,
+      UINT row_pitch,
+      UINT sync_interval,
+      UINT flags,
+      const void *rgba_data,
+      SIZE_T rgba_size,
+      std::string &error)
+  {
+    static RecordPresentFrameFn record =
+        resolve_d3d12_export<RecordPresentFrameFn>("apitrace_d3d12_record_present_frame");
+    if (!record) {
+      return fail(error, "APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES is enabled but the capture export is missing");
+    }
+    record(width, height, row_pitch, sync_interval, flags, rgba_data, rgba_size);
+    return true;
+  }
+#else
+  bool ensure_capture_writer(std::string &error)
+  {
+    if (capture_writer_) {
+      return true;
+    }
+    const char *bundle_root = std::getenv("APITRACE_TRACE_BUNDLE");
+    if (bundle_root == nullptr || *bundle_root == '\0') {
+      return fail(error, "APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES requires APITRACE_TRACE_BUNDLE");
+    }
+    capture_writer_ = std::make_unique<trace::TraceBundleWriter>();
+    if (!capture_writer_->open(bundle_root)) {
+      capture_writer_.reset();
+      return fail(error, "failed to open APITRACE_TRACE_BUNDLE for native D3D12 present capture");
+    }
+    trace::TraceMetadata metadata;
+    metadata.api = trace::ApiKind::D3D12;
+    metadata.producer = "apitrace_d3d12_native_retrace";
+    capture_writer_->write_metadata(metadata);
+    return true;
+  }
+
+  bool record_present_frame(
+      UINT width,
+      UINT height,
+      UINT row_pitch,
+      UINT sync_interval,
+      UINT flags,
+      const void *rgba_data,
+      SIZE_T rgba_size,
+      std::string &error)
+  {
+    if (!rgba_data || width == 0 || height == 0 || row_pitch == 0 || rgba_size == 0) {
+      return true;
+    }
+    if (!ensure_capture_writer(error)) {
+      return false;
+    }
+
+    const auto frame_index = ++capture_frame_index_;
+    trace::AssetRecord asset;
+    asset.blob_id = ++capture_sequence_;
+    asset.kind = trace::AssetKind::Texture;
+    asset.debug_name = "d3d12-present-frame";
+    const auto *begin = static_cast<const std::uint8_t *>(rgba_data);
+    asset.payload_bytes.assign(begin, begin + static_cast<std::size_t>(rgba_size));
+    asset = capture_writer_->register_asset(asset);
+
+    std::ostringstream payload;
+    payload << "{"
+            << "\"frame_index\":" << frame_index << ","
+            << "\"width\":" << width << ","
+            << "\"height\":" << height << ","
+            << "\"row_pitch\":" << row_pitch << ","
+            << "\"sync_interval\":" << sync_interval << ","
+            << "\"flags\":" << flags << ","
+            << "\"format\":\"rgba8\","
+            << "\"frame_path\":\"" << asset.relative_path.generic_string() << "\""
+            << "}";
+
+    trace::EventRecord event;
+    event.kind = trace::EventKind::ResourceBlob;
+    event.callsite.sequence = ++capture_sequence_;
+    event.callsite.function_name = "resource_blob";
+    event.object_debug_name = "D3D12PresentFrame";
+    event.blob_refs = {asset.blob_id};
+    event.payload = payload.str();
+    capture_writer_->append_call_event(event);
+    return true;
+  }
+#endif
 
   bool record_command_list(
       NativeCommandList &native,
@@ -2437,10 +2597,16 @@ private:
     if (FAILED(queue_->Signal(fence_.get(), value))) {
       return;
     }
+#ifdef _WIN32
     if (fence_->GetCompletedValue() < value && fence_event_ &&
         SUCCEEDED(fence_->SetEventOnCompletion(value, fence_event_))) {
       WaitForSingleObject(fence_event_, INFINITE);
     }
+#else
+    while (fence_->GetCompletedValue() < value) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+#endif
   }
 
   static constexpr UINT kBufferCount = 2;
@@ -2455,7 +2621,12 @@ private:
   HWND hwnd_ = nullptr;
   UINT present_delay_ms_ = static_cast<UINT>(env_u32("APITRACE_D3D12_RETRACE_PRESENT_DELAY_MS"));
   UINT64 fence_value_ = 0;
+#ifdef _WIN32
   HANDLE fence_event_ = nullptr;
+#endif
+#if defined(__APPLE__)
+  apitrace::platform::macos::WindowHandles window_handles_;
+#endif
   ComPtr<ID3D12Device> device_;
   ComPtr<ID3D12CommandQueue> queue_;
   ComPtr<IDXGISwapChain3> swap_chain_;
@@ -2471,6 +2642,11 @@ private:
   std::vector<ResourceDataUpdateRef> resource_update_timeline_;
   std::size_t next_descriptor_index_ = 0;
   std::size_t next_resource_update_index_ = 0;
+#if !defined(_WIN32)
+  std::unique_ptr<trace::TraceBundleWriter> capture_writer_;
+  std::uint64_t capture_sequence_ = 0;
+  std::uint64_t capture_frame_index_ = 0;
+#endif
 };
 
 #else
