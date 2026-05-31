@@ -550,7 +550,11 @@ std::string MetalRuntime::render_pass_payload_json(
          << "\"pixel_format\":\"bgra8unorm\","
          << "\"load_action\":\"" << (load_action ? load_action : "clear") << "\","
          << "\"store_action\":\"" << (store_action ? store_action : "store") << "\","
-         << "\"clear_color\":" << format_color_array(clear_color)
+         << "\"clear_color\":" << format_color_array(clear_color) << ","
+         << "\"slot\":0,"
+         << "\"level\":0,"
+         << "\"slice\":0,"
+         << "\"depth_plane\":0"
          << "}}";
     return json.str();
 }

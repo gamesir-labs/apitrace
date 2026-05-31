@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -49,130 +50,308 @@ json parse_nested_json(const json &parent, const char *field_name)
   return json::object();
 }
 
+std::uint64_t json_u64(const json &value, std::uint64_t fallback = 0)
+{
+  if (value.is_number_unsigned()) {
+    return value.get<std::uint64_t>();
+  }
+  if (value.is_number_integer()) {
+    const auto signed_value = value.get<std::int64_t>();
+    return signed_value < 0 ? fallback : static_cast<std::uint64_t>(signed_value);
+  }
+  return fallback;
+}
+
+bool required_u64(const json &payload, const char *field_name, std::uint64_t &value)
+{
+  const auto it = payload.find(field_name);
+  if (it == payload.end() || (!it->is_number_unsigned() && !it->is_number_integer())) {
+    return false;
+  }
+  if (it->is_number_unsigned()) {
+    value = it->get<std::uint64_t>();
+    return true;
+  }
+  const auto signed_value = it->get<std::int64_t>();
+  if (signed_value < 0) {
+    return false;
+  }
+  value = static_cast<std::uint64_t>(signed_value);
+  return true;
+}
+
+bool required_u32(const json &payload, const char *field_name, std::uint32_t &value)
+{
+  std::uint64_t parsed = 0;
+  if (!required_u64(payload, field_name, parsed) || parsed > std::numeric_limits<std::uint32_t>::max()) {
+    return false;
+  }
+  value = static_cast<std::uint32_t>(parsed);
+  return true;
+}
+
+bool required_i32(const json &payload, const char *field_name, std::int32_t &value)
+{
+  const auto it = payload.find(field_name);
+  if (it == payload.end() || (!it->is_number_integer() && !it->is_number_unsigned())) {
+    return false;
+  }
+  if (it->is_number_unsigned()) {
+    const auto parsed = it->get<std::uint64_t>();
+    if (parsed > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+      return false;
+    }
+    value = static_cast<std::int32_t>(parsed);
+    return true;
+  }
+  const auto parsed = it->get<std::int64_t>();
+  if (parsed < std::numeric_limits<std::int32_t>::min() ||
+      parsed > std::numeric_limits<std::int32_t>::max()) {
+    return false;
+  }
+  value = static_cast<std::int32_t>(parsed);
+  return true;
+}
+
+bool validate_sampler_descriptor_payload(
+    const json &descriptor,
+    std::string &error)
+{
+  constexpr std::array<std::string_view, 16> required_fields = {
+      "sampler_id",
+      "gpu_resource_id",
+      "border_color",
+      "r_address_mode",
+      "s_address_mode",
+      "t_address_mode",
+      "mag_filter",
+      "min_filter",
+      "mip_filter",
+      "compare_function",
+      "lod_max_clamp",
+      "lod_min_clamp",
+      "max_anisotropy",
+      "lod_average",
+      "normalized_coordinates",
+      "support_argument_buffers",
+  };
+  for (const auto field : required_fields) {
+    const auto it = descriptor.find(std::string(field));
+    if (it == descriptor.end()) {
+      error = "sampler descriptor is missing " + std::string(field);
+      return false;
+    }
+    if (field == "lod_max_clamp" || field == "lod_min_clamp") {
+      if (!it->is_number()) {
+        error = "sampler descriptor field " + std::string(field) + " must be numeric";
+        return false;
+      }
+    } else if (field == "lod_average" || field == "normalized_coordinates" || field == "support_argument_buffers") {
+      if (!it->is_boolean()) {
+        error = "sampler descriptor field " + std::string(field) + " must be boolean";
+        return false;
+      }
+    } else if (!it->is_number_unsigned() && !it->is_number_integer()) {
+      error = "sampler descriptor field " + std::string(field) + " must be an integer";
+      return false;
+    }
+  }
+  if (json_u64(descriptor.value("sampler_id", json(nullptr))) == 0) {
+    error = "sampler descriptor has zero sampler_id";
+    return false;
+  }
+  return true;
+}
+
 NSNumber *object_key(std::uint64_t object_id)
 {
   return [NSNumber numberWithUnsignedLongLong:object_id];
 }
 
-MTLPixelFormat pixel_format_from_string(std::string_view name)
+bool pixel_format_from_string(std::string_view name, MTLPixelFormat &format)
 {
   if (name == "bgra8unorm") {
-    return MTLPixelFormatBGRA8Unorm;
+    format = MTLPixelFormatBGRA8Unorm;
+    return true;
   }
   if (name == "rgba8unorm") {
-    return MTLPixelFormatRGBA8Unorm;
+    format = MTLPixelFormatRGBA8Unorm;
+    return true;
   }
   if (name == "r32uint") {
-    return MTLPixelFormatR32Uint;
+    format = MTLPixelFormatR32Uint;
+    return true;
   }
-  return MTLPixelFormatBGRA8Unorm;
+  return false;
 }
 
-MTLPixelFormat pixel_format_from_json_field_or(const json &descriptor, const char *field_name, MTLPixelFormat fallback)
+bool pixel_format_from_json_field(const json &descriptor, const char *field_name, MTLPixelFormat &format)
 {
   const auto it = descriptor.find(field_name);
   if (it == descriptor.end()) {
-    return fallback;
+    return false;
   }
   if (it->is_number_unsigned() || it->is_number_integer()) {
-    return static_cast<MTLPixelFormat>(it->get<std::uint32_t>());
+    format = static_cast<MTLPixelFormat>(it->get<std::uint32_t>());
+    return true;
   }
   if (it->is_string()) {
-    return pixel_format_from_string(it->get_ref<const std::string &>());
+    return pixel_format_from_string(it->get_ref<const std::string &>(), format);
   }
-  return fallback;
+  return false;
 }
 
-MTLPixelFormat pixel_format_from_json_field(const json &descriptor, const char *field_name)
+bool optional_pixel_format_from_json_field(
+    const json &descriptor,
+    const char *field_name,
+    MTLPixelFormat &format)
 {
-  return pixel_format_from_json_field_or(descriptor, field_name, MTLPixelFormatBGRA8Unorm);
+  const auto it = descriptor.find(field_name);
+  if (it == descriptor.end() || it->is_null()) {
+    format = MTLPixelFormatInvalid;
+    return true;
+  }
+  return pixel_format_from_json_field(descriptor, field_name, format);
 }
 
-MTLPrimitiveType primitive_type_from_integer(std::uint32_t value)
+bool primitive_type_from_integer(std::uint32_t value, MTLPrimitiveType &primitive_type)
 {
   switch (value) {
+  case 0:
+    primitive_type = MTLPrimitiveTypePoint;
+    return true;
   case 1:
-    return MTLPrimitiveTypeLine;
+    primitive_type = MTLPrimitiveTypeLine;
+    return true;
   case 2:
-    return MTLPrimitiveTypeLineStrip;
+    primitive_type = MTLPrimitiveTypeLineStrip;
+    return true;
   case 3:
-    return MTLPrimitiveTypeTriangle;
+    primitive_type = MTLPrimitiveTypeTriangle;
+    return true;
   case 4:
-    return MTLPrimitiveTypeTriangleStrip;
+    primitive_type = MTLPrimitiveTypeTriangleStrip;
+    return true;
   default:
-    return MTLPrimitiveTypePoint;
+    return false;
   }
 }
 
-MTLIndexType index_type_from_integer(std::uint32_t value)
+bool index_type_from_integer(std::uint32_t value, MTLIndexType &index_type)
 {
-  return value == 0 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+  if (value == 0) {
+    index_type = MTLIndexTypeUInt16;
+    return true;
+  }
+  if (value == 1) {
+    index_type = MTLIndexTypeUInt32;
+    return true;
+  }
+  return false;
 }
 
-void apply_stencil_descriptor(MTLStencilDescriptor *descriptor, const json &payload)
+bool apply_stencil_descriptor(MTLStencilDescriptor *descriptor, const json &payload, std::string &error)
 {
-  if (descriptor == nil || !payload.value("enabled", false)) {
-    return;
+  if (descriptor == nil) {
+    error = "depth stencil descriptor references missing stencil descriptor";
+    return false;
+  }
+  const auto enabled_it = payload.find("enabled");
+  if (enabled_it == payload.end() || !enabled_it->is_boolean()) {
+    error = "depth stencil descriptor is missing enabled";
+    return false;
+  }
+  if (!enabled_it->get<bool>()) {
+    return true;
+  }
+  std::uint32_t depth_stencil_pass_op = 0;
+  std::uint32_t stencil_fail_op = 0;
+  std::uint32_t depth_fail_op = 0;
+  std::uint32_t stencil_compare_function = 0;
+  std::uint32_t write_mask = 0;
+  std::uint32_t read_mask = 0;
+  if (!required_u32(payload, "depth_stencil_pass_op", depth_stencil_pass_op) ||
+      !required_u32(payload, "stencil_fail_op", stencil_fail_op) ||
+      !required_u32(payload, "depth_fail_op", depth_fail_op) ||
+      !required_u32(payload, "stencil_compare_function", stencil_compare_function) ||
+      !required_u32(payload, "write_mask", write_mask) ||
+      !required_u32(payload, "read_mask", read_mask)) {
+    error = "depth stencil descriptor has incomplete stencil payload";
+    return false;
   }
   descriptor.depthStencilPassOperation =
-      static_cast<MTLStencilOperation>(payload.value("depth_stencil_pass_op", 0u));
+      static_cast<MTLStencilOperation>(depth_stencil_pass_op);
   descriptor.stencilFailureOperation =
-      static_cast<MTLStencilOperation>(payload.value("stencil_fail_op", 0u));
+      static_cast<MTLStencilOperation>(stencil_fail_op);
   descriptor.depthFailureOperation =
-      static_cast<MTLStencilOperation>(payload.value("depth_fail_op", 0u));
+      static_cast<MTLStencilOperation>(depth_fail_op);
   descriptor.stencilCompareFunction =
-      static_cast<MTLCompareFunction>(payload.value("stencil_compare_function", 0u));
-  descriptor.writeMask = static_cast<std::uint32_t>(payload.value("write_mask", 0u));
-  descriptor.readMask = static_cast<std::uint32_t>(payload.value("read_mask", 0u));
+      static_cast<MTLCompareFunction>(stencil_compare_function);
+  descriptor.writeMask = write_mask;
+  descriptor.readMask = read_mask;
+  return true;
 }
 
-MTLLoadAction load_action_from_string(std::string_view name)
+bool load_action_from_string(std::string_view name, MTLLoadAction &action)
 {
   if (name == "load") {
-    return MTLLoadActionLoad;
+    action = MTLLoadActionLoad;
+    return true;
   }
   if (name == "dontcare") {
-    return MTLLoadActionDontCare;
+    action = MTLLoadActionDontCare;
+    return true;
   }
-  return MTLLoadActionClear;
+  if (name == "clear") {
+    action = MTLLoadActionClear;
+    return true;
+  }
+  return false;
 }
 
-MTLLoadAction load_action_from_json_field(const json &payload, const char *field_name)
+bool load_action_from_json_field(const json &payload, const char *field_name, MTLLoadAction &action)
 {
   const auto it = payload.find(field_name);
   if (it == payload.end()) {
-    return MTLLoadActionClear;
+    return false;
   }
   if (it->is_number_unsigned() || it->is_number_integer()) {
-    return static_cast<MTLLoadAction>(it->get<std::uint32_t>());
+    action = static_cast<MTLLoadAction>(it->get<std::uint32_t>());
+    return true;
   }
   if (it->is_string()) {
-    return load_action_from_string(it->get_ref<const std::string &>());
+    return load_action_from_string(it->get_ref<const std::string &>(), action);
   }
-  return MTLLoadActionClear;
+  return false;
 }
 
-MTLStoreAction store_action_from_string(std::string_view name)
+bool store_action_from_string(std::string_view name, MTLStoreAction &action)
 {
   if (name == "dontcare") {
-    return MTLStoreActionDontCare;
+    action = MTLStoreActionDontCare;
+    return true;
   }
-  return MTLStoreActionStore;
+  if (name == "store") {
+    action = MTLStoreActionStore;
+    return true;
+  }
+  return false;
 }
 
-MTLStoreAction store_action_from_json_field(const json &payload, const char *field_name)
+bool store_action_from_json_field(const json &payload, const char *field_name, MTLStoreAction &action)
 {
   const auto it = payload.find(field_name);
   if (it == payload.end()) {
-    return MTLStoreActionStore;
+    return false;
   }
   if (it->is_number_unsigned() || it->is_number_integer()) {
-    return static_cast<MTLStoreAction>(it->get<std::uint32_t>());
+    action = static_cast<MTLStoreAction>(it->get<std::uint32_t>());
+    return true;
   }
   if (it->is_string()) {
-    return store_action_from_string(it->get_ref<const std::string &>());
+    return store_action_from_string(it->get_ref<const std::string &>(), action);
   }
-  return MTLStoreActionStore;
+  return false;
 }
 
 std::uint64_t optional_object_id_from_json_field(const json &payload, const char *field_name)
@@ -187,67 +366,123 @@ std::uint64_t optional_object_id_from_json_field(const json &payload, const char
   return 0;
 }
 
-MTLOrigin origin_from_json_array(const json &payload, const char *field_name)
+bool origin_from_json_array(const json &payload, const char *field_name, MTLOrigin &origin)
 {
   const auto it = payload.find(field_name);
-  if (it == payload.end() || !it->is_array() || it->size() < 3) {
-    return MTLOriginMake(0, 0, 0);
+  if (it == payload.end() || !it->is_array() || it->size() != 3) {
+    return false;
   }
-  return MTLOriginMake(
+  for (std::size_t index = 0; index < 3; ++index) {
+    if (!(*it)[index].is_number_unsigned() && !(*it)[index].is_number_integer()) {
+      return false;
+    }
+    if ((*it)[index].is_number_integer() && (*it)[index].get<std::int64_t>() < 0) {
+      return false;
+    }
+  }
+  origin = MTLOriginMake(
       static_cast<NSUInteger>((*it)[0].get<std::uint64_t>()),
       static_cast<NSUInteger>((*it)[1].get<std::uint64_t>()),
       static_cast<NSUInteger>((*it)[2].get<std::uint64_t>()));
+  return true;
 }
 
-MTLSize size_from_json_array(const json &payload, const char *field_name, id<MTLTexture> fallback_texture)
+bool size_from_json_array(const json &payload, const char *field_name, MTLSize &size)
 {
   const auto it = payload.find(field_name);
-  if (it != payload.end() && it->is_array() && it->size() >= 3) {
-    return MTLSizeMake(
-        static_cast<NSUInteger>((*it)[0].get<std::uint64_t>()),
-        static_cast<NSUInteger>((*it)[1].get<std::uint64_t>()),
-        static_cast<NSUInteger>((*it)[2].get<std::uint64_t>()));
+  if (it == payload.end() || !it->is_array() || it->size() != 3) {
+    return false;
   }
-  if (fallback_texture != nil) {
-    return MTLSizeMake(fallback_texture.width, fallback_texture.height, 1);
+  for (std::size_t index = 0; index < 3; ++index) {
+    if (!(*it)[index].is_number_unsigned() && !(*it)[index].is_number_integer()) {
+      return false;
+    }
+    if ((*it)[index].is_number_integer() && (*it)[index].get<std::int64_t>() <= 0) {
+      return false;
+    }
+    if ((*it)[index].get<std::uint64_t>() == 0) {
+      return false;
+    }
   }
-  return MTLSizeMake(1, 1, 1);
+  size = MTLSizeMake(
+      static_cast<NSUInteger>((*it)[0].get<std::uint64_t>()),
+      static_cast<NSUInteger>((*it)[1].get<std::uint64_t>()),
+      static_cast<NSUInteger>((*it)[2].get<std::uint64_t>()));
+  return true;
 }
 
-MTLViewport viewport_from_json_array(const json &value)
+bool viewport_from_json_array(const json &value, MTLViewport &viewport)
 {
-  if (!value.is_array() || value.size() < 6) {
-    return {0.0, 0.0, 1.0, 1.0, 0.0, 1.0};
+  if (!value.is_array() || value.size() != 6) {
+    return false;
   }
-  return {value[0].get<double>(), value[1].get<double>(), value[2].get<double>(),
-          value[3].get<double>(), value[4].get<double>(), value[5].get<double>()};
+  for (std::size_t index = 0; index < 6; ++index) {
+    if (!value[index].is_number()) {
+      return false;
+    }
+  }
+  viewport = {value[0].get<double>(), value[1].get<double>(), value[2].get<double>(),
+              value[3].get<double>(), value[4].get<double>(), value[5].get<double>()};
+  return true;
 }
 
-MTLScissorRect scissor_from_json_array(const json &value)
+bool scissor_from_json_array(const json &value, MTLScissorRect &rect)
 {
-  if (!value.is_array() || value.size() < 4) {
-    return MTLScissorRect{0, 0, 1, 1};
+  if (!value.is_array() || value.size() != 4) {
+    return false;
   }
-  return MTLScissorRect{static_cast<NSUInteger>(value[0].get<std::uint64_t>()),
+  for (std::size_t index = 0; index < 4; ++index) {
+    if (!value[index].is_number_unsigned() && !value[index].is_number_integer()) {
+      return false;
+    }
+    if (value[index].is_number_integer() && value[index].get<std::int64_t>() < 0) {
+      return false;
+    }
+  }
+  rect = MTLScissorRect{static_cast<NSUInteger>(value[0].get<std::uint64_t>()),
                         static_cast<NSUInteger>(value[1].get<std::uint64_t>()),
                         static_cast<NSUInteger>(value[2].get<std::uint64_t>()),
                         static_cast<NSUInteger>(value[3].get<std::uint64_t>())};
+  return true;
 }
 
-MTLTextureSwizzleChannels swizzle_channels_from_json_array(const json &value)
+bool required_clear_color(const json &payload, const char *field_name, std::array<double, 4> &value)
 {
-  if (!value.is_array() || value.size() < 4) {
-    return MTLTextureSwizzleChannelsMake(
-        MTLTextureSwizzleRed,
-        MTLTextureSwizzleGreen,
-        MTLTextureSwizzleBlue,
-        MTLTextureSwizzleAlpha);
+  const auto it = payload.find(field_name);
+  if (it == payload.end() || !it->is_array() || it->size() != 4) {
+    return false;
   }
-  return MTLTextureSwizzleChannelsMake(
+  for (std::size_t index = 0; index < 4; ++index) {
+    if (!(*it)[index].is_number()) {
+      return false;
+    }
+    value[index] = (*it)[index].get<double>();
+  }
+  return true;
+}
+
+bool swizzle_channels_from_json_array(const json &value, MTLTextureSwizzleChannels &channels)
+{
+  if (!value.is_array() || value.size() != 4) {
+    return false;
+  }
+  for (std::size_t index = 0; index < 4; ++index) {
+    if (!value[index].is_number_unsigned() && !value[index].is_number_integer()) {
+      return false;
+    }
+    if (value[index].is_number_integer() && value[index].get<std::int64_t>() < 0) {
+      return false;
+    }
+    if (value[index].get<std::uint64_t>() > MTLTextureSwizzleAlpha) {
+      return false;
+    }
+  }
+  channels = MTLTextureSwizzleChannelsMake(
       static_cast<MTLTextureSwizzle>(value[0].get<std::uint32_t>()),
       static_cast<MTLTextureSwizzle>(value[1].get<std::uint32_t>()),
       static_cast<MTLTextureSwizzle>(value[2].get<std::uint32_t>()),
       static_cast<MTLTextureSwizzle>(value[3].get<std::uint32_t>()));
+  return true;
 }
 
 const char *present_frame_format_for_texture(id<MTLTexture> texture)
@@ -281,13 +516,14 @@ std::vector<std::uint8_t> bytes_from_json_array(const json &payload, const char 
   return bytes;
 }
 
-MTLTextureType texture_type_from_json_field(const json &descriptor, const char *field_name)
+bool texture_type_from_json_field(const json &descriptor, const char *field_name, MTLTextureType &texture_type)
 {
   const auto it = descriptor.find(field_name);
   if (it == descriptor.end() || !(it->is_number_unsigned() || it->is_number_integer())) {
-    return MTLTextureType2D;
+    return false;
   }
-  return static_cast<MTLTextureType>(it->get<std::uint32_t>());
+  texture_type = static_cast<MTLTextureType>(it->get<std::uint32_t>());
+  return true;
 }
 
 id<MTLFunction> new_function(
@@ -361,6 +597,17 @@ std::uint64_t gpu_resource_id_for_sampler(id<MTLSamplerState> sampler)
   return static_cast<std::uint64_t>([sampler gpuResourceID]._impl);
 }
 
+bool env_flag_enabled(const char *name)
+{
+  const char *value = std::getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return false;
+  }
+  return std::strcmp(value, "0") != 0 &&
+         std::strcmp(value, "false") != 0 &&
+         std::strcmp(value, "FALSE") != 0;
+}
+
 class NativeMetalReplayBackend final : public MetalReplayBackend {
 public:
   NativeMetalReplayBackend() = default;
@@ -371,7 +618,9 @@ public:
     reader_ = &reader;
     options_ = options;
     options_.enable_metal_present_capture =
-        std::getenv("APITRACE_METAL_RETRACE_CAPTURE_PRESENT_FRAMES") != nullptr;
+        env_flag_enabled("APITRACE_METAL_RETRACE_CAPTURE_PRESENT_FRAMES");
+    index_asset_paths(reader.assets());
+    index_asset_paths(reader.metal_assets());
 
     device_ = MTLCreateSystemDefaultDevice();
     if (device_ == nil) {
@@ -399,9 +648,15 @@ public:
     render_encoders_ = [[NSMutableDictionary alloc] init];
     compute_encoders_ = [[NSMutableDictionary alloc] init];
     blit_encoders_ = [[NSMutableDictionary alloc] init];
+    fences_ = [[NSMutableDictionary alloc] init];
     pending_presents_ = [[NSMutableDictionary alloc] init];
 
-    if (const char *bundle_root = std::getenv("APITRACE_TRACE_BUNDLE"); bundle_root && *bundle_root) {
+    if (options_.enable_metal_present_capture) {
+      const char *bundle_root = std::getenv("APITRACE_TRACE_BUNDLE");
+      if (bundle_root == nullptr || *bundle_root == '\0') {
+        last_error_ = "APITRACE_METAL_RETRACE_CAPTURE_PRESENT_FRAMES requires APITRACE_TRACE_BUNDLE";
+        return false;
+      }
       capture_writer_ = std::make_unique<trace::TraceBundleWriter>();
       if (!capture_writer_->open(bundle_root)) {
         last_error_ = "failed to open APITRACE_TRACE_BUNDLE for metal retrace capture";
@@ -414,37 +669,10 @@ public:
     }
 
     for (const auto &event : reader_->metal_events()) {
-      if (event.call_kind == trace::MetalCallKind::InsertDebugSignpost) {
-        const json signpost = parse_json(parse_json(event.payload).value("label", std::string()));
-        const auto kind = signpost.value("kind", std::string());
-        if (kind == "dxmt_buffer_gpu_address") {
-          const auto buffer_id = signpost.value("buffer_id", 0ull);
-          const auto gpu_address = signpost.value("gpu_address", 0ull);
-          if (buffer_id != 0 && gpu_address != 0) {
-            for (const auto &record : reader_->metal_events()) {
-              if (record.call_kind != trace::MetalCallKind::DeviceCreate ||
-                  record.function_name != "MTLDevice.newBuffer" ||
-                  record.object_id != buffer_id) {
-                continue;
-              }
-              const json buffer_payload = parse_json(record.payload);
-              original_buffer_lengths_[gpu_address] =
-                  buffer_payload.value("length", original_buffer_lengths_[gpu_address]);
-            }
-          }
-        } else if (kind == "dxmt_texture_gpu_resource_id") {
-          const auto texture_id = signpost.value("texture_id", 0ull);
-          const auto gpu_resource_id = signpost.value("gpu_resource_id", 0ull);
-          if (texture_id != 0 && gpu_resource_id != 0) {
-            original_texture_gpu_resource_ids_[texture_id] = gpu_resource_id;
-          }
-        } else if (kind == "dxmt_sampler_gpu_resource_id") {
-          const auto sampler_id = signpost.value("sampler_id", 0ull);
-          const auto gpu_resource_id = signpost.value("gpu_resource_id", 0ull);
-          if (sampler_id != 0 && gpu_resource_id != 0) {
-            original_sampler_gpu_resource_ids_[sampler_id] = gpu_resource_id;
-          }
-        }
+      if (event.call_kind == trace::MetalCallKind::ObjectMetadata) {
+        index_object_metadata(event.object_id, parse_json(event.payload));
+      } else if (event.call_kind == trace::MetalCallKind::InsertDebugSignpost) {
+        index_object_metadata(event.object_id, parse_json(parse_json(event.payload).value("label", std::string())));
       }
 
       if (event.call_kind != trace::MetalCallKind::PresentDrawable) {
@@ -473,8 +701,12 @@ public:
     const json payload = parse_json(event.payload);
 
     switch (event.call_kind) {
+    case trace::MetalCallKind::Unknown:
+      return fail("unknown Metal call kind is not replayable");
     case trace::MetalCallKind::DeviceCreate:
       return replay_device_create(event, payload);
+    case trace::MetalCallKind::CommandQueueCreate:
+      return true;
     case trace::MetalCallKind::CommandBufferBegin:
       return begin_command_buffer(event);
     case trace::MetalCallKind::CommandBufferCommit:
@@ -491,10 +723,16 @@ public:
       return begin_blit_encoder(event, payload);
     case trace::MetalCallKind::BlitEncoderEnd:
       return end_blit_encoder(event.object_id);
+    case trace::MetalCallKind::BlitEncoderBatch:
+      return blit_encoder_batch(event, payload);
     case trace::MetalCallKind::SetRenderPipelineState:
       return set_render_pipeline_state(event.object_id, payload);
     case trace::MetalCallKind::SetVertexBuffer:
       return set_vertex_buffer(event.object_id, payload);
+    case trace::MetalCallKind::SetVertexTexture:
+      return set_vertex_texture(event.object_id, payload);
+    case trace::MetalCallKind::SetVertexSamplerState:
+      return set_vertex_sampler_state(event.object_id, payload);
     case trace::MetalCallKind::SetVertexBytes:
       return set_vertex_bytes(event.object_id, payload);
     case trace::MetalCallKind::SetVertexBufferOffset:
@@ -503,10 +741,20 @@ public:
       return set_fragment_texture(event.object_id, payload);
     case trace::MetalCallKind::SetFragmentBuffer:
       return set_fragment_buffer(event.object_id, payload);
+    case trace::MetalCallKind::SetFragmentSamplerState:
+      return set_fragment_sampler_state(event.object_id, payload);
     case trace::MetalCallKind::SetFragmentBytes:
       return set_fragment_bytes(event.object_id, payload);
     case trace::MetalCallKind::SetFragmentBufferOffset:
       return set_fragment_buffer_offset(event.object_id, payload);
+    case trace::MetalCallKind::SetCullMode:
+      return set_cull_mode(event.object_id, payload);
+    case trace::MetalCallKind::SetFrontFacingWinding:
+      return set_front_facing_winding(event.object_id, payload);
+    case trace::MetalCallKind::SetTriangleFillMode:
+      return set_triangle_fill_mode(event.object_id, payload);
+    case trace::MetalCallKind::SetDepthStencilState:
+      return set_depth_stencil_state(event.object_id, payload);
     case trace::MetalCallKind::SetViewport:
       return set_viewport(event.object_id, payload);
     case trace::MetalCallKind::SetScissorRect:
@@ -515,38 +763,66 @@ public:
       return set_compute_pipeline_state(event.object_id, payload);
     case trace::MetalCallKind::SetComputeBuffer:
       return set_compute_buffer(event.object_id, payload);
+    case trace::MetalCallKind::SetComputeTexture:
+      return set_compute_texture(event.object_id, payload);
+    case trace::MetalCallKind::SetComputeSamplerState:
+      return set_compute_sampler_state(event.object_id, payload);
     case trace::MetalCallKind::SetComputeBufferOffset:
       return set_compute_buffer_offset(event.object_id, payload);
+    case trace::MetalCallKind::EncoderState:
+      return encoder_state(event.object_id, payload);
+    case trace::MetalCallKind::SetComputeBytes:
+      return set_compute_bytes(event.object_id, payload);
+    case trace::MetalCallKind::DispatchThreads:
+      return dispatch_threads(event.object_id, payload);
     case trace::MetalCallKind::DrawPrimitives:
       return draw_primitives(event.object_id, payload);
     case trace::MetalCallKind::DrawIndexedPrimitives:
       return draw_indexed_primitives(event.object_id, payload);
     case trace::MetalCallKind::DrawPrimitivesIndirect:
       return draw_primitives_indirect(event.object_id, payload);
+    case trace::MetalCallKind::DrawIndexedPrimitivesIndirect:
+      return draw_indexed_primitives_indirect(event.object_id, payload);
     case trace::MetalCallKind::DispatchThreadgroups:
       return dispatch_threadgroups(event.object_id, payload);
     case trace::MetalCallKind::DispatchThreadgroupsIndirect:
       return dispatch_threadgroups_indirect(event.object_id, payload);
     case trace::MetalCallKind::CopyBuffer:
-      return copy_buffer(event.object_id, payload);
+      return copy_buffer(event, payload);
+    case trace::MetalCallKind::CopyBufferToTexture:
+      return copy_buffer_to_texture(event, payload);
     case trace::MetalCallKind::CopyTexture:
       return copy_texture(event.object_id, payload);
+    case trace::MetalCallKind::BlitFill:
+      return blit_fill(event.object_id, payload);
+    case trace::MetalCallKind::BlitBatch:
+      return blit_batch(event, payload);
     case trace::MetalCallKind::PresentDrawable:
       return queue_present(event.object_id, payload);
     case trace::MetalCallKind::UseResource:
       return use_resource(event.object_id, payload);
-    case trace::MetalCallKind::InsertDebugSignpost:
-      return handle_debug_signpost(event.object_id, payload);
     case trace::MetalCallKind::UseResources:
-    case trace::MetalCallKind::SetArgumentBuffer:
-    case trace::MetalCallKind::UpdateFence:
-    case trace::MetalCallKind::WaitForFence:
+      return use_resources(event.object_id, payload);
     case trace::MetalCallKind::MemoryBarrier:
+      return memory_barrier(event.object_id, payload);
+    case trace::MetalCallKind::FenceOps:
+      return fence_ops(event.object_id, payload);
+    case trace::MetalCallKind::UpdateFence:
+      return update_fence(event.object_id, payload);
+    case trace::MetalCallKind::WaitForFence:
+      return wait_for_fence(event.object_id, payload);
     case trace::MetalCallKind::PushDebugGroup:
+      return push_debug_group(event.object_id, payload);
     case trace::MetalCallKind::PopDebugGroup:
+      return pop_debug_group(event.object_id);
+    case trace::MetalCallKind::ObjectMetadata:
+      return object_metadata(event.object_id, payload);
+    case trace::MetalCallKind::InsertDebugSignpost:
+      return handle_debug_signpost(event, payload);
+    case trace::MetalCallKind::SetArgumentBuffer:
       return true;
     default:
-      return true;
+      return fail("unsupported Metal call kind is not replayable");
     }
   }
 
@@ -620,6 +896,74 @@ private:
     return object_id == 0 ? nil : [blit_encoders_ objectForKey:object_key(object_id)];
   }
 
+  id<MTLFence> fence_for_id(std::uint64_t object_id)
+  {
+    if (object_id == 0) {
+      return nil;
+    }
+    id<MTLFence> fence = [fences_ objectForKey:object_key(object_id)];
+    if (fence != nil) {
+      return fence;
+    }
+    fence = [device_ newFence];
+    if (fence != nil) {
+      [fences_ setObject:fence forKey:object_key(object_id)];
+    }
+    return fence;
+  }
+
+  void index_object_metadata(std::uint64_t object_id, const json &metadata)
+  {
+    const auto kind = metadata.value("kind", std::string());
+    if (kind == "dxmt_buffer_gpu_address") {
+      std::uint64_t buffer_id = 0;
+      std::uint64_t gpu_address = 0;
+      if (!required_u64(metadata, "buffer_id", buffer_id) ||
+          !required_u64(metadata, "gpu_address", gpu_address)) {
+        return;
+      }
+      if (buffer_id == 0 || gpu_address == 0) {
+        return;
+      }
+      for (const auto &record : reader_->metal_events()) {
+        if (record.call_kind != trace::MetalCallKind::DeviceCreate ||
+            record.function_name != "MTLDevice.newBuffer" ||
+            record.object_id != buffer_id) {
+          continue;
+        }
+        const json buffer_payload = parse_json(record.payload);
+        std::uint64_t length = 0;
+        if (required_u64(buffer_payload, "length", length)) {
+          original_buffer_lengths_[gpu_address] = length;
+        }
+      }
+      return;
+    }
+    if (kind == "dxmt_texture_gpu_resource_id") {
+      std::uint64_t texture_id = 0;
+      std::uint64_t gpu_resource_id = 0;
+      if (!required_u64(metadata, "texture_id", texture_id) ||
+          !required_u64(metadata, "gpu_resource_id", gpu_resource_id)) {
+        return;
+      }
+      if (texture_id != 0 && gpu_resource_id != 0) {
+        original_texture_gpu_resource_ids_[texture_id] = gpu_resource_id;
+      }
+      return;
+    }
+    if (kind == "dxmt_sampler_gpu_resource_id") {
+      std::uint64_t sampler_id = 0;
+      std::uint64_t gpu_resource_id = 0;
+      if (!required_u64(metadata, "sampler_id", sampler_id) ||
+          !required_u64(metadata, "gpu_resource_id", gpu_resource_id)) {
+        return;
+      }
+      if (sampler_id != 0 && gpu_resource_id != 0) {
+        original_sampler_gpu_resource_ids_[sampler_id] = gpu_resource_id;
+      }
+    }
+  }
+
   id<MTLResource> resource_for_id(std::uint64_t object_id) const
   {
     id<MTLBuffer> buffer = buffer_for_id(object_id);
@@ -634,10 +978,108 @@ private:
     return reader_->layout().root_path / std::filesystem::path(relative_path);
   }
 
+  static bool is_safe_asset_path(const std::filesystem::path &path)
+  {
+    if (path.empty() || path.is_absolute()) {
+      return false;
+    }
+    for (const auto &part : path) {
+      if (part == "..") {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void index_asset_paths(const std::vector<trace::AssetRecord> &assets)
+  {
+    for (const auto &asset : assets) {
+      if (asset.blob_id != 0 && !asset.relative_path.empty()) {
+        asset_paths_by_blob_[asset.blob_id] = asset.relative_path;
+      }
+    }
+  }
+
+  bool verify_event_asset_path(
+      const trace::MetalEventRecord &event,
+      std::string_view relative_path_text,
+      std::string_view field_name)
+  {
+    if (relative_path_text.empty()) {
+      return true;
+    }
+
+    const std::filesystem::path relative_path(relative_path_text);
+    if (!is_safe_asset_path(relative_path)) {
+      return fail(std::string(field_name) + " references unsafe asset path: " + std::string(relative_path_text));
+    }
+
+    if (event.blob_refs.empty()) {
+      return fail("asset path references are missing blob_refs");
+    }
+
+    const auto expected_path = relative_path.generic_string();
+    for (const auto blob_id : event.blob_refs) {
+      if (blob_id == 0) {
+        return fail("asset path has zero blob_ref");
+      }
+      const auto path_it = asset_paths_by_blob_.find(blob_id);
+      if (path_it == asset_paths_by_blob_.end()) {
+        return fail("asset path blob_ref does not resolve");
+      }
+      if (path_it->second.generic_string() == expected_path) {
+        return true;
+      }
+    }
+
+    return fail("asset path blob_ref does not match " + expected_path);
+  }
+
   bool fail(std::string message)
   {
     last_error_ = std::move(message);
     return false;
+  }
+
+  bool restore_buffer_range_from_asset(
+      const trace::MetalEventRecord &event,
+      id<MTLBuffer> buffer,
+      const json &payload)
+  {
+    const auto asset_path = payload.value("source_asset_path", std::string());
+    if (asset_path.empty()) {
+      return true;
+    }
+    if (!verify_event_asset_path(event, asset_path, "source_asset_path")) {
+      return false;
+    }
+    if (buffer == nil) {
+      return fail("buffer range asset references missing source buffer");
+    }
+    void *contents = [buffer contents];
+    if (contents == nullptr) {
+      return fail("buffer range asset requires CPU-visible source buffer");
+    }
+
+    std::uint64_t source_offset = 0;
+    std::uint64_t expected_size = 0;
+    if (!required_u64(payload, "source_offset", source_offset) ||
+        !required_u64(payload, "source_asset_size", expected_size)) {
+      return fail("buffer range asset is missing source_offset or source_asset_size");
+    }
+    const auto bytes = read_binary_file(bundle_path(asset_path));
+    if (bytes.size() < expected_size) {
+      return fail("buffer range asset is truncated: " + asset_path);
+    }
+    if (source_offset > [buffer length] || expected_size > [buffer length] - source_offset) {
+      return fail("buffer range asset exceeds source buffer bounds: " + asset_path);
+    }
+
+    std::memcpy(static_cast<std::uint8_t *>(contents) + source_offset, bytes.data(), static_cast<std::size_t>(expected_size));
+    if (buffer.storageMode == MTLStorageModeManaged) {
+      [buffer didModifyRange:NSMakeRange(static_cast<NSUInteger>(source_offset), static_cast<NSUInteger>(expected_size))];
+    }
+    return true;
   }
 
   struct BufferState {
@@ -1026,6 +1468,10 @@ private:
   {
     const auto index = payload.value("index", 0u);
     const auto buffer_id = payload.value("buffer_id", 0ull);
+    if (buffer_id == 0) {
+      bindings.erase(static_cast<std::uint32_t>(index));
+      return;
+    }
     bindings[static_cast<std::uint32_t>(index)] =
         BufferBinding{buffer_id, payload.value("offset", 0ull), buffer_for_id(buffer_id)};
   }
@@ -1043,8 +1489,14 @@ private:
   {
     if (event.function_name == "MTLDevice.newBuffer") {
       const auto buffer_path = payload.value("buffer_path", std::string());
+      if (!verify_event_asset_path(event, buffer_path, "buffer_path")) {
+        return false;
+      }
       auto bytes = buffer_path.empty() ? std::vector<std::uint8_t>{} : read_binary_file(bundle_path(buffer_path));
-      const auto length = static_cast<NSUInteger>(payload.value("length", static_cast<std::uint64_t>(bytes.size())));
+      std::uint64_t length = 0;
+      if (!required_u64(payload, "length", length)) {
+        return fail("MTLDevice.newBuffer is missing length");
+      }
       id<MTLBuffer> buffer = [device_ newBufferWithLength:length options:MTLResourceStorageModeShared];
       if (buffer == nil) {
         return fail("failed to create MTLBuffer");
@@ -1080,6 +1532,9 @@ private:
 
     if (event.function_name == "MTLDevice.newLibrary") {
       const auto library_path = payload.value("library_path", std::string());
+      if (!verify_event_asset_path(event, library_path, "library_path")) {
+        return false;
+      }
       const auto bytes = read_binary_file(bundle_path(library_path));
       if (bytes.empty()) {
         return fail("failed to read metallib asset: " + library_path);
@@ -1106,11 +1561,11 @@ private:
     }
 
     if (event.function_name == "MTLDevice.newRenderPipelineState") {
-      return create_render_pipeline(event.object_id, payload);
+      return create_render_pipeline(event, payload);
     }
 
     if (event.function_name == "MTLDevice.newComputePipelineState") {
-      return create_compute_pipeline(event.object_id, payload);
+      return create_compute_pipeline(event, payload);
     }
 
     return true;
@@ -1118,24 +1573,44 @@ private:
 
   bool create_texture(std::uint64_t object_id, const json &descriptor)
   {
-    const auto width = static_cast<NSUInteger>(
-        descriptor.value("width", descriptor.value("render_target_width", 1u)));
-    const auto height = static_cast<NSUInteger>(
-        descriptor.value("height", descriptor.value("render_target_height", 1u)));
-    const auto pixel_format = pixel_format_from_json_field(descriptor, "pixel_format");
+    std::uint64_t width = 0;
+    std::uint64_t height = 0;
+    std::uint64_t depth = 0;
+    std::uint64_t array_length = 0;
+    std::uint64_t mipmap_level_count = 0;
+    std::uint64_t sample_count = 0;
+    std::uint64_t usage = 0;
+    if (!required_u64(descriptor, "width", width) ||
+        !required_u64(descriptor, "height", height) ||
+        !required_u64(descriptor, "depth", depth) ||
+        !required_u64(descriptor, "array_length", array_length) ||
+        !required_u64(descriptor, "mipmap_level_count", mipmap_level_count) ||
+        !required_u64(descriptor, "sample_count", sample_count) ||
+        !required_u64(descriptor, "usage", usage)) {
+      return fail("texture descriptor is missing replay metadata");
+    }
+    MTLPixelFormat pixel_format = MTLPixelFormatInvalid;
+    if (!pixel_format_from_json_field(descriptor, "pixel_format", pixel_format)) {
+      return fail("texture descriptor is missing pixel_format");
+    }
+    if (pixel_format == MTLPixelFormatInvalid) {
+      return fail("texture descriptor is missing pixel_format");
+    }
+    MTLTextureType texture_type = MTLTextureType2D;
+    if (!texture_type_from_json_field(descriptor, "type", texture_type)) {
+      return fail("texture descriptor is missing type");
+    }
     auto *texture_descriptor = [[MTLTextureDescriptor alloc] init];
-    texture_descriptor.textureType = texture_type_from_json_field(descriptor, "type");
-    texture_descriptor.width = std::max<NSUInteger>(width, 1);
-    texture_descriptor.height = std::max<NSUInteger>(height, 1);
-    texture_descriptor.depth = static_cast<NSUInteger>(descriptor.value("depth", 1u));
-    texture_descriptor.arrayLength = static_cast<NSUInteger>(descriptor.value("array_length", descriptor.value("arrayLength", 1u)));
-    texture_descriptor.mipmapLevelCount = static_cast<NSUInteger>(descriptor.value("mipmap_level_count", 1u));
-    texture_descriptor.sampleCount = static_cast<NSUInteger>(descriptor.value("sample_count", 1u));
+    texture_descriptor.textureType = texture_type;
+    texture_descriptor.width = std::max<NSUInteger>(static_cast<NSUInteger>(width), 1);
+    texture_descriptor.height = std::max<NSUInteger>(static_cast<NSUInteger>(height), 1);
+    texture_descriptor.depth = static_cast<NSUInteger>(depth);
+    texture_descriptor.arrayLength = static_cast<NSUInteger>(array_length);
+    texture_descriptor.mipmapLevelCount = static_cast<NSUInteger>(mipmap_level_count);
+    texture_descriptor.sampleCount = static_cast<NSUInteger>(sample_count);
     texture_descriptor.pixelFormat = pixel_format;
     texture_descriptor.storageMode = MTLStorageModeShared;
-    texture_descriptor.usage = static_cast<MTLTextureUsage>(
-        descriptor.value("usage", static_cast<std::uint32_t>(
-                                      MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget)));
+    texture_descriptor.usage = static_cast<MTLTextureUsage>(usage);
 
     id<MTLTexture> texture = [device_ newTextureWithDescriptor:texture_descriptor];
     if (texture == nil) {
@@ -1149,11 +1624,14 @@ private:
       for (const auto &value : *initial_bytes) {
         bytes.push_back(static_cast<std::uint8_t>(value.get<int>()));
       }
-      const auto bytes_per_row = static_cast<NSUInteger>(descriptor.value("bytes_per_row", width * 4));
-      [texture replaceRegion:MTLRegionMake2D(0, 0, width, height)
+      std::uint64_t bytes_per_row = 0;
+      if (!required_u64(descriptor, "bytes_per_row", bytes_per_row)) {
+        return fail("texture descriptor initial_bytes is missing bytes_per_row");
+      }
+      [texture replaceRegion:MTLRegionMake2D(0, 0, static_cast<NSUInteger>(width), static_cast<NSUInteger>(height))
                  mipmapLevel:0
                    withBytes:bytes.data()
-                 bytesPerRow:bytes_per_row];
+                 bytesPerRow:static_cast<NSUInteger>(bytes_per_row)];
     }
 
     [textures_ setObject:texture forKey:object_key(object_id)];
@@ -1171,23 +1649,64 @@ private:
     return true;
   }
 
-  bool create_sampler(std::uint64_t object_id, const json &descriptor)
+  bool create_sampler(const json &descriptor)
   {
+    std::string sampler_error;
+    if (!validate_sampler_descriptor_payload(descriptor, sampler_error)) {
+      return fail(sampler_error);
+    }
+    std::uint64_t object_id = 0;
+    std::uint32_t border_color = 0;
+    std::uint32_t r_address_mode = 0;
+    std::uint32_t s_address_mode = 0;
+    std::uint32_t t_address_mode = 0;
+    std::uint32_t mag_filter = 0;
+    std::uint32_t min_filter = 0;
+    std::uint32_t mip_filter = 0;
+    std::uint32_t compare_function = 0;
+    std::uint32_t max_anisotropy = 0;
+    const auto lod_max_clamp_it = descriptor.find("lod_max_clamp");
+    const auto lod_min_clamp_it = descriptor.find("lod_min_clamp");
+    const auto lod_average_it = descriptor.find("lod_average");
+    const auto normalized_coordinates_it = descriptor.find("normalized_coordinates");
+    const auto support_argument_buffers_it = descriptor.find("support_argument_buffers");
+    if (!required_u64(descriptor, "sampler_id", object_id) ||
+        !required_u32(descriptor, "border_color", border_color) ||
+        !required_u32(descriptor, "r_address_mode", r_address_mode) ||
+        !required_u32(descriptor, "s_address_mode", s_address_mode) ||
+        !required_u32(descriptor, "t_address_mode", t_address_mode) ||
+        !required_u32(descriptor, "mag_filter", mag_filter) ||
+        !required_u32(descriptor, "min_filter", min_filter) ||
+        !required_u32(descriptor, "mip_filter", mip_filter) ||
+        !required_u32(descriptor, "compare_function", compare_function) ||
+        !required_u32(descriptor, "max_anisotropy", max_anisotropy) ||
+        lod_max_clamp_it == descriptor.end() ||
+        !lod_max_clamp_it->is_number() ||
+        lod_min_clamp_it == descriptor.end() ||
+        !lod_min_clamp_it->is_number() ||
+        lod_average_it == descriptor.end() ||
+        !lod_average_it->is_boolean() ||
+        normalized_coordinates_it == descriptor.end() ||
+        !normalized_coordinates_it->is_boolean() ||
+        support_argument_buffers_it == descriptor.end() ||
+        !support_argument_buffers_it->is_boolean()) {
+      return fail("sampler descriptor is missing replay metadata");
+    }
     auto *sampler_descriptor = [[MTLSamplerDescriptor alloc] init];
-    sampler_descriptor.borderColor = static_cast<MTLSamplerBorderColor>(descriptor.value("border_color", 0u));
-    sampler_descriptor.rAddressMode = static_cast<MTLSamplerAddressMode>(descriptor.value("r_address_mode", 0u));
-    sampler_descriptor.sAddressMode = static_cast<MTLSamplerAddressMode>(descriptor.value("s_address_mode", 0u));
-    sampler_descriptor.tAddressMode = static_cast<MTLSamplerAddressMode>(descriptor.value("t_address_mode", 0u));
-    sampler_descriptor.magFilter = static_cast<MTLSamplerMinMagFilter>(descriptor.value("mag_filter", 0u));
-    sampler_descriptor.minFilter = static_cast<MTLSamplerMinMagFilter>(descriptor.value("min_filter", 0u));
-    sampler_descriptor.mipFilter = static_cast<MTLSamplerMipFilter>(descriptor.value("mip_filter", 0u));
-    sampler_descriptor.compareFunction = static_cast<MTLCompareFunction>(descriptor.value("compare_function", 0u));
-    sampler_descriptor.lodMaxClamp = descriptor.value("lod_max_clamp", 0.0);
-    sampler_descriptor.lodMinClamp = descriptor.value("lod_min_clamp", 0.0);
-    sampler_descriptor.maxAnisotropy = static_cast<NSUInteger>(descriptor.value("max_anisotropy", 0u));
-    sampler_descriptor.lodAverage = descriptor.value("lod_average", false);
-    sampler_descriptor.normalizedCoordinates = descriptor.value("normalized_coordinates", true);
-    sampler_descriptor.supportArgumentBuffers = descriptor.value("support_argument_buffers", true);
+    sampler_descriptor.borderColor = static_cast<MTLSamplerBorderColor>(border_color);
+    sampler_descriptor.rAddressMode = static_cast<MTLSamplerAddressMode>(r_address_mode);
+    sampler_descriptor.sAddressMode = static_cast<MTLSamplerAddressMode>(s_address_mode);
+    sampler_descriptor.tAddressMode = static_cast<MTLSamplerAddressMode>(t_address_mode);
+    sampler_descriptor.magFilter = static_cast<MTLSamplerMinMagFilter>(mag_filter);
+    sampler_descriptor.minFilter = static_cast<MTLSamplerMinMagFilter>(min_filter);
+    sampler_descriptor.mipFilter = static_cast<MTLSamplerMipFilter>(mip_filter);
+    sampler_descriptor.compareFunction = static_cast<MTLCompareFunction>(compare_function);
+    sampler_descriptor.lodMaxClamp = lod_max_clamp_it->get<double>();
+    sampler_descriptor.lodMinClamp = lod_min_clamp_it->get<double>();
+    sampler_descriptor.maxAnisotropy = static_cast<NSUInteger>(max_anisotropy);
+    sampler_descriptor.lodAverage = lod_average_it->get<bool>();
+    sampler_descriptor.normalizedCoordinates = normalized_coordinates_it->get<bool>();
+    sampler_descriptor.supportArgumentBuffers = support_argument_buffers_it->get<bool>();
 
     id<MTLSamplerState> sampler = [device_ newSamplerStateWithDescriptor:sampler_descriptor];
     if (sampler == nil) {
@@ -1205,25 +1724,48 @@ private:
 
   bool create_texture_view(const json &descriptor)
   {
-    const auto object_id = descriptor.value("texture_id", 0ull);
-    const auto source_texture_id = descriptor.value("source_texture_id", 0ull);
+    std::uint64_t object_id = 0;
+    std::uint64_t source_texture_id = 0;
+    std::uint64_t gpu_resource_id = 0;
+    std::uint32_t pixel_format = 0;
+    std::uint32_t texture_type = 0;
+    std::uint64_t level_start = 0;
+    std::uint64_t level_count = 0;
+    std::uint64_t slice_start = 0;
+    std::uint64_t slice_count = 0;
+    if (!required_u64(descriptor, "texture_id", object_id) ||
+        !required_u64(descriptor, "source_texture_id", source_texture_id) ||
+        !required_u64(descriptor, "gpu_resource_id", gpu_resource_id) ||
+        !required_u32(descriptor, "pixel_format", pixel_format) ||
+        !required_u32(descriptor, "texture_type", texture_type) ||
+        !required_u64(descriptor, "level_start", level_start) ||
+        !required_u64(descriptor, "level_count", level_count) ||
+        !required_u64(descriptor, "slice_start", slice_start) ||
+        !required_u64(descriptor, "slice_count", slice_count) ||
+        descriptor.find("swizzle") == descriptor.end()) {
+      return fail("texture view descriptor is missing replay metadata");
+    }
     id<MTLTexture> source_texture = texture_for_id(source_texture_id);
     if (object_id == 0 || source_texture == nil) {
       return true;
     }
 
-    id<MTLTexture> texture = [source_texture newTextureViewWithPixelFormat:static_cast<MTLPixelFormat>(descriptor.value("pixel_format", 0u))
-                                                               textureType:static_cast<MTLTextureType>(descriptor.value("texture_type", 0u))
-                                                                    levels:NSMakeRange(static_cast<NSUInteger>(descriptor.value("level_start", 0u)),
-                                                                                       static_cast<NSUInteger>(descriptor.value("level_count", 1u)))
-                                                                    slices:NSMakeRange(static_cast<NSUInteger>(descriptor.value("slice_start", 0u)),
-                                                                                       static_cast<NSUInteger>(descriptor.value("slice_count", 1u)))
-                                                                   swizzle:swizzle_channels_from_json_array(descriptor["swizzle"])];
+    MTLTextureSwizzleChannels swizzle = {};
+    if (!swizzle_channels_from_json_array(descriptor["swizzle"], swizzle)) {
+      return fail("texture view descriptor has invalid swizzle");
+    }
+    id<MTLTexture> texture = [source_texture newTextureViewWithPixelFormat:static_cast<MTLPixelFormat>(pixel_format)
+                                                               textureType:static_cast<MTLTextureType>(texture_type)
+                                                                    levels:NSMakeRange(static_cast<NSUInteger>(level_start),
+                                                                                       static_cast<NSUInteger>(level_count))
+                                                                    slices:NSMakeRange(static_cast<NSUInteger>(slice_start),
+                                                                                       static_cast<NSUInteger>(slice_count))
+                                                                   swizzle:swizzle];
     if (texture == nil) {
       return fail("failed to create MTLTexture view");
     }
     [textures_ setObject:texture forKey:object_key(object_id)];
-    const auto original_gpu_resource_id = descriptor.value("gpu_resource_id", original_texture_gpu_resource_ids_[object_id]);
+    const auto original_gpu_resource_id = gpu_resource_id;
     const auto replay_gpu_resource_id = gpu_resource_id_for_texture(texture);
     if (original_gpu_resource_id != 0 && replay_gpu_resource_id != 0) {
       texture_gpu_resource_id_map_[original_gpu_resource_id] = replay_gpu_resource_id;
@@ -1246,20 +1788,34 @@ private:
 
   bool create_depth_stencil_state(const json &descriptor)
   {
-    const auto object_id = descriptor.value("depth_stencil_state_id", 0ull);
+    std::uint64_t object_id = 0;
+    std::uint32_t depth_compare_function = 0;
+    const auto depth_write_enabled_it = descriptor.find("depth_write_enabled");
+    if (!required_u64(descriptor, "depth_stencil_state_id", object_id) ||
+        !required_u32(descriptor, "depth_compare_function", depth_compare_function) ||
+        depth_write_enabled_it == descriptor.end() ||
+        !depth_write_enabled_it->is_boolean()) {
+      return fail("depth stencil descriptor is missing replay metadata");
+    }
     if (object_id == 0) {
-      return true;
+      return fail("depth stencil descriptor has zero depth_stencil_state_id");
     }
 
     auto *state_descriptor = [[MTLDepthStencilDescriptor alloc] init];
     state_descriptor.depthCompareFunction =
-        static_cast<MTLCompareFunction>(descriptor.value("depth_compare_function", 0u));
-    state_descriptor.depthWriteEnabled = descriptor.value("depth_write_enabled", false);
+        static_cast<MTLCompareFunction>(depth_compare_function);
+    state_descriptor.depthWriteEnabled = depth_write_enabled_it->get<bool>();
     if (descriptor.contains("front_stencil")) {
-      apply_stencil_descriptor(state_descriptor.frontFaceStencil, descriptor["front_stencil"]);
+      std::string error;
+      if (!apply_stencil_descriptor(state_descriptor.frontFaceStencil, descriptor["front_stencil"], error)) {
+        return fail(error);
+      }
     }
     if (descriptor.contains("back_stencil")) {
-      apply_stencil_descriptor(state_descriptor.backFaceStencil, descriptor["back_stencil"]);
+      std::string error;
+      if (!apply_stencil_descriptor(state_descriptor.backFaceStencil, descriptor["back_stencil"], error)) {
+        return fail(error);
+      }
     }
 
     id<MTLDepthStencilState> state = [device_ newDepthStencilStateWithDescriptor:state_descriptor];
@@ -1270,18 +1826,42 @@ private:
     return true;
   }
 
-  bool create_render_pipeline(std::uint64_t object_id, const json &payload)
+  bool create_render_pipeline(const trace::MetalEventRecord &event, const json &payload)
   {
     const auto descriptor_path = payload.value("descriptor_path", std::string());
+    if (!verify_event_asset_path(event, descriptor_path, "descriptor_path")) {
+      return false;
+    }
     const auto descriptor_bytes = read_binary_file(bundle_path(descriptor_path));
     const auto descriptor = parse_json(std::string(descriptor_bytes.begin(), descriptor_bytes.end()));
-    const auto library_id = descriptor.value("library_id", 0ull);
-    const auto vertex_library_id = descriptor.value("vertex_library_id", library_id);
-    const auto fragment_library_id = descriptor.value("fragment_library_id", library_id);
+    if (!descriptor.is_object()) {
+      return fail("render pipeline descriptor must be a JSON object");
+    }
+    std::uint64_t vertex_library_id = 0;
+    if (!required_u64(descriptor, "vertex_library_id", vertex_library_id)) {
+      std::uint64_t library_id = 0;
+      if (!required_u64(descriptor, "library_id", library_id)) {
+        return fail("render pipeline descriptor is missing vertex_library_id");
+      }
+      vertex_library_id = library_id;
+    }
+    std::uint64_t fragment_library_id = 0;
+    if (!required_u64(descriptor, "fragment_library_id", fragment_library_id)) {
+      fragment_library_id = vertex_library_id;
+    }
     const auto vertex_function_name = descriptor.value("vertex_function", std::string());
+    if (vertex_function_name.empty()) {
+      return fail("render pipeline descriptor missing vertex_function");
+    }
     const auto fragment_function_name = descriptor.value("fragment_function", std::string());
     const auto fragment_function_constants = descriptor.value("fragment_function_constants", json::array());
-    const auto rasterization_enabled = descriptor.value("rasterization_enabled", true);
+    const auto rasterization_enabled_it = descriptor.find("rasterization_enabled");
+    std::uint64_t raster_sample_count = 0;
+    if (rasterization_enabled_it == descriptor.end() ||
+        !rasterization_enabled_it->is_boolean() ||
+        !required_u64(descriptor, "raster_sample_count", raster_sample_count)) {
+      return fail("render pipeline descriptor is missing rasterization metadata");
+    }
     id<MTLLibrary> vertex_library = library_for_id(vertex_library_id);
     id<MTLLibrary> fragment_library = fragment_function_name.empty() ? nil : library_for_id(fragment_library_id);
     if (vertex_library == nil || (!fragment_function_name.empty() && fragment_library == nil)) {
@@ -1303,62 +1883,100 @@ private:
       }
     }
     const auto colors = descriptor.find("colors");
-    if (colors != descriptor.end() && colors->is_array()) {
-      std::size_t slot = 0;
-      for (const auto &color : *colors) {
-        if (slot >= 8) {
-          break;
-        }
-        auto *attachment = pipeline_descriptor.colorAttachments[slot++];
-        attachment.pixelFormat = pixel_format_from_json_field_or(color, "pixel_format", MTLPixelFormatInvalid);
-        attachment.blendingEnabled = color.value("blending_enabled", false);
-        attachment.writeMask = static_cast<MTLColorWriteMask>(color.value("write_mask", 0u));
-        attachment.rgbBlendOperation = static_cast<MTLBlendOperation>(color.value("rgb_blend_operation", 0u));
-        attachment.alphaBlendOperation = static_cast<MTLBlendOperation>(color.value("alpha_blend_operation", 0u));
-        attachment.sourceRGBBlendFactor = static_cast<MTLBlendFactor>(color.value("src_rgb_blend_factor", 1u));
-        attachment.destinationRGBBlendFactor = static_cast<MTLBlendFactor>(color.value("dst_rgb_blend_factor", 0u));
-        attachment.sourceAlphaBlendFactor = static_cast<MTLBlendFactor>(color.value("src_alpha_blend_factor", 1u));
-        attachment.destinationAlphaBlendFactor = static_cast<MTLBlendFactor>(color.value("dst_alpha_blend_factor", 0u));
-      }
-    } else {
-      pipeline_descriptor.colorAttachments[0].pixelFormat = pixel_format_from_json_field(descriptor, "color_pixel_format");
+    if (colors == descriptor.end() || !colors->is_array() || colors->empty()) {
+      return fail("render pipeline descriptor missing color attachment metadata");
     }
-    pipeline_descriptor.rasterizationEnabled = rasterization_enabled;
-    pipeline_descriptor.depthAttachmentPixelFormat =
-        pixel_format_from_json_field_or(descriptor, "depth_pixel_format", MTLPixelFormatInvalid);
-    pipeline_descriptor.stencilAttachmentPixelFormat =
-        pixel_format_from_json_field_or(descriptor, "stencil_pixel_format", MTLPixelFormatInvalid);
-    pipeline_descriptor.rasterSampleCount =
-        static_cast<NSUInteger>(descriptor.value("raster_sample_count", 1u));
+    std::size_t slot = 0;
+    for (const auto &color : *colors) {
+      if (slot >= 8) {
+        break;
+      }
+      auto *attachment = pipeline_descriptor.colorAttachments[slot++];
+      const auto blending_enabled_it = color.find("blending_enabled");
+      std::uint64_t write_mask = 0;
+      std::uint64_t rgb_blend_operation = 0;
+      std::uint64_t alpha_blend_operation = 0;
+      std::uint64_t src_rgb_blend_factor = 0;
+      std::uint64_t dst_rgb_blend_factor = 0;
+      std::uint64_t src_alpha_blend_factor = 0;
+      std::uint64_t dst_alpha_blend_factor = 0;
+      if (blending_enabled_it == color.end() ||
+          !blending_enabled_it->is_boolean() ||
+          !required_u64(color, "write_mask", write_mask) ||
+          !required_u64(color, "rgb_blend_operation", rgb_blend_operation) ||
+          !required_u64(color, "alpha_blend_operation", alpha_blend_operation) ||
+          !required_u64(color, "src_rgb_blend_factor", src_rgb_blend_factor) ||
+          !required_u64(color, "dst_rgb_blend_factor", dst_rgb_blend_factor) ||
+          !required_u64(color, "src_alpha_blend_factor", src_alpha_blend_factor) ||
+          !required_u64(color, "dst_alpha_blend_factor", dst_alpha_blend_factor)) {
+        return fail("render pipeline color attachment is missing replay metadata");
+      }
+      MTLPixelFormat color_pixel_format = MTLPixelFormatInvalid;
+      if (!pixel_format_from_json_field(color, "pixel_format", color_pixel_format)) {
+        return fail("render pipeline color attachment is missing pixel_format");
+      }
+      attachment.pixelFormat = color_pixel_format;
+      if (attachment.pixelFormat == MTLPixelFormatInvalid) {
+        return fail("render pipeline color attachment is missing pixel_format");
+      }
+      attachment.blendingEnabled = blending_enabled_it->get<bool>();
+      attachment.writeMask = static_cast<MTLColorWriteMask>(write_mask);
+      attachment.rgbBlendOperation = static_cast<MTLBlendOperation>(rgb_blend_operation);
+      attachment.alphaBlendOperation = static_cast<MTLBlendOperation>(alpha_blend_operation);
+      attachment.sourceRGBBlendFactor = static_cast<MTLBlendFactor>(src_rgb_blend_factor);
+      attachment.destinationRGBBlendFactor = static_cast<MTLBlendFactor>(dst_rgb_blend_factor);
+      attachment.sourceAlphaBlendFactor = static_cast<MTLBlendFactor>(src_alpha_blend_factor);
+      attachment.destinationAlphaBlendFactor = static_cast<MTLBlendFactor>(dst_alpha_blend_factor);
+    }
+    pipeline_descriptor.rasterizationEnabled = rasterization_enabled_it->get<bool>();
+    MTLPixelFormat depth_pixel_format = MTLPixelFormatInvalid;
+    MTLPixelFormat stencil_pixel_format = MTLPixelFormatInvalid;
+    if (!optional_pixel_format_from_json_field(descriptor, "depth_pixel_format", depth_pixel_format) ||
+        !optional_pixel_format_from_json_field(descriptor, "stencil_pixel_format", stencil_pixel_format)) {
+      return fail("render pipeline descriptor has invalid depth/stencil pixel format");
+    }
+    pipeline_descriptor.depthAttachmentPixelFormat = depth_pixel_format;
+    pipeline_descriptor.stencilAttachmentPixelFormat = stencil_pixel_format;
+    pipeline_descriptor.rasterSampleCount = static_cast<NSUInteger>(raster_sample_count);
 
     NSError *error = nil;
     id<MTLRenderPipelineState> pipeline = [device_ newRenderPipelineStateWithDescriptor:pipeline_descriptor error:&error];
     if (pipeline == nil) {
       return fail(error ? [[error localizedDescription] UTF8String] : "failed to create render pipeline");
     }
-    [render_pipelines_ setObject:pipeline forKey:object_key(object_id)];
+    [render_pipelines_ setObject:pipeline forKey:object_key(event.object_id)];
     return true;
   }
 
-  bool create_compute_pipeline(std::uint64_t object_id, const json &payload)
+  bool create_compute_pipeline(const trace::MetalEventRecord &event, const json &payload)
   {
     const auto descriptor_path = payload.value("descriptor_path", std::string());
+    if (!verify_event_asset_path(event, descriptor_path, "descriptor_path")) {
+      return false;
+    }
     const auto descriptor_bytes = read_binary_file(bundle_path(descriptor_path));
     const auto descriptor = parse_json(std::string(descriptor_bytes.begin(), descriptor_bytes.end()));
-    const auto library_id = descriptor.value("library_id", 0ull);
+    std::uint64_t library_id = 0;
+    if (!required_u64(descriptor, "library_id", library_id)) {
+      return fail("compute pipeline descriptor is missing library_id");
+    }
     id<MTLLibrary> library = library_for_id(library_id);
     if (library == nil) {
       return fail("compute pipeline references missing library");
     }
 
+    const auto function_name = descriptor.value("function", std::string());
+    if (function_name.empty()) {
+      return fail("compute pipeline descriptor missing function");
+    }
     id<MTLFunction> function =
-        [library newFunctionWithName:[NSString stringWithUTF8String:descriptor.value("function", std::string()).c_str()]];
+        [library newFunctionWithName:[NSString stringWithUTF8String:function_name.c_str()]];
     NSError *error = nil;
     id<MTLComputePipelineState> pipeline = [device_ newComputePipelineStateWithFunction:function error:&error];
     if (pipeline == nil) {
       return fail(error ? [[error localizedDescription] UTF8String] : "failed to create compute pipeline");
     }
-    [compute_pipelines_ setObject:pipeline forKey:object_key(object_id)];
+    [compute_pipelines_ setObject:pipeline forKey:object_key(event.object_id)];
     return true;
   }
 
@@ -1381,10 +1999,14 @@ private:
 
     [command_buffer commit];
     [command_buffer waitUntilCompleted];
-    if (debug_gpu_patch_enabled()) {
-      if (command_buffer.status == MTLCommandBufferStatusError && command_buffer.error != nil) {
-        std::fprintf(stderr, "metal replay debug command buffer error: %s\n", [[command_buffer.error localizedDescription] UTF8String]);
+    if (command_buffer.status == MTLCommandBufferStatusError) {
+      const char *message = command_buffer.error != nil
+                                ? [[command_buffer.error localizedDescription] UTF8String]
+                                : "command buffer completed with error";
+      if (debug_gpu_patch_enabled()) {
+        std::fprintf(stderr, "metal replay debug command buffer error: %s\n", message);
       }
+      return fail(message);
     }
 
     NSDictionary *present_info = [pending_presents_ objectForKey:object_key(event.object_id)];
@@ -1402,10 +2024,11 @@ private:
 
   bool begin_render_encoder(const trace::MetalEventRecord &event, const json &payload)
   {
-    id<MTLCommandBuffer> command_buffer = command_buffer_for_id(payload.value("command_buffer_id", 0ull));
-    if (command_buffer == nil && !event.object_refs.empty()) {
-      command_buffer = command_buffer_for_id(event.object_refs.front());
+    std::uint64_t command_buffer_id = 0;
+    if (!required_u64(payload, "command_buffer_id", command_buffer_id)) {
+      return fail("render encoder is missing command_buffer_id");
     }
+    id<MTLCommandBuffer> command_buffer = command_buffer_for_id(command_buffer_id);
     if (command_buffer == nil) {
       return fail("render encoder references missing command buffer");
     }
@@ -1424,20 +2047,12 @@ private:
         if (color_texture_id == 0) {
           color_texture_id = first_color.value("resolve_texture", 0ull);
         }
-        if (color_texture_id != 0) {
-          pass["color_texture_id"] = color_texture_id;
-          pass["load_action"] = first_color.value("load_action", 2u);
-          pass["store_action"] = first_color.value("store_action", 1u);
-          pass["clear_color"] = first_color.value("clear_color", std::array<double, 4>{0.0, 0.0, 0.0, 1.0});
-        }
       }
     }
     if (color_texture_id == 0) {
       return fail("render pass is missing color_texture_id");
     }
 
-    const auto command_buffer_id =
-        payload.value("command_buffer_id", !event.object_refs.empty() ? event.object_refs.front() : 0ull);
     if (command_buffer_id != 0 &&
         pass.value("render_target_width", 0u) == 0 &&
         pass.value("render_target_height", 0u) == 0) {
@@ -1456,7 +2071,20 @@ private:
     const auto colors = pass.find("colors");
     if (colors != pass.end() && colors->is_array() && !colors->empty()) {
       for (const auto &color : *colors) {
-        const auto slot = static_cast<NSUInteger>(color.value("slot", 0u));
+        std::uint32_t slot = 0;
+        std::uint64_t level = 0;
+        std::uint64_t slice = 0;
+        std::uint64_t depth_plane = 0;
+        if (!required_u32(color, "slot", slot) ||
+            !required_u64(color, "level", level) ||
+            !required_u64(color, "slice", slice) ||
+            !required_u64(color, "depth_plane", depth_plane)) {
+          return fail("render pass color attachment is missing subresource metadata");
+        }
+        std::array<double, 4> clear{};
+        if (!required_clear_color(color, "clear_color", clear)) {
+          return fail("render pass color attachment is missing clear_color");
+        }
         const auto texture_id = optional_object_id_from_json_field(color, "texture");
         if (texture_id == 0) {
           continue;
@@ -1474,14 +2102,19 @@ private:
           first_color_texture = color_texture;
         }
 
-        auto *attachment = descriptor.colorAttachments[slot];
+        MTLLoadAction load_action = MTLLoadActionClear;
+        MTLStoreAction store_action = MTLStoreActionStore;
+        if (!load_action_from_json_field(color, "load_action", load_action) ||
+            !store_action_from_json_field(color, "store_action", store_action)) {
+          return fail("render pass color attachment is missing load/store action metadata");
+        }
+        auto *attachment = descriptor.colorAttachments[static_cast<NSUInteger>(slot)];
         attachment.texture = color_texture;
-        attachment.loadAction = load_action_from_json_field(color, "load_action");
-        attachment.storeAction = store_action_from_json_field(color, "store_action");
-        attachment.level = static_cast<NSUInteger>(color.value("level", 0u));
-        attachment.slice = static_cast<NSUInteger>(color.value("slice", 0u));
-        attachment.depthPlane = static_cast<NSUInteger>(color.value("depth_plane", 0u));
-        const auto clear = color.value("clear_color", pass.value("clear_color", std::array<double, 4>{0.0, 0.0, 0.0, 1.0}));
+        attachment.loadAction = load_action;
+        attachment.storeAction = store_action;
+        attachment.level = static_cast<NSUInteger>(level);
+        attachment.slice = static_cast<NSUInteger>(slice);
+        attachment.depthPlane = static_cast<NSUInteger>(depth_plane);
         attachment.clearColor = MTLClearColorMake(clear[0], clear[1], clear[2], clear[3]);
 
         const auto resolve_texture_id = optional_object_id_from_json_field(color, "resolve_texture");
@@ -1490,7 +2123,18 @@ private:
           if (resolve_texture == nil) {
             return fail("render pass references missing resolve texture");
           }
+          std::uint64_t resolve_level = 0;
+          std::uint64_t resolve_slice = 0;
+          std::uint64_t resolve_depth_plane = 0;
+          if (!required_u64(color, "resolve_level", resolve_level) ||
+              !required_u64(color, "resolve_slice", resolve_slice) ||
+              !required_u64(color, "resolve_depth_plane", resolve_depth_plane)) {
+            return fail("render pass resolve attachment is missing subresource metadata");
+          }
           attachment.resolveTexture = resolve_texture;
+          attachment.resolveLevel = static_cast<NSUInteger>(resolve_level);
+          attachment.resolveSlice = static_cast<NSUInteger>(resolve_slice);
+          attachment.resolveDepthPlane = static_cast<NSUInteger>(resolve_depth_plane);
         }
       }
     } else {
@@ -1503,13 +2147,34 @@ private:
       }
       first_color_texture = color_texture;
 
-      descriptor.colorAttachments[0].texture = color_texture;
-      descriptor.colorAttachments[0].loadAction = load_action_from_json_field(pass, "load_action");
-      descriptor.colorAttachments[0].storeAction = store_action_from_json_field(pass, "store_action");
-
-      const auto clear = pass.value("clear_color", std::array<double, 4>{0.0, 0.0, 0.0, 1.0});
-      descriptor.colorAttachments[0].clearColor =
-          MTLClearColorMake(clear[0], clear[1], clear[2], clear[3]);
+      std::uint32_t slot = 0;
+      std::uint64_t level = 0;
+      std::uint64_t slice = 0;
+      std::uint64_t depth_plane = 0;
+      if (!required_u32(pass, "slot", slot) ||
+          !required_u64(pass, "level", level) ||
+          !required_u64(pass, "slice", slice) ||
+          !required_u64(pass, "depth_plane", depth_plane)) {
+        return fail("render pass color attachment is missing subresource metadata");
+      }
+      std::array<double, 4> clear{};
+      if (!required_clear_color(pass, "clear_color", clear)) {
+        return fail("render pass color attachment is missing clear_color");
+      }
+      MTLLoadAction load_action = MTLLoadActionClear;
+      MTLStoreAction store_action = MTLStoreActionStore;
+      if (!load_action_from_json_field(pass, "load_action", load_action) ||
+          !store_action_from_json_field(pass, "store_action", store_action)) {
+        return fail("render pass color attachment is missing load/store action metadata");
+      }
+      auto *attachment = descriptor.colorAttachments[static_cast<NSUInteger>(slot)];
+      attachment.texture = color_texture;
+      attachment.loadAction = load_action;
+      attachment.storeAction = store_action;
+      attachment.level = static_cast<NSUInteger>(level);
+      attachment.slice = static_cast<NSUInteger>(slice);
+      attachment.depthPlane = static_cast<NSUInteger>(depth_plane);
+      attachment.clearColor = MTLClearColorMake(clear[0], clear[1], clear[2], clear[3]);
     }
 
     const auto depth = pass.find("depth");
@@ -1520,13 +2185,30 @@ private:
         if (depth_texture == nil) {
           return fail("render pass references missing depth texture");
         }
+        MTLLoadAction load_action = MTLLoadActionClear;
+        MTLStoreAction store_action = MTLStoreActionStore;
+        if (!load_action_from_json_field(*depth, "load_action", load_action) ||
+            !store_action_from_json_field(*depth, "store_action", store_action)) {
+          return fail("render pass depth attachment is missing load/store action metadata");
+        }
         descriptor.depthAttachment.texture = depth_texture;
-        descriptor.depthAttachment.loadAction = load_action_from_json_field(*depth, "load_action");
-        descriptor.depthAttachment.storeAction = store_action_from_json_field(*depth, "store_action");
-        descriptor.depthAttachment.clearDepth = depth->value("clear_depth", 1.0);
-        descriptor.depthAttachment.level = static_cast<NSUInteger>(depth->value("level", 0u));
-        descriptor.depthAttachment.slice = static_cast<NSUInteger>(depth->value("slice", 0u));
-        descriptor.depthAttachment.depthPlane = static_cast<NSUInteger>(depth->value("depth_plane", 0u));
+        descriptor.depthAttachment.loadAction = load_action;
+        descriptor.depthAttachment.storeAction = store_action;
+        const auto clear_depth = depth->find("clear_depth");
+        std::uint64_t level = 0;
+        std::uint64_t slice = 0;
+        std::uint64_t depth_plane = 0;
+        if (clear_depth == depth->end() ||
+            !clear_depth->is_number() ||
+            !required_u64(*depth, "level", level) ||
+            !required_u64(*depth, "slice", slice) ||
+            !required_u64(*depth, "depth_plane", depth_plane)) {
+          return fail("render pass depth attachment is missing replay metadata");
+        }
+        descriptor.depthAttachment.clearDepth = clear_depth->get<double>();
+        descriptor.depthAttachment.level = static_cast<NSUInteger>(level);
+        descriptor.depthAttachment.slice = static_cast<NSUInteger>(slice);
+        descriptor.depthAttachment.depthPlane = static_cast<NSUInteger>(depth_plane);
       }
     }
 
@@ -1534,16 +2216,6 @@ private:
     if (encoder == nil) {
       return fail("failed to create render command encoder");
     }
-    auto default_width = static_cast<std::uint64_t>(first_color_texture.width);
-    auto default_height = static_cast<std::uint64_t>(first_color_texture.height);
-    const auto first_color_texture_id = first_color_texture == nil ? 0 : color_texture_id;
-    const auto texture_state_it = texture_states_.find(first_color_texture_id);
-    if (texture_state_it != texture_states_.end()) {
-      default_width = texture_state_it->second.width;
-      default_height = texture_state_it->second.height;
-    }
-    [encoder setViewport:{0.0, 0.0, static_cast<double>(default_width), static_cast<double>(default_height), 0.0, 1.0}];
-    [encoder setScissorRect:MTLScissorRect{0, 0, static_cast<NSUInteger>(default_width), static_cast<NSUInteger>(default_height)}];
     [render_encoders_ setObject:encoder forKey:object_key(event.object_id)];
     [render_encoder_command_buffers_ setObject:object_key(command_buffer_id) forKey:object_key(event.object_id)];
     encoder_resource_states_[event.object_id] = {};
@@ -1554,10 +2226,11 @@ private:
 
   bool begin_compute_encoder(const trace::MetalEventRecord &event, const json &payload)
   {
-    id<MTLCommandBuffer> command_buffer = command_buffer_for_id(payload.value("command_buffer_id", 0ull));
-    if (command_buffer == nil && !event.object_refs.empty()) {
-      command_buffer = command_buffer_for_id(event.object_refs.front());
+    std::uint64_t command_buffer_id = 0;
+    if (!required_u64(payload, "command_buffer_id", command_buffer_id)) {
+      return fail("compute encoder is missing command_buffer_id");
     }
+    id<MTLCommandBuffer> command_buffer = command_buffer_for_id(command_buffer_id);
     if (command_buffer == nil) {
       return fail("compute encoder references missing command buffer");
     }
@@ -1574,10 +2247,11 @@ private:
 
   bool begin_blit_encoder(const trace::MetalEventRecord &event, const json &payload)
   {
-    id<MTLCommandBuffer> command_buffer = command_buffer_for_id(payload.value("command_buffer_id", 0ull));
-    if (command_buffer == nil && !event.object_refs.empty()) {
-      command_buffer = command_buffer_for_id(event.object_refs.front());
+    std::uint64_t command_buffer_id = 0;
+    if (!required_u64(payload, "command_buffer_id", command_buffer_id)) {
+      return fail("blit encoder is missing command_buffer_id");
     }
+    id<MTLCommandBuffer> command_buffer = command_buffer_for_id(command_buffer_id);
     if (command_buffer == nil) {
       return fail("blit encoder references missing command buffer");
     }
@@ -1629,10 +2303,36 @@ private:
     return true;
   }
 
+  bool blit_encoder_batch(const trace::MetalEventRecord &event, const json &payload)
+  {
+    std::uint64_t command_buffer_id = 0;
+    if (!required_u64(payload, "command_buffer_id", command_buffer_id)) {
+      return fail("blit encoder batch is missing command_buffer_id");
+    }
+    id<MTLCommandBuffer> command_buffer = command_buffer_for_id(command_buffer_id);
+    if (command_buffer == nil) {
+      return fail("blit encoder batch references missing command buffer");
+    }
+
+    id<MTLBlitCommandEncoder> encoder = [command_buffer blitCommandEncoder];
+    if (encoder == nil) {
+      return fail("failed to create batched blit command encoder");
+    }
+    [blit_encoders_ setObject:encoder forKey:object_key(event.object_id)];
+    const bool ok = blit_batch(event, payload);
+    [encoder endEncoding];
+    [blit_encoders_ removeObjectForKey:object_key(event.object_id)];
+    return ok;
+  }
+
   bool set_render_pipeline_state(std::uint64_t encoder_id, const json &payload)
   {
     id<MTLRenderCommandEncoder> encoder = render_encoder_for_id(encoder_id);
-    id<MTLRenderPipelineState> pipeline = render_pipeline_for_id(payload.value("pipeline_state_id", 0ull));
+    std::uint64_t pipeline_state_id = 0;
+    if (!required_u64(payload, "pipeline_state_id", pipeline_state_id)) {
+      return fail("setRenderPipelineState is missing pipeline_state_id");
+    }
+    id<MTLRenderPipelineState> pipeline = render_pipeline_for_id(pipeline_state_id);
     if (encoder == nil || pipeline == nil) {
       return fail("setRenderPipelineState references missing encoder or pipeline");
     }
@@ -1643,13 +2343,21 @@ private:
   bool set_vertex_buffer(std::uint64_t encoder_id, const json &payload)
   {
     id<MTLRenderCommandEncoder> encoder = render_encoder_for_id(encoder_id);
-    id<MTLBuffer> buffer = buffer_for_id(payload.value("buffer_id", 0ull));
-    if (encoder == nil || buffer == nil) {
+    std::uint64_t buffer_id = 0;
+    std::uint64_t offset = 0;
+    std::uint32_t index = 0;
+    if (!required_u64(payload, "buffer_id", buffer_id) ||
+        !required_u64(payload, "offset", offset) ||
+        !required_u32(payload, "index", index)) {
+      return fail("setVertexBuffer is missing buffer_id, offset, or index");
+    }
+    id<MTLBuffer> buffer = buffer_for_id(buffer_id);
+    if (encoder == nil || (buffer_id != 0 && buffer == nil)) {
       return fail("setVertexBuffer references missing encoder or buffer");
     }
     [encoder setVertexBuffer:buffer
-                      offset:static_cast<NSUInteger>(payload.value("offset", 0ull))
-                     atIndex:static_cast<NSUInteger>(payload.value("index", 0u))];
+                      offset:static_cast<NSUInteger>(offset)
+                     atIndex:static_cast<NSUInteger>(index)];
     record_buffer_binding(render_vertex_buffer_bindings_[encoder_id], payload);
     return true;
   }
@@ -1664,12 +2372,23 @@ private:
     const auto nested = parse_nested_json(payload, "payload");
     const auto bytes = bytes_from_json_array(nested, "bytes");
     if (bytes.empty()) {
-      return true;
+      return fail("setVertexBytes is missing captured bytes");
+    }
+    std::uint64_t length = 0;
+    if (!required_u64(nested, "length", length)) {
+      return fail("setVertexBytes is missing length");
+    }
+    if (length == 0 || length > bytes.size()) {
+      return fail("setVertexBytes has invalid byte length");
+    }
+    std::uint32_t index = 0;
+    if (!required_u32(payload, "index", index)) {
+      return fail("setVertexBytes is missing index");
     }
 
     [encoder setVertexBytes:bytes.data()
-                     length:static_cast<NSUInteger>(nested.value("length", static_cast<std::uint64_t>(bytes.size())))
-                    atIndex:static_cast<NSUInteger>(payload.value("index", 0u))];
+                     length:static_cast<NSUInteger>(length)
+                    atIndex:static_cast<NSUInteger>(index)];
     return true;
   }
 
@@ -1679,34 +2398,105 @@ private:
     if (encoder == nil) {
       return fail("setVertexBufferOffset references missing encoder");
     }
-    [encoder setVertexBufferOffset:static_cast<NSUInteger>(payload.value("offset", 0ull))
-                           atIndex:static_cast<NSUInteger>(payload.value("index", 0u))];
+    std::uint64_t offset = 0;
+    std::uint32_t index = 0;
+    if (!required_u64(payload, "offset", offset) ||
+        !required_u32(payload, "index", index)) {
+      return fail("setVertexBufferOffset is missing offset or index");
+    }
+    [encoder setVertexBufferOffset:static_cast<NSUInteger>(offset)
+                           atIndex:static_cast<NSUInteger>(index)];
     record_buffer_offset(render_vertex_buffer_bindings_[encoder_id], payload);
+    return true;
+  }
+
+  bool set_vertex_texture(std::uint64_t encoder_id, const json &payload)
+  {
+    id<MTLRenderCommandEncoder> encoder = render_encoder_for_id(encoder_id);
+    std::uint64_t texture_id = 0;
+    std::uint32_t index = 0;
+    if (!required_u64(payload, "texture_id", texture_id) ||
+        !required_u32(payload, "index", index)) {
+      return fail("setVertexTexture is missing texture_id or index");
+    }
+    id<MTLTexture> texture = texture_for_id(texture_id);
+    if (encoder == nil || (texture_id != 0 && texture == nil)) {
+      return fail("setVertexTexture references missing encoder or texture");
+    }
+    [encoder setVertexTexture:texture atIndex:static_cast<NSUInteger>(index)];
+    return true;
+  }
+
+  bool set_vertex_sampler_state(std::uint64_t encoder_id, const json &payload)
+  {
+    id<MTLRenderCommandEncoder> encoder = render_encoder_for_id(encoder_id);
+    std::uint64_t sampler_state_id = 0;
+    std::uint32_t index = 0;
+    if (!required_u64(payload, "sampler_state_id", sampler_state_id) ||
+        !required_u32(payload, "index", index)) {
+      return fail("setVertexSamplerState is missing sampler_state_id or index");
+    }
+    id<MTLSamplerState> sampler = sampler_for_id(sampler_state_id);
+    if (encoder == nil || (sampler_state_id != 0 && sampler == nil)) {
+      return fail("setVertexSamplerState references missing encoder or sampler");
+    }
+    [encoder setVertexSamplerState:sampler atIndex:static_cast<NSUInteger>(index)];
     return true;
   }
 
   bool set_fragment_texture(std::uint64_t encoder_id, const json &payload)
   {
     id<MTLRenderCommandEncoder> encoder = render_encoder_for_id(encoder_id);
-    id<MTLTexture> texture = texture_for_id(payload.value("texture_id", 0ull));
-    if (encoder == nil || texture == nil) {
+    std::uint64_t texture_id = 0;
+    std::uint32_t index = 0;
+    if (!required_u64(payload, "texture_id", texture_id) ||
+        !required_u32(payload, "index", index)) {
+      return fail("setFragmentTexture is missing texture_id or index");
+    }
+    id<MTLTexture> texture = texture_for_id(texture_id);
+    if (encoder == nil || (texture_id != 0 && texture == nil)) {
       return fail("setFragmentTexture references missing encoder or texture");
     }
-    [encoder setFragmentTexture:texture atIndex:static_cast<NSUInteger>(payload.value("index", 0u))];
+    [encoder setFragmentTexture:texture atIndex:static_cast<NSUInteger>(index)];
     return true;
   }
 
   bool set_fragment_buffer(std::uint64_t encoder_id, const json &payload)
   {
     id<MTLRenderCommandEncoder> encoder = render_encoder_for_id(encoder_id);
-    id<MTLBuffer> buffer = buffer_for_id(payload.value("buffer_id", 0ull));
-    if (encoder == nil || buffer == nil) {
+    std::uint64_t buffer_id = 0;
+    std::uint64_t offset = 0;
+    std::uint32_t index = 0;
+    if (!required_u64(payload, "buffer_id", buffer_id) ||
+        !required_u64(payload, "offset", offset) ||
+        !required_u32(payload, "index", index)) {
+      return fail("setFragmentBuffer is missing buffer_id, offset, or index");
+    }
+    id<MTLBuffer> buffer = buffer_for_id(buffer_id);
+    if (encoder == nil || (buffer_id != 0 && buffer == nil)) {
       return fail("setFragmentBuffer references missing encoder or buffer");
     }
     [encoder setFragmentBuffer:buffer
-                        offset:static_cast<NSUInteger>(payload.value("offset", 0ull))
-                       atIndex:static_cast<NSUInteger>(payload.value("index", 0u))];
+                        offset:static_cast<NSUInteger>(offset)
+                       atIndex:static_cast<NSUInteger>(index)];
     record_buffer_binding(render_fragment_buffer_bindings_[encoder_id], payload);
+    return true;
+  }
+
+  bool set_fragment_sampler_state(std::uint64_t encoder_id, const json &payload)
+  {
+    id<MTLRenderCommandEncoder> encoder = render_encoder_for_id(encoder_id);
+    std::uint64_t sampler_state_id = 0;
+    std::uint32_t index = 0;
+    if (!required_u64(payload, "sampler_state_id", sampler_state_id) ||
+        !required_u32(payload, "index", index)) {
+      return fail("setFragmentSamplerState is missing sampler_state_id or index");
+    }
+    id<MTLSamplerState> sampler = sampler_for_id(sampler_state_id);
+    if (encoder == nil || (sampler_state_id != 0 && sampler == nil)) {
+      return fail("setFragmentSamplerState references missing encoder or sampler");
+    }
+    [encoder setFragmentSamplerState:sampler atIndex:static_cast<NSUInteger>(index)];
     return true;
   }
 
@@ -1720,12 +2510,23 @@ private:
     const auto nested = parse_nested_json(payload, "payload");
     const auto bytes = bytes_from_json_array(nested, "bytes");
     if (bytes.empty()) {
-      return true;
+      return fail("setFragmentBytes is missing captured bytes");
+    }
+    std::uint64_t length = 0;
+    if (!required_u64(nested, "length", length)) {
+      return fail("setFragmentBytes is missing length");
+    }
+    if (length == 0 || length > bytes.size()) {
+      return fail("setFragmentBytes has invalid byte length");
+    }
+    std::uint32_t index = 0;
+    if (!required_u32(payload, "index", index)) {
+      return fail("setFragmentBytes is missing index");
     }
 
     [encoder setFragmentBytes:bytes.data()
-                       length:static_cast<NSUInteger>(nested.value("length", static_cast<std::uint64_t>(bytes.size())))
-                      atIndex:static_cast<NSUInteger>(payload.value("index", 0u))];
+                       length:static_cast<NSUInteger>(length)
+                      atIndex:static_cast<NSUInteger>(index)];
     return true;
   }
 
@@ -1735,15 +2536,68 @@ private:
     if (encoder == nil) {
       return fail("setFragmentBufferOffset references missing encoder");
     }
-    [encoder setFragmentBufferOffset:static_cast<NSUInteger>(payload.value("offset", 0ull))
-                             atIndex:static_cast<NSUInteger>(payload.value("index", 0u))];
+    std::uint64_t offset = 0;
+    std::uint32_t index = 0;
+    if (!required_u64(payload, "offset", offset) ||
+        !required_u32(payload, "index", index)) {
+      return fail("setFragmentBufferOffset is missing offset or index");
+    }
+    [encoder setFragmentBufferOffset:static_cast<NSUInteger>(offset)
+                             atIndex:static_cast<NSUInteger>(index)];
     record_buffer_offset(render_fragment_buffer_bindings_[encoder_id], payload);
+    return true;
+  }
+
+  bool set_cull_mode(std::uint64_t encoder_id, const json &payload)
+  {
+    id<MTLRenderCommandEncoder> encoder = render_encoder_for_id(encoder_id);
+    if (encoder == nil) {
+      return fail("setCullMode references missing encoder");
+    }
+    const auto it = payload.find("cull_mode");
+    if (it == payload.end() || !it->is_number()) {
+      return fail("setCullMode is missing cull_mode");
+    }
+    [encoder setCullMode:static_cast<MTLCullMode>(it->get<std::uint32_t>())];
+    return true;
+  }
+
+  bool set_front_facing_winding(std::uint64_t encoder_id, const json &payload)
+  {
+    id<MTLRenderCommandEncoder> encoder = render_encoder_for_id(encoder_id);
+    if (encoder == nil) {
+      return fail("setFrontFacingWinding references missing encoder");
+    }
+    const auto it = payload.find("winding");
+    if (it == payload.end() || !it->is_number()) {
+      return fail("setFrontFacingWinding is missing winding");
+    }
+    [encoder setFrontFacingWinding:static_cast<MTLWinding>(it->get<std::uint32_t>())];
+    return true;
+  }
+
+  bool set_triangle_fill_mode(std::uint64_t encoder_id, const json &payload)
+  {
+    id<MTLRenderCommandEncoder> encoder = render_encoder_for_id(encoder_id);
+    if (encoder == nil) {
+      return fail("setTriangleFillMode references missing encoder");
+    }
+    const auto it = payload.find("fill_mode");
+    if (it == payload.end() || !it->is_number()) {
+      return fail("setTriangleFillMode is missing fill_mode");
+    }
+    [encoder setTriangleFillMode:static_cast<MTLTriangleFillMode>(it->get<std::uint32_t>())];
     return true;
   }
 
   bool use_resource(std::uint64_t encoder_id, const json &payload)
   {
-    const auto resource_id = payload.value("resource_id", 0ull);
+    std::uint64_t resource_id = 0;
+    std::uint32_t usage_value = 0;
+    if (!required_u64(payload, "resource_id", resource_id) ||
+        !required_u32(payload, "usage", usage_value)) {
+      return fail("useResource is missing resource_id or usage");
+    }
     id<MTLResource> resource = resource_for_id(resource_id);
     ActiveResource active_resource;
     const auto buffer_state_it = buffer_states_.find(resource_id);
@@ -1772,15 +2626,19 @@ private:
     }
 
     if (resource == nil) {
-      return true;
+      return fail("useResource references missing resource");
     }
 
-    const auto usage = static_cast<MTLResourceUsage>(payload.value("usage", 1u));
+    const auto usage = static_cast<MTLResourceUsage>(usage_value);
     id<MTLRenderCommandEncoder> render_encoder = render_encoder_for_id(encoder_id);
     if (render_encoder != nil) {
+      std::uint32_t stages = 0;
+      if (!required_u32(payload, "stages", stages)) {
+        return fail("useResource is missing stages");
+      }
       [render_encoder useResource:resource
                             usage:usage
-                           stages:static_cast<MTLRenderStages>(payload.value("stages", 0u))];
+                           stages:static_cast<MTLRenderStages>(stages)];
       return true;
     }
 
@@ -1790,6 +2648,203 @@ private:
       return true;
     }
 
+    return fail("useResource references missing encoder");
+  }
+
+  bool use_resources(std::uint64_t encoder_id, const json &payload)
+  {
+    const auto resources = payload.find("resource_ids");
+    if (resources == payload.end() || !resources->is_array()) {
+      return fail("useResources is missing resource_ids");
+    }
+    for (const auto &resource_id : *resources) {
+      if (!resource_id.is_number_unsigned() && !resource_id.is_number_integer()) {
+        return fail("useResources has invalid resource id");
+      }
+      json single = payload;
+      single["resource_id"] = resource_id.get<std::uint64_t>();
+      if (!use_resource(encoder_id, single)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool memory_barrier(std::uint64_t encoder_id, const json &payload)
+  {
+    const json barrier = parse_nested_json(payload, "payload");
+    std::uint32_t scope_value = 0;
+    std::uint32_t stages_before = 0;
+    std::uint32_t stages_after = 0;
+    if (!required_u32(barrier, "scope", scope_value) ||
+        !required_u32(barrier, "stages_before", stages_before) ||
+        !required_u32(barrier, "stages_after", stages_after)) {
+      return fail("memoryBarrier is missing scope, stages_before, or stages_after");
+    }
+    const auto scope = static_cast<MTLBarrierScope>(scope_value);
+
+    id<MTLRenderCommandEncoder> render_encoder = render_encoder_for_id(encoder_id);
+    if (render_encoder != nil) {
+      [render_encoder memoryBarrierWithScope:scope
+                                 afterStages:static_cast<MTLRenderStages>(stages_before)
+                                beforeStages:static_cast<MTLRenderStages>(stages_after)];
+      return true;
+    }
+
+    id<MTLComputeCommandEncoder> compute_encoder = compute_encoder_for_id(encoder_id);
+    if (compute_encoder != nil) {
+      [compute_encoder memoryBarrierWithScope:scope];
+      return true;
+    }
+
+    return fail("memoryBarrier references missing encoder");
+  }
+
+  bool update_fence(std::uint64_t encoder_id, const json &payload)
+  {
+    std::uint64_t fence_id = 0;
+    std::uint32_t stages = 0;
+    if (!required_u64(payload, "fence_id", fence_id) ||
+        !required_u32(payload, "stages", stages)) {
+      return fail("updateFence is missing fence_id or stages");
+    }
+    id<MTLFence> fence = fence_for_id(fence_id);
+    if (fence == nil) {
+      return fail("updateFence references missing fence");
+    }
+
+    id<MTLRenderCommandEncoder> render_encoder = render_encoder_for_id(encoder_id);
+    if (render_encoder != nil) {
+      [render_encoder updateFence:fence
+                      afterStages:static_cast<MTLRenderStages>(stages)];
+      return true;
+    }
+
+    id<MTLComputeCommandEncoder> compute_encoder = compute_encoder_for_id(encoder_id);
+    if (compute_encoder != nil) {
+      [compute_encoder updateFence:fence];
+      return true;
+    }
+
+    id<MTLBlitCommandEncoder> blit_encoder = blit_encoder_for_id(encoder_id);
+    if (blit_encoder != nil) {
+      [blit_encoder updateFence:fence];
+      return true;
+    }
+
+    return fail("updateFence references missing encoder");
+  }
+
+  bool wait_for_fence(std::uint64_t encoder_id, const json &payload)
+  {
+    std::uint64_t fence_id = 0;
+    std::uint32_t stages = 0;
+    if (!required_u64(payload, "fence_id", fence_id) ||
+        !required_u32(payload, "stages", stages)) {
+      return fail("waitForFence is missing fence_id or stages");
+    }
+    id<MTLFence> fence = fence_for_id(fence_id);
+    if (fence == nil) {
+      return fail("waitForFence references missing fence");
+    }
+
+    id<MTLRenderCommandEncoder> render_encoder = render_encoder_for_id(encoder_id);
+    if (render_encoder != nil) {
+      [render_encoder waitForFence:fence
+                       beforeStages:static_cast<MTLRenderStages>(stages)];
+      return true;
+    }
+
+    id<MTLComputeCommandEncoder> compute_encoder = compute_encoder_for_id(encoder_id);
+    if (compute_encoder != nil) {
+      [compute_encoder waitForFence:fence];
+      return true;
+    }
+
+    id<MTLBlitCommandEncoder> blit_encoder = blit_encoder_for_id(encoder_id);
+    if (blit_encoder != nil) {
+      [blit_encoder waitForFence:fence];
+      return true;
+    }
+
+    return fail("waitForFence references missing encoder");
+  }
+
+  bool fence_ops(std::uint64_t encoder_id, const json &payload)
+  {
+    const auto ops = payload.find("ops");
+    if (ops == payload.end() || !ops->is_array() || ops->empty()) {
+      return fail("fenceOps is missing ops");
+    }
+
+    for (const auto &op : *ops) {
+      if (!op.is_array() || op.size() < 3 || !op[0].is_string() ||
+          (!op[1].is_number_unsigned() && !op[1].is_number_integer()) ||
+          (!op[2].is_number_unsigned() && !op[2].is_number_integer())) {
+        return fail("fenceOps has invalid op");
+      }
+      json single{{"fence_id", op[1].get<std::uint64_t>()}, {"stages", op[2].get<std::uint32_t>()}};
+      if (op[0].get_ref<const std::string &>() == "update") {
+        if (!update_fence(encoder_id, single)) {
+          return false;
+        }
+      } else if (op[0].get_ref<const std::string &>() == "wait") {
+        if (!wait_for_fence(encoder_id, single)) {
+          return false;
+        }
+      } else {
+        return fail("fenceOps has unsupported op " + op[0].get<std::string>());
+      }
+    }
+    return true;
+  }
+
+  bool push_debug_group(std::uint64_t object_id, const json &payload)
+  {
+    NSString *label = [NSString stringWithUTF8String:payload.value("label", std::string()).c_str()];
+    id<MTLRenderCommandEncoder> render_encoder = render_encoder_for_id(object_id);
+    if (render_encoder != nil) {
+      [render_encoder pushDebugGroup:label];
+      return true;
+    }
+    id<MTLComputeCommandEncoder> compute_encoder = compute_encoder_for_id(object_id);
+    if (compute_encoder != nil) {
+      [compute_encoder pushDebugGroup:label];
+      return true;
+    }
+    id<MTLBlitCommandEncoder> blit_encoder = blit_encoder_for_id(object_id);
+    if (blit_encoder != nil) {
+      [blit_encoder pushDebugGroup:label];
+      return true;
+    }
+    id<MTLCommandBuffer> command_buffer = command_buffer_for_id(object_id);
+    if (command_buffer != nil && [command_buffer respondsToSelector:@selector(pushDebugGroup:)]) {
+      [command_buffer pushDebugGroup:label];
+    }
+    return true;
+  }
+
+  bool pop_debug_group(std::uint64_t object_id)
+  {
+    id<MTLRenderCommandEncoder> render_encoder = render_encoder_for_id(object_id);
+    if (render_encoder != nil) {
+      [render_encoder popDebugGroup];
+      return true;
+    }
+    id<MTLComputeCommandEncoder> compute_encoder = compute_encoder_for_id(object_id);
+    if (compute_encoder != nil) {
+      [compute_encoder popDebugGroup];
+      return true;
+    }
+    id<MTLBlitCommandEncoder> blit_encoder = blit_encoder_for_id(object_id);
+    if (blit_encoder != nil) {
+      [blit_encoder popDebugGroup];
+      return true;
+    }
+    id<MTLCommandBuffer> command_buffer = command_buffer_for_id(object_id);
+    if (command_buffer != nil && [command_buffer respondsToSelector:@selector(popDebugGroup)]) {
+      [command_buffer popDebugGroup];
+    }
     return true;
   }
 
@@ -1815,13 +2870,17 @@ private:
 
     const auto it = payload.find("viewports");
     if (it == payload.end() || !it->is_array() || it->empty()) {
-      return true;
+      return fail("setViewport is missing viewports");
     }
 
     std::vector<MTLViewport> viewports;
     viewports.reserve(it->size());
     for (const auto &viewport : *it) {
-      viewports.push_back(viewport_from_json_array(viewport));
+      MTLViewport parsed{};
+      if (!viewport_from_json_array(viewport, parsed)) {
+        return fail("setViewport has invalid viewports");
+      }
+      viewports.push_back(parsed);
     }
     [encoder setViewports:viewports.data() count:viewports.size()];
     return true;
@@ -1841,13 +2900,17 @@ private:
 
     const auto it = payload.find("rects");
     if (it == payload.end() || !it->is_array() || it->empty()) {
-      return true;
+      return fail("setScissorRect is missing rects");
     }
 
     std::vector<MTLScissorRect> rects;
     rects.reserve(it->size());
     for (const auto &rect : *it) {
-      rects.push_back(scissor_from_json_array(rect));
+      MTLScissorRect parsed{};
+      if (!scissor_from_json_array(rect, parsed)) {
+        return fail("setScissorRect has invalid rects");
+      }
+      rects.push_back(parsed);
     }
     [encoder setScissorRects:rects.data() count:rects.size()];
     return true;
@@ -1859,13 +2922,29 @@ private:
     if (encoder == nil) {
       return fail("set rasterizer state references missing encoder");
     }
-    [encoder setTriangleFillMode:static_cast<MTLTriangleFillMode>(payload.value("fill_mode", 0u))];
-    [encoder setCullMode:static_cast<MTLCullMode>(payload.value("cull_mode", 0u))];
-    [encoder setDepthClipMode:static_cast<MTLDepthClipMode>(payload.value("depth_clip_mode", 0u))];
-    [encoder setDepthBias:payload.value("depth_bias", 0.0f)
-               slopeScale:payload.value("slope_scale", 0.0f)
-                    clamp:payload.value("depth_bias_clamp", 0.0f)];
-    [encoder setFrontFacingWinding:static_cast<MTLWinding>(payload.value("winding", 0u))];
+    const auto require_number = [&](const char *field) -> bool {
+      const auto it = payload.find(field);
+      if (it == payload.end() || !it->is_number()) {
+        return fail(std::string("dxmt_set_rasterizer_state is missing ") + field);
+      }
+      return true;
+    };
+    if (!require_number("fill_mode") ||
+        !require_number("cull_mode") ||
+        !require_number("depth_clip_mode") ||
+        !require_number("depth_bias") ||
+        !require_number("slope_scale") ||
+        !require_number("depth_bias_clamp") ||
+        !require_number("winding")) {
+      return false;
+    }
+    [encoder setTriangleFillMode:static_cast<MTLTriangleFillMode>(payload["fill_mode"].get<std::uint32_t>())];
+    [encoder setCullMode:static_cast<MTLCullMode>(payload["cull_mode"].get<std::uint32_t>())];
+    [encoder setDepthClipMode:static_cast<MTLDepthClipMode>(payload["depth_clip_mode"].get<std::uint32_t>())];
+    [encoder setDepthBias:payload["depth_bias"].get<float>()
+               slopeScale:payload["slope_scale"].get<float>()
+                    clamp:payload["depth_bias_clamp"].get<float>()];
+    [encoder setFrontFacingWinding:static_cast<MTLWinding>(payload["winding"].get<std::uint32_t>())];
     return true;
   }
 
@@ -1875,12 +2954,21 @@ private:
     if (encoder == nil) {
       return fail("set depth stencil state references missing encoder");
     }
+    const auto depth_stencil_field = payload.find("depth_stencil_state_id");
+    if (depth_stencil_field == payload.end() ||
+        (!depth_stencil_field->is_number_unsigned() && !depth_stencil_field->is_number_integer())) {
+      return fail("dxmt_set_depth_stencil_state is missing depth_stencil_state_id");
+    }
     id<MTLDepthStencilState> state =
-        depth_stencil_state_for_id(payload.value("depth_stencil_state_id", 0ull));
+        depth_stencil_state_for_id(depth_stencil_field->get<std::uint64_t>());
     if (state != nil) {
       [encoder setDepthStencilState:state];
     }
-    [encoder setStencilReferenceValue:static_cast<std::uint32_t>(payload.value("stencil_ref", 0u))];
+    const auto stencil_ref = payload.find("stencil_ref");
+    if (stencil_ref == payload.end() || !stencil_ref->is_number()) {
+      return fail("dxmt_set_depth_stencil_state is missing stencil_ref");
+    }
+    [encoder setStencilReferenceValue:static_cast<std::uint32_t>(stencil_ref->get<std::uint32_t>())];
     return true;
   }
 
@@ -1890,18 +2978,36 @@ private:
     if (encoder == nil) {
       return fail("set blend factor references missing encoder");
     }
-    [encoder setBlendColorRed:payload.value("red", 0.0f)
-                        green:payload.value("green", 0.0f)
-                         blue:payload.value("blue", 0.0f)
-                        alpha:payload.value("alpha", 0.0f)];
-    [encoder setStencilReferenceValue:static_cast<std::uint32_t>(payload.value("stencil_ref", 0u))];
+    const auto require_number = [&](const char *field) -> bool {
+      const auto it = payload.find(field);
+      if (it == payload.end() || !it->is_number()) {
+        return fail(std::string("dxmt_set_blend_factor is missing ") + field);
+      }
+      return true;
+    };
+    if (!require_number("red") ||
+        !require_number("green") ||
+        !require_number("blue") ||
+        !require_number("alpha") ||
+        !require_number("stencil_ref")) {
+      return false;
+    }
+    [encoder setBlendColorRed:payload["red"].get<float>()
+                        green:payload["green"].get<float>()
+                         blue:payload["blue"].get<float>()
+                        alpha:payload["alpha"].get<float>()];
+    [encoder setStencilReferenceValue:static_cast<std::uint32_t>(payload["stencil_ref"].get<std::uint32_t>())];
     return true;
   }
 
   bool set_compute_pipeline_state(std::uint64_t encoder_id, const json &payload)
   {
     id<MTLComputeCommandEncoder> encoder = compute_encoder_for_id(encoder_id);
-    id<MTLComputePipelineState> pipeline = compute_pipeline_for_id(payload.value("pipeline_state_id", 0ull));
+    std::uint64_t pipeline_state_id = 0;
+    if (!required_u64(payload, "pipeline_state_id", pipeline_state_id)) {
+      return fail("setComputePipelineState is missing pipeline_state_id");
+    }
+    id<MTLComputePipelineState> pipeline = compute_pipeline_for_id(pipeline_state_id);
     if (encoder == nil || pipeline == nil) {
       return fail("setComputePipelineState references missing encoder or pipeline");
     }
@@ -1912,13 +3018,21 @@ private:
   bool set_compute_buffer(std::uint64_t encoder_id, const json &payload)
   {
     id<MTLComputeCommandEncoder> encoder = compute_encoder_for_id(encoder_id);
-    id<MTLBuffer> buffer = buffer_for_id(payload.value("buffer_id", 0ull));
-    if (encoder == nil || buffer == nil) {
+    std::uint64_t buffer_id = 0;
+    std::uint64_t offset = 0;
+    std::uint32_t index = 0;
+    if (!required_u64(payload, "buffer_id", buffer_id) ||
+        !required_u64(payload, "offset", offset) ||
+        !required_u32(payload, "index", index)) {
+      return fail("setComputeBuffer is missing buffer_id, offset, or index");
+    }
+    id<MTLBuffer> buffer = buffer_for_id(buffer_id);
+    if (encoder == nil || (buffer_id != 0 && buffer == nil)) {
       return fail("setComputeBuffer references missing encoder or buffer");
     }
     [encoder setBuffer:buffer
-                offset:static_cast<NSUInteger>(payload.value("offset", 0ull))
-               atIndex:static_cast<NSUInteger>(payload.value("index", 0u))];
+                offset:static_cast<NSUInteger>(offset)
+               atIndex:static_cast<NSUInteger>(index)];
     record_buffer_binding(compute_buffer_bindings_[encoder_id], payload);
     return true;
   }
@@ -1929,9 +3043,70 @@ private:
     if (encoder == nil) {
       return fail("setComputeBufferOffset references missing compute encoder");
     }
-    [encoder setBufferOffset:static_cast<NSUInteger>(payload.value("offset", 0ull))
-                     atIndex:static_cast<NSUInteger>(payload.value("index", 0u))];
+    std::uint64_t offset = 0;
+    std::uint32_t index = 0;
+    if (!required_u64(payload, "offset", offset) ||
+        !required_u32(payload, "index", index)) {
+      return fail("setComputeBufferOffset is missing offset or index");
+    }
+    [encoder setBufferOffset:static_cast<NSUInteger>(offset)
+                     atIndex:static_cast<NSUInteger>(index)];
     record_buffer_offset(compute_buffer_bindings_[encoder_id], payload);
+    return true;
+  }
+
+  bool set_compute_texture(std::uint64_t encoder_id, const json &payload)
+  {
+    id<MTLComputeCommandEncoder> encoder = compute_encoder_for_id(encoder_id);
+    std::uint64_t texture_id = 0;
+    std::uint32_t index = 0;
+    if (!required_u64(payload, "texture_id", texture_id) ||
+        !required_u32(payload, "index", index)) {
+      return fail("setComputeTexture is missing texture_id or index");
+    }
+    id<MTLTexture> texture = texture_for_id(texture_id);
+    if (encoder == nil || (texture_id != 0 && texture == nil)) {
+      return fail("setComputeTexture references missing encoder or texture");
+    }
+    [encoder setTexture:texture atIndex:static_cast<NSUInteger>(index)];
+    return true;
+  }
+
+  bool set_compute_sampler_state(std::uint64_t encoder_id, const json &payload)
+  {
+    id<MTLComputeCommandEncoder> encoder = compute_encoder_for_id(encoder_id);
+    std::uint64_t sampler_state_id = 0;
+    std::uint32_t index = 0;
+    if (!required_u64(payload, "sampler_state_id", sampler_state_id) ||
+        !required_u32(payload, "index", index)) {
+      return fail("setComputeSamplerState is missing sampler_state_id or index");
+    }
+    id<MTLSamplerState> sampler = sampler_for_id(sampler_state_id);
+    if (encoder == nil || (sampler_state_id != 0 && sampler == nil)) {
+      return fail("setComputeSamplerState references missing encoder or sampler");
+    }
+    [encoder setSamplerState:sampler atIndex:static_cast<NSUInteger>(index)];
+    return true;
+  }
+
+  bool encoder_state(std::uint64_t encoder_id, const json &payload)
+  {
+    const auto kind = payload.value("kind", std::string());
+    if (kind == "dxmt_set_rasterizer_state") {
+      return set_rasterizer_state(encoder_id, payload);
+    }
+    if (kind == "dxmt_set_depth_stencil_state") {
+      return set_depth_stencil_state(encoder_id, payload);
+    }
+    if (kind == "dxmt_set_blend_factor") {
+      return set_blend_factor(encoder_id, payload);
+    }
+    if (kind == "dxmt_set_viewports") {
+      return set_viewports(encoder_id, payload);
+    }
+    if (kind == "dxmt_set_scissor_rects") {
+      return set_scissor_rects(encoder_id, payload);
+    }
     return true;
   }
 
@@ -1941,12 +3116,28 @@ private:
     if (encoder == nil) {
       return fail("drawPrimitives references missing render encoder");
     }
+    std::uint32_t primitive_type = 0;
+    std::uint32_t vertex_start = 0;
+    std::uint32_t vertex_count = 0;
+    std::uint32_t instance_count = 0;
+    std::uint32_t base_instance = 0;
+    if (!required_u32(payload, "primitive_type", primitive_type) ||
+        !required_u32(payload, "vertex_start", vertex_start) ||
+        !required_u32(payload, "vertex_count", vertex_count) ||
+        !required_u32(payload, "instance_count", instance_count) ||
+        !required_u32(payload, "base_instance", base_instance)) {
+      return fail("drawPrimitives is missing replay metadata");
+    }
+    MTLPrimitiveType mtl_primitive_type = MTLPrimitiveTypePoint;
+    if (!primitive_type_from_integer(primitive_type, mtl_primitive_type)) {
+      return fail("drawPrimitives has invalid primitive_type");
+    }
     patch_render_bound_buffers(encoder_id);
-    [encoder drawPrimitives:primitive_type_from_integer(payload.value("primitive_type", 0u))
-                vertexStart:static_cast<NSUInteger>(payload.value("vertex_start", 0u))
-                vertexCount:static_cast<NSUInteger>(payload.value("vertex_count", 0u))
-              instanceCount:static_cast<NSUInteger>(payload.value("instance_count", 1u))
-               baseInstance:static_cast<NSUInteger>(payload.value("base_instance", 0u))];
+    [encoder drawPrimitives:mtl_primitive_type
+                vertexStart:static_cast<NSUInteger>(vertex_start)
+                vertexCount:static_cast<NSUInteger>(vertex_count)
+              instanceCount:static_cast<NSUInteger>(instance_count)
+               baseInstance:static_cast<NSUInteger>(base_instance)];
     finish_draw_scope(encoder_id);
     return true;
   }
@@ -1954,19 +3145,43 @@ private:
   bool draw_indexed_primitives(std::uint64_t encoder_id, const json &payload)
   {
     id<MTLRenderCommandEncoder> encoder = render_encoder_for_id(encoder_id);
-    id<MTLBuffer> index_buffer = buffer_for_id(payload.value("index_buffer_id", 0ull));
+    std::uint64_t index_buffer_id = 0;
+    std::uint64_t index_buffer_offset = 0;
+    std::uint32_t primitive_type = 0;
+    std::uint32_t index_count = 0;
+    std::uint32_t index_type = 0;
+    std::uint32_t instance_count = 0;
+    std::int32_t base_vertex = 0;
+    std::uint32_t base_instance = 0;
+    if (!required_u64(payload, "index_buffer_id", index_buffer_id) ||
+        !required_u64(payload, "index_buffer_offset", index_buffer_offset) ||
+        !required_u32(payload, "primitive_type", primitive_type) ||
+        !required_u32(payload, "index_count", index_count) ||
+        !required_u32(payload, "index_type", index_type) ||
+        !required_u32(payload, "instance_count", instance_count) ||
+        !required_i32(payload, "base_vertex", base_vertex) ||
+        !required_u32(payload, "base_instance", base_instance)) {
+      return fail("drawIndexedPrimitives is missing replay metadata");
+    }
+    id<MTLBuffer> index_buffer = buffer_for_id(index_buffer_id);
     if (encoder == nil || index_buffer == nil) {
       return fail("drawIndexedPrimitives references missing encoder or index buffer");
     }
+    MTLPrimitiveType mtl_primitive_type = MTLPrimitiveTypePoint;
+    MTLIndexType mtl_index_type = MTLIndexTypeUInt16;
+    if (!primitive_type_from_integer(primitive_type, mtl_primitive_type) ||
+        !index_type_from_integer(index_type, mtl_index_type)) {
+      return fail("drawIndexedPrimitives has invalid replay enum metadata");
+    }
     patch_render_bound_buffers(encoder_id);
-    [encoder drawIndexedPrimitives:primitive_type_from_integer(payload.value("primitive_type", 0u))
-                         indexCount:static_cast<NSUInteger>(payload.value("index_count", 0u))
-                          indexType:index_type_from_integer(payload.value("index_type", 0u))
+    [encoder drawIndexedPrimitives:mtl_primitive_type
+                         indexCount:static_cast<NSUInteger>(index_count)
+                          indexType:mtl_index_type
                         indexBuffer:index_buffer
-                  indexBufferOffset:static_cast<NSUInteger>(payload.value("index_buffer_offset", 0ull))
-                      instanceCount:static_cast<NSUInteger>(payload.value("instance_count", 1u))
-                         baseVertex:payload.value("base_vertex", 0)
-                       baseInstance:static_cast<NSUInteger>(payload.value("base_instance", 0u))];
+                  indexBufferOffset:static_cast<NSUInteger>(index_buffer_offset)
+                      instanceCount:static_cast<NSUInteger>(instance_count)
+                         baseVertex:base_vertex
+                       baseInstance:static_cast<NSUInteger>(base_instance)];
     finish_draw_scope(encoder_id);
     return true;
   }
@@ -1974,14 +3189,65 @@ private:
   bool draw_primitives_indirect(std::uint64_t encoder_id, const json &payload)
   {
     id<MTLRenderCommandEncoder> encoder = render_encoder_for_id(encoder_id);
-    id<MTLBuffer> indirect_buffer = buffer_for_id(payload.value("indirect_buffer_id", 0ull));
+    std::uint64_t indirect_buffer_id = 0;
+    std::uint64_t indirect_buffer_offset = 0;
+    std::uint32_t primitive_type = 0;
+    if (!required_u64(payload, "indirect_buffer_id", indirect_buffer_id) ||
+        !required_u64(payload, "indirect_buffer_offset", indirect_buffer_offset) ||
+        !required_u32(payload, "primitive_type", primitive_type)) {
+      return fail("drawPrimitivesIndirect is missing replay metadata");
+    }
+    id<MTLBuffer> indirect_buffer = buffer_for_id(indirect_buffer_id);
     if (encoder == nil || indirect_buffer == nil) {
       return fail("drawPrimitivesIndirect references missing encoder or indirect buffer");
     }
+    MTLPrimitiveType mtl_primitive_type = MTLPrimitiveTypePoint;
+    if (!primitive_type_from_integer(primitive_type, mtl_primitive_type)) {
+      return fail("drawPrimitivesIndirect has invalid primitive_type");
+    }
     patch_render_bound_buffers(encoder_id);
-    [encoder drawPrimitives:primitive_type_from_integer(payload.value("primitive_type", 0u))
+    [encoder drawPrimitives:mtl_primitive_type
              indirectBuffer:indirect_buffer
-       indirectBufferOffset:static_cast<NSUInteger>(payload.value("indirect_buffer_offset", 0ull))];
+       indirectBufferOffset:static_cast<NSUInteger>(indirect_buffer_offset)];
+    finish_draw_scope(encoder_id);
+    return true;
+  }
+
+  bool draw_indexed_primitives_indirect(std::uint64_t encoder_id, const json &payload)
+  {
+    id<MTLRenderCommandEncoder> encoder = render_encoder_for_id(encoder_id);
+    std::uint64_t index_buffer_id = 0;
+    std::uint64_t indirect_buffer_id = 0;
+    std::uint64_t index_buffer_offset = 0;
+    std::uint64_t indirect_buffer_offset = 0;
+    std::uint32_t primitive_type = 0;
+    std::uint32_t index_type = 0;
+    if (!required_u64(payload, "index_buffer_id", index_buffer_id) ||
+        !required_u64(payload, "indirect_buffer_id", indirect_buffer_id) ||
+        !required_u64(payload, "index_buffer_offset", index_buffer_offset) ||
+        !required_u64(payload, "indirect_buffer_offset", indirect_buffer_offset) ||
+        !required_u32(payload, "primitive_type", primitive_type) ||
+        !required_u32(payload, "index_type", index_type)) {
+      return fail("drawIndexedPrimitivesIndirect is missing replay metadata");
+    }
+    id<MTLBuffer> index_buffer = buffer_for_id(index_buffer_id);
+    id<MTLBuffer> indirect_buffer = buffer_for_id(indirect_buffer_id);
+    if (encoder == nil || index_buffer == nil || indirect_buffer == nil) {
+      return fail("drawIndexedPrimitivesIndirect references missing encoder or buffers");
+    }
+    MTLPrimitiveType mtl_primitive_type = MTLPrimitiveTypePoint;
+    MTLIndexType mtl_index_type = MTLIndexTypeUInt16;
+    if (!primitive_type_from_integer(primitive_type, mtl_primitive_type) ||
+        !index_type_from_integer(index_type, mtl_index_type)) {
+      return fail("drawIndexedPrimitivesIndirect has invalid replay enum metadata");
+    }
+    patch_render_bound_buffers(encoder_id);
+    [encoder drawIndexedPrimitives:mtl_primitive_type
+                         indexType:mtl_index_type
+                       indexBuffer:index_buffer
+                 indexBufferOffset:static_cast<NSUInteger>(index_buffer_offset)
+                    indirectBuffer:indirect_buffer
+              indirectBufferOffset:static_cast<NSUInteger>(indirect_buffer_offset)];
     finish_draw_scope(encoder_id);
     return true;
   }
@@ -1992,23 +3258,49 @@ private:
     if (encoder == nil) {
       return fail("dispatchThreadgroups references missing compute encoder");
     }
+    std::uint32_t tgx = 0;
+    std::uint32_t tgy = 0;
+    std::uint32_t tgz = 0;
+    std::uint32_t tx = 0;
+    std::uint32_t ty = 0;
+    std::uint32_t tz = 0;
+    if (!required_u32(payload, "tgx", tgx) ||
+        !required_u32(payload, "tgy", tgy) ||
+        !required_u32(payload, "tgz", tgz) ||
+        !required_u32(payload, "tx", tx) ||
+        !required_u32(payload, "ty", ty) ||
+        !required_u32(payload, "tz", tz)) {
+      return fail("dispatchThreadgroups is missing replay metadata");
+    }
     patch_compute_bound_buffers(encoder_id);
-    [encoder dispatchThreadgroups:MTLSizeMake(payload.value("tgx", 1u), payload.value("tgy", 1u), payload.value("tgz", 1u))
-          threadsPerThreadgroup:MTLSizeMake(payload.value("tx", 1u), payload.value("ty", 1u), payload.value("tz", 1u))];
+    [encoder dispatchThreadgroups:MTLSizeMake(tgx, tgy, tgz)
+          threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
     return true;
   }
 
   bool dispatch_threadgroups_indirect(std::uint64_t encoder_id, const json &payload)
   {
     id<MTLComputeCommandEncoder> encoder = compute_encoder_for_id(encoder_id);
-    id<MTLBuffer> indirect_buffer = buffer_for_id(payload.value("indirect_buffer_id", 0ull));
+    std::uint64_t indirect_buffer_id = 0;
+    std::uint64_t indirect_buffer_offset = 0;
+    std::uint32_t tx = 0;
+    std::uint32_t ty = 0;
+    std::uint32_t tz = 0;
+    if (!required_u64(payload, "indirect_buffer_id", indirect_buffer_id) ||
+        !required_u64(payload, "indirect_buffer_offset", indirect_buffer_offset) ||
+        !required_u32(payload, "tx", tx) ||
+        !required_u32(payload, "ty", ty) ||
+        !required_u32(payload, "tz", tz)) {
+      return fail("dispatchThreadgroupsIndirect is missing replay metadata");
+    }
+    id<MTLBuffer> indirect_buffer = buffer_for_id(indirect_buffer_id);
     if (encoder == nil || indirect_buffer == nil) {
       return fail("dispatchThreadgroupsIndirect references missing encoder or indirect buffer");
     }
     patch_compute_bound_buffers(encoder_id);
     [encoder dispatchThreadgroupsWithIndirectBuffer:indirect_buffer
-                               indirectBufferOffset:static_cast<NSUInteger>(payload.value("indirect_buffer_offset", 0ull))
-                              threadsPerThreadgroup:MTLSizeMake(payload.value("tx", 1u), payload.value("ty", 1u), payload.value("tz", 1u))];
+                               indirectBufferOffset:static_cast<NSUInteger>(indirect_buffer_offset)
+                              threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
     return true;
   }
 
@@ -2018,11 +3310,25 @@ private:
     if (encoder == nil) {
       return fail("dispatchThreads references missing compute encoder");
     }
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t depth = 0;
+    std::uint32_t threads_per_group_width = 0;
+    std::uint32_t threads_per_group_height = 0;
+    std::uint32_t threads_per_group_depth = 0;
+    if (!required_u32(payload, "width", width) ||
+        !required_u32(payload, "height", height) ||
+        !required_u32(payload, "depth", depth) ||
+        !required_u32(payload, "threads_per_group_width", threads_per_group_width) ||
+        !required_u32(payload, "threads_per_group_height", threads_per_group_height) ||
+        !required_u32(payload, "threads_per_group_depth", threads_per_group_depth)) {
+      return fail("dispatchThreads is missing replay metadata");
+    }
     patch_compute_bound_buffers(encoder_id);
-    [encoder dispatchThreads:MTLSizeMake(payload.value("width", 1u), payload.value("height", 1u), payload.value("depth", 1u))
-        threadsPerThreadgroup:MTLSizeMake(payload.value("threads_per_group_width", 1u),
-                                          payload.value("threads_per_group_height", 1u),
-                                          payload.value("threads_per_group_depth", 1u))];
+    [encoder dispatchThreads:MTLSizeMake(width, height, depth)
+        threadsPerThreadgroup:MTLSizeMake(threads_per_group_width,
+                                          threads_per_group_height,
+                                          threads_per_group_depth)];
     return true;
   }
 
@@ -2034,87 +3340,247 @@ private:
     }
     const auto bytes = bytes_from_json_array(payload, "bytes");
     if (bytes.empty()) {
-      return true;
+      return fail("setComputeBytes is missing captured bytes");
+    }
+    std::uint64_t length = 0;
+    if (!required_u64(payload, "length", length)) {
+      return fail("setComputeBytes is missing length");
+    }
+    if (length == 0 || length > bytes.size()) {
+      return fail("setComputeBytes has invalid byte length");
+    }
+    std::uint32_t index = 0;
+    if (!required_u32(payload, "index", index)) {
+      return fail("setComputeBytes is missing index");
     }
     [encoder setBytes:bytes.data()
-               length:static_cast<NSUInteger>(payload.value("length", static_cast<std::uint64_t>(bytes.size())))
-              atIndex:static_cast<NSUInteger>(payload.value("index", 0u))];
+               length:static_cast<NSUInteger>(length)
+              atIndex:static_cast<NSUInteger>(index)];
     return true;
   }
 
-  bool copy_buffer(std::uint64_t encoder_id, const json &payload)
+  bool copy_buffer(const trace::MetalEventRecord &event, const json &payload)
   {
+    const auto encoder_id = event.object_id;
     id<MTLBlitCommandEncoder> encoder = blit_encoder_for_id(encoder_id);
-    id<MTLBuffer> source_buffer = buffer_for_id(payload.value("source_buffer_id", 0ull));
-    id<MTLBuffer> destination_buffer = buffer_for_id(payload.value("destination_buffer_id", 0ull));
+    std::uint64_t source_buffer_id = 0;
+    std::uint64_t destination_buffer_id = 0;
+    std::uint64_t source_offset = 0;
+    std::uint64_t destination_offset = 0;
+    std::uint64_t size = 0;
+    if (!required_u64(payload, "source_buffer_id", source_buffer_id) ||
+        !required_u64(payload, "destination_buffer_id", destination_buffer_id) ||
+        !required_u64(payload, "source_offset", source_offset) ||
+        !required_u64(payload, "destination_offset", destination_offset) ||
+        !required_u64(payload, "size", size)) {
+      return fail("copyFromBuffer is missing replay metadata");
+    }
+    id<MTLBuffer> source_buffer = buffer_for_id(source_buffer_id);
+    id<MTLBuffer> destination_buffer = buffer_for_id(destination_buffer_id);
     if (encoder == nil || source_buffer == nil || destination_buffer == nil) {
       return fail("copyFromBuffer references missing encoder or buffers");
     }
+    if (!restore_buffer_range_from_asset(event, source_buffer, payload)) {
+      return false;
+    }
     [encoder copyFromBuffer:source_buffer
-               sourceOffset:static_cast<NSUInteger>(payload.value("source_offset", 0ull))
+               sourceOffset:static_cast<NSUInteger>(source_offset)
                    toBuffer:destination_buffer
-          destinationOffset:static_cast<NSUInteger>(payload.value("destination_offset", 0ull))
-                       size:static_cast<NSUInteger>(payload.value("size", 0ull))];
+          destinationOffset:static_cast<NSUInteger>(destination_offset)
+                       size:static_cast<NSUInteger>(size)];
     return true;
   }
 
   bool copy_texture(std::uint64_t encoder_id, const json &payload)
   {
     id<MTLBlitCommandEncoder> encoder = blit_encoder_for_id(encoder_id);
-    id<MTLTexture> source_texture = texture_for_id(payload.value("source_texture_id", 0ull));
-    id<MTLTexture> destination_texture = texture_for_id(payload.value("destination_texture_id", 0ull));
+    std::uint64_t source_texture_id = 0;
+    std::uint64_t destination_texture_id = 0;
+    if (!required_u64(payload, "source_texture_id", source_texture_id) ||
+        !required_u64(payload, "destination_texture_id", destination_texture_id)) {
+      return fail("copyFromTexture is missing source_texture_id or destination_texture_id");
+    }
+    id<MTLTexture> source_texture = texture_for_id(source_texture_id);
+    id<MTLTexture> destination_texture = texture_for_id(destination_texture_id);
     if (encoder == nil || source_texture == nil || destination_texture == nil) {
       return fail("copyFromTexture references missing encoder or textures");
     }
 
     const auto nested = parse_nested_json(payload, "payload");
+    std::uint32_t source_slice = 0;
+    std::uint32_t source_level = 0;
+    std::uint32_t destination_slice = 0;
+    std::uint32_t destination_level = 0;
+    if (!required_u32(nested, "source_slice", source_slice) ||
+        !required_u32(nested, "source_level", source_level) ||
+        !required_u32(nested, "destination_slice", destination_slice) ||
+        !required_u32(nested, "destination_level", destination_level)) {
+      return fail("copyFromTexture is missing replay metadata");
+    }
+    MTLOrigin source_origin = {};
+    MTLSize source_size = {};
+    MTLOrigin destination_origin = {};
+    if (!origin_from_json_array(nested, "source_origin", source_origin) ||
+        !size_from_json_array(nested, "source_size", source_size) ||
+        !origin_from_json_array(nested, "destination_origin", destination_origin)) {
+      return fail("copyFromTexture is missing replay region metadata");
+    }
     [encoder copyFromTexture:source_texture
-                 sourceSlice:static_cast<NSUInteger>(nested.value("source_slice", 0u))
-                 sourceLevel:static_cast<NSUInteger>(nested.value("source_level", 0u))
-                sourceOrigin:origin_from_json_array(nested, "source_origin")
-                  sourceSize:size_from_json_array(nested, "source_size", source_texture)
+                 sourceSlice:static_cast<NSUInteger>(source_slice)
+                 sourceLevel:static_cast<NSUInteger>(source_level)
+                sourceOrigin:source_origin
+                  sourceSize:source_size
                    toTexture:destination_texture
-            destinationSlice:static_cast<NSUInteger>(nested.value("destination_slice", 0u))
-            destinationLevel:static_cast<NSUInteger>(nested.value("destination_level", 0u))
-           destinationOrigin:origin_from_json_array(nested, "destination_origin")];
+            destinationSlice:static_cast<NSUInteger>(destination_slice)
+            destinationLevel:static_cast<NSUInteger>(destination_level)
+           destinationOrigin:destination_origin];
     return true;
   }
 
-  bool copy_buffer_to_texture(std::uint64_t encoder_id, const json &payload)
+  bool blit_fill(std::uint64_t encoder_id, const json &payload)
   {
     id<MTLBlitCommandEncoder> encoder = blit_encoder_for_id(encoder_id);
-    id<MTLBuffer> source_buffer = buffer_for_id(payload.value("source_buffer", 0ull));
-    id<MTLTexture> destination_texture = texture_for_id(payload.value("destination_texture", 0ull));
+    std::uint64_t buffer_id = 0;
+    std::uint64_t range_start = 0;
+    std::uint64_t range_length = 0;
+    std::uint32_t value = 0;
+    if (!required_u64(payload, "buffer_id", buffer_id) ||
+        !required_u64(payload, "range_start", range_start) ||
+        !required_u64(payload, "range_length", range_length) ||
+        !required_u32(payload, "value", value) ||
+        value > std::numeric_limits<std::uint8_t>::max()) {
+      return fail("fillBuffer is missing replay metadata");
+    }
+    id<MTLBuffer> buffer = buffer_for_id(buffer_id);
+    if (encoder == nil || buffer == nil) {
+      return fail("fillBuffer references missing encoder or buffer");
+    }
+    [encoder fillBuffer:buffer
+                  range:NSMakeRange(static_cast<NSUInteger>(range_start),
+                                    static_cast<NSUInteger>(range_length))
+                  value:static_cast<uint8_t>(value)];
+    return true;
+  }
+
+  bool blit_batch(const trace::MetalEventRecord &event, const json &payload)
+  {
+    const auto encoder_id = event.object_id;
+    const auto ops = payload.find("ops");
+    if (ops == payload.end() || !ops->is_array() || ops->empty()) {
+      return fail("blitBatch is missing ops");
+    }
+
+    for (const auto &op : *ops) {
+      if (op.is_array()) {
+        return fail("blitBatch op must be an object");
+      }
+      if (!op.is_object()) {
+        return fail("blitBatch op must be an object");
+      }
+      const auto kind = op.value("op", std::string());
+      if (kind == "copy_texture") {
+        if (!copy_texture(encoder_id, op)) {
+          return false;
+        }
+      } else if (kind == "fill_buffer") {
+        if (!blit_fill(encoder_id, op)) {
+          return false;
+        }
+      } else if (kind == "wait_fence" || kind == "update_fence") {
+        if (json_u64(op.value("fence_id", json(nullptr))) == 0) {
+          return fail(kind + " blitBatch op is missing fence_id");
+        }
+        continue;
+      } else {
+        return fail("unsupported blitBatch op " + (kind.empty() ? std::string("<missing>") : kind));
+      }
+    }
+    return true;
+  }
+
+  bool copy_buffer_to_texture(const trace::MetalEventRecord &event, const json &payload)
+  {
+    const auto encoder_id = event.object_id;
+    id<MTLBlitCommandEncoder> encoder = blit_encoder_for_id(encoder_id);
+    std::uint64_t source_buffer_id = 0;
+    std::uint64_t destination_texture_id = 0;
+    std::uint64_t source_offset = 0;
+    std::uint32_t source_bytes_per_row = 0;
+    std::uint32_t source_bytes_per_image = 0;
+    std::uint32_t destination_slice = 0;
+    std::uint32_t destination_level = 0;
+    if (!required_u64(payload, "source_buffer", source_buffer_id) ||
+        !required_u64(payload, "destination_texture", destination_texture_id) ||
+        !required_u64(payload, "source_offset", source_offset) ||
+        !required_u32(payload, "source_bytes_per_row", source_bytes_per_row) ||
+        !required_u32(payload, "source_bytes_per_image", source_bytes_per_image) ||
+        !required_u32(payload, "destination_slice", destination_slice) ||
+        !required_u32(payload, "destination_level", destination_level)) {
+      return fail("copyFromBuffer toTexture is missing replay metadata");
+    }
+    id<MTLBuffer> source_buffer = buffer_for_id(source_buffer_id);
+    id<MTLTexture> destination_texture = texture_for_id(destination_texture_id);
     if (encoder == nil || source_buffer == nil || destination_texture == nil) {
       return fail("copyFromBuffer toTexture references missing encoder, buffer, or texture");
     }
+    if (!restore_buffer_range_from_asset(event, source_buffer, payload)) {
+      return false;
+    }
 
+    MTLSize source_size = {};
+    MTLOrigin destination_origin = {};
+    if (!size_from_json_array(payload, "source_size", source_size) ||
+        !origin_from_json_array(payload, "destination_origin", destination_origin)) {
+      return fail("copyFromBuffer toTexture is missing replay region metadata");
+    }
     [encoder copyFromBuffer:source_buffer
-               sourceOffset:static_cast<NSUInteger>(payload.value("source_offset", 0ull))
-          sourceBytesPerRow:static_cast<NSUInteger>(payload.value("source_bytes_per_row", 0u))
-        sourceBytesPerImage:static_cast<NSUInteger>(payload.value("source_bytes_per_image", 0u))
-                 sourceSize:size_from_json_array(payload, "source_size", destination_texture)
+               sourceOffset:static_cast<NSUInteger>(source_offset)
+          sourceBytesPerRow:static_cast<NSUInteger>(source_bytes_per_row)
+        sourceBytesPerImage:static_cast<NSUInteger>(source_bytes_per_image)
+                 sourceSize:source_size
                   toTexture:destination_texture
-           destinationSlice:static_cast<NSUInteger>(payload.value("destination_slice", 0u))
-           destinationLevel:static_cast<NSUInteger>(payload.value("destination_level", 0u))
-          destinationOrigin:origin_from_json_array(payload, "destination_origin")];
+           destinationSlice:static_cast<NSUInteger>(destination_slice)
+           destinationLevel:static_cast<NSUInteger>(destination_level)
+          destinationOrigin:destination_origin];
     return true;
   }
 
-  bool handle_debug_signpost(std::uint64_t object_id, const json &payload)
+  bool object_metadata(std::uint64_t object_id, const json &metadata)
   {
+    index_object_metadata(object_id, metadata);
+    const auto kind = metadata.value("kind", std::string());
+    if (kind == "dxmt_sampler_gpu_resource_id") {
+      return create_sampler(metadata);
+    }
+    if (kind == "dxmt_texture_view") {
+      return create_texture_view(metadata);
+    }
+    if (kind == "dxmt_depth_stencil_state") {
+      return create_depth_stencil_state(metadata);
+    }
+    return true;
+  }
+
+  bool handle_debug_signpost(const trace::MetalEventRecord &event, const json &payload)
+  {
+    const auto object_id = event.object_id;
     const json signpost = parse_json(payload.value("label", std::string()));
     const auto kind = signpost.value("kind", std::string());
     if (kind == "dxmt_buffer_gpu_address") {
-      const auto buffer_id = signpost.value("buffer_id", object_id);
-      const auto gpu_address = signpost.value("gpu_address", 0ull);
-      if (buffer_id != 0 && gpu_address != 0) {
-        pending_buffer_gpu_addresses_[buffer_id] = gpu_address;
+      std::uint64_t buffer_id = 0;
+      std::uint64_t gpu_address = 0;
+      if (!required_u64(signpost, "buffer_id", buffer_id) ||
+          !required_u64(signpost, "gpu_address", gpu_address)) {
+        return fail("dxmt_buffer_gpu_address is missing payload");
       }
+      if (buffer_id == 0 || gpu_address == 0) {
+        return fail("dxmt_buffer_gpu_address has zero payload");
+      }
+      pending_buffer_gpu_addresses_[buffer_id] = gpu_address;
       return true;
     }
     if (kind == "dxmt_copy_buffer_to_texture") {
-      return copy_buffer_to_texture(object_id, signpost);
+      return copy_buffer_to_texture(event, signpost);
     }
     if (kind == "dxmt_dispatch_threads") {
       return dispatch_threads(object_id, signpost);
@@ -2123,7 +3589,7 @@ private:
       return set_compute_bytes(object_id, signpost);
     }
     if (kind == "dxmt_sampler_gpu_resource_id") {
-      return create_sampler(signpost.value("sampler_id", object_id), signpost);
+      return create_sampler(signpost);
     }
     if (kind == "dxmt_texture_view") {
       return create_texture_view(signpost);
@@ -2146,22 +3612,53 @@ private:
     if (kind == "dxmt_set_scissor_rects") {
       return set_scissor_rects(object_id, signpost);
     }
+    NSString *label = [NSString stringWithUTF8String:payload.value("label", std::string()).c_str()];
+    id<MTLRenderCommandEncoder> render_encoder = render_encoder_for_id(object_id);
+    if (render_encoder != nil) {
+      [render_encoder insertDebugSignpost:label];
+      return true;
+    }
+    id<MTLComputeCommandEncoder> compute_encoder = compute_encoder_for_id(object_id);
+    if (compute_encoder != nil) {
+      [compute_encoder insertDebugSignpost:label];
+      return true;
+    }
+    id<MTLBlitCommandEncoder> blit_encoder = blit_encoder_for_id(object_id);
+    if (blit_encoder != nil) {
+      [blit_encoder insertDebugSignpost:label];
+      return true;
+    }
     return true;
   }
 
   bool queue_present(std::uint64_t command_buffer_id, const json &payload)
   {
+    std::uint64_t drawable_id = 0;
+    std::uint64_t frame_index = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t sync_interval = 0;
+    std::uint32_t flags = 0;
+    if (!required_u64(payload, "drawable_id", drawable_id) ||
+        !required_u64(payload, "frame_index", frame_index) ||
+        !required_u32(payload, "width", width) ||
+        !required_u32(payload, "height", height) ||
+        !required_u32(payload, "sync_interval", sync_interval) ||
+        !required_u32(payload, "flags", flags) ||
+        width == 0 || height == 0) {
+      return fail("presentDrawable is missing replay metadata");
+    }
     NSMutableDictionary *info = [[NSMutableDictionary alloc] init];
-    info[@"drawable_id"] = object_key(payload.value("drawable_id", 0ull));
+    info[@"drawable_id"] = object_key(drawable_id);
     NSNumber *present_texture_id = [command_buffer_present_textures_ objectForKey:object_key(command_buffer_id)];
     if (present_texture_id != nil) {
       info[@"present_texture_id"] = present_texture_id;
     }
-    info[@"frame_index"] = object_key(payload.value("frame_index", 0ull));
-    info[@"width"] = [NSNumber numberWithUnsignedInt:payload.value("width", 0u)];
-    info[@"height"] = [NSNumber numberWithUnsignedInt:payload.value("height", 0u)];
-    info[@"sync_interval"] = [NSNumber numberWithUnsignedInt:payload.value("sync_interval", 0u)];
-    info[@"flags"] = [NSNumber numberWithUnsignedInt:payload.value("flags", 0u)];
+    info[@"frame_index"] = object_key(frame_index);
+    info[@"width"] = [NSNumber numberWithUnsignedInt:width];
+    info[@"height"] = [NSNumber numberWithUnsignedInt:height];
+    info[@"sync_interval"] = [NSNumber numberWithUnsignedInt:sync_interval];
+    info[@"flags"] = [NSNumber numberWithUnsignedInt:flags];
     [pending_presents_ setObject:info forKey:object_key(command_buffer_id)];
     return true;
   }
@@ -2197,7 +3694,7 @@ private:
     asset.kind = trace::AssetKind::Texture;
     asset.debug_name = "metal-present-frame";
     asset.payload_bytes = bytes;
-    asset = capture_writer_->register_asset(asset);
+    asset = capture_writer_->register_asset(std::move(asset));
 
     trace::EventRecord event;
     event.kind = trace::EventKind::ResourceBlob;
@@ -2224,6 +3721,7 @@ private:
   std::string last_error_;
   std::unique_ptr<trace::TraceBundleWriter> capture_writer_;
   std::uint64_t capture_sequence_ = 0;
+  std::unordered_map<trace::BlobId, std::filesystem::path> asset_paths_by_blob_;
 
   id<MTLDevice> device_ = nil;
   id<MTLCommandQueue> queue_ = nil;
@@ -2241,6 +3739,7 @@ private:
   NSMutableDictionary<NSNumber *, id<MTLRenderCommandEncoder>> *render_encoders_ = nil;
   NSMutableDictionary<NSNumber *, id<MTLComputeCommandEncoder>> *compute_encoders_ = nil;
   NSMutableDictionary<NSNumber *, id<MTLBlitCommandEncoder>> *blit_encoders_ = nil;
+  NSMutableDictionary<NSNumber *, id<MTLFence>> *fences_ = nil;
   NSMutableDictionary<NSNumber *, NSDictionary *> *pending_presents_ = nil;
   std::unordered_map<std::uint64_t, std::uint64_t> pending_buffer_gpu_addresses_;
   std::unordered_map<std::uint64_t, std::uint64_t> original_texture_gpu_resource_ids_;

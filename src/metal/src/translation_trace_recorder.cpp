@@ -1,5 +1,7 @@
 #include "apitrace/translation_trace_recorder.hpp"
 
+#include "trace/src/payload_object_refs.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <memory>
@@ -95,6 +97,7 @@ struct TranslationTraceRecorder::Impl {
   std::uint64_t command_buffer_sequence_begin = 0;
   std::uint64_t encoder_sequence_begin = 0;
   TranslationPassKind current_pass_kind = TranslationPassKind::Unknown;
+  bool enable_per_call_links = false;
 
   // TODO: keep lightweight current-scope snapshots so marker and call records can inherit DXMT-like chunk/encoder context.
   // TODO: tolerate translation layers that emit command-buffer scopes on one thread and metal-call records on another thread.
@@ -167,6 +170,7 @@ void TranslationTraceRecorder::begin_command_buffer(const TranslationCommandBuff
     trace_record.translation_link_payload = info.payload.empty()
                                                 ? json{{"label", info.label}, {"submission_id", info.submission_id}}.dump()
                                                 : info.payload;
+    trace::append_payload_text_object_refs(trace_record.translation_link_payload, trace_record.object_refs);
     impl_->metal_trace_backend.record_translated_call(trace_record);
     impl_->command_buffer_sequence_begin = impl_->metal_trace_backend.current_metal_sequence();
   }
@@ -243,6 +247,7 @@ void TranslationTraceRecorder::begin_encoder(const TranslationEncoderInfo &info)
     trace_record.translated_call_name = begin_function_name(info.pass_kind);
     trace_record.translation_link_payload =
         info.payload.empty() ? json{{"label", info.label}}.dump() : info.payload;
+    trace::append_payload_text_object_refs(trace_record.translation_link_payload, trace_record.object_refs);
     impl_->metal_trace_backend.record_translated_call(trace_record);
     impl_->encoder_sequence_begin = impl_->metal_trace_backend.current_metal_sequence();
   }
@@ -302,6 +307,7 @@ void TranslationTraceRecorder::emit_marker(const TranslationMarkerInfo &info)
     trace_record.translated_call_name = "MTLCommandEncoder.insertDebugSignpost";
     trace_record.translation_link_payload =
         info.payload.empty() ? json{{"marker_name", info.marker_name}}.dump() : info.payload;
+    trace::append_payload_text_object_refs(trace_record.translation_link_payload, trace_record.object_refs);
     impl_->metal_trace_backend.record_translated_call(trace_record);
   }
 
@@ -327,9 +333,10 @@ void TranslationTraceRecorder::record_metal_call(const MetalTraceRecord &record)
   if (normalized.object_id == 0) {
     normalized.object_id = impl_->current_encoder_id;
   }
+  trace::append_payload_text_object_refs(normalized.translation_link_payload, normalized.object_refs);
   impl_->metal_trace_backend.record_translated_call(normalized);
 
-  if (impl_->options.enable_link_sideband && normalized.d3d_sequence != 0) {
+  if (impl_->enable_per_call_links && impl_->options.enable_link_sideband && normalized.d3d_sequence != 0) {
     trace::TranslationLinkRecord link_record;
     link_record.record_type = "scope";
     link_record.scope_kind = "draw_to_metal_calls";

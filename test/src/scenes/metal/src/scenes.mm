@@ -585,6 +585,9 @@ ValidationResult run_compute_uav(MetalRuntime &runtime)
     const auto indirect_base = make_scalar_buffer(runtime, std::uint32_t{4});
     const auto dispatch_args = make_buffer(runtime, std::vector<std::uint32_t>{4, 1, 1});
     const auto readback_words = make_buffer(runtime, std::vector<std::uint32_t>(8, 0));
+    const auto range_source_words = make_buffer(runtime, std::vector<std::uint32_t>{9, 8, 7, 6, 5, 4, 3, 2});
+    const auto range_readback_words = make_buffer(runtime, std::vector<std::uint32_t>(8, 0));
+    const auto batch_fill_words = make_buffer(runtime, std::vector<std::uint32_t>(4, 0));
 
     const auto present_triangle = make_buffer(runtime, std::vector<ColorVertexPacked>{
         {{0.0f, 1.0f}, {0.0f, 0.0f}, {0.2f, 0.8f, 1.0f, 1.0f}},
@@ -627,6 +630,24 @@ ValidationResult run_compute_uav(MetalRuntime &runtime)
 
     auto blit_encoder = runtime.begin_blit_encoder(command_buffer, d3d_sequence);
     if (runtime.tracing_enabled()) {
+        std::ostringstream batch_payload;
+        batch_payload << "{\"ops\":[{\"op\":\"fill_buffer\","
+                      << "\"buffer_id\":" << batch_fill_words.object_id << ","
+                      << "\"range_start\":0,"
+                      << "\"range_length\":" << (sizeof(std::uint32_t) * 4U) << ","
+                      << "\"value\":90"
+                      << "}]}";
+        apitrace_metal_blit_batch(runtime.trace_session(), blit_encoder.object_id, batch_payload.str().c_str());
+        apitrace_metal_copy_buffer_with_contents(
+            runtime.trace_session(),
+            blit_encoder.object_id,
+            range_source_words.object_id,
+            0,
+            range_readback_words.object_id,
+            0,
+            sizeof(std::uint32_t) * 8U,
+            [range_source_words.handle contents],
+            sizeof(std::uint32_t) * 8U);
         apitrace_metal_copy_buffer(
             runtime.trace_session(),
             blit_encoder.object_id,
@@ -636,6 +657,14 @@ ValidationResult run_compute_uav(MetalRuntime &runtime)
             0,
             sizeof(std::uint32_t) * 8U);
     }
+    [blit_encoder.handle fillBuffer:batch_fill_words.handle
+                               range:NSMakeRange(0, sizeof(std::uint32_t) * 4U)
+                               value:90];
+    [blit_encoder.handle copyFromBuffer:range_source_words.handle
+                           sourceOffset:0
+                               toBuffer:range_readback_words.handle
+                      destinationOffset:0
+                                   size:sizeof(std::uint32_t) * 8U];
     [blit_encoder.handle copyFromBuffer:output_words.handle
                            sourceOffset:0
                                toBuffer:readback_words.handle
@@ -668,6 +697,18 @@ ValidationResult run_compute_uav(MetalRuntime &runtime)
         runtime.validate_buffer_words(readback_words.handle, expected_words, std::size(expected_words));
     if (!buffer_result.passed) {
         return buffer_result;
+    }
+    const std::uint32_t expected_range_words[] = {9, 8, 7, 6, 5, 4, 3, 2};
+    const ValidationResult range_buffer_result =
+        runtime.validate_buffer_words(range_readback_words.handle, expected_range_words, std::size(expected_range_words));
+    if (!range_buffer_result.passed) {
+        return range_buffer_result;
+    }
+    const std::uint32_t expected_batch_fill_words[] = {0x5a5a5a5au, 0x5a5a5a5au, 0x5a5a5a5au, 0x5a5a5a5au};
+    const ValidationResult batch_fill_result =
+        runtime.validate_buffer_words(batch_fill_words.handle, expected_batch_fill_words, std::size(expected_batch_fill_words));
+    if (!batch_fill_result.passed) {
+        return batch_fill_result;
     }
     const PixelExpectation expectations[] = {
         {"compute present", sample_x(runtime, 0.50), sample_y(runtime, 0.50), rgba8(51, 204, 255), 0},
@@ -737,6 +778,86 @@ ValidationResult run_indirect_draw(MetalRuntime &runtime)
     const PixelExpectation expectations[] = {
         {"left indirect", sample_x(runtime, 0.25), sample_y(runtime, 0.45), rgba8(255, 255, 0), 0},
         {"right indirect", sample_x(runtime, 0.75), sample_y(runtime, 0.45), rgba8(255, 0, 255), 0},
+    };
+    return present_and_validate(runtime, command_buffer, expectations, std::size(expectations));
+}
+
+ValidationResult run_indexed_indirect_draw(MetalRuntime &runtime)
+{
+    const std::uint64_t d3d_sequence = 1011;
+    const auto library = make_library(runtime, "indexed-indirect-draw", solid_color_shader_source());
+    const auto pipeline = make_render_pipeline(runtime, library, "vs_main", "fs_main");
+
+    const auto vertex_buffer = make_buffer(runtime, std::vector<ColorVertexPacked>{
+        {{-0.62f, 0.62f}, {0.0f, 0.0f}, {0.0f, 1.0f, 1.0f, 1.0f}},
+        {{-0.88f, -0.22f}, {0.0f, 0.0f}, {0.0f, 1.0f, 1.0f, 1.0f}},
+        {{-0.36f, -0.22f}, {0.0f, 0.0f}, {0.0f, 1.0f, 1.0f, 1.0f}},
+        {{0.62f, 0.62f}, {0.0f, 0.0f}, {1.0f, 0.5f, 0.0f, 1.0f}},
+        {{0.36f, -0.22f}, {0.0f, 0.0f}, {1.0f, 0.5f, 0.0f, 1.0f}},
+        {{0.88f, -0.22f}, {0.0f, 0.0f}, {1.0f, 0.5f, 0.0f, 1.0f}},
+    });
+    const auto index_buffer = make_buffer(runtime, std::vector<std::uint16_t>{0, 1, 2, 3, 4, 5});
+    struct IndexedIndirectArgs {
+        std::uint32_t indexCount;
+        std::uint32_t instanceCount;
+        std::uint32_t indexStart;
+        std::int32_t baseVertex;
+        std::uint32_t baseInstance;
+    };
+    const auto indirect_args = make_buffer(runtime, std::vector<IndexedIndirectArgs>{
+        {3, 1, 0, 0, 0},
+        {3, 1, 3, 0, 0},
+    });
+
+    const float clear_color[4] = {0.02f, 0.02f, 0.02f, 1.0f};
+    auto command_buffer = runtime.begin_command_buffer(d3d_sequence, runtime.next_frame_id(), "metal_indexed_indirect_draw");
+    const std::string payload_json = runtime.render_pass_payload_json(clear_color, "clear", "store");
+    auto encoder = runtime.begin_render_encoder(
+        command_buffer,
+        d3d_sequence,
+        make_render_pass(runtime, clear_color, MTLLoadActionClear, MTLStoreActionStore),
+        payload_json);
+    [encoder.handle setRenderPipelineState:pipeline.handle];
+    [encoder.handle setVertexBuffer:vertex_buffer.handle offset:0 atIndex:0];
+    if (runtime.tracing_enabled()) {
+        apitrace_metal_set_render_pipeline_state(runtime.trace_session(), encoder.object_id, pipeline.object_id);
+        apitrace_metal_set_vertex_buffer(runtime.trace_session(), encoder.object_id, vertex_buffer.object_id, 0, 0);
+        apitrace_metal_draw_indexed_primitives_indirect(
+            runtime.trace_session(),
+            encoder.object_id,
+            3,
+            0,
+            index_buffer.object_id,
+            0,
+            indirect_args.object_id,
+            0);
+        apitrace_metal_draw_indexed_primitives_indirect(
+            runtime.trace_session(),
+            encoder.object_id,
+            3,
+            0,
+            index_buffer.object_id,
+            0,
+            indirect_args.object_id,
+            sizeof(IndexedIndirectArgs));
+    }
+    [encoder.handle drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexType:MTLIndexTypeUInt16
+                              indexBuffer:index_buffer.handle
+                        indexBufferOffset:0
+                           indirectBuffer:indirect_args.handle
+                     indirectBufferOffset:0];
+    [encoder.handle drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexType:MTLIndexTypeUInt16
+                              indexBuffer:index_buffer.handle
+                        indexBufferOffset:0
+                           indirectBuffer:indirect_args.handle
+                     indirectBufferOffset:sizeof(IndexedIndirectArgs)];
+    runtime.end_render_encoder(encoder);
+
+    const PixelExpectation expectations[] = {
+        {"left indexed indirect", sample_x(runtime, 0.25), sample_y(runtime, 0.45), rgba8(0, 255, 255), 0},
+        {"right indexed indirect", sample_x(runtime, 0.75), sample_y(runtime, 0.45), rgba8(255, 128, 0), 0},
     };
     return present_and_validate(runtime, command_buffer, expectations, std::size(expectations));
 }
@@ -925,6 +1046,7 @@ const std::vector<SceneDefinition> &scene_definitions()
         {"metal_textured_quad", run_textured_quad},
         {"metal_compute_uav", run_compute_uav},
         {"metal_indirect_draw", run_indirect_draw},
+        {"metal_indexed_indirect_draw", run_indexed_indirect_draw},
         {"metal_argument_buffer", run_argument_buffer},
         {"metal_multi_pass", run_multi_pass},
         {"metal_present_smoke", run_present_smoke},
