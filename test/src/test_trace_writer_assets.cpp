@@ -1720,6 +1720,11 @@ int main(int argc, char **argv)
     std::cerr << "sideband translation link append overwrote existing link records\n";
     return 1;
   }
+  const auto sideband_callstream = read_text(bundle / "callstream.jsonl");
+  if (sideband_callstream != callstream) {
+    std::cerr << "sideband writer modified the primary D3D callstream\n";
+    return 1;
+  }
 
   const auto unsafe_bundle = bundle.parent_path() / (bundle.filename().generic_string() + "-unsafe-path");
   std::filesystem::remove_all(unsafe_bundle);

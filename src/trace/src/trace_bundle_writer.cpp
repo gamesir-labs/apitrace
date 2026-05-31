@@ -2244,12 +2244,8 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
     impl_->callstream_stream.open(impl_->layout.callstream_path, std::ios::trunc);
     impl_->open = impl_->callstream_stream.is_open();
   } else {
-    if (std::filesystem::is_regular_file(impl_->layout.callstream_path)) {
-      impl_->callstream_stream.open(impl_->layout.callstream_path, std::ios::app);
-      impl_->metadata_written = impl_->callstream_stream.is_open() && std::filesystem::file_size(impl_->layout.callstream_path) > 0;
-    } else {
-      impl_->callstream_stream.open(impl_->layout.callstream_path, std::ios::trunc);
-    }
+    impl_->metadata_written = std::filesystem::is_regular_file(impl_->layout.callstream_path) &&
+                              std::filesystem::file_size(impl_->layout.callstream_path) > 0;
     impl_->open = true;
   }
   if (impl_->open && mode == TraceBundleOpenMode::Primary) {
