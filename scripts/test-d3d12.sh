@@ -2,7 +2,10 @@
 set -eu
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-WINE_BIN="${APITRACE_WINE_BIN:-$ROOT_DIR/../wine-enviroment/bin/wine}"
+DXMT_REPO_ROOT="${APITRACE_DXMT_REPO_ROOT:-$(CDPATH= cd -- "$ROOT_DIR/../.." && pwd)}"
+GAMESIR_ROOT="${APITRACE_GAMESIR_ROOT:-$(CDPATH= cd -- "$DXMT_REPO_ROOT/.." && pwd)}"
+WINE_ENV_ROOT="${APITRACE_WINE_ENV_ROOT:-$GAMESIR_ROOT/wine-enviroment}"
+WINE_BIN="${APITRACE_WINE_BIN:-$WINE_ENV_ROOT/bin/wine}"
 WINE_BIN="${WINE_BIN:-$(command -v wine || true)}"
 ROOT_BUILD_DIR="${APITRACE_ROOT_BUILD_DIR:-$ROOT_DIR/build/windows-cross}"
 TEST_BUILD_DIR="${APITRACE_TEST_BUILD_DIR:-$ROOT_DIR/test/build/windows-x86_64-d3d12}"
@@ -17,8 +20,9 @@ RETRACE_BIN_DIR="$TEST_PREFIX/retrace-bin"
 RETRACE_EXE="$RETRACE_BIN_DIR/retrace.exe"
 ROOT_D3D12_PROXY_DLL="$ROOT_BUILD_DIR/d3d12.dll"
 ROOT_RETRACE_EXE="$ROOT_BUILD_DIR/retrace.exe"
-DXMT_REPO_ROOT="${APITRACE_DXMT_REPO_ROOT:-$ROOT_DIR/../dxmt}"
-DXMT_BUILD_DIR="${APITRACE_DXMT_BUILD_DIR:-$DXMT_REPO_ROOT/build-gs-native-builtin}"
+HOST_BUNDLE_CHECK="$ROOT_DIR/build/cmake-arm64/bundle-check"
+HOST_RETRACE="$ROOT_DIR/build/cmake-arm64/retrace"
+DXMT_BUILD_DIR="${APITRACE_DXMT_BUILD_DIR:-$DXMT_REPO_ROOT/build-builtin}"
 DXMT_STAGE_DIR="${APITRACE_DXMT_STAGE_DIR:-$ROOT_DIR/test/artifacts/dxmt-runtime-d3d12}"
 DXMT_RUNTIME_ROOT=""
 DXMT_D3D12_DLL=""
@@ -26,7 +30,7 @@ DXMT_D3D12CORE_DLL=""
 DXMT_DXGI_DLL=""
 DXMT_WINEMETAL_DLL=""
 DXMT_UNIX_DIR=""
-D3D_COMPILER_DLL="$ROOT_DIR/../wine-enviroment/lib/wine/x86_64-windows/d3dcompiler_47.dll"
+D3D_COMPILER_DLL="${APITRACE_D3D_COMPILER_DLL:-$WINE_ENV_ROOT/lib/wine/x86_64-windows/d3dcompiler_47.dll}"
 COMPARE_LOG="$TEST_PREFIX/compare.log"
 RUN_LOG="$TEST_PREFIX/run.log"
 RETRACE_LOG="$TEST_PREFIX/retrace.log"
@@ -165,9 +169,10 @@ prepare_wine_env() {
     export WINEPREFIX="$WINE_PREFIX"
     export APITRACE_D3D12_BACKEND="dxmt"
     export APITRACE_DOWNSTREAM_D3D12="$DXMT_D3D12_DLL"
+    export APITRACE_D3D12_BUILTIN_CAPTURE=0
     export DXMT_EXPERIMENT_DX12_SUPPORT="1"
-    export WINEDLLPATH="$DXMT_RUNTIME_ROOT:$ROOT_DIR/../wine-enviroment/lib/wine"
-    export DYLD_FALLBACK_LIBRARY_PATH="$DXMT_UNIX_DIR:$ROOT_DIR/../wine-enviroment/lib:$ROOT_DIR/../wine-enviroment/lib/wine/x86_64-unix:/opt/homebrew/lib:/usr/local/lib"
+    export WINEDLLPATH="$DXMT_RUNTIME_ROOT:$WINE_ENV_ROOT/lib/wine"
+    export DYLD_FALLBACK_LIBRARY_PATH="$DXMT_UNIX_DIR:$WINE_ENV_ROOT/lib:$WINE_ENV_ROOT/lib/wine/x86_64-unix:/opt/homebrew/lib:/usr/local/lib"
     export APITRACE_D3D12_CAPTURE_PRESENT_FRAMES=1
     if [ ! -f "$WINE_PREFIX/system.reg" ]; then
         "$WINE_BIN" wineboot -u >/dev/null 2>&1 || true
@@ -181,8 +186,12 @@ step_trace() {
     "$WINE_BIN" "$DEMO_EXE" | tr -d '\r' | tee "$RUN_LOG"
     unset APITRACE_TRACE_BUNDLE
     require_file "$TRACE_BUNDLE/callstream.jsonl"
-    present_count="$(grep -c '"debug_name":"D3D12PresentFrame"' "$TRACE_BUNDLE/callstream.jsonl" || true)"
-    [ "$present_count" -gt 0 ] || fail "trace bundle has no D3D12PresentFrame assets"
+    if [ -x "$HOST_BUNDLE_CHECK" ]; then
+        "$HOST_BUNDLE_CHECK" --require-d3d --require-d3d-replay-closure --require-d3d-native-readiness --require-d3d-present-frames "$TRACE_BUNDLE" >/dev/null
+    fi
+    if [ -x "$HOST_RETRACE" ]; then
+        "$HOST_RETRACE" --validate-only "$TRACE_BUNDLE" >/dev/null
+    fi
     if grep -F "scene start: dxr_smoke" "$RUN_LOG" >/dev/null; then
         fail "dxr_smoke should remain skipped in d3d12 all"
     fi
@@ -202,8 +211,9 @@ step_retrace() {
     unset APITRACE_TRACE_BUNDLE
     unset APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES
     require_file "$RETRACE_BUNDLE/callstream.jsonl"
-    present_count="$(grep -c '"debug_name":"D3D12PresentFrame"' "$RETRACE_BUNDLE/callstream.jsonl" || true)"
-    [ "$present_count" -gt 0 ] || fail "retrace bundle has no D3D12PresentFrame assets"
+    if [ -x "$HOST_BUNDLE_CHECK" ]; then
+        "$HOST_BUNDLE_CHECK" --require-d3d --require-d3d-replay-closure --require-d3d-native-readiness --require-d3d-present-frames "$RETRACE_BUNDLE" >/dev/null
+    fi
 }
 
 step_compare() {

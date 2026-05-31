@@ -66,6 +66,11 @@ cmake --build build/macos-native --target \
 ./scripts/build-matrix.sh
 ```
 
+该矩阵会运行 cross-api bundle smoke、D3D12 native replay smoke 和 PresentFrame tile compare
+自测。D3D12 native replay smoke 在当前进程无法枚举 Metal-backed DXGI adapter 时以 77 跳过，
+矩阵会把这个能力缺失视为 optional skip；最终验收或准备跑大 trace 前可以设置
+`APITRACE_REQUIRE_D3D_NATIVE_REPLAY=1`，把该 skip 提升为失败。
+
 ## CI artifact
 
 Windows CI artifact 布局：

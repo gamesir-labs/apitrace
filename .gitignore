@@ -4,4 +4,7 @@ out/
 compile_commands.json
 test/artifacts/
 test/build/
+test/build-*/
+__pycache__/
+*.pyc
 .DS_Store

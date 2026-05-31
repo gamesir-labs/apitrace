@@ -2,7 +2,10 @@
 set -eu
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-WINE_BIN="${APITRACE_WINE_BIN:-$ROOT_DIR/../wine-enviroment/bin/wine}"
+DXMT_REPO_ROOT="${APITRACE_DXMT_REPO_ROOT:-$(CDPATH= cd -- "$ROOT_DIR/../.." && pwd)}"
+GAMESIR_ROOT="${APITRACE_GAMESIR_ROOT:-$(CDPATH= cd -- "$DXMT_REPO_ROOT/.." && pwd)}"
+WINE_ENV_ROOT="${APITRACE_WINE_ENV_ROOT:-$GAMESIR_ROOT/wine-enviroment}"
+WINE_BIN="${APITRACE_WINE_BIN:-$WINE_ENV_ROOT/bin/wine}"
 if [ ! -x "$WINE_BIN" ]; then
     WINE_BIN="$(command -v wine || true)"
 fi
@@ -17,8 +20,7 @@ RUN_LOG="$LINK_DIR/d3d12-trace.log"
 METAL_RETRACE_LOG="$LINK_DIR/d3d12-metal-retrace.log"
 METAL_COMPARE_LOG="$LINK_DIR/d3d12-metal-compare.log"
 
-DXMT_REPO_ROOT="${APITRACE_DXMT_REPO_ROOT:-$ROOT_DIR/../dxmt}"
-DXMT_BUILD_DIR="${APITRACE_DXMT_BUILD_DIR:-$DXMT_REPO_ROOT/build-gs-native-builtin}"
+DXMT_BUILD_DIR="${APITRACE_DXMT_BUILD_DIR:-$DXMT_REPO_ROOT/build-builtin}"
 DXMT_STAGE_DIR="${APITRACE_DXMT_STAGE_DIR:-$ROOT_DIR/test/artifacts/dxmt-runtime-d3d12}"
 DXMT_RUNTIME_ROOT=""
 DXMT_UNIX_DIR=""
@@ -27,6 +29,7 @@ DEMO_BIN_DIR="$TEST_PREFIX/bin"
 DEMO_EXE="$DEMO_BIN_DIR/apitrace_test_d3d12.exe"
 ROOT_D3D12_PROXY_DLL="$WINDOWS_BUILD_DIR/d3d12.dll"
 NATIVE_RETRACE="$HOST_BUILD_DIR/retrace"
+HOST_BUNDLE_CHECK="$HOST_BUILD_DIR/bundle-check"
 
 fail() {
     echo "error: $*" >&2
@@ -77,12 +80,13 @@ prepare_wine_env() {
     export WINEDLLOVERRIDES="mscoree,mshtml=d;d3d12,d3d12core,dxgi,winemetal=n,b"
     export WINEDEBUG="-all"
     export WINEARCH="win64"
-    export WINEPREFIX="${APITRACE_WINEPREFIX:-$ROOT_DIR/test/artifacts/wineprefix-d3d12}"
+    export WINEPREFIX="${APITRACE_WINEPREFIX:-$LINK_DIR/wineprefix-d3d12-link}"
     export APITRACE_D3D12_BACKEND="dxmt"
     export APITRACE_DOWNSTREAM_D3D12="$DXMT_RUNTIME_ROOT/x86_64-windows/d3d12.dll"
     export DXMT_EXPERIMENT_DX12_SUPPORT=1
-    export WINEDLLPATH="$DXMT_RUNTIME_ROOT:$ROOT_DIR/../wine-enviroment/lib/wine"
-    export DYLD_FALLBACK_LIBRARY_PATH="$DXMT_UNIX_DIR:$ROOT_DIR/../wine-enviroment/lib:$ROOT_DIR/../wine-enviroment/lib/wine/x86_64-unix:/opt/homebrew/lib:/usr/local/lib"
+    export APITRACE_D3D12_BUILTIN_CAPTURE=0
+    export WINEDLLPATH="$DXMT_RUNTIME_ROOT:$WINE_ENV_ROOT/lib/wine"
+    export DYLD_FALLBACK_LIBRARY_PATH="$DXMT_UNIX_DIR:$WINE_ENV_ROOT/lib:$WINE_ENV_ROOT/lib/wine/x86_64-unix:/opt/homebrew/lib:/usr/local/lib"
     export APITRACE_D3D12_CAPTURE_PRESENT_FRAMES=1
 }
 
@@ -98,6 +102,19 @@ trace_d3d12_to_metal() {
     require_file "$LINK_TRACE/callstream.jsonl"
     require_file "$LINK_TRACE/metal-callstream.jsonl"
     require_file "$LINK_TRACE/analysis/translation-links.jsonl"
+    if [ -x "$HOST_BUNDLE_CHECK" ]; then
+        "$HOST_BUNDLE_CHECK" \
+            --require-d3d \
+            --require-metal \
+            --require-translation-links \
+            --require-shared-resources \
+            --require-d3d-replay-closure \
+            --require-d3d-native-readiness \
+            --require-d3d-present-frames \
+            --require-metal-replay-closure \
+            "$LINK_TRACE" >/dev/null
+    fi
+    "$NATIVE_RETRACE" --metal --validate-only "$LINK_TRACE" >/dev/null
     if grep -F "scene start: dxr_smoke" "$RUN_LOG" >/dev/null; then
         fail "dxr_smoke should remain skipped in d3d12 all"
     fi
@@ -113,77 +130,13 @@ retrace_metal() {
 }
 
 compare_metal() {
-    python3 - "$ROOT_DIR" "$LINK_TRACE" "$METAL_RETRACE_BUNDLE" <<'PY' | tee "$METAL_COMPARE_LOG"
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1])
-baseline = pathlib.Path(sys.argv[2])
-candidate = pathlib.Path(sys.argv[3])
-sys.path.insert(0, str(root / "scripts" / "lib"))
-import present_frame_compare as compare
-
-baseline_frames = compare.load_frames(baseline, "d3d12")
-candidate_frames = compare.load_frames(candidate, "metal")
-if len(baseline_frames) != len(candidate_frames):
-    compare.fail(f"frame counts differ: baseline={len(baseline_frames)} candidate={len(candidate_frames)}")
-
-failed_frames = 0
-failed_tiles = 0
-max_channel_delta = 0
-for index, (baseline_frame, candidate_frame) in enumerate(zip(baseline_frames, candidate_frames)):
-    if (
-        baseline_frame.width != candidate_frame.width
-        or baseline_frame.height != candidate_frame.height
-        or baseline_frame.row_pitch != candidate_frame.row_pitch
-    ):
-        compare.fail(
-            f"frame {index}: metadata differs "
-            f"baseline=({baseline_frame.width}x{baseline_frame.height}, row_pitch={baseline_frame.row_pitch}) "
-            f"candidate=({candidate_frame.width}x{candidate_frame.height}, row_pitch={candidate_frame.row_pitch})"
-        )
-
-    baseline_pixels = compare.read_frame_rgba(baseline, baseline_frame)
-    candidate_pixels = compare.read_frame_rgba(candidate, candidate_frame)
-    frame_failures = []
-    for tile_x, tile_y, tile_width, tile_height in compare.iter_tiles(
-        baseline_frame.width,
-        baseline_frame.height,
-        100,
-    ):
-        tile = compare.compare_tile(
-            baseline_pixels,
-            candidate_pixels,
-            baseline_frame.width,
-            tile_x,
-            tile_y,
-            tile_width,
-            tile_height,
-        )
-        max_channel_delta = max(max_channel_delta, tile.max_channel_delta)
-        if tile.matched_ratio + 1e-12 < 0.95:
-            frame_failures.append(tile)
-
-    if frame_failures:
-        failed_frames += 1
-        failed_tiles += len(frame_failures)
-        for tile in frame_failures[:20]:
-            print(
-                f"frame={index} baseline_frame_index={baseline_frame.frame_index} "
-                f"candidate_frame_index={candidate_frame.frame_index} "
-                f"tile=({tile.x},{tile.y}) size={tile.width}x{tile.height} "
-                f"matched_ratio={tile.matched_ratio:.4f} max_channel_delta={tile.max_channel_delta}"
-            )
-
-print("api=d3d12-to-metal")
-print(f"frames_compared={len(baseline_frames)}")
-print(f"failed_frames={failed_frames}")
-print(f"failed_tiles={failed_tiles}")
-print("tile_size=100")
-print("tile_pixel_threshold=0.95")
-print(f"max_channel_delta={max_channel_delta}")
-raise SystemExit(1 if failed_frames else 0)
-PY
+    python3 "$ROOT_DIR/scripts/lib/present_frame_compare.py" \
+        --baseline-api d3d12 \
+        --candidate-api metal \
+        --baseline "$LINK_TRACE" \
+        --candidate "$METAL_RETRACE_BUNDLE" \
+        --tile 100 \
+        --tile-pixel-threshold 0.95 | tee "$METAL_COMPARE_LOG"
     grep -F "failed_frames=0" "$METAL_COMPARE_LOG" >/dev/null || fail "d3d12-to-metal compare failed"
 }
 

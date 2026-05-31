@@ -39,6 +39,11 @@ set(APITRACE_D3D12_DEMO_SOURCES
     ${APITRACE_D3D_DEMO_COMMON_SOURCES}
 )
 
+set(APITRACE_D3D12_ASSET_DUMP_SOURCES
+    src/d3d12_asset_dump.cpp
+    src/demo_common.hpp
+)
+
 set(APITRACE_METAL_DEMO_SOURCES
     src/metal_main.mm
     src/runtime/metal/include/runtime/metal/runtime.hpp
@@ -79,6 +84,7 @@ if(APITRACE_BUILD_TEST_DEMO AND WIN32)
 
     apitrace_configure_d3d_demo(apitrace_test_d3d11 APITRACE_D3D11_DEMO_SOURCES)
     apitrace_configure_d3d_demo(apitrace_test_d3d12 APITRACE_D3D12_DEMO_SOURCES)
+    apitrace_configure_d3d_demo(apitrace_d3d12_asset_dump APITRACE_D3D12_ASSET_DUMP_SOURCES)
     install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/assets/ DESTINATION ${CMAKE_INSTALL_BINDIR}/assets)
 endif()
 

@@ -7,11 +7,28 @@ include(GNUInstallDirs)
 option(APITRACE_BUILD_TOOLS "Build command-line tools" ON)
 option(APITRACE_BUILD_WINDOWS_DLLS "Build Windows proxy DLLs when supported" ON)
 option(APITRACE_BUILD_METAL_BACKEND "Build Metal backend sources when supported" ON)
+# Produce the PE-side capture units (d3d11/d3d12 capture + core) as STATIC
+# archives suitable for embedding into a host PE module (e.g. DXMT's own
+# d3d11.dll / d3d12.dll). When OFF, the platform_windows_d3d11/d3d12 targets
+# remain SHARED proxy DLLs as before.
+option(APITRACE_BUILD_PE_CAPTURE_STATIC "Emit PE capture units as STATIC archives for embedding" OFF)
 
 # Native macOS D3D retrace via DXMT dylibs. Disabled by default; turn ON
 # together with APITRACE_DXMT_NATIVE_BUILD_DIR pointing at dxmt/build-gs-native.
 option(APITRACE_BUILD_D3D_NATIVE_RETRACE "Enable native macOS D3D retrace via DXMT" OFF)
 set(APITRACE_DXMT_NATIVE_BUILD_DIR "" CACHE PATH "DXMT build-gs-native directory")
+set(APITRACE_DXC_INCLUDE_DIR "" CACHE PATH "DXC include directory for native D3D12 asset dump tooling")
+
+if(APPLE AND NOT APITRACE_DXC_INCLUDE_DIR)
+    set(_APITRACE_DEFAULT_DXC_INCLUDE_DIR "$ENV{HOME}/.local/opt/dxc-linux-1.9.2602/include")
+    if(EXISTS "${_APITRACE_DEFAULT_DXC_INCLUDE_DIR}/dxc/dxcapi.h")
+        set(APITRACE_DXC_INCLUDE_DIR
+            "${_APITRACE_DEFAULT_DXC_INCLUDE_DIR}"
+            CACHE PATH
+            "DXC include directory for native D3D12 asset dump tooling"
+            FORCE)
+    endif()
+endif()
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
@@ -20,7 +37,7 @@ add_library(apitrace_d3d_headers INTERFACE)
 target_include_directories(apitrace_d3d_headers
     INTERFACE
         ${PROJECT_SOURCE_DIR}/third_party/d3d-headers/directx
-        ${PROJECT_SOURCE_DIR}/third_party/d3d-headers/windows
+        $<$<NOT:$<PLATFORM_ID:Windows>>:${PROJECT_SOURCE_DIR}/third_party/d3d-headers/windows>
 )
 
 if(APITRACE_BUILD_D3D_NATIVE_RETRACE)
@@ -72,6 +89,7 @@ set(APITRACE_CORE_SOURCES
     src/retrace/src/metal_replay_backend_factory.cpp
     src/retrace/src/d3d11_replay_parser.cpp
     src/trace/src/metal_callstream_writer.cpp
+    src/trace/src/payload_object_refs.cpp
     src/trace/src/trace_bundle_reader.cpp
     src/trace/src/trace_bundle_writer.cpp
     src/trace/src/translation_link_writer.cpp
@@ -99,7 +117,7 @@ target_include_directories(apitrace_core
 )
 
 target_compile_features(apitrace_core PUBLIC cxx_std_17)
-target_link_libraries(apitrace_core PRIVATE apitrace_nlohmann_json)
+target_link_libraries(apitrace_core PRIVATE apitrace_nlohmann_json apitrace_d3d_headers)
 
 if(WIN32)
     target_compile_definitions(apitrace_core PUBLIC APITRACE_HAS_D3D_NATIVE=1)
@@ -116,14 +134,25 @@ if(APITRACE_BUILD_D3D_NATIVE_RETRACE)
     )
 endif()
 
-add_library(apitrace_platform_windows_d3d11 SHARED
-    src/d3d11/src/d3d11_proxy.cpp
-    src/d3d11/src/d3d11_capture_internal.cpp
-)
+if(APITRACE_BUILD_PE_CAPTURE_STATIC)
+    add_library(apitrace_platform_windows_d3d11 STATIC
+        src/d3d11/src/d3d11_proxy.cpp
+        src/d3d11/src/d3d11_capture_internal.cpp
+    )
 
-add_library(apitrace_platform_windows_d3d12 SHARED
-    src/d3d12/src/d3d12_proxy.cpp
-)
+    add_library(apitrace_platform_windows_d3d12 STATIC
+        src/d3d12/src/d3d12_proxy.cpp
+    )
+else()
+    add_library(apitrace_platform_windows_d3d11 SHARED
+        src/d3d11/src/d3d11_proxy.cpp
+        src/d3d11/src/d3d11_capture_internal.cpp
+    )
+
+    add_library(apitrace_platform_windows_d3d12 SHARED
+        src/d3d12/src/d3d12_proxy.cpp
+    )
+endif()
 
 add_library(apitrace_platform_apple_metal
     src/metal/src/metal_bridge.cpp
@@ -177,13 +206,20 @@ target_compile_features(apitrace_platform_windows_d3d11 PUBLIC cxx_std_17)
 target_compile_features(apitrace_platform_windows_d3d12 PUBLIC cxx_std_17)
 target_compile_features(apitrace_platform_apple_metal PUBLIC cxx_std_17)
 
-if(WIN32 AND APITRACE_BUILD_WINDOWS_DLLS)
+if(WIN32 AND APITRACE_BUILD_WINDOWS_DLLS AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
     set_target_properties(apitrace_platform_windows_d3d11 PROPERTIES OUTPUT_NAME d3d11 PREFIX "")
     set_target_properties(apitrace_platform_windows_d3d12 PROPERTIES OUTPUT_NAME d3d12 PREFIX "")
     if(MINGW AND CMAKE_SIZEOF_VOID_P EQUAL 4)
         target_link_options(apitrace_platform_windows_d3d11 PRIVATE -Wl,--add-stdcall-alias)
         target_link_options(apitrace_platform_windows_d3d12 PRIVATE -Wl,--add-stdcall-alias)
     endif()
+elseif(APITRACE_BUILD_PE_CAPTURE_STATIC)
+    set_target_properties(apitrace_platform_windows_d3d11 PROPERTIES
+        OUTPUT_NAME apitrace_d3d11_capture
+    )
+    set_target_properties(apitrace_platform_windows_d3d12 PROPERTIES
+        OUTPUT_NAME apitrace_d3d12_capture
+    )
 else()
     set_target_properties(apitrace_platform_windows_d3d11 PROPERTIES EXCLUDE_FROM_ALL TRUE)
     set_target_properties(apitrace_platform_windows_d3d12 PROPERTIES EXCLUDE_FROM_ALL TRUE)
@@ -210,7 +246,7 @@ if(APPLE AND APITRACE_BUILD_METAL_BACKEND)
     )
 endif()
 
-if(APITRACE_BUILD_TOOLS)
+if(APITRACE_BUILD_TOOLS AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
     add_executable(apitrace_retrace src/tools/retrace/src/main.cpp)
     set_target_properties(apitrace_retrace PROPERTIES OUTPUT_NAME retrace)
     target_link_libraries(apitrace_retrace PRIVATE apitrace_core)
@@ -232,11 +268,112 @@ if(APITRACE_BUILD_TOOLS)
             -Wl,-exported_symbol,_macdrv_view_release_metal_view
         )
     endif()
+
+    add_executable(apitrace_bundle_check src/tools/bundle-check/src/main.cpp)
+    set_target_properties(apitrace_bundle_check PROPERTIES OUTPUT_NAME bundle-check)
+    target_link_libraries(apitrace_bundle_check PRIVATE apitrace_core apitrace_nlohmann_json)
+    if(APPLE AND APITRACE_BUILD_D3D_NATIVE_RETRACE)
+        target_link_libraries(apitrace_bundle_check PRIVATE apitrace_platform_macos)
+    endif()
+    target_include_directories(apitrace_bundle_check PRIVATE ${APITRACE_PUBLIC_INCLUDE_DIRS} ${APITRACE_PRIVATE_INCLUDE_DIRS})
+    target_compile_features(apitrace_bundle_check PRIVATE cxx_std_17)
+endif()
+
+if(NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
+    add_executable(apitrace_test_trace_writer_assets test/src/test_trace_writer_assets.cpp)
+    target_link_libraries(apitrace_test_trace_writer_assets PRIVATE apitrace_core)
+    target_compile_features(apitrace_test_trace_writer_assets PRIVATE cxx_std_17)
+
+    add_executable(apitrace_test_d3d12_capture_api test/src/test_d3d12_capture_api.cpp)
+    target_link_libraries(apitrace_test_d3d12_capture_api PRIVATE apitrace_core apitrace_nlohmann_json apitrace_d3d_headers)
+    target_compile_features(apitrace_test_d3d12_capture_api PRIVATE cxx_std_17)
+
+    add_executable(apitrace_test_d3d11_replay_semantics test/src/test_d3d11_replay_semantics.cpp)
+    target_link_libraries(apitrace_test_d3d11_replay_semantics PRIVATE apitrace_core)
+    target_include_directories(apitrace_test_d3d11_replay_semantics PRIVATE ${APITRACE_PRIVATE_INCLUDE_DIRS})
+    target_compile_features(apitrace_test_d3d11_replay_semantics PRIVATE cxx_std_17)
+
+    add_executable(apitrace_test_d3d12_replay_semantics test/src/test_d3d12_replay_semantics.cpp)
+    target_link_libraries(apitrace_test_d3d12_replay_semantics PRIVATE apitrace_core)
+    target_compile_definitions(apitrace_test_d3d12_replay_semantics PRIVATE APITRACE_ENABLE_TEST_HOOKS)
+    if(APPLE AND APITRACE_BUILD_D3D_NATIVE_RETRACE)
+        target_link_libraries(apitrace_test_d3d12_replay_semantics PRIVATE apitrace_platform_macos)
+    endif()
+    target_compile_features(apitrace_test_d3d12_replay_semantics PRIVATE cxx_std_17)
+
+    add_executable(apitrace_test_d3d12_native_replay_smoke test/src/test_d3d12_native_replay_smoke.cpp)
+    target_link_libraries(apitrace_test_d3d12_native_replay_smoke PRIVATE apitrace_core)
+    if(APPLE AND APITRACE_BUILD_D3D_NATIVE_RETRACE)
+        target_link_libraries(apitrace_test_d3d12_native_replay_smoke PRIVATE apitrace_platform_macos)
+    endif()
+    target_compile_features(apitrace_test_d3d12_native_replay_smoke PRIVATE cxx_std_17)
+
+    if(APPLE AND APITRACE_DXC_INCLUDE_DIR)
+        add_executable(apitrace_d3d12_native_asset_dump test/src/d3d12_native_asset_dump.cpp)
+        target_include_directories(apitrace_d3d12_native_asset_dump PRIVATE "${APITRACE_DXC_INCLUDE_DIR}")
+        target_compile_features(apitrace_d3d12_native_asset_dump PRIVATE cxx_std_17)
+        target_compile_options(apitrace_d3d12_native_asset_dump PRIVATE -arch x86_64)
+        target_link_options(apitrace_d3d12_native_asset_dump PRIVATE -arch x86_64)
+        set_target_properties(apitrace_d3d12_native_asset_dump PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    endif()
+
+    add_executable(apitrace_test_metal_callstream_roundtrip test/src/test_metal_callstream_roundtrip.cpp)
+    target_link_libraries(apitrace_test_metal_callstream_roundtrip PRIVATE apitrace_core)
+    target_include_directories(apitrace_test_metal_callstream_roundtrip PRIVATE ${APITRACE_PRIVATE_INCLUDE_DIRS})
+    target_compile_features(apitrace_test_metal_callstream_roundtrip PRIVATE cxx_std_17)
+
+    add_executable(apitrace_test_metal_replay_closure test/src/test_metal_replay_closure.cpp)
+    target_link_libraries(apitrace_test_metal_replay_closure PRIVATE apitrace_core apitrace_nlohmann_json)
+    if(APPLE AND APITRACE_BUILD_METAL_BACKEND)
+        target_link_libraries(apitrace_test_metal_replay_closure PRIVATE apitrace_platform_apple_metal)
+    endif()
+    target_include_directories(apitrace_test_metal_replay_closure PRIVATE ${APITRACE_PRIVATE_INCLUDE_DIRS})
+    target_compile_features(apitrace_test_metal_replay_closure PRIVATE cxx_std_17)
+
+    if(APPLE AND APITRACE_BUILD_METAL_BACKEND)
+        add_executable(apitrace_test_metal_native_replay_smoke test/src/test_metal_native_replay_smoke.mm)
+        target_link_libraries(apitrace_test_metal_native_replay_smoke PRIVATE
+            apitrace_core
+            apitrace_platform_apple_metal
+            "-framework Foundation"
+            "-framework Metal"
+        )
+        target_compile_features(apitrace_test_metal_native_replay_smoke PRIVATE cxx_std_17)
+        set_source_files_properties(test/src/test_metal_native_replay_smoke.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    endif()
+
+    add_executable(apitrace_test_cross_api_bundle_closure test/src/test_cross_api_bundle_closure.cpp)
+    target_link_libraries(apitrace_test_cross_api_bundle_closure PRIVATE apitrace_core apitrace_nlohmann_json)
+    if(APPLE AND APITRACE_BUILD_D3D_NATIVE_RETRACE)
+        target_link_libraries(apitrace_test_cross_api_bundle_closure PRIVATE apitrace_platform_macos)
+    endif()
+    target_include_directories(apitrace_test_cross_api_bundle_closure PRIVATE ${APITRACE_PRIVATE_INCLUDE_DIRS})
+    target_compile_features(apitrace_test_cross_api_bundle_closure PRIVATE cxx_std_17)
 endif()
 
 if(WIN32)
-    target_link_libraries(apitrace_core PRIVATE d3d11 d3d12 dxgi user32)
-    target_link_libraries(apitrace_platform_windows_d3d12 PRIVATE uuid)
+    if(APITRACE_BUILD_PE_CAPTURE_STATIC)
+        # Static archives are linked into a host PE module (DXMT's own
+        # d3d11.dll / d3d12.dll). The host already imports d3d11/d3d12/dxgi/uuid
+        # at its final link step, so do not redeclare those imports here.
+    else()
+        target_link_libraries(apitrace_core PRIVATE d3d11 d3d12 dxgi user32)
+        target_link_libraries(apitrace_platform_windows_d3d12 PRIVATE uuid)
+    endif()
+endif()
+
+if(APITRACE_BUILD_PE_CAPTURE_STATIC)
+    add_library(apitrace_d3d_capture INTERFACE)
+    target_link_libraries(apitrace_d3d_capture
+        INTERFACE
+            apitrace_platform_windows_d3d11
+            apitrace_platform_windows_d3d12
+            apitrace_core
+    )
+    target_include_directories(apitrace_d3d_capture
+        INTERFACE
+            ${APITRACE_PUBLIC_INCLUDE_DIRS}
+    )
 endif()
 
 install(TARGETS apitrace_core
@@ -245,11 +382,11 @@ install(TARGETS apitrace_core
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
-if(APITRACE_BUILD_TOOLS)
+if(APITRACE_BUILD_TOOLS AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
     install(TARGETS apitrace_retrace RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
-if(WIN32 AND APITRACE_BUILD_WINDOWS_DLLS)
+if(WIN32 AND APITRACE_BUILD_WINDOWS_DLLS AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
     install(TARGETS apitrace_platform_windows_d3d11
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -257,6 +394,12 @@ if(WIN32 AND APITRACE_BUILD_WINDOWS_DLLS)
     install(TARGETS apitrace_platform_windows_d3d12
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    )
+endif()
+
+if(APITRACE_BUILD_PE_CAPTURE_STATIC)
+    install(TARGETS apitrace_core apitrace_platform_windows_d3d11 apitrace_platform_windows_d3d12
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     )
 endif()
 

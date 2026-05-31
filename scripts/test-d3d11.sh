@@ -2,8 +2,11 @@
 set -eu
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-WINE_BIN="${APITRACE_WINE_BIN:-$ROOT_DIR/../wine-enviroment/bin/wine}"
-WINESERVER_BIN="${APITRACE_WINESERVER_BIN:-$ROOT_DIR/../wine-enviroment/bin/wineserver}"
+DXMT_REPO_ROOT="${APITRACE_DXMT_REPO_ROOT:-$(CDPATH= cd -- "$ROOT_DIR/../.." && pwd)}"
+GAMESIR_ROOT="${APITRACE_GAMESIR_ROOT:-$(CDPATH= cd -- "$DXMT_REPO_ROOT/.." && pwd)}"
+WINE_ENV_ROOT="${APITRACE_WINE_ENV_ROOT:-$GAMESIR_ROOT/wine-enviroment}"
+WINE_BIN="${APITRACE_WINE_BIN:-$WINE_ENV_ROOT/bin/wine}"
+WINESERVER_BIN="${APITRACE_WINESERVER_BIN:-$WINE_ENV_ROOT/bin/wineserver}"
 ROOT_BUILD_DIR="${APITRACE_ROOT_BUILD_DIR:-$ROOT_DIR/build/windows-cross}"
 TEST_BUILD_DIR="${APITRACE_TEST_BUILD_DIR:-$ROOT_DIR/test/build/windows-x86_64-d3d11}"
 TEST_PREFIX="${APITRACE_TEST_PREFIX:-$ROOT_DIR/test/artifacts/d3d11}"
@@ -17,8 +20,8 @@ RETRACE_BIN_DIR="$TEST_PREFIX/retrace-bin"
 RETRACE_EXE="$RETRACE_BIN_DIR/retrace.exe"
 ROOT_D3D11_PROXY_DLL="$ROOT_BUILD_DIR/d3d11.dll"
 ROOT_RETRACE_EXE="$ROOT_BUILD_DIR/retrace.exe"
-DXMT_REPO_ROOT="${APITRACE_DXMT_REPO_ROOT:-$ROOT_DIR/../dxmt}"
-DXMT_BUILD_DIR="${APITRACE_DXMT_BUILD_DIR:-$DXMT_REPO_ROOT/build-gs-native-builtin}"
+HOST_BUNDLE_CHECK="$ROOT_DIR/build/cmake-arm64/bundle-check"
+DXMT_BUILD_DIR="${APITRACE_DXMT_BUILD_DIR:-$DXMT_REPO_ROOT/build-builtin}"
 DXMT_STAGE_DIR="${APITRACE_DXMT_STAGE_DIR:-$ROOT_DIR/test/artifacts/dxmt-runtime-d3d11}"
 DXMT_RUNTIME_ROOT=""
 DXMT_D3D11_DLL=""
@@ -27,7 +30,7 @@ DXMT_D3D12CORE_DLL=""
 DXMT_DXGI_DLL=""
 DXMT_WINEMETAL_DLL=""
 DXMT_UNIX_DIR=""
-D3D_COMPILER_DLL="$ROOT_DIR/../wine-enviroment/lib/wine/x86_64-windows/d3dcompiler_47.dll"
+D3D_COMPILER_DLL="${APITRACE_D3D_COMPILER_DLL:-$WINE_ENV_ROOT/lib/wine/x86_64-windows/d3dcompiler_47.dll}"
 COMPARE_LOG="$TEST_PREFIX/compare.log"
 RUN_LOG="$TEST_PREFIX/run.log"
 RETRACE_LOG="$TEST_PREFIX/retrace.log"
@@ -173,8 +176,8 @@ prepare_wine_env() {
     export WINEARCH="win64"
     export WINEPREFIX="$WINE_PREFIX"
     export APITRACE_DOWNSTREAM_D3D11="$DXMT_D3D11_DLL"
-    export WINEDLLPATH="$DXMT_RUNTIME_ROOT:$ROOT_DIR/../wine-enviroment/lib/wine"
-    export DYLD_FALLBACK_LIBRARY_PATH="$DXMT_UNIX_DIR:$ROOT_DIR/../wine-enviroment/lib:$ROOT_DIR/../wine-enviroment/lib/wine/x86_64-unix:/opt/homebrew/lib:/usr/local/lib"
+    export WINEDLLPATH="$DXMT_RUNTIME_ROOT:$WINE_ENV_ROOT/lib/wine"
+    export DYLD_FALLBACK_LIBRARY_PATH="$DXMT_UNIX_DIR:$WINE_ENV_ROOT/lib:$WINE_ENV_ROOT/lib/wine/x86_64-unix:/opt/homebrew/lib:/usr/local/lib"
     if [ ! -f "$WINE_PREFIX/system.reg" ]; then
         "$WINE_BIN" wineboot -u >/dev/null 2>&1 || true
     fi
@@ -187,8 +190,12 @@ step_trace() {
     "$WINE_BIN" "$DEMO_EXE" | tr -d '\r' | tee "$RUN_LOG"
     unset APITRACE_TRACE_BUNDLE
     require_file "$TRACE_BUNDLE/callstream.jsonl"
-    present_count="$(grep -c '"debug_name":"D3D11PresentFrame"' "$TRACE_BUNDLE/callstream.jsonl" || true)"
-    [ "$present_count" -gt 0 ] || fail "trace bundle has no D3D11PresentFrame assets"
+    if [ -x "$HOST_BUNDLE_CHECK" ]; then
+        "$HOST_BUNDLE_CHECK" --require-d3d --require-d3d-present-frames "$TRACE_BUNDLE" >/dev/null
+    else
+        present_count="$(grep -c '"debug_name":"D3D11PresentFrame"' "$TRACE_BUNDLE/callstream.jsonl" || true)"
+        [ "$present_count" -gt 0 ] || fail "trace bundle has no D3D11PresentFrame assets"
+    fi
 }
 
 step_retrace() {
@@ -200,8 +207,12 @@ step_retrace() {
     "$WINE_BIN" cmd /c "cd /d $retrace_bin_path && retrace.exe $trace_bundle_path" | tr -d '\r' | tee "$RETRACE_LOG"
     unset APITRACE_TRACE_BUNDLE
     require_file "$RETRACE_BUNDLE/callstream.jsonl"
-    present_count="$(grep -c '"debug_name":"D3D11PresentFrame"' "$RETRACE_BUNDLE/callstream.jsonl" || true)"
-    [ "$present_count" -gt 0 ] || fail "retrace bundle has no D3D11PresentFrame assets"
+    if [ -x "$HOST_BUNDLE_CHECK" ]; then
+        "$HOST_BUNDLE_CHECK" --require-d3d --require-d3d-present-frames "$RETRACE_BUNDLE" >/dev/null
+    else
+        present_count="$(grep -c '"debug_name":"D3D11PresentFrame"' "$RETRACE_BUNDLE/callstream.jsonl" || true)"
+        [ "$present_count" -gt 0 ] || fail "retrace bundle has no D3D11PresentFrame assets"
+    fi
 }
 
 step_compare() {

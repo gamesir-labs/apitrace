@@ -2,10 +2,12 @@
 set -euo pipefail
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+DXMT_REPO_ROOT="${APITRACE_DXMT_REPO_ROOT:-$(CDPATH= cd -- "$ROOT_DIR/../.." && pwd)}"
 ROOT_BUILD_DIR="${APITRACE_ROOT_BUILD_DIR:-$ROOT_DIR/build/cmake-native-d3d-abi}"
-DXMT_NATIVE_BUILD_DIR="${APITRACE_DXMT_NATIVE_BUILD_DIR:-$ROOT_DIR/../dxmt/build-gs-native}"
+DXMT_NATIVE_BUILD_DIR="${APITRACE_DXMT_NATIVE_BUILD_DIR:-$DXMT_REPO_ROOT/build-gs-native}"
 SMOKE_BIN="$ROOT_BUILD_DIR/test/abi-check/apitrace_native_d3d12_smoke"
 SMOKE_LOG="$ROOT_DIR/test/artifacts/d3d-native-abi/smoke.log"
+REQUIRE_NATIVE_ABI="${APITRACE_REQUIRE_D3D_NATIVE_ABI:-0}"
 
 fail() {
   echo "error: $*" >&2
@@ -42,6 +44,13 @@ cmake --build "$ROOT_BUILD_DIR" --target apitrace_native_d3d12_smoke
 require_file "$SMOKE_BIN"
 
 DXMT_EXPERIMENT_DX12_SUPPORT=1 "$SMOKE_BIN" "$DXMT_NATIVE_BUILD_DIR" | tee "$SMOKE_LOG"
+if grep -F "ABI_SMOKE_SKIP" "$SMOKE_LOG" >/dev/null; then
+  if [ "$REQUIRE_NATIVE_ABI" != "0" ]; then
+    fail "native D3D ABI smoke skipped but APITRACE_REQUIRE_D3D_NATIVE_ABI=$REQUIRE_NATIVE_ABI"
+  fi
+  echo "test-d3d-native-abi SKIP: no Metal-backed DXGI adapter in this process"
+  exit 0
+fi
 grep -F "ABI_SMOKE_OK" "$SMOKE_LOG" >/dev/null || fail "ABI smoke did not report ABI_SMOKE_OK"
 
 echo "test-d3d-native-abi PASS"

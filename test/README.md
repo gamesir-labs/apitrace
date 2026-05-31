@@ -142,6 +142,39 @@ D3D11 和 D3D12 trace / retrace 都写 `D3D*PresentFrame` debug 资产。Metal t
 - 用 native `retrace --metal` 回放该 bundle，并捕获 Metal PresentFrame。
 - 对比 D3D12 trace PresentFrame 和 Metal retrace PresentFrame，tile 规则同上。
 
+`scripts/test-cross-api-smoke.sh`：
+
+- 生成合成 D3D12 + Metal 双侧 bundle。
+- 用 `bundle-check` 同时要求 D3D、Metal、translation links、共享资源、双侧 replay closure、D3D native readiness 和双侧 PresentFrame。
+- 校验 Metal draw/dispatch 的 `draw_to_metal_calls` 必须链接到 D3D pipeline-dependent 调用，而不是只链接到提交/边界记录。
+- 分别执行 D3D validate-only 与 Metal validate-only。
+- 对同一 bundle 内的 D3D12 PresentFrame 和 Metal PresentFrame 执行 `d3d12-to-metal` tile compare。
+- 构建并运行 `apitrace_test_metal_native_replay_smoke`。该 smoke 使用真实 `metallib`、离屏 render target
+  和非 validate-only `ReplaySession` 跑 native Metal retrace，再把 retrace 捕获帧与原生 Metal 直接
+  渲染出的基准帧比较；随后用相同 Metal 命令流但错误 `MetalPresentFrame` 的 poisoned trace 再跑一次，
+  要求 retrace 捕获帧仍等于真实基准且不等于 poisoned 记录帧，防止 retrace 退化成直接播放记录帧。
+  如果当前环境没有 Metal device，测试以 77 跳过。
+
+`scripts/test-d3d12-native-smoke.sh`：
+
+- 优先构建并运行 macOS native `apitrace_d3d12_native_asset_dump`，通过 D3DMetal bundled
+  `libdxcompiler.dylib` 生成真实 fullscreen-triangle VS/PS DXIL 和 serialized root signature
+  资产；如果 native DXC 输入不可用，再回退到 Wine `apitrace_d3d12_asset_dump.exe` +
+  `d3d12.dll` + `d3dcompiler_47.dll` 生成 DXBC 资产。
+- 生成最小但 pipeline-dependent 的 D3D12 bundle：swapchain back buffer、RTV、root signature、
+  graphics PSO、viewport/scissor、OMSetRenderTargets、DrawInstanced、state transition、Present。
+- 用 `bundle-check --require-d3d --require-d3d-replay-closure --require-d3d-native-readiness --require-d3d-present-frames`
+  校验 bundle 闭包，并要求 D3D pipeline / shader / root-signature 资产和 draw 元数据闭合。
+- 在 DXMT ABI probe 前先运行 ARM64 Metal native probe 并保存诊断日志；该 probe 只用于区分当前
+  shell/GUI 环境下的 Metal 可用性，不再作为 x86_64 DXMT native replay 的硬性 gate。
+- 先运行 native DXMT ABI smoke，确认当前进程能枚举 Metal-backed DXGI adapter。
+- 用 native macOS `retrace` 真实回放 D3D12 bundle，并捕获 retrace PresentFrame。
+- 用 `present_frame_compare.py --api d3d12 --tile 4 --tile-pixel-threshold 1.0` 比对 trace 与 native retrace。
+- 同时生成 poisoned-baseline bundle：D3D12 命令流完全相同，但输入 `D3D12PresentFrame` 故意写成错误颜色。
+  native retrace 的捕获帧必须和这个 poisoned baseline 不匹配，用来防止 retrace 退化成直接播放记录帧。
+- 如果当前进程没有 Metal-backed DXGI adapter，测试以 77 跳过；设置
+  `APITRACE_REQUIRE_D3D_NATIVE_REPLAY=1` 可把该 skip 提升为失败。
+
 ## 构建入口
 
 推荐直接运行模块脚本。需要手动构建 demo 时可使用：
@@ -157,8 +190,9 @@ Metal demo 构建：
 
 ```sh
 cmake -S test -B test/build/macos-native-arm64 -G Ninja \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 \
   -DAPITRACE_BUILD_METAL_DEMO=ON \
-  -DAPITRACE_ROOT_BUILD_DIR=build/cmake-arm64
+  -DAPITRACE_ROOT_BUILD_DIR=build/cmake-metal-arm64
 cmake --build test/build/macos-native-arm64
 cmake --install test/build/macos-native-arm64 --prefix test/artifacts/metal
 ```

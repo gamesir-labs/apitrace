@@ -3,6 +3,7 @@ set -eu
 
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 HOST_BUILD_DIR="${APITRACE_HOST_BUILD_DIR:-$ROOT_DIR/build/cmake}"
+METAL_HOST_BUILD_DIR="${APITRACE_METAL_HOST_BUILD_DIR:-$ROOT_DIR/build/cmake-metal-arm64}"
 WIN_BUILD_DIR="${APITRACE_WIN_BUILD_DIR:-$ROOT_DIR/build/windows-x86_64}"
 DEMO_BUILD_DIR="${APITRACE_DEMO_BUILD_DIR:-$ROOT_DIR/test/build/windows-x86_64}"
 ARTIFACT_DIR="${APITRACE_ARTIFACT_DIR:-$ROOT_DIR/test/artifacts/windows-x86_64}"
@@ -12,9 +13,24 @@ WINE_ROOT="${APITRACE_WINE_ROOT:-/Users/shiyu/Documents/Project/gamesir/wine-pro
 WINE_BRANCH="${APITRACE_WINE_BRANCH:-proton-11.0-macos}"
 BUILD_WINE="${APITRACE_BUILD_WINE:-0}"
 
+run_optional_skip() {
+    set +e
+    "$@"
+    status=$?
+    set -e
+    if [ "$status" -eq 77 ]; then
+        echo "optional matrix step skipped: $*" >&2
+        return 0
+    fi
+    return "$status"
+}
+
 build_native() {
     cmake -S "$ROOT_DIR" -B "$HOST_BUILD_DIR" -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
     cmake --build "$HOST_BUILD_DIR"
+    APITRACE_ROOT_BUILD_DIR="$METAL_HOST_BUILD_DIR" "$ROOT_DIR/scripts/test-cross-api-smoke.sh"
+    run_optional_skip "$ROOT_DIR/scripts/test-d3d12-native-smoke.sh"
+    "$ROOT_DIR/scripts/test-present-frame-compare.sh"
 }
 
 build_windows_apitrace() {

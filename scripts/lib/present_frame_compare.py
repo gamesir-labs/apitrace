@@ -131,6 +131,7 @@ def load_frames(bundle: pathlib.Path, api: str) -> list[Frame]:
     debug_name = DEBUG_NAME_BY_API[api]
     allowed_formats = FORMAT_BY_API[api]
     frames: list[Frame] = []
+    previous_frame_index: int | None = None
     with callstream.open("r", encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
             line = line.strip()
@@ -166,6 +167,12 @@ def load_frames(bundle: pathlib.Path, api: str) -> list[Frame]:
 
             if frame.width <= 0 or frame.height <= 0 or frame.row_pitch < frame.width * 4:
                 fail(f"{callstream}:{line_number}: invalid frame dimensions")
+            if previous_frame_index is not None and frame.frame_index <= previous_frame_index:
+                fail(
+                    f"{callstream}:{line_number}: frame_index is not strictly increasing "
+                    f"({frame.frame_index} after {previous_frame_index})"
+                )
+            previous_frame_index = frame.frame_index
 
             absolute = bundle / frame.path
             if not absolute.is_file():
@@ -179,29 +186,38 @@ def load_frames(bundle: pathlib.Path, api: str) -> list[Frame]:
     return frames
 
 
-def read_frame_rgba(bundle: pathlib.Path, frame: Frame) -> bytes:
-    data = (bundle / frame.path).read_bytes()
-    row_bytes = frame.width * 4
-    if frame.row_pitch == row_bytes:
-        packed = data
-    else:
-        rows = []
-        for row in range(frame.height):
-            begin = row * frame.row_pitch
-            rows.append(data[begin : begin + row_bytes])
-        packed = b"".join(rows)
+def convert_row_to_rgba(row: bytes, pixel_format: str) -> bytes:
+    if pixel_format == "rgba8":
+        return row
 
-    if frame.pixel_format == "rgba8":
-        return packed
-
-    rgba = bytearray(len(packed))
-    for offset in range(0, len(packed), 4):
-        b, g, r, a = packed[offset : offset + 4]
+    rgba = bytearray(len(row))
+    for offset in range(0, len(row), 4):
+        b, g, r, a = row[offset : offset + 4]
         rgba[offset + 0] = r
         rgba[offset + 1] = g
         rgba[offset + 2] = b
         rgba[offset + 3] = a
     return bytes(rgba)
+
+
+def read_tile_rows_rgba(
+    handle,
+    frame: Frame,
+    tile_x: int,
+    tile_y: int,
+    tile_width: int,
+    tile_height: int,
+) -> list[bytes]:
+    rows: list[bytes] = []
+    row_bytes = tile_width * 4
+    for row in range(tile_height):
+        offset = (tile_y + row) * frame.row_pitch + tile_x * 4
+        handle.seek(offset)
+        packed = handle.read(row_bytes)
+        if len(packed) != row_bytes:
+            fail(f"{frame.path}: short read while loading tile row")
+        rows.append(convert_row_to_rgba(packed, frame.pixel_format))
+    return rows
 
 
 def iter_tiles(width: int, height: int, tile_size: int) -> list[tuple[int, int, int, int]]:
@@ -212,10 +228,9 @@ def iter_tiles(width: int, height: int, tile_size: int) -> list[tuple[int, int, 
     return tiles
 
 
-def compare_tile(
-    baseline: bytes,
-    candidate: bytes,
-    frame_width: int,
+def compare_tile_rows(
+    baseline_rows: list[bytes],
+    candidate_rows: list[bytes],
     tile_x: int,
     tile_y: int,
     tile_width: int,
@@ -223,11 +238,11 @@ def compare_tile(
 ) -> TileMismatch:
     mismatched_pixels = 0
     max_channel_delta = 0
-    row_stride = frame_width * 4
     for row in range(tile_height):
-        row_base = (tile_y + row) * row_stride + tile_x * 4
+        baseline = baseline_rows[row]
+        candidate = candidate_rows[row]
         for column in range(tile_width):
-            pixel_base = row_base + column * 4
+            pixel_base = column * 4
             pixel_mismatch = False
             pixel_max_delta = 0
             for channel in range(4):
@@ -246,6 +261,42 @@ def compare_tile(
         mismatched_pixels=mismatched_pixels,
         total_pixels=tile_width * tile_height,
         max_channel_delta=max_channel_delta,
+    )
+
+
+def compare_tile_from_files(
+    baseline_handle,
+    baseline_frame: Frame,
+    candidate_handle,
+    candidate_frame: Frame,
+    tile_x: int,
+    tile_y: int,
+    tile_width: int,
+    tile_height: int,
+) -> TileMismatch:
+    baseline_rows = read_tile_rows_rgba(
+        baseline_handle,
+        baseline_frame,
+        tile_x,
+        tile_y,
+        tile_width,
+        tile_height,
+    )
+    candidate_rows = read_tile_rows_rgba(
+        candidate_handle,
+        candidate_frame,
+        tile_x,
+        tile_y,
+        tile_width,
+        tile_height,
+    )
+    return compare_tile_rows(
+        baseline_rows,
+        candidate_rows,
+        tile_x,
+        tile_y,
+        tile_width,
+        tile_height,
     )
 
 
@@ -297,6 +348,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline", required=True, type=pathlib.Path)
     parser.add_argument("--candidate", required=True, type=pathlib.Path)
     parser.add_argument("--api", choices=sorted(DEBUG_NAME_BY_API))
+    parser.add_argument("--baseline-api", choices=sorted(DEBUG_NAME_BY_API))
+    parser.add_argument("--candidate-api", choices=sorted(DEBUG_NAME_BY_API))
     parser.add_argument("--tile", type=int, default=100, help="tile size and stride, default 100")
     parser.add_argument(
         "--tile-pixel-threshold",
@@ -318,21 +371,22 @@ def main() -> int:
     if args.max_report <= 0:
         fail("--max-report must be positive")
 
-    baseline_api = args.api or detect_api(args.baseline)
-    candidate_api = args.api or detect_api(args.candidate)
-    if baseline_api != candidate_api:
+    baseline_api = args.baseline_api or args.api or detect_api(args.baseline)
+    candidate_api = args.candidate_api or args.api or detect_api(args.candidate)
+    if args.api and (args.baseline_api or args.candidate_api):
+        fail("--api cannot be combined with --baseline-api or --candidate-api")
+    if baseline_api != candidate_api and not (args.baseline_api and args.candidate_api):
         fail(
             f"baseline and candidate PresentFrame kinds differ "
-            f"({baseline_api} != {candidate_api}); pass --api explicitly if this is intentional"
+            f"({baseline_api} != {candidate_api}); pass --baseline-api and --candidate-api explicitly if this is intentional"
         )
-    api = baseline_api
 
-    baseline_frames = load_frames(args.baseline, api)
-    candidate_frames = load_frames(args.candidate, api)
+    baseline_frames = load_frames(args.baseline, baseline_api)
+    candidate_frames = load_frames(args.candidate, candidate_api)
     if not baseline_frames:
-        fail(f"{args.baseline} has no {DEBUG_NAME_BY_API[api]} assets")
+        fail(f"{args.baseline} has no {DEBUG_NAME_BY_API[baseline_api]} assets")
     if not candidate_frames:
-        fail(f"{args.candidate} has no {DEBUG_NAME_BY_API[api]} assets")
+        fail(f"{args.candidate} has no {DEBUG_NAME_BY_API[candidate_api]} assets")
     if len(baseline_frames) != len(candidate_frames):
         fail(f"frame counts differ: baseline={len(baseline_frames)} candidate={len(candidate_frames)}")
 
@@ -342,11 +396,14 @@ def main() -> int:
     failed_frames = 0
 
     for index, (baseline_frame, candidate_frame) in enumerate(zip(baseline_frames, candidate_frames)):
+        if baseline_frame.frame_index != candidate_frame.frame_index:
+            fail(
+                f"frame {index}: frame_index differs "
+                f"baseline={baseline_frame.frame_index} candidate={candidate_frame.frame_index}"
+            )
         if (
             baseline_frame.width != candidate_frame.width
             or baseline_frame.height != candidate_frame.height
-            or baseline_frame.row_pitch != candidate_frame.row_pitch
-            or baseline_frame.pixel_format != candidate_frame.pixel_format
         ):
             fail(
                 f"frame {index}: metadata differs "
@@ -354,26 +411,28 @@ def main() -> int:
                 f"candidate=({candidate_frame.width}x{candidate_frame.height}, row_pitch={candidate_frame.row_pitch}, format={candidate_frame.pixel_format})"
             )
 
-        baseline_pixels = read_frame_rgba(args.baseline, baseline_frame)
-        candidate_pixels = read_frame_rgba(args.candidate, candidate_frame)
         frame_failures: list[TileMismatch] = []
-        for tile_x, tile_y, tile_width, tile_height in iter_tiles(
-            baseline_frame.width,
-            baseline_frame.height,
-            args.tile,
-        ):
-            tile = compare_tile(
-                baseline_pixels,
-                candidate_pixels,
+        with (args.baseline / baseline_frame.path).open("rb") as baseline_handle, (
+            args.candidate / candidate_frame.path
+        ).open("rb") as candidate_handle:
+            for tile_x, tile_y, tile_width, tile_height in iter_tiles(
                 baseline_frame.width,
-                tile_x,
-                tile_y,
-                tile_width,
-                tile_height,
-            )
-            max_channel_delta = max(max_channel_delta, tile.max_channel_delta)
-            if tile.matched_ratio + 1e-12 < args.tile_pixel_threshold:
-                frame_failures.append(tile)
+                baseline_frame.height,
+                args.tile,
+            ):
+                tile = compare_tile_from_files(
+                    baseline_handle,
+                    baseline_frame,
+                    candidate_handle,
+                    candidate_frame,
+                    tile_x,
+                    tile_y,
+                    tile_width,
+                    tile_height,
+                )
+                max_channel_delta = max(max_channel_delta, tile.max_channel_delta)
+                if tile.matched_ratio + 1e-12 < args.tile_pixel_threshold:
+                    frame_failures.append(tile)
 
         if frame_failures:
             failed_frames += 1
@@ -395,7 +454,8 @@ def main() -> int:
                     build_tile_mask(baseline_frame.width, baseline_frame.height, frame_failures),
                 )
 
-    print(f"api={api}")
+    api_label = baseline_api if baseline_api == candidate_api else f"{baseline_api}-to-{candidate_api}"
+    print(f"api={api_label}")
     print(f"frames_compared={len(baseline_frames)}")
     print(f"failed_frames={failed_frames}")
     print(f"failed_tiles={failed_tiles_total}")
