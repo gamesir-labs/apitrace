@@ -2,8 +2,6 @@
 
 #include <nlohmann/json.hpp>
 
-#include <filesystem>
-#include <fstream>
 #include <memory>
 #include <utility>
 
@@ -12,15 +10,6 @@ namespace apitrace::trace {
 namespace {
 
 using json = nlohmann::json;
-
-std::filesystem::path analysis_path_for_stream(const BundleLayout &layout, std::string_view stream_name)
-{
-  std::filesystem::path name(stream_name);
-  if (!name.has_extension()) {
-    name += ".jsonl";
-  }
-  return layout.analysis_directory_path / name;
-}
 
 std::string translation_link_record_json(const TranslationLinkRecord &record)
 {
@@ -44,10 +33,8 @@ std::string translation_link_record_json(const TranslationLinkRecord &record)
 struct TranslationLinkWriter::Impl {
   TraceBundleWriter *bundle_writer = nullptr;
   TranslationLinkStreamOptions options;
-  std::ofstream stream;
   bool open = false;
 
-  // TODO: buffer sideband records only when translation-layer callers need transactional flush semantics.
   // TODO: support multiple concurrent link streams without requiring the caller to manage bundle file naming.
 };
 
@@ -66,12 +53,8 @@ bool TranslationLinkWriter::open(TraceBundleWriter &bundle_writer, TranslationLi
   impl_->open = true;
 
   impl_->bundle_writer->declare_analysis_stream(impl_->options.stream_name);
-  const auto stream_path = impl_->options.stream_name == "translation-links"
-                               ? impl_->bundle_writer->layout().translation_links_path
-                               : analysis_path_for_stream(impl_->bundle_writer->layout(), impl_->options.stream_name);
-  impl_->stream.open(stream_path, std::ios::binary | std::ios::app);
   // TODO: surface producer metadata in a readable analysis stream header once optional sideband metadata files are defined.
-  return impl_->stream.is_open();
+  return true;
 }
 
 void TranslationLinkWriter::append_record(const TranslationLinkRecord &record)
@@ -80,17 +63,13 @@ void TranslationLinkWriter::append_record(const TranslationLinkRecord &record)
     return;
   }
 
-  impl_->stream << translation_link_record_json(record) << "\n";
+  impl_->bundle_writer->append_analysis_line(impl_->options.stream_name, translation_link_record_json(record));
 
   // TODO: let callers opt into explicit flush boundaries when translated-call linking volume becomes large.
 }
 
 void TranslationLinkWriter::close()
 {
-  if (impl_->stream.is_open()) {
-    impl_->stream.flush();
-    impl_->stream.close();
-  }
   impl_->bundle_writer = nullptr;
   impl_->open = false;
 }

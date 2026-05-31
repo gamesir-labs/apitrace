@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace apitrace::trace {
@@ -40,9 +41,12 @@ public:
   void append_call_event(const EventRecord &event);
   void append_metal_event(const MetalEventRecord &event);
   AssetRecord register_asset(const AssetRecord &asset);
+  AssetRecord register_asset(AssetRecord &&asset);
   AssetRecord register_metal_asset(MetalAssetKind kind, const AssetRecord &asset);
+  AssetRecord register_metal_asset(MetalAssetKind kind, AssetRecord &&asset);
   void write_object_index(const std::vector<ObjectRecord> &objects);
   void declare_analysis_stream(std::string_view stream_name);
+  void append_analysis_line(std::string_view stream_name, std::string_view json_line);
   void append_analysis_record(const AnalysisRecord &record);
   void write_checksum_index(const ChecksumIndex &checksums);
   void close();
@@ -73,6 +77,8 @@ public:
   const std::vector<AssetRecord> &metal_assets() const noexcept;
   const std::vector<ObjectRecord> &objects() const noexcept;
   const ChecksumIndex &checksums() const noexcept;
+  const std::unordered_set<std::string> &validated_checksum_paths() const noexcept;
+  bool has_asset_index() const noexcept;
   const std::string &last_error() const noexcept;
 
 private:

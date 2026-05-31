@@ -109,6 +109,12 @@ retrace 实际渲染帧；最后用 `scripts/lib/present_frame_compare.py --api 
 每个 tile 至少 `95%` 像素完全匹配；`max_channel_delta` 只作为诊断输出，不引入
 per-channel tolerance。这个流程验证 retrace 真实渲染结果，不改变 retrace 的 replay 语义。
 
+Metal 侧同样区分 validate-only 和 native replay：`retrace --metal --validate-only` 只校验 Metal
+callstream 闭包，不能证明 GPU 命令实际执行；`apitrace_test_metal_native_replay_smoke` 使用真实
+`metallib` 和离屏 render target 运行非 validate-only native Metal backend，并通过
+`APITRACE_METAL_RETRACE_CAPTURE_PRESENT_FRAMES=1` 读回实际 replay 输出。该输出会与同一 `metallib`
+和几何数据直接执行的原生 Metal 基准帧比较；该 smoke 在无 Metal device 的沙盒环境以 77 跳过。
+
 为靠近 D3D11 当前进度，D3D12 retrace 已开始消费并校验这些语义记录：
 
 - resource / root signature / PSO 创建记录及其资产引用

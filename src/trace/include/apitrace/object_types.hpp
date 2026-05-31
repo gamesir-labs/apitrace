@@ -24,6 +24,7 @@ enum class ObjectKind {
   PipelineState,
   RootSignature,
   DescriptorHeap,
+  QueryHeap,
 };
 
 struct ObjectRecord {

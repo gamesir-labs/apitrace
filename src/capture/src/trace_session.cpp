@@ -40,6 +40,11 @@ trace::AssetRecord TraceSession::register_asset(const trace::AssetRecord &asset)
   return impl_->state.register_asset(asset);
 }
 
+trace::AssetRecord TraceSession::register_asset(trace::AssetRecord &&asset)
+{
+  return impl_->state.register_asset(std::move(asset));
+}
+
 void TraceSession::record_object(const trace::ObjectRecord &object)
 {
   impl_->state.record_object(object);

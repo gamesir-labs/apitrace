@@ -13,7 +13,8 @@ namespace {
 void print_usage(std::string_view argv0)
 {
   const std::string message =
-      "usage: " + std::string(argv0) + " [--metal] [--metal-backend <name>] <trace-path>\n";
+      "usage: " + std::string(argv0) +
+      " [--validate-only] [--metal] [--metal-backend <name>] <trace-path>\n";
 #ifdef _WIN32
   DWORD written = 0;
   const HANDLE handle = GetStdHandle(STD_ERROR_HANDLE);
@@ -77,6 +78,10 @@ int main(int argc, char **argv)
     if (arg == "--metal") {
       options.enable_metal_retrace = true;
       options.backend = apitrace::replay::BackendKind::MetalTranslation;
+      continue;
+    }
+    if (arg == "--validate-only") {
+      options.validate_only = true;
       continue;
     }
     if (arg == "--metal-backend") {

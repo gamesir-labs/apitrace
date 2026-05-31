@@ -37,6 +37,8 @@ std::string_view metal_call_kind_name(MetalCallKind kind)
     return "blit_encoder_begin";
   case MetalCallKind::BlitEncoderEnd:
     return "blit_encoder_end";
+  case MetalCallKind::BlitEncoderBatch:
+    return "blit_encoder_batch";
   case MetalCallKind::SetRenderPipelineState:
     return "set_render_pipeline_state";
   case MetalCallKind::SetVertexBuffer:
@@ -87,8 +89,12 @@ std::string_view metal_call_kind_name(MetalCallKind kind)
     return "dispatch_threadgroups";
   case MetalCallKind::DispatchThreadgroupsIndirect:
     return "dispatch_threadgroups_indirect";
+  case MetalCallKind::BlitBatch:
+    return "blit_batch";
   case MetalCallKind::CopyBuffer:
     return "copy_buffer";
+  case MetalCallKind::CopyBufferToTexture:
+    return "copy_buffer_to_texture";
   case MetalCallKind::CopyTexture:
     return "copy_texture";
   case MetalCallKind::BlitFill:
@@ -107,8 +113,16 @@ std::string_view metal_call_kind_name(MetalCallKind kind)
     return "set_compute_buffer_offset";
   case MetalCallKind::SetArgumentBuffer:
     return "set_argument_buffer";
+  case MetalCallKind::EncoderState:
+    return "encoder_state";
+  case MetalCallKind::SetComputeBytes:
+    return "set_compute_bytes";
+  case MetalCallKind::DispatchThreads:
+    return "dispatch_threads";
   case MetalCallKind::MemoryBarrier:
     return "memory_barrier";
+  case MetalCallKind::FenceOps:
+    return "fence_ops";
   case MetalCallKind::UpdateFence:
     return "update_fence";
   case MetalCallKind::WaitForFence:
@@ -119,6 +133,8 @@ std::string_view metal_call_kind_name(MetalCallKind kind)
     return "push_debug_group";
   case MetalCallKind::PopDebugGroup:
     return "pop_debug_group";
+  case MetalCallKind::ObjectMetadata:
+    return "object_metadata";
   case MetalCallKind::InsertDebugSignpost:
     return "insert_debug_signpost";
   }
@@ -139,6 +155,7 @@ bool metal_call_kind_from_name(std::string_view name, MetalCallKind &kind)
       MetalCallKind::ComputeEncoderEnd,
       MetalCallKind::BlitEncoderBegin,
       MetalCallKind::BlitEncoderEnd,
+      MetalCallKind::BlitEncoderBatch,
       MetalCallKind::SetRenderPipelineState,
       MetalCallKind::SetVertexBuffer,
       MetalCallKind::SetVertexTexture,
@@ -164,7 +181,9 @@ bool metal_call_kind_from_name(std::string_view name, MetalCallKind &kind)
       MetalCallKind::SetComputeSamplerState,
       MetalCallKind::DispatchThreadgroups,
       MetalCallKind::DispatchThreadgroupsIndirect,
+      MetalCallKind::BlitBatch,
       MetalCallKind::CopyBuffer,
+      MetalCallKind::CopyBufferToTexture,
       MetalCallKind::CopyTexture,
       MetalCallKind::BlitFill,
       MetalCallKind::UseResource,
@@ -174,12 +193,17 @@ bool metal_call_kind_from_name(std::string_view name, MetalCallKind &kind)
       MetalCallKind::SetFragmentBufferOffset,
       MetalCallKind::SetComputeBufferOffset,
       MetalCallKind::SetArgumentBuffer,
+      MetalCallKind::EncoderState,
+      MetalCallKind::SetComputeBytes,
+      MetalCallKind::DispatchThreads,
       MetalCallKind::MemoryBarrier,
+      MetalCallKind::FenceOps,
       MetalCallKind::UpdateFence,
       MetalCallKind::WaitForFence,
       MetalCallKind::PresentDrawable,
       MetalCallKind::PushDebugGroup,
       MetalCallKind::PopDebugGroup,
+      MetalCallKind::ObjectMetadata,
       MetalCallKind::InsertDebugSignpost,
   };
 
@@ -196,21 +220,32 @@ bool metal_call_kind_from_name(std::string_view name, MetalCallKind &kind)
 
 std::string metal_event_record_json(const MetalEventRecord &event)
 {
-  json record = {
-      {"call_kind", metal_call_kind_name(event.call_kind)},
-      {"metal_sequence", event.metal_sequence},
-      {"d3d_sequence", event.d3d_sequence},
-      {"frame_id", event.frame_id},
-      {"object_id", event.object_id},
-      {"object_refs", event.object_refs},
-      {"blob_refs", event.blob_refs},
-      {"function", event.function_name},
-      {"payload", event.payload.empty() ? json::object() : json::parse(event.payload, nullptr, false)},
-  };
-  if (!record["payload"].is_object() && !record["payload"].is_array()) {
-    record["payload"] = json::object();
+  std::ostringstream record;
+  record << "{\"call_kind\":\"" << metal_call_kind_name(event.call_kind)
+         << "\",\"metal_sequence\":" << event.metal_sequence
+         << ",\"d3d_sequence\":" << event.d3d_sequence
+         << ",\"frame_id\":" << event.frame_id
+         << ",\"object_id\":" << event.object_id
+         << ",\"object_refs\":[";
+  for (std::size_t i = 0; i < event.object_refs.size(); i++) {
+    if (i)
+      record << ',';
+    record << event.object_refs[i];
   }
-  return record.dump();
+  record << "],\"blob_refs\":[";
+  for (std::size_t i = 0; i < event.blob_refs.size(); i++) {
+    if (i)
+      record << ',';
+    record << event.blob_refs[i];
+  }
+  record << "]";
+  if (!event.function_name.empty()) {
+    record << ",\"function\":\"" << event.function_name << "\"";
+  }
+  record << ",\"payload\":"
+         << (event.payload.empty() ? "{}" : event.payload)
+         << "}";
+  return record.str();
 }
 
 bool parse_metal_callstream(
@@ -260,10 +295,10 @@ bool parse_metal_callstream(
     event.frame_id = record.value("frame_id", 0ull);
     event.object_id = record.value("object_id", 0ull);
     event.function_name = record.value("function", std::string());
-    if (event.metal_sequence == 0 || event.function_name.empty()) {
+    if (event.metal_sequence == 0) {
       std::ostringstream message;
       message << callstream_path.filename().generic_string() << ": line " << line_number
-              << " missing metal_sequence or function";
+              << " missing metal_sequence";
       error = message.str();
       return false;
     }

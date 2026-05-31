@@ -120,6 +120,11 @@ trace::AssetRecord TraceSessionState::register_asset(const trace::AssetRecord &a
   return bundle_sink_.writer().register_asset(asset);
 }
 
+trace::AssetRecord TraceSessionState::register_asset(trace::AssetRecord &&asset)
+{
+  return bundle_sink_.writer().register_asset(std::move(asset));
+}
+
 void TraceSessionState::record_object(const trace::ObjectRecord &object)
 {
   if (object.object_id == 0) {

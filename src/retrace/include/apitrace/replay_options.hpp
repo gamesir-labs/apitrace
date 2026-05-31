@@ -19,6 +19,7 @@ struct ReplayOptions {
   bool enable_metal_trace = false;
   bool enable_metal_retrace = false;
   bool enable_metal_present_capture = false;
+  bool validate_only = false;
   std::string metal_backend_name = "native";
 
   // TODO: split backend selection from replay policy once per-backend settings appear.

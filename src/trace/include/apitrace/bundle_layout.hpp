@@ -7,6 +7,7 @@ namespace apitrace::trace {
 inline constexpr const char *kCallstreamFileName = "callstream.jsonl";
 inline constexpr const char *kMetalCallstreamFileName = "metal-callstream.jsonl";
 inline constexpr const char *kChecksumsFileName = "checksums.json";
+inline constexpr const char *kAssetIndexFileName = "assets.json";
 inline constexpr const char *kAnalysisDirectoryName = "analysis";
 inline constexpr const char *kTranslationLinksFileName = "translation-links.jsonl";
 inline constexpr const char *kMetalDirectoryName = "metal";
@@ -20,6 +21,7 @@ struct BundleLayout {
   std::filesystem::path callstream_path;
   std::filesystem::path metal_callstream_path;
   std::filesystem::path checksums_path;
+  std::filesystem::path asset_index_path;
   std::filesystem::path analysis_directory_path;
   std::filesystem::path translation_links_path;
   std::filesystem::path objects_directory_path;

@@ -15,6 +15,7 @@
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -182,7 +183,7 @@ std::string sha256_file(const std::filesystem::path &path)
 {
   std::ifstream input(path, std::ios::binary);
   Sha256 sha256;
-  std::array<std::uint8_t, 4096> buffer{};
+  std::vector<std::uint8_t> buffer(1024 * 1024);
   while (input.good()) {
     input.read(reinterpret_cast<char *>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
     const auto read_count = static_cast<std::size_t>(input.gcount());
@@ -254,6 +255,9 @@ std::optional<ObjectKind> object_kind_from_name(std::string_view name)
   if (name == "DescriptorHeap") {
     return ObjectKind::DescriptorHeap;
   }
+  if (name == "QueryHeap") {
+    return ObjectKind::QueryHeap;
+  }
   return std::nullopt;
 }
 
@@ -297,7 +301,7 @@ void collect_asset_paths(const json &value, std::vector<std::string> &paths)
 {
   if (value.is_object()) {
     for (const auto &[key, child] : value.items()) {
-      if (ends_with(key, "_path") && child.is_string()) {
+      if ((ends_with(key, "_path") || key == "path") && child.is_string()) {
         paths.push_back(child.get<std::string>());
       }
       collect_asset_paths(child, paths);
@@ -310,6 +314,83 @@ void collect_asset_paths(const json &value, std::vector<std::string> &paths)
       collect_asset_paths(child, paths);
     }
   }
+}
+
+void collect_nested_asset_paths(const json &value, std::vector<std::string> &paths)
+{
+  if (value.is_object()) {
+    if (const auto type = value.find("type"); type != value.end() && type->is_string() &&
+        (*type == "graphics" || *type == "compute")) {
+      for (std::string_view stage : {"vs", "ps", "ds", "hs", "gs", "cs", "as", "ms"}) {
+        const auto shader = value.find(std::string(stage));
+        if (shader == value.end() || !shader->is_object()) {
+          continue;
+        }
+        const auto path_key = std::string(stage) + "_path";
+        const auto path = shader->find(path_key);
+        if (path != shader->end() && path->is_string()) {
+          paths.push_back(path->get<std::string>());
+        }
+      }
+      return;
+    }
+
+    for (const auto &[key, child] : value.items()) {
+      if ((ends_with(key, "_path") || key == "path") && child.is_string()) {
+        paths.push_back(child.get<std::string>());
+      }
+      collect_nested_asset_paths(child, paths);
+    }
+    return;
+  }
+
+  if (value.is_array()) {
+    for (const auto &child : value) {
+      collect_nested_asset_paths(child, paths);
+    }
+  }
+}
+
+AssetKind asset_kind_from_name(std::string_view name)
+{
+  if (name == "ShaderDxbc") {
+    return AssetKind::ShaderDxbc;
+  }
+  if (name == "ShaderDxil") {
+    return AssetKind::ShaderDxil;
+  }
+  if (name == "RootSignature") {
+    return AssetKind::RootSignature;
+  }
+  if (name == "Texture") {
+    return AssetKind::Texture;
+  }
+  if (name == "Buffer") {
+    return AssetKind::Buffer;
+  }
+  if (name == "Pipeline") {
+    return AssetKind::Pipeline;
+  }
+  if (name == "ObjectIndex") {
+    return AssetKind::ObjectIndex;
+  }
+  if (name == "Analysis") {
+    return AssetKind::Analysis;
+  }
+  return AssetKind::Unknown;
+}
+
+bool is_safe_bundle_relative_path(const std::filesystem::path &relative_path)
+{
+  if (relative_path.empty() || relative_path.is_absolute()) {
+    return false;
+  }
+  for (const auto &part : relative_path) {
+    if (part == "..") {
+      return false;
+    }
+  }
+  return true;
 }
 
 template <typename Integer>
@@ -437,6 +518,73 @@ bool parse_objects(
     }
     record.kind = *kind;
     objects.push_back(std::move(record));
+  }
+  return true;
+}
+
+bool parse_asset_index(
+    const std::filesystem::path &asset_index_path,
+    std::vector<AssetRecord> &assets,
+    std::vector<AssetRecord> &metal_assets,
+    std::unordered_map<BlobId, std::filesystem::path> &indexed_blob_paths,
+    std::string &error)
+{
+  assets.clear();
+  metal_assets.clear();
+  indexed_blob_paths.clear();
+
+  if (!std::filesystem::is_regular_file(asset_index_path)) {
+    return true;
+  }
+
+  std::ifstream input(asset_index_path);
+  if (!input.is_open()) {
+    error = "failed to open asset index: " + file_label(asset_index_path);
+    return false;
+  }
+  json root = json::parse(input, nullptr, false);
+  if (root.is_discarded() || !root.is_object()) {
+    error = file_label(asset_index_path) + ": invalid JSON";
+    return false;
+  }
+  const auto list = root.find("assets");
+  if (list == root.end() || !list->is_array()) {
+    error = file_label(asset_index_path) + ": assets must be an array";
+    return false;
+  }
+
+  for (const auto &entry : *list) {
+    if (!entry.is_object()) {
+      error = file_label(asset_index_path) + ": asset entry must be an object";
+      return false;
+    }
+    AssetRecord asset;
+    asset.blob_id = entry.value("blob_id", 0ull);
+    asset.relative_path = entry.value("path", std::string());
+    asset.kind = asset_kind_from_name(entry.value("kind", std::string("Unknown")));
+    asset.debug_name = entry.value("debug_name", std::string());
+    asset.content_hash = entry.value("content_hash", std::string());
+    asset.fast_fingerprint = entry.value("fast_fingerprint", std::string());
+    asset.byte_size = entry.value("byte_size", 0ull);
+    asset.binary_payload = entry.value("binary_payload", true);
+    if (asset.blob_id == 0 || asset.relative_path.empty()) {
+      error = file_label(asset_index_path) + ": asset entry missing blob_id or path";
+      return false;
+    }
+    if (!is_safe_bundle_relative_path(asset.relative_path)) {
+      error = file_label(asset_index_path) + ": unsafe asset path " + asset.relative_path.generic_string();
+      return false;
+    }
+    const auto [blob_it, inserted] = indexed_blob_paths.emplace(asset.blob_id, asset.relative_path);
+    if (!inserted && blob_it->second != asset.relative_path) {
+      error = file_label(asset_index_path) + ": blob_id maps to multiple paths: " + std::to_string(asset.blob_id);
+      return false;
+    }
+    if (entry.value("metal", false)) {
+      metal_assets.push_back(std::move(asset));
+    } else {
+      assets.push_back(std::move(asset));
+    }
   }
   return true;
 }
@@ -610,9 +758,13 @@ bool validate_checksum_entry(
     const std::filesystem::path &relative_path,
     const std::unordered_map<std::string, ChecksumRecord> &lookup,
     const std::filesystem::path &checksums_path,
+    std::unordered_set<std::string> &validated_paths,
     std::string &error)
 {
   const auto key = relative_path.generic_string();
+  if (validated_paths.find(key) != validated_paths.end())
+    return true;
+
   const auto checksum_it = lookup.find(key);
   if (checksum_it == lookup.end()) {
     error = file_label(checksums_path) + ": missing checksum entry for " + key;
@@ -633,6 +785,87 @@ bool validate_checksum_entry(
     error = "checksum mismatch for " + key;
     return false;
   }
+  validated_paths.insert(key);
+  return true;
+}
+
+bool validate_asset_index_record(
+    const std::filesystem::path &bundle_root,
+    const AssetRecord &asset,
+    const std::unordered_map<std::string, ChecksumRecord> &lookup,
+    std::unordered_map<std::string, std::uint64_t> &file_sizes,
+    std::string &error)
+{
+  if (asset.relative_path.empty()) {
+    return true;
+  }
+  const auto key = asset.relative_path.generic_string();
+  const auto checksum_it = lookup.find(key);
+  if (checksum_it == lookup.end()) {
+    error = "asset index path missing checksum entry: " + key;
+    return false;
+  }
+  if (!asset.content_hash.empty()) {
+    if (checksum_it->second.algorithm != "sha256") {
+      error = "asset index content_hash requires sha256 checksum: " + key;
+      return false;
+    }
+    if (checksum_it->second.digest != asset.content_hash) {
+      error = "asset index content_hash does not match checksum: " + key;
+      return false;
+    }
+  }
+  if (asset.byte_size != 0) {
+    std::uint64_t actual_size = 0;
+    if (const auto known_size = file_sizes.find(key); known_size != file_sizes.end()) {
+      actual_size = known_size->second;
+    } else {
+      std::error_code stat_error;
+      actual_size = std::filesystem::file_size(bundle_root / asset.relative_path, stat_error);
+      if (stat_error) {
+        error = "failed to stat asset index path: " + key;
+        return false;
+      }
+      file_sizes.emplace(key, actual_size);
+    }
+    if (actual_size != asset.byte_size) {
+      error = "asset index byte_size does not match file size: " + key;
+      return false;
+    }
+  }
+  return true;
+}
+
+bool read_referenced_asset_json(
+    const std::filesystem::path &bundle_root,
+    const std::filesystem::path &relative_path,
+    std::unordered_map<std::string, json> &cache,
+    json &asset_json,
+    std::string &error)
+{
+  const auto key = relative_path.generic_string();
+  if (const auto cached = cache.find(key); cached != cache.end()) {
+    asset_json = cached->second;
+    return true;
+  }
+  const auto absolute_path = bundle_root / relative_path;
+  if (!std::filesystem::is_regular_file(absolute_path)) {
+    error = "missing referenced asset file: " + key;
+    return false;
+  }
+
+  std::ifstream input(absolute_path);
+  if (!input.is_open()) {
+    error = "failed to open referenced asset file: " + key;
+    return false;
+  }
+
+  asset_json = json::parse(input, nullptr, false);
+  if (asset_json.is_discarded() || !asset_json.is_object()) {
+    error = "referenced asset JSON is invalid: " + key;
+    return false;
+  }
+  cache.emplace(key, asset_json);
   return true;
 }
 
@@ -647,7 +880,9 @@ struct TraceBundleReader::Impl {
   std::vector<AssetRecord> metal_assets;
   std::vector<ObjectRecord> objects;
   ChecksumIndex checksums;
+  std::unordered_set<std::string> validated_checksum_paths;
   std::string last_error;
+  bool has_asset_index = false;
   bool open = false;
 
   // TODO: track reader phases explicitly so validation, parsing, and asset discovery can fail independently.
@@ -665,6 +900,7 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
   impl_->layout.callstream_path = bundle_root / kCallstreamFileName;
   impl_->layout.metal_callstream_path = bundle_root / kMetalCallstreamFileName;
   impl_->layout.checksums_path = bundle_root / kChecksumsFileName;
+  impl_->layout.asset_index_path = bundle_root / kAssetIndexFileName;
   impl_->layout.analysis_directory_path = bundle_root / kAnalysisDirectoryName;
   impl_->layout.translation_links_path = impl_->layout.analysis_directory_path / kTranslationLinksFileName;
   impl_->layout.objects_directory_path = bundle_root / kObjectsDirectoryName;
@@ -695,6 +931,17 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
     return false;
   }
 
+  std::unordered_map<BlobId, std::filesystem::path> indexed_blob_paths;
+  if (!parse_asset_index(
+          impl_->layout.asset_index_path,
+          impl_->assets,
+          impl_->metal_assets,
+          indexed_blob_paths,
+          impl_->last_error)) {
+    return false;
+  }
+  impl_->has_asset_index = std::filesystem::is_regular_file(impl_->layout.asset_index_path);
+
   if (std::filesystem::is_regular_file(impl_->layout.metal_callstream_path) &&
       !detail::parse_metal_callstream(impl_->layout.metal_callstream_path, impl_->metal_events, impl_->last_error)) {
     return false;
@@ -707,6 +954,128 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
   }
 
   std::unordered_map<std::string, std::size_t> asset_indices_by_path;
+  std::unordered_map<std::string, std::size_t> metal_asset_indices_by_path;
+  std::unordered_set<std::string> asset_blob_keys;
+  std::unordered_set<std::string> metal_asset_blob_keys;
+  for (std::size_t index = 0; index < impl_->assets.size(); ++index) {
+    asset_indices_by_path.emplace(impl_->assets[index].relative_path.generic_string(), index);
+    asset_blob_keys.insert(impl_->assets[index].relative_path.generic_string() + "#" + std::to_string(impl_->assets[index].blob_id));
+  }
+  for (std::size_t index = 0; index < impl_->metal_assets.size(); ++index) {
+    metal_asset_indices_by_path.emplace(impl_->metal_assets[index].relative_path.generic_string(), index);
+    metal_asset_blob_keys.insert(impl_->metal_assets[index].relative_path.generic_string() + "#" + std::to_string(impl_->metal_assets[index].blob_id));
+  }
+  auto register_asset_path = [&](const std::filesystem::path &relative_path, BlobId blob_id, bool metal) -> bool {
+    if (!is_safe_bundle_relative_path(relative_path)) {
+      impl_->last_error = "unsafe asset path reference: " + relative_path.generic_string();
+      return false;
+    }
+    if (impl_->has_asset_index && blob_id != 0) {
+      const auto indexed_path = indexed_blob_paths.find(blob_id);
+      if (indexed_path == indexed_blob_paths.end()) {
+        impl_->last_error = "blob_ref missing from asset index: " + std::to_string(blob_id);
+        return false;
+      }
+      if (indexed_path->second != relative_path) {
+        impl_->last_error = "blob_ref path mismatch: " + std::to_string(blob_id) +
+                            " -> " + indexed_path->second.generic_string() +
+                            ", event references " + relative_path.generic_string();
+        return false;
+      }
+    }
+
+    AssetRecord asset;
+    asset.blob_id = blob_id;
+    asset.relative_path = relative_path;
+
+    auto &indices_by_path = metal ? metal_asset_indices_by_path : asset_indices_by_path;
+    auto &blob_keys = metal ? metal_asset_blob_keys : asset_blob_keys;
+    auto &asset_list = metal ? impl_->metal_assets : impl_->assets;
+    const auto key = asset.relative_path.generic_string();
+    const auto blob_key = key + "#" + std::to_string(blob_id);
+    if (blob_id != 0 && !blob_keys.insert(blob_key).second) {
+      return true;
+    }
+    const auto existing = indices_by_path.find(key);
+    if (existing == indices_by_path.end()) {
+      indices_by_path.emplace(key, asset_list.size());
+      asset_list.push_back(asset);
+    } else if (asset_list[existing->second].blob_id == 0 && asset.blob_id != 0) {
+      asset_list[existing->second].blob_id = asset.blob_id;
+    } else if (asset.blob_id != 0 && asset_list[existing->second].blob_id != asset.blob_id) {
+      asset_list.push_back(asset);
+    }
+    return true;
+  };
+  std::unordered_map<std::string, json> referenced_asset_json_cache;
+  auto register_referenced_assets = [&](const json &record, const std::vector<BlobId> &blob_refs) -> bool {
+    std::vector<std::string> referenced_paths;
+    collect_asset_paths(record, referenced_paths);
+    std::vector<std::string> nested_referenced_paths;
+    for (const auto &referenced_path : referenced_paths) {
+      const std::filesystem::path relative_path = referenced_path;
+      if (ends_with(relative_path.generic_string(), ".json")) {
+        json asset_json;
+        if (!read_referenced_asset_json(
+                impl_->layout.root_path,
+                relative_path,
+                referenced_asset_json_cache,
+                asset_json,
+                impl_->last_error)) {
+          return false;
+        }
+        collect_nested_asset_paths(asset_json, nested_referenced_paths);
+      }
+    }
+
+    std::vector<std::string> all_paths = referenced_paths;
+    all_paths.insert(all_paths.end(), nested_referenced_paths.begin(), nested_referenced_paths.end());
+    std::size_t legacy_blob_ref_index = 0;
+    for (const auto &path_text : all_paths) {
+      const std::filesystem::path relative_path = path_text;
+      MetalAssetKind metal_kind = MetalAssetKind::Library;
+      BlobId blob_id = {};
+      if (impl_->has_asset_index) {
+        for (const auto candidate_blob_id : blob_refs) {
+          const auto indexed_path = indexed_blob_paths.find(candidate_blob_id);
+          if (indexed_path != indexed_blob_paths.end() && indexed_path->second == relative_path) {
+            blob_id = candidate_blob_id;
+            break;
+          }
+        }
+      } else if (legacy_blob_ref_index < blob_refs.size()) {
+        blob_id = blob_refs[legacy_blob_ref_index];
+      }
+      const bool metal_asset = detail::is_metal_asset_path(relative_path, &metal_kind);
+      if (!register_asset_path(relative_path, blob_id, metal_asset)) {
+        return false;
+      }
+      ++legacy_blob_ref_index;
+    }
+    return true;
+  };
+
+  if (std::filesystem::is_regular_file(impl_->layout.metal_callstream_path)) {
+    std::ifstream metal_input(impl_->layout.metal_callstream_path);
+    std::string metal_line;
+    while (std::getline(metal_input, metal_line)) {
+      if (metal_line.empty()) {
+        continue;
+      }
+      json record = json::parse(metal_line, nullptr, false);
+      if (record.is_discarded()) {
+        continue;
+      }
+      std::vector<BlobId> blob_refs;
+      if (record.contains("blob_refs") && record["blob_refs"].is_array()) {
+        blob_refs = record["blob_refs"].get<std::vector<BlobId>>();
+      }
+      if (!register_referenced_assets(record, blob_refs)) {
+        return false;
+      }
+    }
+  }
+
   bool header_seen = false;
   std::string line;
   std::size_t line_number = 0;
@@ -752,23 +1121,8 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
       return false;
     }
 
-    std::vector<std::string> referenced_paths;
-    collect_asset_paths(record, referenced_paths);
-    for (std::size_t index = 0; index < referenced_paths.size(); ++index) {
-      AssetRecord asset;
-      if (index < event.blob_refs.size()) {
-        asset.blob_id = event.blob_refs[index];
-      }
-      asset.relative_path = referenced_paths[index];
-
-      const auto key = asset.relative_path.generic_string();
-      const auto existing = asset_indices_by_path.find(key);
-      if (existing == asset_indices_by_path.end()) {
-        asset_indices_by_path.emplace(key, impl_->assets.size());
-        impl_->assets.push_back(asset);
-      } else if (impl_->assets[existing->second].blob_id == 0 && asset.blob_id != 0) {
-        impl_->assets[existing->second].blob_id = asset.blob_id;
-      }
+    if (!register_referenced_assets(record, event.blob_refs)) {
+      return false;
     }
   }
 
@@ -777,24 +1131,41 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
     return false;
   }
 
+  std::unordered_set<std::string> validated_checksum_paths;
+  std::unordered_map<std::string, std::uint64_t> validated_asset_file_sizes;
   for (const auto &required_relative_path :
-       {std::filesystem::path(kCallstreamFileName), std::filesystem::path(kObjectsDirectoryName) / kObjectIndexFileName}) {
+       {std::filesystem::path(kCallstreamFileName),
+        std::filesystem::path(kObjectsDirectoryName) / kObjectIndexFileName,
+        std::filesystem::path(kAssetIndexFileName)}) {
+    if (required_relative_path == kAssetIndexFileName && !std::filesystem::is_regular_file(impl_->layout.asset_index_path)) {
+      continue;
+    }
     if (!validate_checksum_entry(
             impl_->layout.root_path,
             required_relative_path,
             checksum_lookup,
             impl_->layout.checksums_path,
+            validated_checksum_paths,
             impl_->last_error)) {
       return false;
     }
   }
 
   for (const auto &asset : impl_->assets) {
+    if (!validate_asset_index_record(
+            impl_->layout.root_path,
+            asset,
+            checksum_lookup,
+            validated_asset_file_sizes,
+            impl_->last_error)) {
+      return false;
+    }
     if (!validate_checksum_entry(
             impl_->layout.root_path,
             asset.relative_path,
             checksum_lookup,
             impl_->layout.checksums_path,
+            validated_checksum_paths,
             impl_->last_error)) {
       return false;
     }
@@ -809,7 +1180,10 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
     AssetRecord asset;
     asset.relative_path = entry.relative_path;
     asset.debug_name = entry.relative_path.filename().generic_string();
-    impl_->metal_assets.push_back(std::move(asset));
+    if (metal_asset_indices_by_path.find(asset.relative_path.generic_string()) == metal_asset_indices_by_path.end()) {
+      metal_asset_indices_by_path.emplace(asset.relative_path.generic_string(), impl_->metal_assets.size());
+      impl_->metal_assets.push_back(std::move(asset));
+    }
   }
 
   if (std::filesystem::is_regular_file(impl_->layout.metal_callstream_path) &&
@@ -818,21 +1192,32 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
           std::filesystem::path(kMetalCallstreamFileName),
           checksum_lookup,
           impl_->layout.checksums_path,
+          validated_checksum_paths,
           impl_->last_error)) {
     return false;
   }
 
   for (const auto &asset : impl_->metal_assets) {
+    if (!validate_asset_index_record(
+            impl_->layout.root_path,
+            asset,
+            checksum_lookup,
+            validated_asset_file_sizes,
+            impl_->last_error)) {
+      return false;
+    }
     if (!validate_checksum_entry(
             impl_->layout.root_path,
             asset.relative_path,
             checksum_lookup,
             impl_->layout.checksums_path,
+            validated_checksum_paths,
             impl_->last_error)) {
       return false;
     }
   }
 
+  impl_->validated_checksum_paths = std::move(validated_checksum_paths);
   impl_->last_error.clear();
   impl_->open = true;
   return true;
@@ -886,6 +1271,16 @@ const std::vector<ObjectRecord> &TraceBundleReader::objects() const noexcept
 const ChecksumIndex &TraceBundleReader::checksums() const noexcept
 {
   return impl_->checksums;
+}
+
+const std::unordered_set<std::string> &TraceBundleReader::validated_checksum_paths() const noexcept
+{
+  return impl_->validated_checksum_paths;
+}
+
+bool TraceBundleReader::has_asset_index() const noexcept
+{
+  return impl_ && impl_->has_asset_index;
 }
 
 const std::string &TraceBundleReader::last_error() const noexcept
