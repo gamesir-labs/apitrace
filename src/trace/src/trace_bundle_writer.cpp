@@ -2001,6 +2001,7 @@ struct TraceBundleWriter::Impl {
   std::unordered_set<std::string> analysis_streams_may_reference_asset_alias;
   bool open = false;
   bool metadata_written = false;
+  bool append_existing_primary_callstream = false;
   TraceBundleOpenMode open_mode = TraceBundleOpenMode::Primary;
   bool cache_events = false;
   bool writer_stats = false;
@@ -2240,12 +2241,18 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
   std::filesystem::create_directories(impl_->layout.metal_libraries_directory_path);
   std::filesystem::create_directories(impl_->layout.metal_pipelines_directory_path);
 
+  const bool existing_primary_callstream =
+      std::filesystem::is_regular_file(impl_->layout.callstream_path) &&
+      std::filesystem::file_size(impl_->layout.callstream_path) > 0;
   if (mode == TraceBundleOpenMode::Primary) {
-    impl_->callstream_stream.open(impl_->layout.callstream_path, std::ios::trunc);
+    const auto callstream_mode =
+        existing_primary_callstream ? std::ios::app : std::ios::trunc;
+    impl_->callstream_stream.open(impl_->layout.callstream_path, callstream_mode);
     impl_->open = impl_->callstream_stream.is_open();
+    impl_->metadata_written = impl_->open && existing_primary_callstream;
+    impl_->append_existing_primary_callstream = impl_->metadata_written;
   } else {
-    impl_->metadata_written = std::filesystem::is_regular_file(impl_->layout.callstream_path) &&
-                              std::filesystem::file_size(impl_->layout.callstream_path) > 0;
+    impl_->metadata_written = existing_primary_callstream;
     impl_->open = true;
   }
   if (impl_->open && mode == TraceBundleOpenMode::Primary) {
