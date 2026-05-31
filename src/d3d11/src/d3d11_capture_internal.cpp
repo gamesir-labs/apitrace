@@ -1,5 +1,6 @@
 #include "d3d11_capture_internal.hpp"
 
+#include "apitrace/asset_index.hpp"
 #include "apitrace/capture_runtime.hpp"
 
 #include <windows.h>
@@ -469,13 +470,14 @@ trace::AssetRecord register_asset_bytes(
   asset.blob_id = ++state.next_blob_id;
   asset.kind = kind;
   asset.debug_name = std::move(debug_name);
+  asset.fast_fingerprint = trace::fast_fingerprint_bytes(data, size);
   asset.payload_bytes.resize(size);
   if (size != 0) {
     std::memcpy(asset.payload_bytes.data(), data, size);
   }
 
   if (auto *session = runtime::ensure_process_trace_session(trace::ApiKind::D3D11)) {
-    return session->register_asset(asset);
+    return session->register_asset(std::move(asset));
   }
   return asset;
 }

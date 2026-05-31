@@ -516,8 +516,7 @@ private:
       UINT flags,
       std::string &error)
   {
-    if (std::getenv("APITRACE_D3D11_RETRACE_CAPTURE_PRESENT_FRAMES") == nullptr &&
-        std::getenv("APITRACE_TRACE_BUNDLE") == nullptr) {
+    if (!env_flag_enabled("APITRACE_D3D11_RETRACE_CAPTURE_PRESENT_FRAMES")) {
       return true;
     }
     if (!ensure_capture_writer(error)) {
@@ -603,7 +602,7 @@ private:
     asset.kind = trace::AssetKind::Texture;
     asset.debug_name = "d3d11-present-frame";
     asset.payload_bytes = std::move(rgba);
-    asset = capture_writer_->register_asset(asset);
+    asset = capture_writer_->register_asset(std::move(asset));
 
     std::ostringstream payload;
     payload << "{"
