@@ -2,6 +2,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <limits>
+#include <unordered_set>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -11,12 +13,36 @@ namespace apitrace::replay::internal {
 namespace {
 
 using json = nlohmann::json;
+
+struct D3D11ReplayParseContext {
+  const trace::TraceBundleReader &reader;
+  std::unordered_map<trace::BlobId, std::filesystem::path> asset_paths_by_blob;
+};
+
 using ParseCallHandler = bool (*)(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error);
+
+std::unordered_map<trace::BlobId, std::filesystem::path> build_asset_path_index(
+    const trace::TraceBundleReader &reader)
+{
+  std::unordered_map<trace::BlobId, std::filesystem::path> asset_paths;
+  asset_paths.reserve(reader.assets().size() + reader.metal_assets().size());
+  for (const auto &asset : reader.assets()) {
+    if (asset.blob_id != 0 && !asset.relative_path.empty()) {
+      asset_paths[asset.blob_id] = asset.relative_path;
+    }
+  }
+  for (const auto &asset : reader.metal_assets()) {
+    if (asset.blob_id != 0 && !asset.relative_path.empty()) {
+      asset_paths[asset.blob_id] = asset.relative_path;
+    }
+  }
+  return asset_paths;
+}
 
 std::string record_prefix(const trace::EventRecord &event)
 {
@@ -74,7 +100,7 @@ bool require_payload_key(
 }
 
 std::filesystem::path resolve_asset_path(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     std::string_view key,
@@ -85,7 +111,44 @@ std::filesystem::path resolve_asset_path(
     error = record_prefix(event) + ": missing " + std::string(key);
     return {};
   }
-  return reader.layout().root_path / std::filesystem::path(it->get<std::string>());
+  const std::filesystem::path relative_path(it->get<std::string>());
+  if (relative_path.is_absolute()) {
+    error = record_prefix(event) + ": " + std::string(key) + " references an absolute asset path";
+    return {};
+  }
+  for (const auto &part : relative_path) {
+    if (part == "..") {
+      error = record_prefix(event) + ": " + std::string(key) + " references an unsafe asset path";
+      return {};
+    }
+  }
+  if (event.blob_refs.empty()) {
+    error = record_prefix(event) + ": " + std::string(key) + " is missing blob_refs";
+    return {};
+  }
+
+  std::unordered_set<std::string> event_asset_paths;
+  event_asset_paths.reserve(event.blob_refs.size());
+  for (const auto blob_id : event.blob_refs) {
+    if (blob_id == 0) {
+      error = record_prefix(event) + ": " + std::string(key) + " has zero blob_ref";
+      return {};
+    }
+
+    const auto path_it = context.asset_paths_by_blob.find(blob_id);
+    if (path_it == context.asset_paths_by_blob.end()) {
+      error = record_prefix(event) + ": " + std::string(key) + " blob_ref does not resolve";
+      return {};
+    }
+    event_asset_paths.insert(path_it->second.generic_string());
+  }
+
+  const auto relative_key = relative_path.generic_string();
+  if (event_asset_paths.find(relative_key) == event_asset_paths.end()) {
+    error = record_prefix(event) + ": " + std::string(key) + " blob_ref does not match " + relative_key;
+    return {};
+  }
+  return context.reader.layout().root_path / relative_path;
 }
 
 bool require_json_object(
@@ -117,6 +180,91 @@ bool parse_bool_field(
     return false;
   }
   value = it->get<bool>();
+  return true;
+}
+
+bool parse_u32_field(
+    const trace::EventRecord &event,
+    const json &source,
+    std::string_view key,
+    std::uint32_t &value,
+    std::string &error)
+{
+  const auto it = source.find(std::string(key));
+  if (it == source.end() || (!it->is_number_unsigned() && !it->is_number_integer())) {
+    error = record_prefix(event) + ": missing uint32 field " + std::string(key);
+    return false;
+  }
+  std::uint64_t parsed = 0;
+  if (it->is_number_unsigned()) {
+    parsed = it->get<std::uint64_t>();
+  } else {
+    const auto signed_value = it->get<std::int64_t>();
+    if (signed_value < 0) {
+      error = record_prefix(event) + ": uint32 field " + std::string(key) + " is negative";
+      return false;
+    }
+    parsed = static_cast<std::uint64_t>(signed_value);
+  }
+  if (parsed > std::numeric_limits<std::uint32_t>::max()) {
+    error = record_prefix(event) + ": uint32 field " + std::string(key) + " is out of range";
+    return false;
+  }
+  value = static_cast<std::uint32_t>(parsed);
+  return true;
+}
+
+bool parse_i32_field(
+    const trace::EventRecord &event,
+    const json &source,
+    std::string_view key,
+    std::int32_t &value,
+    std::string &error)
+{
+  const auto it = source.find(std::string(key));
+  if (it == source.end() || !it->is_number_integer()) {
+    error = record_prefix(event) + ": missing int32 field " + std::string(key);
+    return false;
+  }
+  const auto parsed = it->get<std::int64_t>();
+  if (parsed < std::numeric_limits<std::int32_t>::min() ||
+      parsed > std::numeric_limits<std::int32_t>::max()) {
+    error = record_prefix(event) + ": int32 field " + std::string(key) + " is out of range";
+    return false;
+  }
+  value = static_cast<std::int32_t>(parsed);
+  return true;
+}
+
+bool parse_float_field(
+    const trace::EventRecord &event,
+    const json &source,
+    std::string_view key,
+    float &value,
+    std::string &error)
+{
+  const auto it = source.find(std::string(key));
+  if (it == source.end() || !it->is_number()) {
+    error = record_prefix(event) + ": missing float field " + std::string(key);
+    return false;
+  }
+  value = it->get<float>();
+  return true;
+}
+
+bool parse_string_field(
+    const trace::EventRecord &event,
+    const json &source,
+    std::string_view key,
+    std::string &value,
+    std::string &error)
+{
+  const auto it = source.find(std::string(key));
+  if (it == source.end() || !it->is_string()) {
+    error = record_prefix(event) + ": missing string field " + std::string(key);
+    return false;
+  }
+  value = it->get<std::string>();
   return true;
 }
 
@@ -170,15 +318,13 @@ bool parse_input_elements(
     }
 
     InputElementDesc element;
-    element.semantic_name = entry.value("semantic_name", "");
-    element.semantic_index = entry.value("semantic_index", 0u);
-    element.format = entry.value("format", 0u);
-    element.input_slot = entry.value("input_slot", 0u);
-    element.aligned_byte_offset = entry.value("aligned_byte_offset", 0u);
-    element.input_slot_class = entry.value("input_slot_class", 0u);
-    element.instance_data_step_rate = entry.value("instance_data_step_rate", 0u);
-    if (element.semantic_name.empty()) {
-      error = record_prefix(event) + ": input layout element missing semantic_name";
+    if (!parse_string_field(event, entry, "semantic_name", element.semantic_name, error) ||
+        !parse_u32_field(event, entry, "semantic_index", element.semantic_index, error) ||
+        !parse_u32_field(event, entry, "format", element.format, error) ||
+        !parse_u32_field(event, entry, "input_slot", element.input_slot, error) ||
+        !parse_u32_field(event, entry, "aligned_byte_offset", element.aligned_byte_offset, error) ||
+        !parse_u32_field(event, entry, "input_slot_class", element.input_slot_class, error) ||
+        !parse_u32_field(event, entry, "instance_data_step_rate", element.instance_data_step_rate, error)) {
       return false;
     }
     elements.push_back(std::move(element));
@@ -188,17 +334,19 @@ bool parse_input_elements(
 
 bool parse_texture2d_desc(const trace::EventRecord &event, const json &source, Texture2DDesc &desc, std::string &error)
 {
-  desc.width = source.value("width", 0u);
-  desc.height = source.value("height", 0u);
-  desc.mip_levels = source.value("mip_levels", 0u);
-  desc.array_size = source.value("array_size", 0u);
-  desc.format = source.value("format", 0u);
-  desc.sample_count = source.value("sample_count", 1u);
-  desc.sample_quality = source.value("sample_quality", 0u);
-  desc.usage = source.value("usage", 0u);
-  desc.bind_flags = source.value("bind_flags", 0u);
-  desc.cpu_access_flags = source.value("cpu_access_flags", 0u);
-  desc.misc_flags = source.value("misc_flags", 0u);
+  if (!parse_u32_field(event, source, "width", desc.width, error) ||
+      !parse_u32_field(event, source, "height", desc.height, error) ||
+      !parse_u32_field(event, source, "mip_levels", desc.mip_levels, error) ||
+      !parse_u32_field(event, source, "array_size", desc.array_size, error) ||
+      !parse_u32_field(event, source, "format", desc.format, error) ||
+      !parse_u32_field(event, source, "sample_count", desc.sample_count, error) ||
+      !parse_u32_field(event, source, "sample_quality", desc.sample_quality, error) ||
+      !parse_u32_field(event, source, "usage", desc.usage, error) ||
+      !parse_u32_field(event, source, "bind_flags", desc.bind_flags, error) ||
+      !parse_u32_field(event, source, "cpu_access_flags", desc.cpu_access_flags, error) ||
+      !parse_u32_field(event, source, "misc_flags", desc.misc_flags, error)) {
+    return false;
+  }
   if (desc.width == 0 || desc.height == 0 || desc.array_size == 0) {
     error = record_prefix(event) + ": incomplete texture2d desc";
     return false;
@@ -212,8 +360,10 @@ bool parse_shader_resource_view_desc(
     ShaderResourceViewDesc &desc,
     std::string &error)
 {
-  desc.format = source.value("format", 0u);
-  desc.view_dimension = source.value("view_dimension", 0u);
+  if (!parse_u32_field(event, source, "format", desc.format, error) ||
+      !parse_u32_field(event, source, "view_dimension", desc.view_dimension, error)) {
+    return false;
+  }
   const auto texture2d = source.find("texture2d");
   if (texture2d != source.end()) {
     if (!texture2d->is_object()) {
@@ -221,8 +371,10 @@ bool parse_shader_resource_view_desc(
       return false;
     }
     desc.has_texture2d = true;
-    desc.texture2d_most_detailed_mip = texture2d->value("most_detailed_mip", 0u);
-    desc.texture2d_mip_levels = texture2d->value("mip_levels", 0u);
+    if (!parse_u32_field(event, *texture2d, "most_detailed_mip", desc.texture2d_most_detailed_mip, error) ||
+        !parse_u32_field(event, *texture2d, "mip_levels", desc.texture2d_mip_levels, error)) {
+      return false;
+    }
   }
   return true;
 }
@@ -233,15 +385,19 @@ bool parse_render_target_view_desc(
     CreateRenderTargetViewCommand &command,
     std::string &error)
 {
-  command.format = source.value("format", 0u);
-  command.view_dimension = source.value("view_dimension", 0u);
+  if (!parse_u32_field(event, source, "format", command.format, error) ||
+      !parse_u32_field(event, source, "view_dimension", command.view_dimension, error)) {
+    return false;
+  }
   const auto texture2d = source.find("texture2d");
   if (texture2d != source.end()) {
     if (!texture2d->is_object()) {
       error = record_prefix(event) + ": render target view texture2d desc must be an object";
       return false;
     }
-    command.texture2d_mip_slice = texture2d->value("mip_slice", 0u);
+    if (!parse_u32_field(event, *texture2d, "mip_slice", command.texture2d_mip_slice, error)) {
+      return false;
+    }
   }
   return true;
 }
@@ -252,9 +408,11 @@ bool parse_depth_stencil_view_desc(
     DepthStencilViewDesc &desc,
     std::string &error)
 {
-  desc.format = source.value("format", 0u);
-  desc.view_dimension = source.value("view_dimension", 0u);
-  desc.flags = source.value("flags", 0u);
+  if (!parse_u32_field(event, source, "format", desc.format, error) ||
+      !parse_u32_field(event, source, "view_dimension", desc.view_dimension, error) ||
+      !parse_u32_field(event, source, "flags", desc.flags, error)) {
+    return false;
+  }
   const auto texture2d = source.find("texture2d");
   if (texture2d != source.end()) {
     if (!texture2d->is_object()) {
@@ -262,7 +420,9 @@ bool parse_depth_stencil_view_desc(
       return false;
     }
     desc.has_texture2d = true;
-    desc.texture2d_mip_slice = texture2d->value("mip_slice", 0u);
+    if (!parse_u32_field(event, *texture2d, "mip_slice", desc.texture2d_mip_slice, error)) {
+      return false;
+    }
   }
   return true;
 }
@@ -273,18 +433,18 @@ bool parse_sampler_state_desc(
     SamplerStateDesc &desc,
     std::string &error)
 {
-  desc.filter = source.value("filter", 0u);
-  desc.address_u = source.value("address_u", 0u);
-  desc.address_v = source.value("address_v", 0u);
-  desc.address_w = source.value("address_w", 0u);
-  desc.mip_lod_bias = source.value("mip_lod_bias", 0.0f);
-  desc.max_anisotropy = source.value("max_anisotropy", 0u);
-  desc.comparison_func = source.value("comparison_func", 0u);
-  if (!parse_float4_field(event, source, "border_color", desc.border_color, error)) {
+  if (!parse_u32_field(event, source, "filter", desc.filter, error) ||
+      !parse_u32_field(event, source, "address_u", desc.address_u, error) ||
+      !parse_u32_field(event, source, "address_v", desc.address_v, error) ||
+      !parse_u32_field(event, source, "address_w", desc.address_w, error) ||
+      !parse_float_field(event, source, "mip_lod_bias", desc.mip_lod_bias, error) ||
+      !parse_u32_field(event, source, "max_anisotropy", desc.max_anisotropy, error) ||
+      !parse_u32_field(event, source, "comparison_func", desc.comparison_func, error) ||
+      !parse_float4_field(event, source, "border_color", desc.border_color, error) ||
+      !parse_float_field(event, source, "min_lod", desc.min_lod, error) ||
+      !parse_float_field(event, source, "max_lod", desc.max_lod, error)) {
     return false;
   }
-  desc.min_lod = source.value("min_lod", 0.0f);
-  desc.max_lod = source.value("max_lod", 0.0f);
   return true;
 }
 
@@ -316,13 +476,21 @@ bool parse_blend_state_desc(
     if (!parse_bool_field(event, entry, "blend_enable", target.blend_enable, error)) {
       return false;
     }
-    target.src_blend = entry.value("src_blend", 0u);
-    target.dest_blend = entry.value("dest_blend", 0u);
-    target.blend_op = entry.value("blend_op", 0u);
-    target.src_blend_alpha = entry.value("src_blend_alpha", 0u);
-    target.dest_blend_alpha = entry.value("dest_blend_alpha", 0u);
-    target.blend_op_alpha = entry.value("blend_op_alpha", 0u);
-    target.write_mask = static_cast<std::uint8_t>(entry.value("write_mask", 0u));
+    std::uint32_t write_mask = 0;
+    if (!parse_u32_field(event, entry, "src_blend", target.src_blend, error) ||
+        !parse_u32_field(event, entry, "dest_blend", target.dest_blend, error) ||
+        !parse_u32_field(event, entry, "blend_op", target.blend_op, error) ||
+        !parse_u32_field(event, entry, "src_blend_alpha", target.src_blend_alpha, error) ||
+        !parse_u32_field(event, entry, "dest_blend_alpha", target.dest_blend_alpha, error) ||
+        !parse_u32_field(event, entry, "blend_op_alpha", target.blend_op_alpha, error) ||
+        !parse_u32_field(event, entry, "write_mask", write_mask, error)) {
+      return false;
+    }
+    if (write_mask > std::numeric_limits<std::uint8_t>::max()) {
+      error = record_prefix(event) + ": uint8 field write_mask is out of range";
+      return false;
+    }
+    target.write_mask = static_cast<std::uint8_t>(write_mask);
   }
   return true;
 }
@@ -337,10 +505,21 @@ bool parse_depth_stencil_state_desc(
       !parse_bool_field(event, source, "stencil_enable", desc.stencil_enable, error)) {
     return false;
   }
-  desc.depth_write_mask = source.value("depth_write_mask", 0u);
-  desc.depth_func = source.value("depth_func", 0u);
-  desc.stencil_read_mask = static_cast<std::uint8_t>(source.value("stencil_read_mask", 0u));
-  desc.stencil_write_mask = static_cast<std::uint8_t>(source.value("stencil_write_mask", 0u));
+  std::uint32_t stencil_read_mask = 0;
+  std::uint32_t stencil_write_mask = 0;
+  if (!parse_u32_field(event, source, "depth_write_mask", desc.depth_write_mask, error) ||
+      !parse_u32_field(event, source, "depth_func", desc.depth_func, error) ||
+      !parse_u32_field(event, source, "stencil_read_mask", stencil_read_mask, error) ||
+      !parse_u32_field(event, source, "stencil_write_mask", stencil_write_mask, error)) {
+    return false;
+  }
+  if (stencil_read_mask > std::numeric_limits<std::uint8_t>::max() ||
+      stencil_write_mask > std::numeric_limits<std::uint8_t>::max()) {
+    error = record_prefix(event) + ": stencil mask is out of range";
+    return false;
+  }
+  desc.stencil_read_mask = static_cast<std::uint8_t>(stencil_read_mask);
+  desc.stencil_write_mask = static_cast<std::uint8_t>(stencil_write_mask);
   return true;
 }
 
@@ -350,12 +529,12 @@ bool parse_rasterizer_state_desc(
     RasterizerStateDesc &desc,
     std::string &error)
 {
-  desc.fill_mode = source.value("fill_mode", 0u);
-  desc.cull_mode = source.value("cull_mode", 0u);
-  desc.depth_bias = source.value("depth_bias", 0);
-  desc.depth_bias_clamp = source.value("depth_bias_clamp", 0.0f);
-  desc.slope_scaled_depth_bias = source.value("slope_scaled_depth_bias", 0.0f);
-  if (!parse_bool_field(event, source, "front_counter_clockwise", desc.front_counter_clockwise, error) ||
+  if (!parse_u32_field(event, source, "fill_mode", desc.fill_mode, error) ||
+      !parse_u32_field(event, source, "cull_mode", desc.cull_mode, error) ||
+      !parse_i32_field(event, source, "depth_bias", desc.depth_bias, error) ||
+      !parse_float_field(event, source, "depth_bias_clamp", desc.depth_bias_clamp, error) ||
+      !parse_float_field(event, source, "slope_scaled_depth_bias", desc.slope_scaled_depth_bias, error) ||
+      !parse_bool_field(event, source, "front_counter_clockwise", desc.front_counter_clockwise, error) ||
       !parse_bool_field(event, source, "depth_clip_enable", desc.depth_clip_enable, error) ||
       !parse_bool_field(event, source, "scissor_enable", desc.scissor_enable, error) ||
       !parse_bool_field(event, source, "multisample_enable", desc.multisample_enable, error) ||
@@ -382,21 +561,26 @@ bool parse_viewports(
       }
 
       ViewportDesc viewport;
-      viewport.top_left_x = entry.value("top_left_x", 0.0f);
-      viewport.top_left_y = entry.value("top_left_y", 0.0f);
-      viewport.width = entry.value("width", 0.0f);
-      viewport.height = entry.value("height", 0.0f);
-      viewport.min_depth = entry.value("min_depth", 0.0f);
-      viewport.max_depth = entry.value("max_depth", 1.0f);
+      if (!parse_float_field(event, entry, "top_left_x", viewport.top_left_x, error) ||
+          !parse_float_field(event, entry, "top_left_y", viewport.top_left_y, error) ||
+          !parse_float_field(event, entry, "width", viewport.width, error) ||
+          !parse_float_field(event, entry, "height", viewport.height, error) ||
+          !parse_float_field(event, entry, "min_depth", viewport.min_depth, error) ||
+          !parse_float_field(event, entry, "max_depth", viewport.max_depth, error)) {
+        return false;
+      }
       viewports.push_back(viewport);
     }
     return true;
   }
 
-  if (payload.value("num_viewports", 0u) == 1) {
+  std::uint32_t num_viewports = 0;
+  if (parse_u32_field(event, payload, "num_viewports", num_viewports, error) && num_viewports == 1) {
     ViewportDesc viewport;
-    viewport.width = payload.value("first_width", 0.0f);
-    viewport.height = payload.value("first_height", 0.0f);
+    if (!parse_float_field(event, payload, "first_width", viewport.width, error) ||
+        !parse_float_field(event, payload, "first_height", viewport.height, error)) {
+      return false;
+    }
     viewports = {viewport};
     return true;
   }
@@ -425,10 +609,12 @@ bool parse_rects(
       return false;
     }
     RectDesc rect;
-    rect.left = entry.value("left", 0);
-    rect.top = entry.value("top", 0);
-    rect.right = entry.value("right", 0);
-    rect.bottom = entry.value("bottom", 0);
+    if (!parse_i32_field(event, entry, "left", rect.left, error) ||
+        !parse_i32_field(event, entry, "top", rect.top, error) ||
+        !parse_i32_field(event, entry, "right", rect.right, error) ||
+        !parse_i32_field(event, entry, "bottom", rect.bottom, error)) {
+      return false;
+    }
     rects.push_back(rect);
   }
   return true;
@@ -451,19 +637,30 @@ bool parse_vertex_buffer_bindings(
       }
 
       VertexBufferBinding binding;
-      binding.buffer_id = entry.value("object_id", 0ull);
-      binding.stride = entry.value("stride", 0u);
-      binding.offset = entry.value("offset", 0u);
+      if (!parse_u32_field(event, entry, "stride", binding.stride, error) ||
+          !parse_u32_field(event, entry, "offset", binding.offset, error)) {
+        return false;
+      }
+      const auto object_id = entry.find("object_id");
+      if (object_id == entry.end() || (!object_id->is_number_unsigned() && !object_id->is_number_integer())) {
+        error = record_prefix(event) + ": missing object_id in vertex buffer binding";
+        return false;
+      }
+      binding.buffer_id = object_id->get<trace::ObjectId>();
       bindings.push_back(binding);
     }
     return true;
   }
 
-  if (payload.value("num_buffers", 0u) == 1 && event.object_refs.size() >= 2) {
+  std::uint32_t num_buffers = 0;
+  if (parse_u32_field(event, payload, "num_buffers", num_buffers, error) && num_buffers == 1 &&
+      event.object_refs.size() >= 2) {
     VertexBufferBinding binding;
     binding.buffer_id = event.object_refs[1];
-    binding.stride = payload.value("first_stride", 0u);
-    binding.offset = payload.value("first_offset", 0u);
+    if (!parse_u32_field(event, payload, "first_stride", binding.stride, error) ||
+        !parse_u32_field(event, payload, "first_offset", binding.offset, error)) {
+      return false;
+    }
     bindings = {binding};
     return true;
   }
@@ -482,13 +679,13 @@ std::optional<std::uint64_t> parse_frame_index(const json &payload)
 }
 
 bool parse_create_device_and_swap_chain(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 3, error)) {
     return false;
   }
@@ -501,51 +698,55 @@ bool parse_create_device_and_swap_chain(
   command.swap_chain_id = event.object_refs[0];
   command.device_id = event.object_refs[1];
   command.context_id = event.object_refs[2];
-  command.driver_type = payload.value("driver_type", std::string("UNKNOWN"));
-  command.flags = payload.value("flags", 0u);
-  command.sdk_version = payload.value("sdk_version", 0u);
-  command.feature_level = payload.value("feature_level", std::string("11_0"));
-  command.swap_chain.width = swap_chain->value("width", 0u);
-  command.swap_chain.height = swap_chain->value("height", 0u);
-  command.swap_chain.format = swap_chain->value("format", 0u);
-  command.swap_chain.sample_count = swap_chain->value("sample_count", 1u);
-  command.swap_chain.sample_quality = swap_chain->value("sample_quality", 0u);
-  command.swap_chain.buffer_usage = swap_chain->value("buffer_usage", 32u);
-  command.swap_chain.buffer_count = swap_chain->value("buffer_count", 0u);
-  command.swap_chain.swap_effect = swap_chain->value("swap_effect", 0u);
-  command.swap_chain.flags = swap_chain->value("flags", 0u);
-  command.swap_chain.windowed = swap_chain->value("windowed", true);
+  if (!parse_string_field(event, payload, "driver_type", command.driver_type, error) ||
+      !parse_u32_field(event, payload, "flags", command.flags, error) ||
+      !parse_u32_field(event, payload, "sdk_version", command.sdk_version, error) ||
+      !parse_string_field(event, payload, "feature_level", command.feature_level, error) ||
+      !parse_u32_field(event, *swap_chain, "width", command.swap_chain.width, error) ||
+      !parse_u32_field(event, *swap_chain, "height", command.swap_chain.height, error) ||
+      !parse_u32_field(event, *swap_chain, "format", command.swap_chain.format, error) ||
+      !parse_u32_field(event, *swap_chain, "sample_count", command.swap_chain.sample_count, error) ||
+      !parse_u32_field(event, *swap_chain, "sample_quality", command.swap_chain.sample_quality, error) ||
+      !parse_u32_field(event, *swap_chain, "buffer_usage", command.swap_chain.buffer_usage, error) ||
+      !parse_u32_field(event, *swap_chain, "buffer_count", command.swap_chain.buffer_count, error) ||
+      !parse_u32_field(event, *swap_chain, "swap_effect", command.swap_chain.swap_effect, error) ||
+      !parse_u32_field(event, *swap_chain, "flags", command.swap_chain.flags, error) ||
+      !parse_bool_field(event, *swap_chain, "windowed", command.swap_chain.windowed, error)) {
+    return false;
+  }
   plan.commands.emplace_back(std::move(command));
   return true;
 }
 
 bool parse_get_buffer(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 2, error)) {
     return false;
   }
   auto command = make_command_header<GetBufferCommand>(event);
   command.swap_chain_id = event.object_refs[0];
   command.resource_id = event.object_refs[1];
-  command.buffer_index = payload.value("buffer_index", 0u);
+  if (!parse_u32_field(event, payload, "buffer_index", command.buffer_index, error)) {
+    return false;
+  }
   plan.commands.emplace_back(std::move(command));
   return true;
 }
 
 bool parse_create_render_target_view(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 3, error)) {
     return false;
   }
@@ -553,7 +754,9 @@ bool parse_create_render_target_view(
   command.device_id = event.object_refs[0];
   command.resource_id = event.object_refs[1];
   command.view_id = event.object_refs[2];
-  command.desc_present = payload.value("desc_present", false);
+  if (!parse_bool_field(event, payload, "desc_present", command.desc_present, error)) {
+    return false;
+  }
   if (command.desc_present) {
     const json *desc = nullptr;
     if (!require_json_object(event, payload, "desc", desc, error) ||
@@ -566,7 +769,7 @@ bool parse_create_render_target_view(
 }
 
 bool parse_create_texture2d(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
@@ -583,12 +786,14 @@ bool parse_create_texture2d(
   auto command = make_command_header<CreateTexture2DCommand>(event);
   command.device_id = event.object_refs[0];
   command.texture_id = event.object_refs[1];
-  command.has_initial_data = payload.value("has_initial_data", false);
+  if (!parse_bool_field(event, payload, "has_initial_data", command.has_initial_data, error)) {
+    return false;
+  }
   if (!parse_texture2d_desc(event, *desc, command.desc, error)) {
     return false;
   }
   if (command.has_initial_data) {
-    command.initial_data_path = resolve_asset_path(reader, event, payload, "initial_data_path", error);
+    command.initial_data_path = resolve_asset_path(context, event, payload, "initial_data_path", error);
     if (!error.empty()) {
       return false;
     }
@@ -598,13 +803,13 @@ bool parse_create_texture2d(
 }
 
 bool parse_create_shader_resource_view(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 3, error)) {
     return false;
   }
@@ -612,7 +817,9 @@ bool parse_create_shader_resource_view(
   command.device_id = event.object_refs[0];
   command.resource_id = event.object_refs[1];
   command.view_id = event.object_refs[2];
-  command.desc_present = payload.value("desc_present", false);
+  if (!parse_bool_field(event, payload, "desc_present", command.desc_present, error)) {
+    return false;
+  }
   if (command.desc_present) {
     const json *desc = nullptr;
     if (!require_json_object(event, payload, "desc", desc, error) ||
@@ -625,13 +832,13 @@ bool parse_create_shader_resource_view(
 }
 
 bool parse_create_depth_stencil_view(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 3, error)) {
     return false;
   }
@@ -639,7 +846,9 @@ bool parse_create_depth_stencil_view(
   command.device_id = event.object_refs[0];
   command.resource_id = event.object_refs[1];
   command.view_id = event.object_refs[2];
-  command.desc_present = payload.value("desc_present", false);
+  if (!parse_bool_field(event, payload, "desc_present", command.desc_present, error)) {
+    return false;
+  }
   if (command.desc_present) {
     const json *desc = nullptr;
     if (!require_json_object(event, payload, "desc", desc, error) ||
@@ -652,7 +861,7 @@ bool parse_create_depth_stencil_view(
 }
 
 bool parse_create_input_layout(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
@@ -664,7 +873,7 @@ bool parse_create_input_layout(
   auto command = make_command_header<CreateInputLayoutCommand>(event);
   command.device_id = event.object_refs[0];
   command.input_layout_id = event.object_refs[1];
-  command.shader_path = resolve_asset_path(reader, event, payload, "shader_path", error);
+  command.shader_path = resolve_asset_path(context, event, payload, "shader_path", error);
   if (!error.empty()) {
     return false;
   }
@@ -676,7 +885,7 @@ bool parse_create_input_layout(
 }
 
 bool parse_create_shader(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
@@ -688,7 +897,7 @@ bool parse_create_shader(
   auto command = make_command_header<CreateShaderCommand>(event);
   command.device_id = event.object_refs[0];
   command.shader_id = event.object_refs[1];
-  command.shader_path = resolve_asset_path(reader, event, payload, "shader_path", error);
+  command.shader_path = resolve_asset_path(context, event, payload, "shader_path", error);
   if (!error.empty()) {
     return false;
   }
@@ -698,7 +907,7 @@ bool parse_create_shader(
 }
 
 bool parse_create_buffer(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
@@ -710,13 +919,15 @@ bool parse_create_buffer(
   auto command = make_command_header<CreateBufferCommand>(event);
   command.device_id = event.object_refs[0];
   command.buffer_id = event.object_refs[1];
-  command.byte_width = payload.value("byte_width", 0u);
-  command.usage = payload.value("usage", 0u);
-  command.bind_flags = payload.value("bind_flags", 0u);
-  command.cpu_access_flags = payload.value("cpu_access_flags", 0u);
-  command.has_initial_data = payload.value("has_initial_data", false);
+  if (!parse_u32_field(event, payload, "byte_width", command.byte_width, error) ||
+      !parse_u32_field(event, payload, "usage", command.usage, error) ||
+      !parse_u32_field(event, payload, "bind_flags", command.bind_flags, error) ||
+      !parse_u32_field(event, payload, "cpu_access_flags", command.cpu_access_flags, error) ||
+      !parse_bool_field(event, payload, "has_initial_data", command.has_initial_data, error)) {
+    return false;
+  }
   if (command.has_initial_data) {
-    command.initial_data_path = resolve_asset_path(reader, event, payload, "initial_data_path", error);
+    command.initial_data_path = resolve_asset_path(context, event, payload, "initial_data_path", error);
     if (!error.empty()) {
       return false;
     }
@@ -726,13 +937,13 @@ bool parse_create_buffer(
 }
 
 bool parse_create_blend_state(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 2, error)) {
     return false;
   }
@@ -751,13 +962,13 @@ bool parse_create_blend_state(
 }
 
 bool parse_create_depth_stencil_state(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 2, error)) {
     return false;
   }
@@ -776,13 +987,13 @@ bool parse_create_depth_stencil_state(
 }
 
 bool parse_create_rasterizer_state(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 2, error)) {
     return false;
   }
@@ -801,13 +1012,13 @@ bool parse_create_rasterizer_state(
 }
 
 bool parse_create_sampler_state(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 2, error)) {
     return false;
   }
@@ -826,28 +1037,30 @@ bool parse_create_sampler_state(
 }
 
 bool parse_map(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 2, error)) {
     return false;
   }
   auto command = make_command_header<MapCommand>(event);
   command.context_id = event.object_refs[0];
   command.resource_id = event.object_refs[1];
-  command.subresource = payload.value("subresource", 0u);
-  command.map_type = payload.value("map_type", std::string("OTHER"));
-  command.map_flags = payload.value("map_flags", 0u);
+  if (!parse_u32_field(event, payload, "subresource", command.subresource, error) ||
+      !parse_string_field(event, payload, "map_type", command.map_type, error) ||
+      !parse_u32_field(event, payload, "map_flags", command.map_flags, error)) {
+    return false;
+  }
   plan.commands.emplace_back(std::move(command));
   return true;
 }
 
 bool parse_unmap(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
@@ -859,8 +1072,10 @@ bool parse_unmap(
   auto command = make_command_header<UnmapCommand>(event);
   command.context_id = event.object_refs[0];
   command.resource_id = event.object_refs[1];
-  command.subresource = payload.value("subresource", 0u);
-  command.snapshot_path = resolve_asset_path(reader, event, payload, "snapshot_path", error);
+  if (!parse_u32_field(event, payload, "subresource", command.subresource, error)) {
+    return false;
+  }
+  command.snapshot_path = resolve_asset_path(context, event, payload, "snapshot_path", error);
   if (!error.empty()) {
     return false;
   }
@@ -869,7 +1084,7 @@ bool parse_unmap(
 }
 
 bool parse_update_subresource(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
@@ -881,24 +1096,34 @@ bool parse_update_subresource(
   auto command = make_command_header<UpdateSubresourceCommand>(event);
   command.context_id = event.object_refs[0];
   command.resource_id = event.object_refs[1];
-  command.resource_class = parse_resource_class_name(payload.value("resource_class", std::string("unknown")));
-  command.dst_subresource = payload.value("dst_subresource", 0u);
-  command.src_row_pitch = payload.value("src_row_pitch", 0u);
-  command.src_depth_pitch = payload.value("src_depth_pitch", 0u);
-  command.has_dst_box = payload.value("has_dst_box", false);
+  std::string resource_class;
+  if (!parse_string_field(event, payload, "resource_class", resource_class, error) ||
+      !parse_u32_field(event, payload, "dst_subresource", command.dst_subresource, error) ||
+      !parse_u32_field(event, payload, "src_row_pitch", command.src_row_pitch, error) ||
+      !parse_u32_field(event, payload, "src_depth_pitch", command.src_depth_pitch, error) ||
+      !parse_bool_field(event, payload, "has_dst_box", command.has_dst_box, error)) {
+    return false;
+  }
+  command.resource_class = parse_resource_class_name(resource_class);
+  if (command.resource_class == ReplayResourceClass::Unknown) {
+    error = record_prefix(event) + ": unsupported resource_class " + resource_class;
+    return false;
+  }
   if (command.has_dst_box) {
     const json *box = nullptr;
     if (!require_json_object(event, payload, "dst_box", box, error)) {
       return false;
     }
-    command.dst_box.left = box->value("left", 0u);
-    command.dst_box.top = box->value("top", 0u);
-    command.dst_box.front = box->value("front", 0u);
-    command.dst_box.right = box->value("right", 0u);
-    command.dst_box.bottom = box->value("bottom", 0u);
-    command.dst_box.back = box->value("back", 0u);
+    if (!parse_u32_field(event, *box, "left", command.dst_box.left, error) ||
+        !parse_u32_field(event, *box, "top", command.dst_box.top, error) ||
+        !parse_u32_field(event, *box, "front", command.dst_box.front, error) ||
+        !parse_u32_field(event, *box, "right", command.dst_box.right, error) ||
+        !parse_u32_field(event, *box, "bottom", command.dst_box.bottom, error) ||
+        !parse_u32_field(event, *box, "back", command.dst_box.back, error)) {
+      return false;
+    }
   }
-  command.data_path = resolve_asset_path(reader, event, payload, "data_path", error);
+  command.data_path = resolve_asset_path(context, event, payload, "data_path", error);
   if (!error.empty()) {
     return false;
   }
@@ -907,13 +1132,13 @@ bool parse_update_subresource(
 }
 
 bool parse_clear_state(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   (void)payload;
   if (!require_object_ref_count(event, 1, error)) {
     return false;
@@ -925,19 +1150,21 @@ bool parse_clear_state(
 }
 
 bool parse_om_set_render_targets(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 1, error)) {
     return false;
   }
   auto command = make_command_header<SetRenderTargetsCommand>(event);
   command.context_id = event.object_refs[0];
-  command.has_depth_stencil = payload.value("has_depth_stencil", false);
+  if (!parse_bool_field(event, payload, "has_depth_stencil", command.has_depth_stencil, error)) {
+    return false;
+  }
   command.render_target_view_ids.assign(event.object_refs.begin() + 1, event.object_refs.end());
   if (command.has_depth_stencil) {
     if (command.render_target_view_ids.empty()) {
@@ -952,13 +1179,13 @@ bool parse_om_set_render_targets(
 }
 
 bool parse_rs_set_viewports(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 1, error)) {
     return false;
   }
@@ -972,13 +1199,13 @@ bool parse_rs_set_viewports(
 }
 
 bool parse_clear_render_target_view(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 2, error)) {
     return false;
   }
@@ -993,34 +1220,42 @@ bool parse_clear_render_target_view(
 }
 
 bool parse_clear_depth_stencil_view(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 2, error)) {
     return false;
   }
   auto command = make_command_header<ClearDepthStencilViewCommand>(event);
   command.context_id = event.object_refs[0];
   command.depth_stencil_view_id = event.object_refs[1];
-  command.clear_flags = payload.value("clear_flags", 0u);
-  command.depth = payload.value("depth", 1.0f);
-  command.stencil = static_cast<std::uint8_t>(payload.value("stencil", 0u));
+  std::uint32_t stencil = 0;
+  if (!parse_u32_field(event, payload, "clear_flags", command.clear_flags, error) ||
+      !parse_float_field(event, payload, "depth", command.depth, error) ||
+      !parse_u32_field(event, payload, "stencil", stencil, error)) {
+    return false;
+  }
+  if (stencil > std::numeric_limits<std::uint8_t>::max()) {
+    error = record_prefix(event) + ": uint8 field stencil is out of range";
+    return false;
+  }
+  command.stencil = static_cast<std::uint8_t>(stencil);
   plan.commands.emplace_back(std::move(command));
   return true;
 }
 
 bool parse_ia_set_input_layout(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   (void)payload;
   if (!require_object_ref_count(event, 2, error)) {
     return false;
@@ -1033,19 +1268,21 @@ bool parse_ia_set_input_layout(
 }
 
 bool parse_ia_set_vertex_buffers(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 1, error)) {
     return false;
   }
   auto command = make_command_header<SetVertexBuffersCommand>(event);
   command.context_id = event.object_refs[0];
-  command.start_slot = payload.value("start_slot", 0u);
+  if (!parse_u32_field(event, payload, "start_slot", command.start_slot, error)) {
+    return false;
+  }
   if (!parse_vertex_buffer_bindings(event, payload, command.bindings, error)) {
     return false;
   }
@@ -1054,55 +1291,63 @@ bool parse_ia_set_vertex_buffers(
 }
 
 bool parse_ia_set_index_buffer(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 2, error)) {
     return false;
   }
   auto command = make_command_header<SetIndexBufferCommand>(event);
   command.context_id = event.object_refs[0];
   command.buffer_id = event.object_refs[1];
-  command.format = payload.value("format", 0u);
-  command.offset = payload.value("offset", 0u);
+  if (!parse_u32_field(event, payload, "format", command.format, error) ||
+      !parse_u32_field(event, payload, "offset", command.offset, error)) {
+    return false;
+  }
   plan.commands.emplace_back(std::move(command));
   return true;
 }
 
 bool parse_ia_set_primitive_topology(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 1, error)) {
     return false;
   }
   auto command = make_command_header<SetPrimitiveTopologyCommand>(event);
   command.context_id = event.object_refs[0];
-  command.topology = payload.value("topology", std::string("OTHER"));
+  if (!parse_string_field(event, payload, "topology", command.topology, error)) {
+    return false;
+  }
   plan.commands.emplace_back(std::move(command));
   return true;
 }
 
 bool parse_set_shader(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 2, error)) {
     return false;
   }
-  if (payload.value("class_instance_count", 0u) != 0u) {
+  std::uint32_t class_instance_count = 0;
+  if (!parse_u32_field(event, payload, "class_instance_count", class_instance_count, error)) {
+    return false;
+  }
+  if (class_instance_count != 0u) {
     error = record_prefix(event) + ": class instances are unsupported";
     return false;
   }
@@ -1116,19 +1361,21 @@ bool parse_set_shader(
 }
 
 bool parse_set_constant_buffers(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 1, error)) {
     return false;
   }
   auto command = make_command_header<SetConstantBuffersCommand>(event);
   command.context_id = event.object_refs[0];
-  command.start_slot = payload.value("start_slot", 0u);
+  if (!parse_u32_field(event, payload, "start_slot", command.start_slot, error)) {
+    return false;
+  }
   command.vertex_stage = event.callsite.function_name == "ID3D11DeviceContext::VSSetConstantBuffers";
   command.buffer_ids.assign(event.object_refs.begin() + 1, event.object_refs.end());
   plan.commands.emplace_back(std::move(command));
@@ -1136,78 +1383,84 @@ bool parse_set_constant_buffers(
 }
 
 bool parse_ps_set_shader_resources(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 1, error)) {
     return false;
   }
   auto command = make_command_header<SetShaderResourcesCommand>(event);
   command.context_id = event.object_refs[0];
-  command.start_slot = payload.value("start_slot", 0u);
+  if (!parse_u32_field(event, payload, "start_slot", command.start_slot, error)) {
+    return false;
+  }
   command.shader_resource_view_ids.assign(event.object_refs.begin() + 1, event.object_refs.end());
   plan.commands.emplace_back(std::move(command));
   return true;
 }
 
 bool parse_ps_set_samplers(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 1, error)) {
     return false;
   }
   auto command = make_command_header<SetSamplersCommand>(event);
   command.context_id = event.object_refs[0];
-  command.start_slot = payload.value("start_slot", 0u);
+  if (!parse_u32_field(event, payload, "start_slot", command.start_slot, error)) {
+    return false;
+  }
   command.sampler_ids.assign(event.object_refs.begin() + 1, event.object_refs.end());
   plan.commands.emplace_back(std::move(command));
   return true;
 }
 
 bool parse_om_set_depth_stencil_state(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 1, error)) {
     return false;
   }
   auto command = make_command_header<SetDepthStencilStateCommand>(event);
   command.context_id = event.object_refs[0];
   command.depth_stencil_state_id = event.object_refs.size() >= 2 ? event.object_refs[1] : 0;
-  command.stencil_ref = payload.value("stencil_ref", 0u);
+  if (!parse_u32_field(event, payload, "stencil_ref", command.stencil_ref, error)) {
+    return false;
+  }
   plan.commands.emplace_back(std::move(command));
   return true;
 }
 
 bool parse_om_set_blend_state(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 1, error)) {
     return false;
   }
   auto command = make_command_header<SetBlendStateCommand>(event);
   command.context_id = event.object_refs[0];
   command.blend_state_id = event.object_refs.size() >= 2 ? event.object_refs[1] : 0;
-  command.sample_mask = payload.value("sample_mask", 0u);
-  if (!parse_float4_field(event, payload, "blend_factor", command.blend_factor, error)) {
+  if (!parse_u32_field(event, payload, "sample_mask", command.sample_mask, error) ||
+      !parse_float4_field(event, payload, "blend_factor", command.blend_factor, error)) {
     return false;
   }
   plan.commands.emplace_back(std::move(command));
@@ -1215,13 +1468,13 @@ bool parse_om_set_blend_state(
 }
 
 bool parse_rs_set_state(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   (void)payload;
   if (!require_object_ref_count(event, 1, error)) {
     return false;
@@ -1234,13 +1487,13 @@ bool parse_rs_set_state(
 }
 
 bool parse_rs_set_scissor_rects(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 1, error)) {
     return false;
   }
@@ -1254,74 +1507,80 @@ bool parse_rs_set_scissor_rects(
 }
 
 bool parse_draw(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 1, error)) {
     return false;
   }
   auto command = make_command_header<DrawCommand>(event);
   command.context_id = event.object_refs[0];
-  command.vertex_count = payload.value("vertex_count", 0u);
-  command.start_vertex_location = payload.value("start_vertex_location", 0u);
+  if (!parse_u32_field(event, payload, "vertex_count", command.vertex_count, error) ||
+      !parse_u32_field(event, payload, "start_vertex_location", command.start_vertex_location, error)) {
+    return false;
+  }
   plan.commands.emplace_back(std::move(command));
   return true;
 }
 
 bool parse_draw_indexed(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 1, error)) {
     return false;
   }
   auto command = make_command_header<DrawIndexedCommand>(event);
   command.context_id = event.object_refs[0];
-  command.index_count = payload.value("index_count", 0u);
-  command.start_index_location = payload.value("start_index_location", 0u);
-  command.base_vertex_location = payload.value("base_vertex_location", 0);
+  if (!parse_u32_field(event, payload, "index_count", command.index_count, error) ||
+      !parse_u32_field(event, payload, "start_index_location", command.start_index_location, error) ||
+      !parse_i32_field(event, payload, "base_vertex_location", command.base_vertex_location, error)) {
+    return false;
+  }
   plan.commands.emplace_back(std::move(command));
   return true;
 }
 
 bool parse_draw_indexed_instanced(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 1, error)) {
     return false;
   }
   auto command = make_command_header<DrawIndexedInstancedCommand>(event);
   command.context_id = event.object_refs[0];
-  command.index_count_per_instance = payload.value("index_count_per_instance", 0u);
-  command.instance_count = payload.value("instance_count", 0u);
-  command.start_index_location = payload.value("start_index_location", 0u);
-  command.base_vertex_location = payload.value("base_vertex_location", 0);
-  command.start_instance_location = payload.value("start_instance_location", 0u);
+  if (!parse_u32_field(event, payload, "index_count_per_instance", command.index_count_per_instance, error) ||
+      !parse_u32_field(event, payload, "instance_count", command.instance_count, error) ||
+      !parse_u32_field(event, payload, "start_index_location", command.start_index_location, error) ||
+      !parse_i32_field(event, payload, "base_vertex_location", command.base_vertex_location, error) ||
+      !parse_u32_field(event, payload, "start_instance_location", command.start_instance_location, error)) {
+    return false;
+  }
   plan.commands.emplace_back(std::move(command));
   return true;
 }
 
 bool parse_copy_resource(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   (void)payload;
   if (!require_object_ref_count(event, 3, error)) {
     return false;
@@ -1335,13 +1594,13 @@ bool parse_copy_resource(
 }
 
 bool parse_resolve_subresource(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 3, error)) {
     return false;
   }
@@ -1349,21 +1608,23 @@ bool parse_resolve_subresource(
   command.context_id = event.object_refs[0];
   command.dst_resource_id = event.object_refs[1];
   command.src_resource_id = event.object_refs[2];
-  command.dst_subresource = payload.value("dst_subresource", 0u);
-  command.src_subresource = payload.value("src_subresource", 0u);
-  command.format = payload.value("format", 0u);
+  if (!parse_u32_field(event, payload, "dst_subresource", command.dst_subresource, error) ||
+      !parse_u32_field(event, payload, "src_subresource", command.src_subresource, error) ||
+      !parse_u32_field(event, payload, "format", command.format, error)) {
+    return false;
+  }
   plan.commands.emplace_back(std::move(command));
   return true;
 }
 
 bool parse_present(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
     std::string &error)
 {
-  (void)reader;
+  (void)context;
   if (!require_object_ref_count(event, 1, error)) {
     return false;
   }
@@ -1373,8 +1634,10 @@ bool parse_present(
   }
   auto command = make_command_header<PresentCommand>(event);
   command.swap_chain_id = event.object_refs[0];
-  command.sync_interval = payload.value("sync_interval", 0u);
-  command.flags = payload.value("flags", 0u);
+  if (!parse_u32_field(event, payload, "sync_interval", command.sync_interval, error) ||
+      !parse_u32_field(event, payload, "flags", command.flags, error)) {
+    return false;
+  }
   if (!require_payload_key(event, payload, "frame_index", error)) {
     return false;
   }
@@ -1391,7 +1654,7 @@ bool parse_present(
 }
 
 bool parse_resource_blob(
-    const trace::TraceBundleReader &reader,
+    const D3D11ReplayParseContext &context,
     const trace::EventRecord &event,
     const json &payload,
     D3D11ReplayPlan &plan,
@@ -1417,16 +1680,20 @@ bool parse_resource_blob(
     error = record_prefix(event) + ": D3D11PresentFrame frame_index is not contiguous";
     return false;
   }
-  frame.width = payload.value("width", 0u);
-  frame.height = payload.value("height", 0u);
-  frame.row_pitch = payload.value("row_pitch", 0u);
-  frame.sync_interval = payload.value("sync_interval", 0u);
-  frame.flags = payload.value("flags", 0u);
-  if (payload.value("format", std::string()) != "rgba8") {
+  std::string format;
+  if (!parse_u32_field(event, payload, "width", frame.width, error) ||
+      !parse_u32_field(event, payload, "height", frame.height, error) ||
+      !parse_u32_field(event, payload, "row_pitch", frame.row_pitch, error) ||
+      !parse_u32_field(event, payload, "sync_interval", frame.sync_interval, error) ||
+      !parse_u32_field(event, payload, "flags", frame.flags, error) ||
+      !parse_string_field(event, payload, "format", format, error)) {
+    return false;
+  }
+  if (format != "rgba8") {
     error = record_prefix(event) + ": D3D11PresentFrame format must be rgba8";
     return false;
   }
-  frame.frame_path = resolve_asset_path(reader, event, payload, "frame_path", error);
+  frame.frame_path = resolve_asset_path(context, event, payload, "frame_path", error);
   if (!error.empty()) {
     return false;
   }
@@ -1509,7 +1776,9 @@ bool parse_boundary_event(const trace::EventRecord &event, const json &payload, 
   case trace::BoundaryKind::Frame: {
     auto command = make_command_header<FrameBoundaryCommand>(event);
     command.header.label = "Frame";
-    command.label = payload.value("label", std::string());
+    if (!parse_string_field(event, payload, "label", command.label, error)) {
+      return false;
+    }
     if (!require_payload_key(event, payload, "frame_index", error)) {
       return false;
     }
@@ -1552,7 +1821,9 @@ bool parse_boundary_event(const trace::EventRecord &event, const json &payload, 
   case trace::BoundaryKind::Present: {
     auto command = make_command_header<PresentBoundaryCommand>(event);
     command.header.label = "Present";
-    command.label = payload.value("label", std::string());
+    if (!parse_string_field(event, payload, "label", command.label, error)) {
+      return false;
+    }
     if (!require_payload_key(event, payload, "frame_index", error)) {
       return false;
     }
@@ -1569,8 +1840,10 @@ bool parse_boundary_event(const trace::EventRecord &event, const json &payload, 
       error = record_prefix(event) + ": Present boundary is missing matching IDXGISwapChain::Present call";
       return false;
     }
-    command.sync_interval = payload.value("sync_interval", 0u);
-    command.flags = payload.value("flags", 0u);
+    if (!parse_u32_field(event, payload, "sync_interval", command.sync_interval, error) ||
+        !parse_u32_field(event, payload, "flags", command.flags, error)) {
+      return false;
+    }
     if (plan.present_sync_intervals[command.frame_index] != command.sync_interval ||
         plan.present_flags[command.frame_index] != command.flags) {
       error = record_prefix(event) + ": Present boundary does not match captured IDXGISwapChain::Present parameters";
@@ -1612,6 +1885,7 @@ bool build_d3d11_replay_plan(
     D3D11ReplayPlan &plan,
     std::string &error)
 {
+  const D3D11ReplayParseContext context{reader, build_asset_path_index(reader)};
   plan.commands.clear();
   plan.present_call_count = 0;
   plan.present_boundary_count = 0;
@@ -1622,9 +1896,9 @@ bool build_d3d11_replay_plan(
   plan.present_flags.clear();
   plan.open_frames.clear();
   plan.presented_frames.clear();
-  plan.commands.reserve(reader.events().size());
+  plan.commands.reserve(context.reader.events().size());
 
-  for (const auto &event : reader.events()) {
+  for (const auto &event : context.reader.events()) {
     json payload;
     if (!payload_to_json(event, payload, error)) {
       return false;
@@ -1638,7 +1912,7 @@ bool build_d3d11_replay_plan(
     }
 
     if (event.kind == trace::EventKind::ResourceBlob) {
-      if (!parse_resource_blob(reader, event, payload, plan, error)) {
+      if (!parse_resource_blob(context, event, payload, plan, error)) {
         return false;
       }
       continue;
@@ -1649,7 +1923,7 @@ bool build_d3d11_replay_plan(
       error = record_prefix(event) + ": unsupported function";
       return false;
     }
-    if (!handler->second(reader, event, payload, plan, error)) {
+    if (!handler->second(context, event, payload, plan, error)) {
       return false;
     }
   }

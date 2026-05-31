@@ -124,17 +124,19 @@ void D3D12SubmissionTracker::wait_on_fence_for_queue(
   pending_waits_.push_back(wait);
 }
 
-void D3D12SubmissionTracker::mark_present(std::uint64_t sequence)
+void D3D12SubmissionTracker::mark_present(std::uint64_t sequence, std::uint64_t frame_index)
 {
   if (has_open_batch_) {
     current_batch_.presented = true;
     current_batch_.present_sequence = sequence;
+    current_batch_.present_frame_index = frame_index;
     return;
   }
 
   if (!completed_batches_.empty()) {
     completed_batches_.back().presented = true;
     completed_batches_.back().present_sequence = sequence;
+    completed_batches_.back().present_frame_index = frame_index;
   }
 }
 

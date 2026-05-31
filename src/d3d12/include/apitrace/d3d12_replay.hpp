@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace apitrace::d3d12 {
@@ -17,15 +18,19 @@ class D3D12NativeReplayer;
 
 class D3D12ReplayBackend {
 public:
+  struct DescriptorSemanticState;
+
   D3D12ReplayBackend();
   ~D3D12ReplayBackend();
 
   bool initialize(const trace::TraceBundleReader &reader);
   bool replay_event(const trace::EventRecord &event);
   bool finalize_replay();
+  bool validate_only();
   void shutdown();
 
   const std::string &last_error() const noexcept;
+  const std::vector<DescriptorSemanticState> &descriptors() const noexcept;
   enum class ReplayCommandKind {
     Unknown,
     BeginCommandList,
@@ -41,13 +46,23 @@ public:
     SetRenderTargets,
     ClearRenderTarget,
     ClearDepthStencil,
+    ClearUnorderedAccess,
+    DiscardResource,
     SetPrimitiveTopology,
     SetVertexBuffers,
     SetIndexBuffer,
     ResourceBarrier,
+    SetDynamicState,
+    RenderPass,
+    Query,
+    Predication,
+    WriteBufferImmediate,
+    TemporalUpscale,
+    UnsupportedNative,
     Draw,
     Dispatch,
     ExecuteIndirect,
+    ExecuteBundle,
     Copy,
     Resolve,
     MapResource,
@@ -63,9 +78,6 @@ public:
     std::string payload;
   };
 
-private:
-  friend class D3D12NativeReplayer;
-
   std::string last_error_;
   bool initialized_ = false;
   std::uint64_t commands_replayed_ = 0;
@@ -76,6 +88,7 @@ private:
   std::uint64_t draw_calls_seen_ = 0;
   std::uint64_t dispatch_calls_seen_ = 0;
   std::uint64_t last_sequence_ = 0;
+  std::unordered_map<trace::BlobId, std::filesystem::path> blob_paths_;
   D3D12ObjectRegistry objects_;
   D3D12SubmissionTracker submissions_;
   std::filesystem::path bundle_root_;
@@ -124,6 +137,8 @@ private:
       std::uint32_t sync_interval,
       std::uint32_t flags);
   bool validate_replay_closure();
+  bool validate_native_replay_readiness();
+  const std::vector<ReplayCommandRecord> &replay_commands() const noexcept;
 
   struct ResourceDataUpdate {
     std::uint64_t sequence = 0;
@@ -150,10 +165,24 @@ private:
     std::uint32_t subresource = 0;
   };
 
+  struct ResourceBarrierSemanticState {
+    std::uint64_t sequence = 0;
+    trace::ObjectId command_list_object_id = 0;
+    std::uint32_t type = 0;
+    std::uint32_t flags = 0;
+    trace::ObjectId resource_object_id = 0;
+    trace::ObjectId resource_before_object_id = 0;
+    trace::ObjectId resource_after_object_id = 0;
+    std::uint32_t before = 0;
+    std::uint32_t after = 0;
+    std::uint32_t subresource = 0;
+  };
+
   struct GpuVirtualAddressBinding {
     std::uint64_t gpu_virtual_address = 0;
     trace::ObjectId resource_object_id = 0;
     std::uint64_t offset = 0;
+    bool resolved = true;
   };
 
   struct Root32BitConstantsBinding {
@@ -163,6 +192,7 @@ private:
   };
 
   struct VertexBufferBinding {
+    std::uint64_t sequence = 0;
     std::uint32_t slot = 0;
     GpuVirtualAddressBinding address;
     std::uint32_t size_in_bytes = 0;
@@ -170,6 +200,7 @@ private:
   };
 
   struct IndexBufferBinding {
+    std::uint64_t sequence = 0;
     GpuVirtualAddressBinding address;
     std::uint32_t size_in_bytes = 0;
     std::uint32_t format = 0;
@@ -212,6 +243,12 @@ private:
     std::uint32_t dst_y = 0;
     std::uint32_t dst_z = 0;
     bool has_src_box = false;
+    std::uint32_t src_box_left = 0;
+    std::uint32_t src_box_top = 0;
+    std::uint32_t src_box_front = 0;
+    std::uint32_t src_box_right = 0;
+    std::uint32_t src_box_bottom = 0;
+    std::uint32_t src_box_back = 0;
   };
 
   struct ResourceCopySemanticState {
@@ -221,14 +258,66 @@ private:
     trace::ObjectId src_resource_object_id = 0;
   };
 
+  struct BufferCopySemanticState {
+    std::uint64_t sequence = 0;
+    trace::ObjectId command_list_object_id = 0;
+    trace::ObjectId dst_buffer_object_id = 0;
+    trace::ObjectId src_buffer_object_id = 0;
+    std::uint64_t dst_offset = 0;
+    std::uint64_t src_offset = 0;
+    std::uint64_t byte_count = 0;
+  };
+
   struct ResolveSubresourceSemanticState {
     std::uint64_t sequence = 0;
     trace::ObjectId command_list_object_id = 0;
     trace::ObjectId dst_resource_object_id = 0;
     trace::ObjectId src_resource_object_id = 0;
     std::uint32_t dst_subresource = 0;
+    std::uint32_t dst_x = 0;
+    std::uint32_t dst_y = 0;
     std::uint32_t src_subresource = 0;
+    bool has_src_rect = false;
+    std::int32_t src_rect_left = 0;
+    std::int32_t src_rect_top = 0;
+    std::int32_t src_rect_right = 0;
+    std::int32_t src_rect_bottom = 0;
     std::uint32_t format = 0;
+    std::uint32_t mode = 3;
+  };
+
+  struct QueryCommandSemanticState {
+    std::uint64_t sequence = 0;
+    trace::ObjectId command_list_object_id = 0;
+    trace::ObjectId query_heap_object_id = 0;
+    std::uint32_t type = 0;
+    std::uint32_t index = 0;
+    std::uint32_t start_index = 0;
+    std::uint32_t query_count = 0;
+    trace::ObjectId dst_buffer_object_id = 0;
+    std::uint64_t aligned_dst_buffer_offset = 0;
+    bool resolve = false;
+    bool end = false;
+  };
+
+  struct PredicationSemanticState {
+    std::uint64_t sequence = 0;
+    trace::ObjectId command_list_object_id = 0;
+    trace::ObjectId buffer_object_id = 0;
+    std::uint64_t aligned_buffer_offset = 0;
+    std::uint32_t operation = 0;
+  };
+
+  struct WriteBufferImmediateEntry {
+    GpuVirtualAddressBinding dest;
+    std::uint32_t value = 0;
+    std::uint32_t mode = 0;
+  };
+
+  struct WriteBufferImmediateSemanticState {
+    std::uint64_t sequence = 0;
+    trace::ObjectId command_list_object_id = 0;
+    std::vector<WriteBufferImmediateEntry> writes;
   };
 
   struct FenceSemanticState {
@@ -275,6 +364,30 @@ private:
     std::uint64_t last_submit_fence_value = 0;
   };
 
+  struct HeapSemanticState {
+    trace::ObjectId heap_object_id = 0;
+    std::uint64_t create_sequence = 0;
+    std::uint64_t size_in_bytes = 0;
+    std::uint64_t alignment = 0;
+    std::uint32_t heap_type = 0;
+    std::uint32_t flags = 0;
+  };
+
+  struct QueryHeapSemanticState {
+    trace::ObjectId query_heap_object_id = 0;
+    std::uint64_t create_sequence = 0;
+    std::uint32_t type = 0;
+    std::uint32_t count = 0;
+    std::uint32_t node_mask = 0;
+  };
+
+  struct DescriptorBinding {
+    std::uint64_t descriptor = 0;
+    trace::ObjectId heap_object_id = 0;
+    std::uint32_t heap_type = 0;
+    std::uint32_t descriptor_index = 0;
+  };
+
   struct CommandSignatureArgument {
     std::uint32_t type = 0;
     std::uint32_t slot = 0;
@@ -299,17 +412,39 @@ private:
     trace::ObjectId command_signature_object_id = 0;
     trace::ObjectId arg_buffer_object_id = 0;
     trace::ObjectId count_buffer_object_id = 0;
+    trace::ObjectId pipeline_state_object_id = 0;
+    trace::ObjectId graphics_root_signature_object_id = 0;
+    trace::ObjectId compute_root_signature_object_id = 0;
+    std::unordered_map<std::uint32_t, DescriptorBinding> graphics_root_tables;
+    std::unordered_map<std::uint32_t, DescriptorBinding> compute_root_tables;
+    std::vector<DescriptorBinding> render_targets;
+    DescriptorBinding depth_stencil;
+    std::vector<ViewportSemanticState> viewports;
+    std::vector<ScissorRectSemanticState> scissor_rects;
+    std::uint32_t primitive_topology = 0;
     std::uint32_t max_command_count = 0;
     std::uint64_t arg_buffer_offset = 0;
     std::uint64_t count_buffer_offset = 0;
   };
 
+  struct ExecuteBundleSemanticState {
+    std::uint64_t sequence = 0;
+    trace::ObjectId command_list_object_id = 0;
+    trace::ObjectId bundle_command_list_object_id = 0;
+  };
+
   struct DispatchSemanticState {
     std::uint64_t sequence = 0;
     trace::ObjectId command_list_object_id = 0;
+    trace::ObjectId pipeline_state_object_id = 0;
+    trace::ObjectId graphics_root_signature_object_id = 0;
+    trace::ObjectId compute_root_signature_object_id = 0;
+    std::unordered_map<std::uint32_t, DescriptorBinding> graphics_root_tables;
+    std::unordered_map<std::uint32_t, DescriptorBinding> compute_root_tables;
     std::uint32_t thread_group_count_x = 0;
     std::uint32_t thread_group_count_y = 0;
     std::uint32_t thread_group_count_z = 0;
+    bool mesh = false;
   };
 
   struct DispatchRaysSemanticState {
@@ -329,6 +464,27 @@ private:
     GpuVirtualAddressBinding callable_shader_table;
     std::uint64_t callable_shader_table_size = 0;
     std::uint64_t callable_shader_table_stride = 0;
+  };
+
+  struct TemporalUpscaleSemanticState {
+    std::uint64_t sequence = 0;
+    trace::ObjectId command_list_object_id = 0;
+    std::uint32_t input_content_width = 0;
+    std::uint32_t input_content_height = 0;
+    bool auto_exposure = false;
+    bool in_reset = false;
+    bool depth_reversed = false;
+    bool motion_vector_in_display_res = false;
+    trace::ObjectId color_object_id = 0;
+    trace::ObjectId depth_object_id = 0;
+    trace::ObjectId motion_vector_object_id = 0;
+    trace::ObjectId output_object_id = 0;
+    trace::ObjectId exposure_texture_object_id = 0;
+    float motion_vector_scale_x = 0.0f;
+    float motion_vector_scale_y = 0.0f;
+    float pre_exposure = 0.0f;
+    float jitter_offset_x = 0.0f;
+    float jitter_offset_y = 0.0f;
   };
 
   struct PipelineSemanticState {
@@ -355,7 +511,37 @@ private:
     std::vector<std::uint32_t> rtv_formats;
     bool has_vertex_shader = false;
     bool has_pixel_shader = false;
+    bool has_domain_shader = false;
+    bool has_hull_shader = false;
+    bool has_geometry_shader = false;
     bool has_compute_shader = false;
+    bool requires_dxmt_backend = false;
+  };
+
+  struct RootDescriptorRangeSemanticState {
+    std::uint32_t type = 0;
+    std::uint32_t descriptor_count = 0;
+    std::uint32_t base_shader_register = 0;
+    std::uint32_t register_space = 0;
+    std::uint32_t offset_from_table_start = 0;
+    std::uint32_t flags = 0;
+  };
+
+  struct RootDescriptorTableSemanticState {
+    std::uint32_t root_parameter_index = 0;
+    std::uint32_t shader_visibility = 0;
+    std::vector<RootDescriptorRangeSemanticState> ranges;
+  };
+
+  struct RootParameterSemanticState {
+    std::uint32_t root_parameter_index = 0;
+    std::uint32_t parameter_type = 0;
+    std::uint32_t shader_visibility = 0;
+    std::uint32_t shader_register = 0;
+    std::uint32_t register_space = 0;
+    std::uint32_t num_32bit_values = 0;
+    std::uint32_t range_count = 0;
+    std::uint32_t flags = 0;
   };
 
   struct RootSignatureSemanticState {
@@ -366,11 +552,23 @@ private:
     std::filesystem::path relative_path;
     std::vector<trace::BlobId> blob_refs;
     std::vector<std::uint8_t> bytes;
+    std::vector<RootDescriptorTableSemanticState> descriptor_tables;
+    bool has_descriptor_table_metadata = false;
+    std::vector<RootParameterSemanticState> root_parameters;
+    bool has_root_parameter_metadata = false;
   };
 
   struct DrawSemanticState {
     std::uint64_t sequence = 0;
     trace::ObjectId command_list_object_id = 0;
+    trace::ObjectId pipeline_state_object_id = 0;
+    trace::ObjectId graphics_root_signature_object_id = 0;
+    std::unordered_map<std::uint32_t, DescriptorBinding> graphics_root_tables;
+    std::vector<DescriptorBinding> render_targets;
+    DescriptorBinding depth_stencil;
+    std::vector<ViewportSemanticState> viewports;
+    std::vector<ScissorRectSemanticState> scissor_rects;
+    std::uint32_t primitive_topology = 0;
     std::uint32_t vertex_count_per_instance = 0;
     std::uint32_t instance_count = 0;
     std::uint32_t start_vertex_location = 0;
@@ -380,6 +578,14 @@ private:
   struct DrawIndexedSemanticState {
     std::uint64_t sequence = 0;
     trace::ObjectId command_list_object_id = 0;
+    trace::ObjectId pipeline_state_object_id = 0;
+    trace::ObjectId graphics_root_signature_object_id = 0;
+    std::unordered_map<std::uint32_t, DescriptorBinding> graphics_root_tables;
+    std::vector<DescriptorBinding> render_targets;
+    DescriptorBinding depth_stencil;
+    std::vector<ViewportSemanticState> viewports;
+    std::vector<ScissorRectSemanticState> scissor_rects;
+    std::uint32_t primitive_topology = 0;
     std::uint32_t index_count_per_instance = 0;
     std::uint32_t instance_count = 0;
     std::uint32_t start_index_location = 0;
@@ -389,11 +595,13 @@ private:
 
   struct ResourceSemanticState {
     trace::ObjectId resource_object_id = 0;
+    trace::ObjectId heap_object_id = 0;
     std::uint64_t create_sequence = 0;
     std::uint32_t heap_type = 0;
     std::uint32_t heap_flags = 0;
     std::uint32_t initial_state = 0;
     std::uint32_t current_state = 0;
+    std::uint64_t heap_offset = 0;
     std::uint64_t last_transition_sequence = 0;
     std::uint64_t gpu_virtual_address = 0;
     std::uint64_t width = 0;
@@ -434,13 +642,6 @@ private:
     std::uint64_t gpu_start = 0;
   };
 
-  struct DescriptorBinding {
-    std::uint64_t descriptor = 0;
-    trace::ObjectId heap_object_id = 0;
-    std::uint32_t heap_type = 0;
-    std::uint32_t descriptor_index = 0;
-  };
-
   struct RenderTargetClearSemanticState {
     std::uint64_t sequence = 0;
     trace::ObjectId command_list_object_id = 0;
@@ -462,6 +663,30 @@ private:
     std::vector<ScissorRectSemanticState> rects;
   };
 
+  struct UnorderedAccessClearSemanticState {
+    std::uint64_t sequence = 0;
+    trace::ObjectId command_list_object_id = 0;
+    DescriptorBinding gpu_descriptor;
+    DescriptorBinding cpu_descriptor;
+    trace::ObjectId resource_object_id = 0;
+    std::uint32_t uint_values[4] = {0, 0, 0, 0};
+    float float_values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    bool integer = false;
+    std::uint32_t rect_count = 0;
+    std::vector<ScissorRectSemanticState> rects;
+  };
+
+  struct DiscardResourceSemanticState {
+    std::uint64_t sequence = 0;
+    trace::ObjectId command_list_object_id = 0;
+    trace::ObjectId resource_object_id = 0;
+    std::uint32_t first_subresource = 0;
+    std::uint32_t subresource_count = 0;
+    std::uint32_t rect_count = 0;
+    bool has_region = false;
+    std::vector<ScissorRectSemanticState> rects;
+  };
+
   struct DescriptorSemanticState {
     std::string kind;
     std::uint64_t create_sequence = 0;
@@ -479,17 +704,48 @@ private:
     std::uint32_t num_elements = 0;
     std::uint32_t structure_byte_stride = 0;
     std::uint64_t counter_offset_in_bytes = 0;
+    bool has_view_desc = false;
     std::uint32_t most_detailed_mip = 0;
     std::uint32_t mip_levels = 0;
     std::uint32_t mip_slice = 0;
     std::uint32_t plane_slice = 0;
     std::uint32_t first_array_slice = 0;
     std::uint32_t array_size = 0;
+    std::uint32_t first_2d_array_face = 0;
+    std::uint32_t num_cubes = 0;
     std::uint32_t first_w_slice = 0;
     std::uint32_t w_size = 0;
     float resource_min_lod_clamp = 0.0f;
     GpuVirtualAddressBinding raytracing_acceleration_structure;
     GpuVirtualAddressBinding buffer;
+  };
+
+  struct SamplerSemanticState {
+    std::uint64_t create_sequence = 0;
+    std::uint64_t descriptor = 0;
+    DescriptorBinding binding;
+    std::uint32_t filter = 0;
+    std::uint32_t address_u = 0;
+    std::uint32_t address_v = 0;
+    std::uint32_t address_w = 0;
+    float mip_lod_bias = 0.0f;
+    std::uint32_t max_anisotropy = 0;
+    std::uint32_t comparison_func = 0;
+    float border_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float min_lod = 0.0f;
+    float max_lod = 0.0f;
+    bool has_desc = false;
+  };
+
+  struct CopyDescriptorPair {
+    std::uint64_t dst_descriptor = 0;
+    std::uint64_t src_descriptor = 0;
+  };
+
+  struct CopyDescriptorSemanticState {
+    std::uint64_t create_sequence = 0;
+    std::uint32_t descriptor_heap_type = 0;
+    std::vector<CopyDescriptorPair> descriptors;
   };
 
   struct CommandListSemanticState {
@@ -527,18 +783,36 @@ private:
     std::unordered_map<std::uint32_t, GpuVirtualAddressBinding> compute_root_unordered_accesses;
     std::vector<VertexBufferBinding> vertex_buffers;
     IndexBufferBinding index_buffer;
+    std::vector<BufferCopySemanticState> buffer_copies;
     std::vector<TextureCopySemanticState> texture_copies;
     std::vector<ResourceCopySemanticState> resource_copies;
+    std::vector<ResourceBarrierSemanticState> barriers;
     std::vector<ResolveSubresourceSemanticState> resolves;
+    std::vector<QueryCommandSemanticState> queries;
+    std::vector<PredicationSemanticState> predications;
+    std::vector<WriteBufferImmediateSemanticState> write_buffer_immediates;
     std::vector<RenderTargetClearSemanticState> render_target_clears;
     std::vector<DepthStencilClearSemanticState> depth_stencil_clears;
+    std::vector<UnorderedAccessClearSemanticState> unordered_access_clears;
+    std::vector<DiscardResourceSemanticState> discards;
     std::vector<ExecuteIndirectSemanticState> indirect_executes;
+    std::vector<ExecuteBundleSemanticState> bundle_executes;
     std::vector<DrawSemanticState> draws;
     std::vector<DrawIndexedSemanticState> indexed_draws;
     std::vector<DispatchSemanticState> dispatches;
     std::vector<DispatchRaysSemanticState> ray_dispatches;
+    std::vector<TemporalUpscaleSemanticState> temporal_upscales;
     std::vector<std::uint64_t> command_indices;
   };
+
+  const CommandListSemanticState *command_list_state(trace::ObjectId object_id) const noexcept;
+  const std::vector<CopyDescriptorSemanticState> &descriptor_copies() const noexcept;
+
+private:
+  friend class D3D12NativeReplayer;
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
+  friend struct D3D12ReplayBackendTestHook;
+#endif
 
   bool resolve_descriptor_binding(
       std::uint64_t descriptor,
@@ -583,8 +857,12 @@ private:
   std::unordered_map<trace::ObjectId, CommandQueueSemanticState> command_queues_;
   std::unordered_map<trace::ObjectId, CommandAllocatorSemanticState> command_allocators_;
   std::unordered_map<trace::ObjectId, DeviceSemanticState> devices_;
+  std::unordered_map<trace::ObjectId, HeapSemanticState> heaps_;
+  std::unordered_map<trace::ObjectId, QueryHeapSemanticState> query_heaps_;
   std::unordered_map<trace::ObjectId, DescriptorHeapSemanticState> descriptor_heaps_;
   std::vector<DescriptorSemanticState> descriptors_;
+  std::vector<SamplerSemanticState> samplers_;
+  std::vector<CopyDescriptorSemanticState> descriptor_copies_;
   std::unordered_map<trace::ObjectId, CommandSignatureSemanticState> command_signatures_;
   std::unordered_map<trace::ObjectId, FenceSemanticState> fences_;
   std::unordered_map<trace::ObjectId, ResourceSemanticState> resources_;

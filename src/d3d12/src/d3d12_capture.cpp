@@ -1,6 +1,1290 @@
 #include "apitrace/d3d12_capture.hpp"
 
+#include "apitrace/asset_index.hpp"
+#include "apitrace/capture_runtime.hpp"
+#include "apitrace/event_types.hpp"
+#include "apitrace/trace_session.hpp"
+
+#ifndef CINTERFACE
+#define CINTERFACE
+#endif
+#include <d3d12.h>
+
+#include <atomic>
+#include <algorithm>
+#include <cstring>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
 namespace apitrace::d3d12 {
+namespace {
+
+enum class PipelineStateSubobjectType : std::uint32_t {
+  RootSignature = 0x0,
+  VS = 0x1,
+  PS = 0x2,
+  DS = 0x3,
+  HS = 0x4,
+  GS = 0x5,
+  CS = 0x6,
+  StreamOutput = 0x7,
+  Blend = 0x8,
+  SampleMask = 0x9,
+  Rasterizer = 0xa,
+  DepthStencil = 0xb,
+  InputLayout = 0xc,
+  IbStripCutValue = 0xd,
+  PrimitiveTopology = 0xe,
+  RenderTargetFormats = 0xf,
+  DepthStencilFormat = 0x10,
+  SampleDesc = 0x11,
+  NodeMask = 0x12,
+  CachedPso = 0x13,
+  Flags = 0x14,
+  DepthStencil1 = 0x15,
+  ViewInstancing = 0x16,
+  AS = 0x18,
+  MS = 0x19,
+};
+
+struct DepthStencilDesc1 {
+  WINBOOL DepthEnable;
+  D3D12_DEPTH_WRITE_MASK DepthWriteMask;
+  D3D12_COMPARISON_FUNC DepthFunc;
+  WINBOOL StencilEnable;
+  UINT8 StencilReadMask;
+  UINT8 StencilWriteMask;
+  D3D12_DEPTH_STENCILOP_DESC FrontFace;
+  D3D12_DEPTH_STENCILOP_DESC BackFace;
+  WINBOOL DepthBoundsTestEnable;
+};
+
+struct RtFormatArray {
+  DXGI_FORMAT RTFormats[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+  UINT NumRenderTargets;
+};
+
+struct ViewInstancingDesc {
+  UINT ViewInstanceCount;
+  const void *pViewInstanceLocations;
+  UINT Flags;
+};
+
+std::atomic<std::uint64_t> g_sequence{0};
+std::atomic<std::uint64_t> g_blob_id{0};
+std::mutex g_object_mutex;
+std::mutex g_command_batch_mutex;
+std::mutex g_present_mutex;
+std::unordered_map<const void *, trace::ObjectId> g_object_ids;
+
+struct ResourceGpuVirtualAddressState {
+  trace::ObjectId object_id = 0;
+  std::uint64_t base = 0;
+  std::uint64_t width = 0;
+  std::uint64_t create_sequence = 0;
+};
+
+struct GpuVirtualAddressResolve {
+  trace::ObjectId object_id = 0;
+  std::uint64_t offset = 0;
+  std::uint64_t width = 0;
+  const char *status = "unmapped";
+};
+
+std::unordered_map<const void *, ResourceGpuVirtualAddressState> g_resource_gpu_virtual_addresses;
+
+struct CopyBufferBatchOp {
+  std::uint64_t sequence = 0;
+  std::string function_name;
+  const void *dst_buffer = nullptr;
+  std::uint64_t dst_offset = 0;
+  const void *src_buffer = nullptr;
+  std::uint64_t src_offset = 0;
+  std::uint64_t byte_count = 0;
+};
+
+struct PendingCopyBufferBatch {
+  std::vector<CopyBufferBatchOp> ops;
+};
+
+struct CopyBufferBatchFlush {
+  const void *command_list = nullptr;
+  PendingCopyBufferBatch batch;
+};
+
+std::unordered_map<const void *, PendingCopyBufferBatch> g_copy_buffer_batches;
+TraceSession *g_present_session = nullptr;
+std::uint64_t g_present_frame_index = 0;
+
+trace::ApiKind classify_api(const char *opname)
+{
+  if (!opname) {
+    return trace::ApiKind::Unknown;
+  }
+  if (std::strncmp(opname, "ID3D11", 6) == 0 || std::strncmp(opname, "D3D11", 5) == 0) {
+    return trace::ApiKind::D3D11;
+  }
+  if (std::strncmp(opname, "ID3D12", 6) == 0 || std::strncmp(opname, "D3D12", 5) == 0) {
+    return trace::ApiKind::D3D12;
+  }
+  if (std::strncmp(opname, "IDXGI", 5) == 0 || std::strncmp(opname, "DXGI", 4) == 0) {
+    return trace::ApiKind::D3D12;
+  }
+  return trace::ApiKind::Unknown;
+}
+
+std::string escape_json_string(std::string_view text)
+{
+  std::string escaped;
+  escaped.reserve(text.size() + 8);
+  for (const unsigned char ch : text) {
+    switch (ch) {
+    case '\"':
+      escaped += "\\\"";
+      break;
+    case '\\':
+      escaped += "\\\\";
+      break;
+    case '\b':
+      escaped += "\\b";
+      break;
+    case '\f':
+      escaped += "\\f";
+      break;
+    case '\n':
+      escaped += "\\n";
+      break;
+    case '\r':
+      escaped += "\\r";
+      break;
+    case '\t':
+      escaped += "\\t";
+      break;
+    default:
+      if (ch < 0x20) {
+        escaped += "?";
+      } else {
+        escaped.push_back(static_cast<char>(ch));
+      }
+      break;
+    }
+  }
+  return escaped;
+}
+
+std::string root_signature_descriptor_tables_json(const D3D12_ROOT_SIGNATURE_DESC *desc)
+{
+  std::ostringstream payload;
+  payload << "[";
+  bool first_table = true;
+  if (desc && desc->pParameters) {
+    for (UINT parameter_index = 0; parameter_index < desc->NumParameters; ++parameter_index) {
+      const auto &parameter = desc->pParameters[parameter_index];
+      if (parameter.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+        continue;
+      }
+      if (!first_table) {
+        payload << ",";
+      }
+      first_table = false;
+      payload << "{\"root_parameter_index\":" << parameter_index
+              << ",\"shader_visibility\":" << static_cast<unsigned int>(parameter.ShaderVisibility)
+              << ",\"ranges\":[";
+      UINT next_offset = 0;
+      for (UINT range_index = 0; range_index < parameter.DescriptorTable.NumDescriptorRanges; ++range_index) {
+        const auto &range = parameter.DescriptorTable.pDescriptorRanges[range_index];
+        if (range_index) {
+          payload << ",";
+        }
+        const UINT offset = range.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+                                ? next_offset
+                                : range.OffsetInDescriptorsFromTableStart;
+        payload << "{\"type\":" << static_cast<unsigned int>(range.RangeType)
+                << ",\"descriptor_count\":" << range.NumDescriptors
+                << ",\"base_shader_register\":" << range.BaseShaderRegister
+                << ",\"register_space\":" << range.RegisterSpace
+                << ",\"offset_from_table_start\":" << offset
+                << ",\"flags\":0}";
+        if (range.NumDescriptors != UINT_MAX &&
+            offset <= UINT_MAX - range.NumDescriptors) {
+          next_offset = offset + range.NumDescriptors;
+        }
+      }
+      payload << "]}";
+    }
+  }
+  payload << "]";
+  return payload.str();
+}
+
+std::string root_signature_parameters_json(const D3D12_ROOT_SIGNATURE_DESC *desc)
+{
+  std::ostringstream payload;
+  payload << "[";
+  if (desc && desc->pParameters) {
+    for (UINT parameter_index = 0; parameter_index < desc->NumParameters; ++parameter_index) {
+      const auto &parameter = desc->pParameters[parameter_index];
+      if (parameter_index) {
+        payload << ",";
+      }
+      payload << "{\"root_parameter_index\":" << parameter_index
+              << ",\"parameter_type\":" << static_cast<unsigned int>(parameter.ParameterType)
+              << ",\"shader_visibility\":" << static_cast<unsigned int>(parameter.ShaderVisibility);
+      if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+        payload << ",\"range_count\":" << parameter.DescriptorTable.NumDescriptorRanges;
+      } else if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+        payload << ",\"shader_register\":" << parameter.Constants.ShaderRegister
+                << ",\"register_space\":" << parameter.Constants.RegisterSpace
+                << ",\"num_32bit_values\":" << parameter.Constants.Num32BitValues;
+      } else {
+        payload << ",\"shader_register\":" << parameter.Descriptor.ShaderRegister
+                << ",\"register_space\":" << parameter.Descriptor.RegisterSpace;
+      }
+      payload << "}";
+    }
+  }
+  payload << "]";
+  return payload.str();
+}
+
+trace::ObjectKind to_trace_object_kind(CaptureObjectKind kind)
+{
+  switch (kind) {
+  case CaptureObjectKind::Device:
+    return trace::ObjectKind::Device;
+  case CaptureObjectKind::CommandQueue:
+    return trace::ObjectKind::CommandQueue;
+  case CaptureObjectKind::CommandAllocator:
+    return trace::ObjectKind::CommandAllocator;
+  case CaptureObjectKind::CommandList:
+    return trace::ObjectKind::CommandList;
+  case CaptureObjectKind::CommandSignature:
+    return trace::ObjectKind::CommandSignature;
+  case CaptureObjectKind::Fence:
+    return trace::ObjectKind::Fence;
+  case CaptureObjectKind::SwapChain:
+    return trace::ObjectKind::SwapChain;
+  case CaptureObjectKind::Resource:
+    return trace::ObjectKind::Resource;
+  case CaptureObjectKind::View:
+    return trace::ObjectKind::View;
+  case CaptureObjectKind::Shader:
+    return trace::ObjectKind::Shader;
+  case CaptureObjectKind::PipelineState:
+    return trace::ObjectKind::PipelineState;
+  case CaptureObjectKind::RootSignature:
+    return trace::ObjectKind::RootSignature;
+  case CaptureObjectKind::DescriptorHeap:
+    return trace::ObjectKind::DescriptorHeap;
+  case CaptureObjectKind::QueryHeap:
+    return trace::ObjectKind::QueryHeap;
+  case CaptureObjectKind::Unknown:
+  default:
+    return trace::ObjectKind::Unknown;
+  }
+}
+
+TraceSession *session_for(trace::ApiKind api)
+{
+  return runtime::ensure_process_trace_session(api);
+}
+
+std::uint64_t next_present_frame_index()
+{
+  auto *session = session_for(trace::ApiKind::D3D12);
+  std::lock_guard lock(g_present_mutex);
+  if (g_present_session != session) {
+    g_present_session = session;
+    g_present_frame_index = 0;
+  }
+  return g_present_frame_index++;
+}
+
+trace::ObjectId lookup_object_id_locked(const void *object)
+{
+  if (!object) {
+    return 0;
+  }
+  auto found = g_object_ids.find(object);
+  if (found != g_object_ids.end()) {
+    return found->second;
+  }
+  const auto id = static_cast<trace::ObjectId>(reinterpret_cast<std::uintptr_t>(object));
+  g_object_ids.emplace(object, id);
+  return id;
+}
+
+GpuVirtualAddressResolve resolve_gpu_virtual_address_locked(std::uint64_t address)
+{
+  GpuVirtualAddressResolve resolve;
+  if (address == 0) {
+    resolve.status = "null";
+    return resolve;
+  }
+
+  const ResourceGpuVirtualAddressState *best = nullptr;
+  for (const auto &[resource, state] : g_resource_gpu_virtual_addresses) {
+    (void)resource;
+    if (state.base == 0 || address < state.base) {
+      continue;
+    }
+    const auto offset = address - state.base;
+    if (offset >= state.width) {
+      continue;
+    }
+    if (!best || state.create_sequence > best->create_sequence) {
+      best = &state;
+    }
+  }
+
+  if (!best) {
+    return resolve;
+  }
+
+  resolve.object_id = best->object_id;
+  resolve.offset = address - best->base;
+  resolve.width = best->width;
+  resolve.status = "mapped";
+  return resolve;
+}
+
+void append_gpu_virtual_address_resolve_json(std::ostringstream &payload, const GpuVirtualAddressResolve &resolve)
+{
+  payload << ",\"gpuva_resolve_status\":\"" << resolve.status << "\""
+          << ",\"resolved_resource_object_id\":" << resolve.object_id
+          << ",\"resolved_resource_offset\":" << resolve.offset
+          << ",\"resolved_resource_width\":" << resolve.width;
+}
+
+void append_gpu_virtual_address_binding_json(std::ostringstream &payload, const char *key, std::uint64_t address)
+{
+  std::lock_guard lock(g_object_mutex);
+  payload << "\"" << key << "\":" << address;
+  append_gpu_virtual_address_resolve_json(payload, resolve_gpu_virtual_address_locked(address));
+}
+
+std::vector<trace::ObjectId> collect_object_refs(const void *const *objects, std::uint32_t object_count)
+{
+  std::vector<trace::ObjectId> refs;
+  if (!objects || object_count == 0) {
+    return refs;
+  }
+  refs.reserve(object_count);
+  std::lock_guard lock(g_object_mutex);
+  for (std::uint32_t index = 0; index < object_count; ++index) {
+    if (const auto id = lookup_object_id_locked(objects[index])) {
+      refs.push_back(id);
+    }
+  }
+  return refs;
+}
+
+std::vector<trace::BlobId> collect_blob_refs(const std::uint64_t *blobs, std::uint32_t blob_count)
+{
+  std::vector<trace::BlobId> refs;
+  if (!blobs || blob_count == 0) {
+    return refs;
+  }
+  refs.reserve(blob_count);
+  for (std::uint32_t index = 0; index < blob_count; ++index) {
+    if (blobs[index]) {
+      refs.push_back(static_cast<trace::BlobId>(blobs[index]));
+    }
+  }
+  return refs;
+}
+
+void append_copy_buffer_batch_payload(std::ostringstream &payload, const PendingCopyBufferBatch &batch)
+{
+  payload << "{\"op_count\":" << batch.ops.size() << ",\"ops\":[";
+  for (std::size_t index = 0; index < batch.ops.size(); ++index) {
+    if (index != 0) {
+      payload << ",";
+    }
+    const auto &op = batch.ops[index];
+    payload << "{\"sequence\":" << op.sequence
+            << ",\"function\":\"" << escape_json_string(op.function_name) << "\""
+            << ",\"dst_buffer_object_id\":" << object_id(op.dst_buffer)
+            << ",\"dst_offset\":" << op.dst_offset
+            << ",\"src_buffer_object_id\":" << object_id(op.src_buffer)
+            << ",\"src_offset\":" << op.src_offset
+            << ",\"byte_count\":" << op.byte_count
+            << "}";
+  }
+  payload << "]}";
+}
+
+void record_call_event_unbatched(
+    std::uint64_t sequence,
+    const char *opname,
+    const char *payload_json,
+    const void *const *object_refs,
+    std::uint32_t object_ref_count,
+    const std::uint64_t *blob_refs,
+    std::uint32_t blob_ref_count,
+    std::int32_t result_code)
+{
+  if (auto *session = session_for(classify_api(opname))) {
+    trace::EventRecord event;
+    event.kind = trace::EventKind::Call;
+    event.callsite.sequence = sequence;
+    event.callsite.function_name = opname ? opname : "";
+    event.callsite.result_code = result_code;
+    event.object_refs = collect_object_refs(object_refs, object_ref_count);
+    event.blob_refs = collect_blob_refs(blob_refs, blob_ref_count);
+    event.payload = payload_json && *payload_json ? payload_json : "{}";
+    session->append_call_event(event);
+  }
+}
+
+void record_boundary_event_unbatched(
+    std::uint64_t sequence,
+    trace::BoundaryKind boundary,
+    const char *payload_json)
+{
+  if (auto *session = session_for(trace::ApiKind::D3D12)) {
+    trace::EventRecord event;
+    event.kind = trace::EventKind::Boundary;
+    event.callsite.sequence = sequence;
+    event.callsite.function_name = "D3DBoundary";
+    event.boundary = boundary;
+    event.payload = payload_json && *payload_json ? payload_json : "{}";
+    session->append_call_event(event);
+  }
+}
+
+void record_copy_buffer_batch_event(const void *command_list, const PendingCopyBufferBatch &batch)
+{
+  std::vector<const void *> refs;
+  refs.reserve(1 + batch.ops.size() * 2);
+  refs.push_back(command_list);
+  for (const auto &op : batch.ops) {
+    refs.push_back(op.dst_buffer);
+    refs.push_back(op.src_buffer);
+  }
+
+  std::ostringstream payload;
+  append_copy_buffer_batch_payload(payload, batch);
+  record_call_event_unbatched(
+      batch.ops.front().sequence,
+      "ID3D12GraphicsCommandList::CopyBufferRegionBatch",
+      payload.str().c_str(),
+      refs.data(),
+      static_cast<std::uint32_t>(refs.size()),
+      nullptr,
+      0,
+      0);
+}
+
+std::vector<CopyBufferBatchFlush> collect_copy_buffer_batches(const void *command_list)
+{
+  std::lock_guard lock(g_command_batch_mutex);
+  std::vector<CopyBufferBatchFlush> batches;
+  if (command_list) {
+    auto found = g_copy_buffer_batches.find(command_list);
+    if (found != g_copy_buffer_batches.end() && !found->second.ops.empty()) {
+      batches.push_back(CopyBufferBatchFlush{command_list, std::move(found->second)});
+      g_copy_buffer_batches.erase(found);
+    }
+  } else {
+    batches.reserve(g_copy_buffer_batches.size());
+    for (auto &entry : g_copy_buffer_batches) {
+      if (!entry.second.ops.empty()) {
+        batches.push_back(CopyBufferBatchFlush{entry.first, std::move(entry.second)});
+      }
+    }
+    g_copy_buffer_batches.clear();
+  }
+  std::sort(batches.begin(), batches.end(), [](const auto &lhs, const auto &rhs) {
+    return lhs.batch.ops.front().sequence < rhs.batch.ops.front().sequence;
+  });
+  return batches;
+}
+
+void flush_copy_buffer_batches(const void *command_list = nullptr)
+{
+  auto batches = collect_copy_buffer_batches(command_list);
+  for (const auto &batch : batches) {
+    record_copy_buffer_batch_event(batch.command_list, batch.batch);
+  }
+}
+
+trace::AssetRecord register_asset_bytes(
+    trace::AssetKind kind,
+    const char *debug_name,
+    const void *data,
+    std::size_t size)
+{
+  trace::AssetRecord asset;
+  asset.blob_id = g_blob_id.fetch_add(1, std::memory_order_relaxed) + 1;
+  asset.kind = kind;
+  asset.debug_name = debug_name ? debug_name : "";
+
+  if (!data || size == 0) {
+    if (auto *session = session_for(trace::ApiKind::D3D12)) {
+      asset = session->register_asset(std::move(asset));
+    }
+    return asset;
+  }
+
+  asset.fast_fingerprint = trace::fast_fingerprint_bytes(data, size);
+  const auto *bytes = static_cast<const std::uint8_t *>(data);
+  asset.payload_bytes.assign(bytes, bytes + size);
+  if (auto *session = session_for(trace::ApiKind::D3D12)) {
+    asset = session->register_asset(std::move(asset));
+  }
+
+  return asset;
+}
+
+trace::AssetRecord register_asset_text(trace::AssetKind kind, const char *debug_name, const std::string &text)
+{
+  return register_asset_bytes(kind, debug_name, text.data(), text.size());
+}
+
+std::size_t align_stream_offset(std::size_t value, std::size_t alignment)
+{
+  return (value + alignment - 1) & ~(alignment - 1);
+}
+
+std::size_t pipeline_stream_payload_size(PipelineStateSubobjectType type)
+{
+  switch (type) {
+  case PipelineStateSubobjectType::RootSignature:
+    return sizeof(ID3D12RootSignature *);
+  case PipelineStateSubobjectType::VS:
+  case PipelineStateSubobjectType::PS:
+  case PipelineStateSubobjectType::DS:
+  case PipelineStateSubobjectType::HS:
+  case PipelineStateSubobjectType::GS:
+  case PipelineStateSubobjectType::CS:
+  case PipelineStateSubobjectType::AS:
+  case PipelineStateSubobjectType::MS:
+    return sizeof(D3D12_SHADER_BYTECODE);
+  case PipelineStateSubobjectType::StreamOutput:
+    return sizeof(D3D12_STREAM_OUTPUT_DESC);
+  case PipelineStateSubobjectType::Blend:
+    return sizeof(D3D12_BLEND_DESC);
+  case PipelineStateSubobjectType::SampleMask:
+    return sizeof(UINT);
+  case PipelineStateSubobjectType::Rasterizer:
+    return sizeof(D3D12_RASTERIZER_DESC);
+  case PipelineStateSubobjectType::DepthStencil:
+    return sizeof(D3D12_DEPTH_STENCIL_DESC);
+  case PipelineStateSubobjectType::DepthStencil1:
+    return sizeof(DepthStencilDesc1);
+  case PipelineStateSubobjectType::InputLayout:
+    return sizeof(D3D12_INPUT_LAYOUT_DESC);
+  case PipelineStateSubobjectType::IbStripCutValue:
+    return sizeof(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE);
+  case PipelineStateSubobjectType::PrimitiveTopology:
+    return sizeof(D3D12_PRIMITIVE_TOPOLOGY_TYPE);
+  case PipelineStateSubobjectType::RenderTargetFormats:
+    return sizeof(RtFormatArray);
+  case PipelineStateSubobjectType::DepthStencilFormat:
+    return sizeof(DXGI_FORMAT);
+  case PipelineStateSubobjectType::SampleDesc:
+    return sizeof(DXGI_SAMPLE_DESC);
+  case PipelineStateSubobjectType::NodeMask:
+    return sizeof(UINT);
+  case PipelineStateSubobjectType::CachedPso:
+    return sizeof(D3D12_CACHED_PIPELINE_STATE);
+  case PipelineStateSubobjectType::Flags:
+    return sizeof(D3D12_PIPELINE_STATE_FLAGS);
+  case PipelineStateSubobjectType::ViewInstancing:
+    return sizeof(ViewInstancingDesc);
+  default:
+    return 0;
+  }
+}
+
+std::size_t pipeline_stream_payload_alignment(PipelineStateSubobjectType type)
+{
+  switch (type) {
+  case PipelineStateSubobjectType::RootSignature:
+    return alignof(ID3D12RootSignature *);
+  case PipelineStateSubobjectType::VS:
+  case PipelineStateSubobjectType::PS:
+  case PipelineStateSubobjectType::DS:
+  case PipelineStateSubobjectType::HS:
+  case PipelineStateSubobjectType::GS:
+  case PipelineStateSubobjectType::CS:
+  case PipelineStateSubobjectType::AS:
+  case PipelineStateSubobjectType::MS:
+    return alignof(D3D12_SHADER_BYTECODE);
+  case PipelineStateSubobjectType::StreamOutput:
+    return alignof(D3D12_STREAM_OUTPUT_DESC);
+  case PipelineStateSubobjectType::Blend:
+    return alignof(D3D12_BLEND_DESC);
+  case PipelineStateSubobjectType::SampleMask:
+    return alignof(UINT);
+  case PipelineStateSubobjectType::Rasterizer:
+    return alignof(D3D12_RASTERIZER_DESC);
+  case PipelineStateSubobjectType::DepthStencil:
+    return alignof(D3D12_DEPTH_STENCIL_DESC);
+  case PipelineStateSubobjectType::DepthStencil1:
+    return alignof(DepthStencilDesc1);
+  case PipelineStateSubobjectType::InputLayout:
+    return alignof(D3D12_INPUT_LAYOUT_DESC);
+  case PipelineStateSubobjectType::IbStripCutValue:
+    return alignof(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE);
+  case PipelineStateSubobjectType::PrimitiveTopology:
+    return alignof(D3D12_PRIMITIVE_TOPOLOGY_TYPE);
+  case PipelineStateSubobjectType::RenderTargetFormats:
+    return alignof(RtFormatArray);
+  case PipelineStateSubobjectType::DepthStencilFormat:
+    return alignof(DXGI_FORMAT);
+  case PipelineStateSubobjectType::SampleDesc:
+    return alignof(DXGI_SAMPLE_DESC);
+  case PipelineStateSubobjectType::NodeMask:
+    return alignof(UINT);
+  case PipelineStateSubobjectType::CachedPso:
+    return alignof(D3D12_CACHED_PIPELINE_STATE);
+  case PipelineStateSubobjectType::Flags:
+    return alignof(D3D12_PIPELINE_STATE_FLAGS);
+  case PipelineStateSubobjectType::ViewInstancing:
+    return alignof(ViewInstancingDesc);
+  default:
+    return 0;
+  }
+}
+
+std::string shader_asset_json(
+    const char *field_name,
+    const D3D12_SHADER_BYTECODE &bytecode,
+    std::vector<trace::BlobId> &blob_refs)
+{
+  if (!bytecode.pShaderBytecode || bytecode.BytecodeLength == 0) {
+    return std::string("\"") + field_name + "\":null";
+  }
+  const auto asset = register_asset_bytes(
+      trace::AssetKind::ShaderDxil,
+      (std::string("d3d12-") + field_name).c_str(),
+      bytecode.pShaderBytecode,
+      bytecode.BytecodeLength);
+  blob_refs.push_back(asset.blob_id);
+  std::ostringstream payload;
+  payload << "\"" << field_name << "\":{"
+          << "\"bytecode_size\":" << static_cast<std::uint64_t>(bytecode.BytecodeLength)
+          << ",\"" << field_name << "_path\":\"" << asset.relative_path.generic_string() << "\""
+          << "}";
+  return payload.str();
+}
+
+struct ShaderAssetMetadataJson {
+  std::string asset_json;
+  std::string metadata_json;
+};
+
+ShaderAssetMetadataJson shader_asset_metadata_json(
+    const char *field_name,
+    const D3D12_SHADER_BYTECODE &bytecode,
+    std::vector<trace::BlobId> &blob_refs)
+{
+  if (!bytecode.pShaderBytecode || bytecode.BytecodeLength == 0) {
+    const auto null_field = std::string("\"") + field_name + "\":null";
+    return {null_field, null_field};
+  }
+  const auto asset = register_asset_bytes(
+      trace::AssetKind::ShaderDxil,
+      (std::string("d3d12-") + field_name).c_str(),
+      bytecode.pShaderBytecode,
+      bytecode.BytecodeLength);
+  blob_refs.push_back(asset.blob_id);
+  std::ostringstream asset_payload;
+  asset_payload << "\"" << field_name << "\":{"
+                << "\"bytecode_size\":" << static_cast<std::uint64_t>(bytecode.BytecodeLength)
+                << ",\"" << field_name << "_path\":\"" << asset.relative_path.generic_string() << "\""
+                << "}";
+  std::ostringstream metadata_payload;
+  metadata_payload << "\"" << field_name << "\":{"
+                   << "\"bytecode_size\":" << static_cast<std::uint64_t>(bytecode.BytecodeLength)
+                   << ",\"blob_id\":" << asset.blob_id
+                   << "}";
+  return {asset_payload.str(), metadata_payload.str()};
+}
+
+struct StreamShaderAssetJson {
+  std::string vs = "\"vs\":null";
+  std::string ps = "\"ps\":null";
+  std::string ds = "\"ds\":null";
+  std::string hs = "\"hs\":null";
+  std::string gs = "\"gs\":null";
+  std::string cs = "\"cs\":null";
+  std::string as = "\"as\":null";
+  std::string ms = "\"ms\":null";
+};
+
+struct StreamShaderMetadataJson {
+  std::string vs = "\"vs\":null";
+  std::string ps = "\"ps\":null";
+  std::string ds = "\"ds\":null";
+  std::string hs = "\"hs\":null";
+  std::string gs = "\"gs\":null";
+  std::string cs = "\"cs\":null";
+  std::string as = "\"as\":null";
+  std::string ms = "\"ms\":null";
+};
+
+
+std::string srv_desc_detail_json(const D3D12_SHADER_RESOURCE_VIEW_DESC *desc)
+{
+  if (!desc) {
+    return "null";
+  }
+  std::ostringstream payload;
+  payload << "{";
+  switch (desc->ViewDimension) {
+  case D3D12_SRV_DIMENSION_BUFFER:
+    payload << "\"first_element\":" << desc->Buffer.FirstElement
+            << ",\"num_elements\":" << desc->Buffer.NumElements
+            << ",\"structure_byte_stride\":" << desc->Buffer.StructureByteStride
+            << ",\"flags\":" << static_cast<unsigned int>(desc->Buffer.Flags);
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURE1D:
+    payload << "\"most_detailed_mip\":" << desc->Texture1D.MostDetailedMip
+            << ",\"mip_levels\":" << desc->Texture1D.MipLevels
+            << ",\"resource_min_lod_clamp\":" << desc->Texture1D.ResourceMinLODClamp;
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+    payload << "\"most_detailed_mip\":" << desc->Texture1DArray.MostDetailedMip
+            << ",\"mip_levels\":" << desc->Texture1DArray.MipLevels
+            << ",\"first_array_slice\":" << desc->Texture1DArray.FirstArraySlice
+            << ",\"array_size\":" << desc->Texture1DArray.ArraySize
+            << ",\"resource_min_lod_clamp\":" << desc->Texture1DArray.ResourceMinLODClamp;
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURE2D:
+    payload << "\"most_detailed_mip\":" << desc->Texture2D.MostDetailedMip
+            << ",\"mip_levels\":" << desc->Texture2D.MipLevels
+            << ",\"plane_slice\":" << desc->Texture2D.PlaneSlice
+            << ",\"resource_min_lod_clamp\":" << desc->Texture2D.ResourceMinLODClamp;
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+    payload << "\"most_detailed_mip\":" << desc->Texture2DArray.MostDetailedMip
+            << ",\"mip_levels\":" << desc->Texture2DArray.MipLevels
+            << ",\"first_array_slice\":" << desc->Texture2DArray.FirstArraySlice
+            << ",\"array_size\":" << desc->Texture2DArray.ArraySize
+            << ",\"plane_slice\":" << desc->Texture2DArray.PlaneSlice
+            << ",\"resource_min_lod_clamp\":" << desc->Texture2DArray.ResourceMinLODClamp;
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+    payload << "\"first_array_slice\":" << desc->Texture2DMSArray.FirstArraySlice
+            << ",\"array_size\":" << desc->Texture2DMSArray.ArraySize;
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURE3D:
+    payload << "\"most_detailed_mip\":" << desc->Texture3D.MostDetailedMip
+            << ",\"mip_levels\":" << desc->Texture3D.MipLevels
+            << ",\"resource_min_lod_clamp\":" << desc->Texture3D.ResourceMinLODClamp;
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURECUBE:
+    payload << "\"most_detailed_mip\":" << desc->TextureCube.MostDetailedMip
+            << ",\"mip_levels\":" << desc->TextureCube.MipLevels
+            << ",\"resource_min_lod_clamp\":" << desc->TextureCube.ResourceMinLODClamp;
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+    payload << "\"most_detailed_mip\":" << desc->TextureCubeArray.MostDetailedMip
+            << ",\"mip_levels\":" << desc->TextureCubeArray.MipLevels
+            << ",\"first_2d_array_face\":" << desc->TextureCubeArray.First2DArrayFace
+            << ",\"num_cubes\":" << desc->TextureCubeArray.NumCubes
+            << ",\"resource_min_lod_clamp\":" << desc->TextureCubeArray.ResourceMinLODClamp;
+    break;
+#ifdef D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE
+  case D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE:
+    payload << "\"location\":" << desc->RaytracingAccelerationStructure.Location;
+    break;
+#endif
+  default:
+    break;
+  }
+  payload << "}";
+  return payload.str();
+}
+
+std::string uav_desc_detail_json(const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc)
+{
+  if (!desc) {
+    return "null";
+  }
+  std::ostringstream payload;
+  payload << "{";
+  switch (desc->ViewDimension) {
+  case D3D12_UAV_DIMENSION_BUFFER:
+    payload << "\"first_element\":" << desc->Buffer.FirstElement
+            << ",\"num_elements\":" << desc->Buffer.NumElements
+            << ",\"structure_byte_stride\":" << desc->Buffer.StructureByteStride
+            << ",\"counter_offset_in_bytes\":" << desc->Buffer.CounterOffsetInBytes
+            << ",\"flags\":" << static_cast<unsigned int>(desc->Buffer.Flags);
+    break;
+  case D3D12_UAV_DIMENSION_TEXTURE1D:
+    payload << "\"mip_slice\":" << desc->Texture1D.MipSlice;
+    break;
+  case D3D12_UAV_DIMENSION_TEXTURE1DARRAY:
+    payload << "\"mip_slice\":" << desc->Texture1DArray.MipSlice
+            << ",\"first_array_slice\":" << desc->Texture1DArray.FirstArraySlice
+            << ",\"array_size\":" << desc->Texture1DArray.ArraySize;
+    break;
+  case D3D12_UAV_DIMENSION_TEXTURE2D:
+    payload << "\"mip_slice\":" << desc->Texture2D.MipSlice
+            << ",\"plane_slice\":" << desc->Texture2D.PlaneSlice;
+    break;
+  case D3D12_UAV_DIMENSION_TEXTURE2DARRAY:
+    payload << "\"mip_slice\":" << desc->Texture2DArray.MipSlice
+            << ",\"first_array_slice\":" << desc->Texture2DArray.FirstArraySlice
+            << ",\"array_size\":" << desc->Texture2DArray.ArraySize
+            << ",\"plane_slice\":" << desc->Texture2DArray.PlaneSlice;
+    break;
+  case D3D12_UAV_DIMENSION_TEXTURE3D:
+    payload << "\"mip_slice\":" << desc->Texture3D.MipSlice
+            << ",\"first_w_slice\":" << desc->Texture3D.FirstWSlice
+            << ",\"w_size\":" << desc->Texture3D.WSize;
+    break;
+  default:
+    break;
+  }
+  payload << "}";
+  return payload.str();
+}
+
+std::string rtv_desc_detail_json(const D3D12_RENDER_TARGET_VIEW_DESC *desc)
+{
+  if (!desc) {
+    return "null";
+  }
+  std::ostringstream payload;
+  payload << "{";
+  switch (desc->ViewDimension) {
+  case D3D12_RTV_DIMENSION_BUFFER:
+    payload << "\"first_element\":" << desc->Buffer.FirstElement
+            << ",\"num_elements\":" << desc->Buffer.NumElements;
+    break;
+  case D3D12_RTV_DIMENSION_TEXTURE1D:
+    payload << "\"mip_slice\":" << desc->Texture1D.MipSlice;
+    break;
+  case D3D12_RTV_DIMENSION_TEXTURE1DARRAY:
+    payload << "\"mip_slice\":" << desc->Texture1DArray.MipSlice
+            << ",\"first_array_slice\":" << desc->Texture1DArray.FirstArraySlice
+            << ",\"array_size\":" << desc->Texture1DArray.ArraySize;
+    break;
+  case D3D12_RTV_DIMENSION_TEXTURE2D:
+    payload << "\"mip_slice\":" << desc->Texture2D.MipSlice
+            << ",\"plane_slice\":" << desc->Texture2D.PlaneSlice;
+    break;
+  case D3D12_RTV_DIMENSION_TEXTURE2DARRAY:
+    payload << "\"mip_slice\":" << desc->Texture2DArray.MipSlice
+            << ",\"first_array_slice\":" << desc->Texture2DArray.FirstArraySlice
+            << ",\"array_size\":" << desc->Texture2DArray.ArraySize
+            << ",\"plane_slice\":" << desc->Texture2DArray.PlaneSlice;
+    break;
+  case D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY:
+    payload << "\"first_array_slice\":" << desc->Texture2DMSArray.FirstArraySlice
+            << ",\"array_size\":" << desc->Texture2DMSArray.ArraySize;
+    break;
+  case D3D12_RTV_DIMENSION_TEXTURE3D:
+    payload << "\"mip_slice\":" << desc->Texture3D.MipSlice
+            << ",\"first_w_slice\":" << desc->Texture3D.FirstWSlice
+            << ",\"w_size\":" << desc->Texture3D.WSize;
+    break;
+  default:
+    break;
+  }
+  payload << "}";
+  return payload.str();
+}
+
+std::string dsv_desc_detail_json(const D3D12_DEPTH_STENCIL_VIEW_DESC *desc)
+{
+  if (!desc) {
+    return "null";
+  }
+  std::ostringstream payload;
+  payload << "{";
+  switch (desc->ViewDimension) {
+  case D3D12_DSV_DIMENSION_TEXTURE1D:
+    payload << "\"mip_slice\":" << desc->Texture1D.MipSlice;
+    break;
+  case D3D12_DSV_DIMENSION_TEXTURE1DARRAY:
+    payload << "\"mip_slice\":" << desc->Texture1DArray.MipSlice
+            << ",\"first_array_slice\":" << desc->Texture1DArray.FirstArraySlice
+            << ",\"array_size\":" << desc->Texture1DArray.ArraySize;
+    break;
+  case D3D12_DSV_DIMENSION_TEXTURE2D:
+    payload << "\"mip_slice\":" << desc->Texture2D.MipSlice;
+    break;
+  case D3D12_DSV_DIMENSION_TEXTURE2DARRAY:
+    payload << "\"mip_slice\":" << desc->Texture2DArray.MipSlice
+            << ",\"first_array_slice\":" << desc->Texture2DArray.FirstArraySlice
+            << ",\"array_size\":" << desc->Texture2DArray.ArraySize;
+    break;
+  case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY:
+    payload << "\"first_array_slice\":" << desc->Texture2DMSArray.FirstArraySlice
+            << ",\"array_size\":" << desc->Texture2DMSArray.ArraySize;
+    break;
+  default:
+    break;
+  }
+  payload << "}";
+  return payload.str();
+}
+
+std::string render_target_blend_desc_json(const D3D12_RENDER_TARGET_BLEND_DESC &desc)
+{
+  std::ostringstream payload;
+  payload << "{\"blend_enable\":" << (desc.BlendEnable ? "true" : "false")
+          << ",\"logic_op_enable\":" << (desc.LogicOpEnable ? "true" : "false")
+          << ",\"src_blend\":" << static_cast<unsigned int>(desc.SrcBlend)
+          << ",\"dest_blend\":" << static_cast<unsigned int>(desc.DestBlend)
+          << ",\"blend_op\":" << static_cast<unsigned int>(desc.BlendOp)
+          << ",\"src_blend_alpha\":" << static_cast<unsigned int>(desc.SrcBlendAlpha)
+          << ",\"dest_blend_alpha\":" << static_cast<unsigned int>(desc.DestBlendAlpha)
+          << ",\"blend_op_alpha\":" << static_cast<unsigned int>(desc.BlendOpAlpha)
+          << ",\"logic_op\":" << static_cast<unsigned int>(desc.LogicOp)
+          << ",\"render_target_write_mask\":" << static_cast<unsigned int>(desc.RenderTargetWriteMask)
+          << "}";
+  return payload.str();
+}
+
+std::string blend_desc_json(const D3D12_BLEND_DESC &desc)
+{
+  std::ostringstream payload;
+  payload << "{\"alpha_to_coverage_enable\":" << (desc.AlphaToCoverageEnable ? "true" : "false")
+          << ",\"independent_blend_enable\":" << (desc.IndependentBlendEnable ? "true" : "false")
+          << ",\"render_targets\":[";
+  for (UINT index = 0; index < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    payload << render_target_blend_desc_json(desc.RenderTarget[index]);
+  }
+  payload << "]}";
+  return payload.str();
+}
+
+std::string rasterizer_desc_json(const D3D12_RASTERIZER_DESC &desc)
+{
+  std::ostringstream payload;
+  payload << "{\"fill_mode\":" << static_cast<unsigned int>(desc.FillMode)
+          << ",\"cull_mode\":" << static_cast<unsigned int>(desc.CullMode)
+          << ",\"front_counter_clockwise\":" << (desc.FrontCounterClockwise ? "true" : "false")
+          << ",\"depth_bias\":" << desc.DepthBias
+          << ",\"depth_bias_clamp\":" << desc.DepthBiasClamp
+          << ",\"slope_scaled_depth_bias\":" << desc.SlopeScaledDepthBias
+          << ",\"depth_clip_enable\":" << (desc.DepthClipEnable ? "true" : "false")
+          << ",\"multisample_enable\":" << (desc.MultisampleEnable ? "true" : "false")
+          << ",\"antialiased_line_enable\":" << (desc.AntialiasedLineEnable ? "true" : "false")
+          << ",\"forced_sample_count\":" << desc.ForcedSampleCount
+          << ",\"conservative_raster\":" << static_cast<unsigned int>(desc.ConservativeRaster)
+          << "}";
+  return payload.str();
+}
+
+std::string depth_stencil_op_desc_json(const D3D12_DEPTH_STENCILOP_DESC &desc)
+{
+  std::ostringstream payload;
+  payload << "{\"stencil_fail_op\":" << static_cast<unsigned int>(desc.StencilFailOp)
+          << ",\"stencil_depth_fail_op\":" << static_cast<unsigned int>(desc.StencilDepthFailOp)
+          << ",\"stencil_pass_op\":" << static_cast<unsigned int>(desc.StencilPassOp)
+          << ",\"stencil_func\":" << static_cast<unsigned int>(desc.StencilFunc)
+          << "}";
+  return payload.str();
+}
+
+std::string depth_stencil_desc_json(const D3D12_DEPTH_STENCIL_DESC &desc)
+{
+  std::ostringstream payload;
+  payload << "{\"depth_enable\":" << (desc.DepthEnable ? "true" : "false")
+          << ",\"depth_write_mask\":" << static_cast<unsigned int>(desc.DepthWriteMask)
+          << ",\"depth_func\":" << static_cast<unsigned int>(desc.DepthFunc)
+          << ",\"stencil_enable\":" << (desc.StencilEnable ? "true" : "false")
+          << ",\"stencil_read_mask\":" << static_cast<unsigned int>(desc.StencilReadMask)
+          << ",\"stencil_write_mask\":" << static_cast<unsigned int>(desc.StencilWriteMask)
+          << ",\"front_face\":" << depth_stencil_op_desc_json(desc.FrontFace)
+          << ",\"back_face\":" << depth_stencil_op_desc_json(desc.BackFace)
+          << "}";
+  return payload.str();
+}
+
+std::string input_layout_json(const D3D12_INPUT_LAYOUT_DESC &desc)
+{
+  std::ostringstream payload;
+  payload << "{\"element_count\":" << desc.NumElements << ",\"elements\":[";
+  for (UINT index = 0; index < desc.NumElements; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    const auto &element = desc.pInputElementDescs[index];
+    payload << "{\"semantic_name\":\"";
+    const char *semantic_name = element.SemanticName ? element.SemanticName : "";
+    for (const char *cursor = semantic_name; *cursor; ++cursor) {
+      if (*cursor == '"' || *cursor == '\\') {
+        payload << '\\';
+      }
+      payload << *cursor;
+    }
+    payload << "\""
+            << ",\"semantic_index\":" << element.SemanticIndex
+            << ",\"format\":" << static_cast<unsigned int>(element.Format)
+            << ",\"input_slot\":" << element.InputSlot
+            << ",\"aligned_byte_offset\":" << element.AlignedByteOffset
+            << ",\"input_slot_class\":" << static_cast<unsigned int>(element.InputSlotClass)
+            << ",\"instance_data_step_rate\":" << element.InstanceDataStepRate
+            << "}";
+  }
+  payload << "]}";
+  return payload.str();
+}
+
+std::string stream_output_json(const D3D12_STREAM_OUTPUT_DESC &desc)
+{
+  std::ostringstream payload;
+  payload << "{\"declaration_count\":" << desc.NumEntries
+          << ",\"stride_count\":" << desc.NumStrides
+          << ",\"rasterized_stream\":" << desc.RasterizedStream
+          << "}";
+  return payload.str();
+}
+
+std::string resource_desc_json(const D3D12_RESOURCE_DESC *desc)
+{
+  if (!desc) {
+    return "null";
+  }
+  std::ostringstream payload;
+  payload << "{\"dimension\":" << static_cast<unsigned int>(desc->Dimension)
+          << ",\"alignment\":" << desc->Alignment
+          << ",\"width\":" << desc->Width
+          << ",\"height\":" << desc->Height
+          << ",\"depth_or_array_size\":" << desc->DepthOrArraySize
+          << ",\"mip_levels\":" << desc->MipLevels
+          << ",\"format\":" << static_cast<unsigned int>(desc->Format)
+          << ",\"sample_count\":" << desc->SampleDesc.Count
+          << ",\"sample_quality\":" << desc->SampleDesc.Quality
+          << ",\"layout\":" << static_cast<unsigned int>(desc->Layout)
+          << ",\"flags\":" << static_cast<unsigned int>(desc->Flags)
+          << "}";
+  return payload.str();
+}
+
+std::string cpu_descriptor_json(D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
+{
+  return std::to_string(static_cast<std::uint64_t>(descriptor.ptr));
+}
+
+std::string cpu_descriptor_detail_json(D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
+{
+  std::ostringstream payload;
+  payload << "{\"ptr\":" << static_cast<std::uint64_t>(descriptor.ptr)
+          << ",\"object_id\":" << object_id(reinterpret_cast<const void *>(descriptor.ptr))
+          << "}";
+  return payload.str();
+}
+
+std::string gpu_descriptor_json(D3D12_GPU_DESCRIPTOR_HANDLE descriptor)
+{
+  return std::to_string(static_cast<std::uint64_t>(descriptor.ptr));
+}
+
+std::string gpu_descriptor_detail_json(D3D12_GPU_DESCRIPTOR_HANDLE descriptor)
+{
+  std::ostringstream payload;
+  payload << "{\"ptr\":" << static_cast<std::uint64_t>(descriptor.ptr) << "}";
+  return payload.str();
+}
+
+void append_copy_descriptor_pairs_json(
+    std::ostringstream &payload,
+    std::uint32_t dst_descriptor_range_count,
+    const D3D12_CPU_DESCRIPTOR_HANDLE *dst_descriptor_range_starts,
+    const std::uint32_t *dst_descriptor_range_sizes,
+    std::uint32_t src_descriptor_range_count,
+    const D3D12_CPU_DESCRIPTOR_HANDLE *src_descriptor_range_starts,
+    const std::uint32_t *src_descriptor_range_sizes,
+    std::uint32_t descriptor_size)
+{
+  payload << ",\"descriptors\":[";
+  bool first = true;
+  std::uint32_t dst_range_index = 0;
+  std::uint32_t src_range_index = 0;
+  std::uint32_t dst_offset = 0;
+  std::uint32_t src_offset = 0;
+  while (dst_descriptor_range_starts &&
+         src_descriptor_range_starts &&
+         dst_range_index < dst_descriptor_range_count &&
+         src_range_index < src_descriptor_range_count) {
+    const std::uint32_t dst_range_size =
+        dst_descriptor_range_sizes ? dst_descriptor_range_sizes[dst_range_index] : 1;
+    const std::uint32_t src_range_size =
+        src_descriptor_range_sizes ? src_descriptor_range_sizes[src_range_index] : 1;
+    if (dst_offset >= dst_range_size) {
+      ++dst_range_index;
+      dst_offset = 0;
+      continue;
+    }
+    if (src_offset >= src_range_size) {
+      ++src_range_index;
+      src_offset = 0;
+      continue;
+    }
+    if (!first) {
+      payload << ",";
+    }
+    first = false;
+    payload << "{\"dst_descriptor\":"
+            << (static_cast<std::uint64_t>(dst_descriptor_range_starts[dst_range_index].ptr) +
+                static_cast<std::uint64_t>(dst_offset) * descriptor_size)
+            << ",\"src_descriptor\":"
+            << (static_cast<std::uint64_t>(src_descriptor_range_starts[src_range_index].ptr) +
+                static_cast<std::uint64_t>(src_offset) * descriptor_size)
+            << "}";
+    ++dst_offset;
+    ++src_offset;
+  }
+  payload << "]";
+}
+
+void append_rect_json(std::ostringstream &payload, const D3D12_RECT &rect)
+{
+  payload << "{\"left\":" << rect.left
+          << ",\"top\":" << rect.top
+          << ",\"right\":" << rect.right
+          << ",\"bottom\":" << rect.bottom
+          << "}";
+}
+
+void append_box_json(std::ostringstream &payload, const D3D12_BOX &box)
+{
+  payload << "{\"left\":" << box.left
+          << ",\"top\":" << box.top
+          << ",\"front\":" << box.front
+          << ",\"right\":" << box.right
+          << ",\"bottom\":" << box.bottom
+          << ",\"back\":" << box.back
+          << "}";
+}
+
+std::string render_pass_clear_value_json(const RenderPassClearValue &clear)
+{
+  std::ostringstream payload;
+  payload << "{\"format\":" << clear.format
+          << ",\"color\":[";
+  for (std::uint32_t index = 0; index < 4; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    payload << clear.color[index];
+  }
+  payload << "],\"depth\":" << clear.depth
+          << ",\"stencil\":" << static_cast<std::uint32_t>(clear.stencil)
+          << "}";
+  return payload.str();
+}
+
+std::string render_pass_beginning_access_json(const RenderPassBeginningAccessDesc &access)
+{
+  std::ostringstream payload;
+  payload << "{\"type\":" << access.type
+          << ",\"clear\":" << render_pass_clear_value_json(access.clear)
+          << "}";
+  return payload.str();
+}
+
+std::string render_pass_ending_access_json(
+    const RenderPassEndingAccessDesc &access,
+    std::vector<const void *> &refs)
+{
+  if (access.src_resource) {
+    refs.push_back(access.src_resource);
+  }
+  if (access.dst_resource) {
+    refs.push_back(access.dst_resource);
+  }
+
+  std::ostringstream payload;
+  payload << "{\"type\":" << access.type
+          << ",\"src_resource_object_id\":" << object_id(access.src_resource)
+          << ",\"dst_resource_object_id\":" << object_id(access.dst_resource)
+          << ",\"subresource_count\":" << access.subresource_count
+          << ",\"subresources\":[";
+  for (std::uint32_t index = 0; access.subresources && index < access.subresource_count; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    const auto &subresource = access.subresources[index];
+    payload << "{\"src_subresource\":" << subresource.src_subresource
+            << ",\"dst_subresource\":" << subresource.dst_subresource
+            << ",\"dst_x\":" << subresource.dst_x
+            << ",\"dst_y\":" << subresource.dst_y
+            << ",\"src_rect\":";
+    if (subresource.has_src_rect) {
+      payload << "{\"left\":" << subresource.src_left
+              << ",\"top\":" << subresource.src_top
+              << ",\"right\":" << subresource.src_right
+              << ",\"bottom\":" << subresource.src_bottom
+              << "}";
+    } else {
+      payload << "null";
+    }
+    payload << "}";
+  }
+  payload << "],\"format\":" << access.format
+          << ",\"resolve_mode\":" << access.resolve_mode
+          << ",\"preserve_resolve_source\":" << (access.preserve_resolve_source ? "true" : "false")
+          << "}";
+  return payload.str();
+}
+
+std::string render_pass_render_target_json(
+    const RenderPassRenderTargetDesc &render_target,
+    std::vector<const void *> &refs)
+{
+  std::ostringstream payload;
+  payload << "{\"cpu_descriptor\":" << render_target.cpu_descriptor
+          << ",\"beginning_access\":" << render_pass_beginning_access_json(render_target.beginning_access)
+          << ",\"ending_access\":" << render_pass_ending_access_json(render_target.ending_access, refs)
+          << "}";
+  return payload.str();
+}
+
+std::string render_pass_depth_stencil_json(
+    const RenderPassDepthStencilDesc &depth_stencil,
+    std::vector<const void *> &refs)
+{
+  std::ostringstream payload;
+  payload << "{\"cpu_descriptor\":" << depth_stencil.cpu_descriptor
+          << ",\"depth_beginning_access\":" << render_pass_beginning_access_json(depth_stencil.depth_beginning_access)
+          << ",\"stencil_beginning_access\":" << render_pass_beginning_access_json(depth_stencil.stencil_beginning_access)
+          << ",\"depth_ending_access\":" << render_pass_ending_access_json(depth_stencil.depth_ending_access, refs)
+          << ",\"stencil_ending_access\":" << render_pass_ending_access_json(depth_stencil.stencil_ending_access, refs)
+          << "}";
+  return payload.str();
+}
+
+void append_texture_copy_location_json(std::ostringstream &payload, const D3D12_TEXTURE_COPY_LOCATION *location)
+{
+  if (!location) {
+    payload << "null";
+    return;
+  }
+  payload << "{\"resource_object_id\":" << object_id(location->pResource)
+          << ",\"type\":" << static_cast<unsigned int>(location->Type);
+  if (location->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+    payload << ",\"placed_footprint\":{\"offset\":" << location->PlacedFootprint.Offset
+            << ",\"format\":" << static_cast<unsigned int>(location->PlacedFootprint.Footprint.Format)
+            << ",\"width\":" << location->PlacedFootprint.Footprint.Width
+            << ",\"height\":" << location->PlacedFootprint.Footprint.Height
+            << ",\"depth\":" << location->PlacedFootprint.Footprint.Depth
+            << ",\"row_pitch\":" << location->PlacedFootprint.Footprint.RowPitch
+            << "}";
+  } else {
+    payload << ",\"subresource_index\":" << location->SubresourceIndex;
+  }
+  payload << "}";
+}
+
+} // namespace
 
 D3D12CaptureHooks::D3D12CaptureHooks() = default;
 
@@ -18,6 +1302,2040 @@ void D3D12CaptureHooks::install_device_hooks(runtime::CaptureRuntime &runtime)
 void D3D12CaptureHooks::install_submission_hooks(runtime::CaptureRuntime &runtime)
 {
   runtime.extend_hooks_for_module("d3d12.dll");
+}
+
+bool builtin_capture_enabled()
+{
+  if (const char *value = std::getenv("APITRACE_D3D12_BUILTIN_CAPTURE")) {
+    if (std::strcmp(value, "0") == 0 ||
+        std::strcmp(value, "false") == 0 ||
+        std::strcmp(value, "FALSE") == 0) {
+      return false;
+    }
+  }
+  return runtime::current_process_trace_session() != nullptr ||
+         runtime::ensure_process_trace_session(trace::ApiKind::D3D12) != nullptr;
+}
+
+std::uint64_t current_sequence()
+{
+  return g_sequence.load(std::memory_order_relaxed);
+}
+
+std::uint64_t object_id(const void *object)
+{
+  if (!object) {
+    return 0;
+  }
+  std::lock_guard lock(g_object_mutex);
+  return lookup_object_id_locked(object);
+}
+
+std::uint64_t register_blob(const char *debug_name, const void *data, std::size_t size)
+{
+  return register_asset_bytes(trace::AssetKind::Unknown, debug_name, data, size).blob_id;
+}
+
+std::uint64_t record_call(
+    const char *opname,
+    const char *payload_json,
+    const void *const *object_refs,
+    std::uint32_t object_ref_count,
+    const std::uint64_t *blob_refs,
+    std::uint32_t blob_ref_count,
+    std::int32_t result_code)
+{
+  const auto sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  flush_copy_buffer_batches();
+  record_call_with_sequence(
+      sequence,
+      opname,
+      payload_json,
+      object_refs,
+      object_ref_count,
+      blob_refs,
+      blob_ref_count,
+      result_code);
+  return sequence;
+}
+
+void record_call_with_sequence(
+    std::uint64_t sequence,
+    const char *opname,
+    const char *payload_json,
+    const void *const *object_refs,
+    std::uint32_t object_ref_count,
+    const std::uint64_t *blob_refs,
+    std::uint32_t blob_ref_count,
+    std::int32_t result_code)
+{
+  flush_copy_buffer_batches();
+  record_call_event_unbatched(
+      sequence,
+      opname,
+      payload_json,
+      object_refs,
+      object_ref_count,
+      blob_refs,
+      blob_ref_count,
+      result_code);
+}
+
+void record_object_create(
+    const void *object,
+    CaptureObjectKind kind,
+    const void *parent_object,
+    const char *debug_name,
+    const char *payload_json)
+{
+  if (!object) {
+    return;
+  }
+
+  trace::ObjectRecord object_record;
+  {
+    std::lock_guard lock(g_object_mutex);
+    object_record.object_id = lookup_object_id_locked(object);
+    object_record.parent_object_id = lookup_object_id_locked(parent_object);
+  }
+  object_record.kind = to_trace_object_kind(kind);
+  object_record.debug_name = debug_name ? debug_name : "";
+
+  if (auto *session = session_for(trace::ApiKind::D3D12)) {
+    session->record_object(object_record);
+    flush_copy_buffer_batches();
+    trace::EventRecord event;
+    event.kind = trace::EventKind::ObjectCreate;
+    event.callsite.sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    event.callsite.function_name = "D3DObjectCreate";
+    event.object_id = object_record.object_id;
+    event.object_kind = object_record.kind;
+    event.parent_object_id = object_record.parent_object_id;
+    event.object_debug_name = object_record.debug_name;
+    event.payload = payload_json && *payload_json ? payload_json : "{}";
+    session->append_call_event(event);
+  }
+}
+
+void record_object_destroy(const void *object, CaptureObjectKind kind, const char *payload_json)
+{
+  const auto id = object_id(object);
+  if (!id) {
+    return;
+  }
+  if (auto *session = session_for(trace::ApiKind::D3D12)) {
+    flush_copy_buffer_batches();
+    trace::EventRecord event;
+    event.kind = trace::EventKind::ObjectDestroy;
+    event.callsite.sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    event.callsite.function_name = "D3DObjectDestroy";
+    event.object_id = id;
+    event.object_kind = to_trace_object_kind(kind);
+    event.payload = payload_json && *payload_json ? payload_json : "{}";
+    session->append_call_event(event);
+  }
+  if (kind == CaptureObjectKind::Resource) {
+    std::lock_guard lock(g_object_mutex);
+    g_resource_gpu_virtual_addresses.erase(object);
+  }
+}
+
+void record_resource_blob(
+    const char *debug_name,
+    const std::uint64_t *blob_refs,
+    std::uint32_t blob_ref_count,
+    const char *payload_json)
+{
+  if (auto *session = session_for(trace::ApiKind::D3D12)) {
+    flush_copy_buffer_batches();
+    trace::EventRecord event;
+    event.kind = trace::EventKind::ResourceBlob;
+    event.callsite.sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    event.callsite.function_name = "D3DResourceBlob";
+    event.object_debug_name = debug_name ? debug_name : "";
+    event.blob_refs = collect_blob_refs(blob_refs, blob_ref_count);
+    event.payload = payload_json && *payload_json ? payload_json : "{}";
+    session->append_call_event(event);
+  }
+}
+
+std::uint64_t record_d3d12_create_device(const void *device)
+{
+  if (!device) {
+    return 0;
+  }
+  record_object_create(device, CaptureObjectKind::Device, nullptr, "ID3D12Device");
+  const void *refs[] = {device};
+  return record_call("D3D12CreateDevice", "{}", refs, 1);
+}
+
+std::uint64_t record_d3d11_create_device(const void *device)
+{
+  if (!device) {
+    return 0;
+  }
+  const void *refs[] = {device};
+  return record_call("D3D11CreateDevice", "{}", refs, 1);
+}
+
+std::uint64_t record_dxgi_create_swapchain(
+    const void *factory,
+    const void *device,
+    const void *swapchain)
+{
+  if (!swapchain) {
+    return 0;
+  }
+  record_object_create(swapchain, CaptureObjectKind::SwapChain, factory, "IDXGISwapChain");
+  const void *refs[] = {device, swapchain};
+  return record_call("IDXGIFactory::CreateSwapChain", "{}", refs, 2);
+}
+
+std::uint64_t record_execute_command_lists(const void *queue, const void *command_list)
+{
+  if (!queue || !command_list) {
+    return 0;
+  }
+  const void *refs[] = {queue, command_list};
+  return record_call("ID3D12CommandQueue::ExecuteCommandLists", "{}", refs, 2);
+}
+
+std::uint64_t record_present(const void *swapchain, std::uint32_t sync_interval, std::uint32_t flags)
+{
+  if (!swapchain) {
+    return 0;
+  }
+  flush_copy_buffer_batches();
+  const auto frame_index = next_present_frame_index();
+  const auto frame_begin_sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  std::ostringstream frame_begin_payload;
+  frame_begin_payload << "{\"label\":\"FrameBegin\",\"frame_index\":" << frame_index << "}";
+  record_boundary_event_unbatched(
+      frame_begin_sequence,
+      trace::BoundaryKind::Frame,
+      frame_begin_payload.str().c_str());
+
+  std::ostringstream payload;
+  payload << "{\"frame_index\":" << frame_index
+          << ",\"sync_interval\":" << sync_interval
+          << ",\"flags\":" << flags
+          << "}";
+  const void *refs[] = {swapchain};
+  const auto present_sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  record_call_event_unbatched(
+      present_sequence,
+      "IDXGISwapChain::Present",
+      payload.str().c_str(),
+      refs,
+      1,
+      nullptr,
+      0,
+      0);
+
+  std::ostringstream present_boundary_payload;
+  present_boundary_payload << "{\"label\":\"Present\",\"frame_index\":" << frame_index
+                           << ",\"sync_interval\":" << sync_interval
+                           << ",\"flags\":" << flags << "}";
+  const auto present_boundary_sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  record_boundary_event_unbatched(
+      present_boundary_sequence,
+      trace::BoundaryKind::Present,
+      present_boundary_payload.str().c_str());
+
+  std::ostringstream frame_end_payload;
+  frame_end_payload << "{\"label\":\"FrameEnd\",\"frame_index\":" << frame_index << "}";
+  const auto frame_end_sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  record_boundary_event_unbatched(
+      frame_end_sequence,
+      trace::BoundaryKind::Frame,
+      frame_end_payload.str().c_str());
+  return present_sequence;
+}
+
+void record_fence_dependency(
+    const char *scope,
+    std::uint64_t d3d_sequence,
+    std::uint64_t encoder_id,
+    bool implicit_pre_raster_wait,
+    const std::uint64_t *strong_masks,
+    std::uint32_t strong_count,
+    const std::uint64_t *full_masks,
+    std::uint32_t full_count,
+    const std::uint64_t *minimal_masks,
+    std::uint32_t minimal_count,
+    std::uint32_t mask_count)
+{
+  (void)strong_masks;
+  (void)full_masks;
+  (void)minimal_masks;
+  std::ostringstream payload;
+  payload << "{\"kind\":\"fence_dependency\""
+          << ",\"scope\":\"" << (scope ? scope : "unknown") << "\""
+          << ",\"d3d_sequence\":" << d3d_sequence
+          << ",\"encoder_id\":" << encoder_id
+          << ",\"implicit_pre_raster_wait\":" << (implicit_pre_raster_wait ? "true" : "false")
+          << ",\"strong_count\":" << strong_count
+          << ",\"full_count\":" << full_count
+          << ",\"minimal_count\":" << minimal_count
+          << ",\"mask_count\":" << mask_count
+          << "}";
+  record_call_with_sequence(d3d_sequence, "DXMT::FenceDependency", payload.str().c_str());
+}
+
+std::uint64_t record_create_command_queue(
+    ID3D12Device *device,
+    const D3D12_COMMAND_QUEUE_DESC *desc,
+    const void *command_queue,
+    std::int32_t result_code)
+{
+  if (command_queue && result_code >= 0) {
+    record_object_create(command_queue, CaptureObjectKind::CommandQueue, device, "ID3D12CommandQueue");
+  }
+  std::ostringstream payload;
+  payload << "{\"type\":" << (desc ? static_cast<unsigned int>(desc->Type) : 0)
+          << ",\"priority\":" << (desc ? desc->Priority : 0)
+          << ",\"flags\":" << (desc ? static_cast<unsigned int>(desc->Flags) : 0)
+          << ",\"node_mask\":" << (desc ? desc->NodeMask : 0)
+          << "}";
+  const void *refs[] = {device, command_queue};
+  return record_call("ID3D12Device::CreateCommandQueue", payload.str().c_str(), refs, 2, nullptr, 0, result_code);
+}
+
+std::uint64_t record_create_command_allocator(
+    ID3D12Device *device,
+    std::uint32_t type,
+    const void *command_allocator,
+    std::int32_t result_code)
+{
+  if (command_allocator && result_code >= 0) {
+    record_object_create(command_allocator, CaptureObjectKind::CommandAllocator, device, "ID3D12CommandAllocator");
+  }
+  std::ostringstream payload;
+  payload << "{\"type\":" << type << "}";
+  const void *refs[] = {device, command_allocator};
+  return record_call("ID3D12Device::CreateCommandAllocator", payload.str().c_str(), refs, 2, nullptr, 0, result_code);
+}
+
+std::uint64_t record_create_command_list(
+    ID3D12Device *device,
+    std::uint32_t node_mask,
+    std::uint32_t type,
+    const void *command_allocator,
+    const void *initial_pipeline_state,
+    const void *command_list,
+    std::int32_t result_code)
+{
+  if (command_list && result_code >= 0) {
+    record_object_create(command_list, CaptureObjectKind::CommandList, device, "ID3D12GraphicsCommandList");
+  }
+  std::ostringstream payload;
+  payload << "{\"node_mask\":" << node_mask
+          << ",\"type\":" << type
+          << ",\"command_allocator_object_id\":" << object_id(command_allocator)
+          << ",\"initial_pipeline_state_object_id\":" << object_id(initial_pipeline_state)
+          << "}";
+  const void *refs[] = {device, command_allocator, initial_pipeline_state, command_list};
+  return record_call("ID3D12Device::CreateCommandList", payload.str().c_str(), refs, 4, nullptr, 0, result_code);
+}
+
+std::uint64_t record_create_command_list1(
+    ID3D12Device *device,
+    std::uint32_t node_mask,
+    std::uint32_t type,
+    std::uint32_t flags,
+    const void *command_list,
+    std::int32_t result_code)
+{
+  if (command_list && result_code >= 0) {
+    record_object_create(command_list, CaptureObjectKind::CommandList, device, "ID3D12GraphicsCommandList");
+  }
+  std::ostringstream payload;
+  payload << "{\"node_mask\":" << node_mask
+          << ",\"type\":" << type
+          << ",\"flags\":" << flags
+          << "}";
+  const void *refs[] = {device, command_list};
+  return record_call("ID3D12Device::CreateCommandList1", payload.str().c_str(), refs, 2, nullptr, 0, result_code);
+}
+
+std::uint64_t record_create_graphics_pipeline_state(
+    ID3D12Device *device,
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
+    const void *pipeline_state,
+    std::int32_t result_code)
+{
+  if (pipeline_state && result_code >= 0) {
+    record_object_create(pipeline_state, CaptureObjectKind::PipelineState, device, "ID3D12PipelineState");
+  }
+  std::vector<trace::BlobId> shader_blob_refs;
+  std::vector<trace::BlobId> blob_refs;
+  std::string pipeline_path;
+  std::ostringstream payload;
+  payload << "{";
+  if (desc) {
+    std::ostringstream pipeline;
+    pipeline << "{\"type\":\"graphics\""
+             << ",\"root_signature_object_id\":" << object_id(desc->pRootSignature)
+             << ",\"node_mask\":" << desc->NodeMask
+             << ",\"flags\":" << static_cast<unsigned int>(desc->Flags)
+             << ",\"input_layout\":" << input_layout_json(desc->InputLayout)
+             << ",\"blend_state\":" << blend_desc_json(desc->BlendState)
+             << ",\"sample_mask\":" << desc->SampleMask
+             << ",\"rasterizer_state\":" << rasterizer_desc_json(desc->RasterizerState)
+             << ",\"depth_stencil_state\":" << depth_stencil_desc_json(desc->DepthStencilState)
+             << ",\"stream_output\":" << stream_output_json(desc->StreamOutput)
+             << ",\"primitive_topology_type\":" << static_cast<unsigned int>(desc->PrimitiveTopologyType)
+             << ",\"num_render_targets\":" << desc->NumRenderTargets
+             << ",\"rtv_formats\":[";
+    for (UINT index = 0; index < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++index) {
+      if (index) {
+        pipeline << ",";
+      }
+      pipeline << static_cast<unsigned int>(desc->RTVFormats[index]);
+    }
+    pipeline << "]"
+             << ",\"dsv_format\":" << static_cast<unsigned int>(desc->DSVFormat)
+             << ",\"sample_desc\":{\"count\":" << desc->SampleDesc.Count
+             << ",\"quality\":" << desc->SampleDesc.Quality << "}"
+             << ",\"ib_strip_cut_value\":" << static_cast<unsigned int>(desc->IBStripCutValue)
+             << "," << shader_asset_json("vs", desc->VS, shader_blob_refs)
+             << "," << shader_asset_json("ps", desc->PS, shader_blob_refs)
+             << "," << shader_asset_json("ds", desc->DS, shader_blob_refs)
+             << "," << shader_asset_json("hs", desc->HS, shader_blob_refs)
+             << "," << shader_asset_json("gs", desc->GS, shader_blob_refs)
+             << "}";
+    const auto pipeline_asset = register_asset_text(
+        trace::AssetKind::Pipeline, "d3d12-graphics-pipeline", pipeline.str());
+    pipeline_path = pipeline_asset.relative_path.generic_string();
+    blob_refs.push_back(pipeline_asset.blob_id);
+    payload << "\"pipeline_path\":\"" << pipeline_path << "\"";
+  }
+  payload << "}";
+  blob_refs.insert(blob_refs.end(), shader_blob_refs.begin(), shader_blob_refs.end());
+  const void *refs[] = {device, pipeline_state};
+  return record_call(
+      "ID3D12Device::CreateGraphicsPipelineState",
+      payload.str().c_str(),
+      refs,
+      2,
+      reinterpret_cast<const std::uint64_t *>(blob_refs.data()),
+      blob_refs.size(),
+      result_code);
+}
+
+std::uint64_t record_create_compute_pipeline_state(
+    ID3D12Device *device,
+    const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc,
+    const void *pipeline_state,
+    std::int32_t result_code)
+{
+  if (pipeline_state && result_code >= 0) {
+    record_object_create(pipeline_state, CaptureObjectKind::PipelineState, device, "ID3D12PipelineState");
+  }
+  std::vector<trace::BlobId> shader_blob_refs;
+  std::vector<trace::BlobId> blob_refs;
+  std::ostringstream payload;
+  payload << "{";
+  if (desc) {
+    std::ostringstream pipeline;
+    pipeline << "{\"type\":\"compute\""
+             << ",\"root_signature_object_id\":" << object_id(desc->pRootSignature)
+             << ",\"node_mask\":" << desc->NodeMask
+             << ",\"flags\":" << static_cast<unsigned int>(desc->Flags)
+             << "," << shader_asset_json("cs", desc->CS, shader_blob_refs)
+             << "}";
+    const auto pipeline_asset = register_asset_text(
+        trace::AssetKind::Pipeline, "d3d12-compute-pipeline", pipeline.str());
+    blob_refs.push_back(pipeline_asset.blob_id);
+    blob_refs.insert(blob_refs.end(), shader_blob_refs.begin(), shader_blob_refs.end());
+    payload << "\"pipeline_path\":\"" << pipeline_asset.relative_path.generic_string() << "\"";
+  }
+  payload << "}";
+  const void *refs[] = {device, pipeline_state};
+  return record_call(
+      "ID3D12Device::CreateComputePipelineState",
+      payload.str().c_str(),
+      refs,
+      2,
+      reinterpret_cast<const std::uint64_t *>(blob_refs.data()),
+      blob_refs.size(),
+      result_code);
+}
+
+std::uint64_t record_create_pipeline_state(
+    ID3D12Device *device,
+    const void *stream_data,
+    std::size_t stream_size,
+    const void *pipeline_state,
+    std::int32_t result_code)
+{
+  if (pipeline_state && result_code >= 0) {
+    record_object_create(pipeline_state, CaptureObjectKind::PipelineState, device, "ID3D12PipelineState");
+  }
+
+  std::vector<trace::BlobId> shader_blob_refs;
+  std::vector<trace::BlobId> blob_refs;
+  std::ostringstream payload;
+  payload << "{";
+  if (stream_data && stream_size > 0) {
+    const auto *bytes = static_cast<const std::uint8_t *>(stream_data);
+    std::size_t offset = 0;
+    bool first_subobject = true;
+    bool has_cs = false;
+    bool has_as = false;
+    bool has_ms = false;
+    StreamShaderAssetJson shader_json;
+    StreamShaderMetadataJson shader_metadata_json;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics{};
+    graphics.SampleMask = UINT_MAX;
+    graphics.SampleDesc.Count = 1;
+    graphics.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
+
+    std::ostringstream stream;
+    stream << "{\"source\":\"stream\",\"subobjects\":[";
+    while (offset < stream_size) {
+      if (stream_size - offset < sizeof(std::uint32_t)) {
+        break;
+      }
+
+      const auto type_offset = offset;
+      const auto raw_type = *reinterpret_cast<const std::uint32_t *>(bytes + offset);
+      const auto type = static_cast<PipelineStateSubobjectType>(raw_type);
+      offset += sizeof(std::uint32_t);
+      const auto payload_size = pipeline_stream_payload_size(type);
+      const auto payload_alignment = pipeline_stream_payload_alignment(type);
+      if (!payload_size || !payload_alignment) {
+        break;
+      }
+      offset = align_stream_offset(offset, payload_alignment);
+      if (stream_size - offset < payload_size) {
+        break;
+      }
+
+      const auto *subobject = bytes + offset;
+      if (!first_subobject) {
+        stream << ",";
+      }
+      first_subobject = false;
+      stream << "{\"type\":" << raw_type
+             << ",\"type_offset\":" << static_cast<std::uint64_t>(type_offset);
+
+      switch (type) {
+      case PipelineStateSubobjectType::RootSignature: {
+        const auto root_signature = *reinterpret_cast<ID3D12RootSignature *const *>(subobject);
+        graphics.pRootSignature = root_signature;
+        compute.pRootSignature = root_signature;
+        stream << ",\"root_signature_object_id\":" << object_id(root_signature);
+        break;
+      }
+      case PipelineStateSubobjectType::VS:
+        graphics.VS = *reinterpret_cast<const D3D12_SHADER_BYTECODE *>(subobject);
+        {
+          const auto shader = shader_asset_metadata_json("vs", graphics.VS, shader_blob_refs);
+          shader_json.vs = shader.asset_json;
+          shader_metadata_json.vs = shader.metadata_json;
+        }
+        stream << "," << shader_metadata_json.vs;
+        break;
+      case PipelineStateSubobjectType::PS:
+        graphics.PS = *reinterpret_cast<const D3D12_SHADER_BYTECODE *>(subobject);
+        {
+          const auto shader = shader_asset_metadata_json("ps", graphics.PS, shader_blob_refs);
+          shader_json.ps = shader.asset_json;
+          shader_metadata_json.ps = shader.metadata_json;
+        }
+        stream << "," << shader_metadata_json.ps;
+        break;
+      case PipelineStateSubobjectType::DS:
+        graphics.DS = *reinterpret_cast<const D3D12_SHADER_BYTECODE *>(subobject);
+        {
+          const auto shader = shader_asset_metadata_json("ds", graphics.DS, shader_blob_refs);
+          shader_json.ds = shader.asset_json;
+          shader_metadata_json.ds = shader.metadata_json;
+        }
+        stream << "," << shader_metadata_json.ds;
+        break;
+      case PipelineStateSubobjectType::HS:
+        graphics.HS = *reinterpret_cast<const D3D12_SHADER_BYTECODE *>(subobject);
+        {
+          const auto shader = shader_asset_metadata_json("hs", graphics.HS, shader_blob_refs);
+          shader_json.hs = shader.asset_json;
+          shader_metadata_json.hs = shader.metadata_json;
+        }
+        stream << "," << shader_metadata_json.hs;
+        break;
+      case PipelineStateSubobjectType::GS:
+        graphics.GS = *reinterpret_cast<const D3D12_SHADER_BYTECODE *>(subobject);
+        {
+          const auto shader = shader_asset_metadata_json("gs", graphics.GS, shader_blob_refs);
+          shader_json.gs = shader.asset_json;
+          shader_metadata_json.gs = shader.metadata_json;
+        }
+        stream << "," << shader_metadata_json.gs;
+        break;
+      case PipelineStateSubobjectType::CS:
+        compute.CS = *reinterpret_cast<const D3D12_SHADER_BYTECODE *>(subobject);
+        has_cs = compute.CS.pShaderBytecode && compute.CS.BytecodeLength > 0;
+        {
+          const auto shader = shader_asset_metadata_json("cs", compute.CS, shader_blob_refs);
+          shader_json.cs = shader.asset_json;
+          shader_metadata_json.cs = shader.metadata_json;
+        }
+        stream << "," << shader_metadata_json.cs;
+        break;
+      case PipelineStateSubobjectType::AS: {
+        const auto shader = *reinterpret_cast<const D3D12_SHADER_BYTECODE *>(subobject);
+        has_as = shader.pShaderBytecode && shader.BytecodeLength > 0;
+        const auto shader_json_fields = shader_asset_metadata_json("as", shader, shader_blob_refs);
+        shader_json.as = shader_json_fields.asset_json;
+        shader_metadata_json.as = shader_json_fields.metadata_json;
+        stream << "," << shader_metadata_json.as;
+        break;
+      }
+      case PipelineStateSubobjectType::MS: {
+        const auto shader = *reinterpret_cast<const D3D12_SHADER_BYTECODE *>(subobject);
+        has_ms = shader.pShaderBytecode && shader.BytecodeLength > 0;
+        const auto shader_json_fields = shader_asset_metadata_json("ms", shader, shader_blob_refs);
+        shader_json.ms = shader_json_fields.asset_json;
+        shader_metadata_json.ms = shader_json_fields.metadata_json;
+        stream << "," << shader_metadata_json.ms;
+        break;
+      }
+      case PipelineStateSubobjectType::StreamOutput:
+        graphics.StreamOutput = *reinterpret_cast<const D3D12_STREAM_OUTPUT_DESC *>(subobject);
+        stream << ",\"stream_output\":" << stream_output_json(graphics.StreamOutput);
+        break;
+      case PipelineStateSubobjectType::Blend:
+        graphics.BlendState = *reinterpret_cast<const D3D12_BLEND_DESC *>(subobject);
+        stream << ",\"blend_state\":" << blend_desc_json(graphics.BlendState);
+        break;
+      case PipelineStateSubobjectType::SampleMask:
+        graphics.SampleMask = *reinterpret_cast<const UINT *>(subobject);
+        stream << ",\"sample_mask\":" << graphics.SampleMask;
+        break;
+      case PipelineStateSubobjectType::Rasterizer:
+        graphics.RasterizerState = *reinterpret_cast<const D3D12_RASTERIZER_DESC *>(subobject);
+        stream << ",\"rasterizer_state\":" << rasterizer_desc_json(graphics.RasterizerState);
+        break;
+      case PipelineStateSubobjectType::DepthStencil:
+        graphics.DepthStencilState = *reinterpret_cast<const D3D12_DEPTH_STENCIL_DESC *>(subobject);
+        stream << ",\"depth_stencil_state\":" << depth_stencil_desc_json(graphics.DepthStencilState);
+        break;
+      case PipelineStateSubobjectType::DepthStencil1: {
+        const auto &depth_stencil = *reinterpret_cast<const DepthStencilDesc1 *>(subobject);
+        graphics.DepthStencilState.DepthEnable = depth_stencil.DepthEnable;
+        graphics.DepthStencilState.DepthWriteMask = depth_stencil.DepthWriteMask;
+        graphics.DepthStencilState.DepthFunc = depth_stencil.DepthFunc;
+        graphics.DepthStencilState.StencilEnable = depth_stencil.StencilEnable;
+        graphics.DepthStencilState.StencilReadMask = depth_stencil.StencilReadMask;
+        graphics.DepthStencilState.StencilWriteMask = depth_stencil.StencilWriteMask;
+        graphics.DepthStencilState.FrontFace = depth_stencil.FrontFace;
+        graphics.DepthStencilState.BackFace = depth_stencil.BackFace;
+        stream << ",\"depth_stencil_state\":" << depth_stencil_desc_json(graphics.DepthStencilState)
+               << ",\"depth_bounds_test_enable\":" << (depth_stencil.DepthBoundsTestEnable ? "true" : "false");
+        break;
+      }
+      case PipelineStateSubobjectType::InputLayout:
+        graphics.InputLayout = *reinterpret_cast<const D3D12_INPUT_LAYOUT_DESC *>(subobject);
+        stream << ",\"input_layout\":" << input_layout_json(graphics.InputLayout);
+        break;
+      case PipelineStateSubobjectType::IbStripCutValue:
+        graphics.IBStripCutValue = *reinterpret_cast<const D3D12_INDEX_BUFFER_STRIP_CUT_VALUE *>(subobject);
+        stream << ",\"ib_strip_cut_value\":" << static_cast<unsigned int>(graphics.IBStripCutValue);
+        break;
+      case PipelineStateSubobjectType::PrimitiveTopology:
+        graphics.PrimitiveTopologyType = *reinterpret_cast<const D3D12_PRIMITIVE_TOPOLOGY_TYPE *>(subobject);
+        stream << ",\"primitive_topology_type\":" << static_cast<unsigned int>(graphics.PrimitiveTopologyType);
+        break;
+      case PipelineStateSubobjectType::RenderTargetFormats: {
+        const auto &formats = *reinterpret_cast<const RtFormatArray *>(subobject);
+        graphics.NumRenderTargets = formats.NumRenderTargets;
+        stream << ",\"num_render_targets\":" << formats.NumRenderTargets << ",\"rtv_formats\":[";
+        for (UINT index = 0; index < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++index) {
+          if (index) {
+            stream << ",";
+          }
+          const auto format = index < formats.NumRenderTargets ? formats.RTFormats[index] : DXGI_FORMAT_UNKNOWN;
+          graphics.RTVFormats[index] = format;
+          stream << static_cast<unsigned int>(format);
+        }
+        stream << "]";
+        break;
+      }
+      case PipelineStateSubobjectType::DepthStencilFormat:
+        graphics.DSVFormat = *reinterpret_cast<const DXGI_FORMAT *>(subobject);
+        stream << ",\"dsv_format\":" << static_cast<unsigned int>(graphics.DSVFormat);
+        break;
+      case PipelineStateSubobjectType::SampleDesc:
+        graphics.SampleDesc = *reinterpret_cast<const DXGI_SAMPLE_DESC *>(subobject);
+        stream << ",\"sample_desc\":{\"count\":" << graphics.SampleDesc.Count
+               << ",\"quality\":" << graphics.SampleDesc.Quality << "}";
+        break;
+      case PipelineStateSubobjectType::NodeMask:
+        graphics.NodeMask = *reinterpret_cast<const UINT *>(subobject);
+        compute.NodeMask = graphics.NodeMask;
+        stream << ",\"node_mask\":" << graphics.NodeMask;
+        break;
+      case PipelineStateSubobjectType::CachedPso: {
+        const auto &cached = *reinterpret_cast<const D3D12_CACHED_PIPELINE_STATE *>(subobject);
+        graphics.CachedPSO = cached;
+        compute.CachedPSO = cached;
+        stream << ",\"cached_pso_size\":" << static_cast<std::uint64_t>(cached.CachedBlobSizeInBytes);
+        break;
+      }
+      case PipelineStateSubobjectType::Flags:
+        graphics.Flags = *reinterpret_cast<const D3D12_PIPELINE_STATE_FLAGS *>(subobject);
+        compute.Flags = graphics.Flags;
+        stream << ",\"flags\":" << static_cast<unsigned int>(graphics.Flags);
+        break;
+      case PipelineStateSubobjectType::ViewInstancing: {
+        const auto &view_instancing = *reinterpret_cast<const ViewInstancingDesc *>(subobject);
+        stream << ",\"view_instance_count\":" << view_instancing.ViewInstanceCount;
+        break;
+      }
+      default:
+        break;
+      }
+      stream << "}";
+      offset = align_stream_offset(offset + payload_size, sizeof(void *));
+    }
+    stream << "]";
+
+    std::ostringstream pipeline;
+    if (has_cs && !has_as && !has_ms) {
+      pipeline << "{\"type\":\"compute\""
+               << ",\"source\":\"stream\""
+               << ",\"root_signature_object_id\":" << object_id(compute.pRootSignature)
+               << ",\"node_mask\":" << compute.NodeMask
+               << ",\"flags\":" << static_cast<unsigned int>(compute.Flags)
+               << "," << shader_json.cs
+               << "}";
+    } else {
+      pipeline << "{\"type\":\"" << (has_ms ? "mesh" : "graphics") << "\""
+               << ",\"source\":\"stream\""
+               << ",\"root_signature_object_id\":" << object_id(graphics.pRootSignature)
+               << ",\"node_mask\":" << graphics.NodeMask
+               << ",\"flags\":" << static_cast<unsigned int>(graphics.Flags)
+               << ",\"input_layout\":" << input_layout_json(graphics.InputLayout)
+               << ",\"blend_state\":" << blend_desc_json(graphics.BlendState)
+               << ",\"sample_mask\":" << graphics.SampleMask
+               << ",\"rasterizer_state\":" << rasterizer_desc_json(graphics.RasterizerState)
+               << ",\"depth_stencil_state\":" << depth_stencil_desc_json(graphics.DepthStencilState)
+               << ",\"stream_output\":" << stream_output_json(graphics.StreamOutput)
+               << ",\"primitive_topology_type\":" << static_cast<unsigned int>(graphics.PrimitiveTopologyType)
+               << ",\"num_render_targets\":" << graphics.NumRenderTargets
+               << ",\"rtv_formats\":[";
+      for (UINT index = 0; index < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++index) {
+        if (index) {
+          pipeline << ",";
+        }
+        pipeline << static_cast<unsigned int>(graphics.RTVFormats[index]);
+      }
+      pipeline << "]"
+               << ",\"dsv_format\":" << static_cast<unsigned int>(graphics.DSVFormat)
+               << ",\"sample_desc\":{\"count\":" << graphics.SampleDesc.Count
+               << ",\"quality\":" << graphics.SampleDesc.Quality << "}"
+               << ",\"ib_strip_cut_value\":" << static_cast<unsigned int>(graphics.IBStripCutValue)
+               << "," << shader_json.vs
+               << "," << shader_json.ps
+               << "," << shader_json.ds
+               << "," << shader_json.hs
+               << "," << shader_json.gs;
+      if (has_as) {
+        pipeline << "," << shader_json.as;
+      }
+      if (has_ms) {
+        pipeline << "," << shader_json.ms;
+      }
+      pipeline << "}";
+    }
+
+    const auto pipeline_asset = register_asset_text(
+        trace::AssetKind::Pipeline,
+        has_cs && !has_as && !has_ms ? "d3d12-stream-compute-pipeline" : "d3d12-stream-graphics-pipeline",
+        pipeline.str());
+    blob_refs.push_back(pipeline_asset.blob_id);
+    blob_refs.insert(blob_refs.end(), shader_blob_refs.begin(), shader_blob_refs.end());
+    payload << "\"pipeline_path\":\"" << pipeline_asset.relative_path.generic_string() << "\""
+            << ",\"stream_size\":" << static_cast<std::uint64_t>(stream_size)
+            << ",\"source\":\"stream\""
+            << ",\"requires_dxmt_backend\":" << (has_ms || has_as ? "true" : "false")
+            << ",\"stream_metadata\":" << stream.str() << "}";
+  }
+  payload << "}";
+  const void *refs[] = {device, pipeline_state};
+  return record_call(
+      "ID3D12Device2::CreatePipelineState",
+      payload.str().c_str(),
+      refs,
+      2,
+      reinterpret_cast<const std::uint64_t *>(blob_refs.data()),
+      blob_refs.size(),
+      result_code);
+}
+
+std::uint64_t record_create_descriptor_heap(
+    ID3D12Device *device,
+    const D3D12_DESCRIPTOR_HEAP_DESC *desc,
+    const void *descriptor_heap,
+    std::uint32_t descriptor_size,
+    std::uint64_t cpu_start,
+    std::uint64_t gpu_start,
+    std::int32_t result_code)
+{
+  if (descriptor_heap && result_code >= 0) {
+    record_object_create(descriptor_heap, CaptureObjectKind::DescriptorHeap, device, "ID3D12DescriptorHeap");
+  }
+  std::ostringstream payload;
+  payload << "{\"type\":" << (desc ? static_cast<unsigned int>(desc->Type) : 0)
+          << ",\"num_descriptors\":" << (desc ? desc->NumDescriptors : 0)
+          << ",\"flags\":" << (desc ? static_cast<unsigned int>(desc->Flags) : 0)
+          << ",\"node_mask\":" << (desc ? desc->NodeMask : 0)
+          << ",\"descriptor_size\":" << descriptor_size
+          << ",\"cpu_start\":" << cpu_start
+          << ",\"gpu_start\":" << gpu_start
+          << "}";
+  const void *refs[] = {device, descriptor_heap};
+  return record_call("ID3D12Device::CreateDescriptorHeap", payload.str().c_str(), refs, 2, nullptr, 0, result_code);
+}
+
+std::uint64_t record_create_query_heap(
+    ID3D12Device *device,
+    const D3D12_QUERY_HEAP_DESC *desc,
+    const void *query_heap,
+    std::int32_t result_code)
+{
+  if (query_heap && result_code >= 0) {
+    record_object_create(
+        query_heap,
+        CaptureObjectKind::QueryHeap,
+        device,
+        "ID3D12QueryHeap");
+  }
+  std::ostringstream payload;
+  payload << "{\"type\":" << (desc ? static_cast<unsigned int>(desc->Type) : 0)
+          << ",\"count\":" << (desc ? desc->Count : 0)
+          << ",\"node_mask\":" << (desc ? desc->NodeMask : 0)
+          << "}";
+  const void *refs[] = {device, query_heap};
+  return record_call("ID3D12Device::CreateQueryHeap", payload.str().c_str(), refs, 2, nullptr, 0, result_code);
+}
+
+std::uint64_t record_create_root_signature(
+    ID3D12Device *device,
+    std::uint32_t node_mask,
+    const void *bytecode,
+    std::size_t bytecode_length,
+    const void *root_signature,
+    std::int32_t result_code,
+    const D3D12_ROOT_SIGNATURE_DESC *desc)
+{
+  if (root_signature && result_code >= 0) {
+    record_object_create(root_signature, CaptureObjectKind::RootSignature, device, "ID3D12RootSignature");
+  }
+  const auto asset = bytecode && bytecode_length
+                         ? register_asset_bytes(trace::AssetKind::RootSignature, "d3d12-root-signature", bytecode, bytecode_length)
+                         : trace::AssetRecord{};
+  std::ostringstream payload;
+  payload << "{\"node_mask\":" << node_mask
+          << ",\"bytecode_size\":" << static_cast<std::uint64_t>(bytecode_length);
+  if (asset.blob_id != 0) {
+    payload << ",\"root_signature_path\":\"" << asset.relative_path.generic_string() << "\"";
+  }
+  if (desc) {
+    payload << ",\"descriptor_tables\":" << root_signature_descriptor_tables_json(desc);
+    payload << ",\"root_parameters\":" << root_signature_parameters_json(desc);
+  }
+  payload << "}";
+  const void *refs[] = {device, root_signature};
+  return record_call(
+      "ID3D12Device::CreateRootSignature",
+      payload.str().c_str(),
+      refs,
+      2,
+      asset.blob_id ? &asset.blob_id : nullptr,
+      asset.blob_id ? 1 : 0,
+      result_code);
+}
+
+std::uint64_t record_create_committed_resource(
+    ID3D12Device *device,
+    const D3D12_HEAP_PROPERTIES *heap_properties,
+    std::uint32_t heap_flags,
+    const D3D12_RESOURCE_DESC *desc,
+    std::uint32_t initial_state,
+    const D3D12_CLEAR_VALUE *optimized_clear_value,
+    const void *resource,
+    std::uint64_t gpu_virtual_address,
+    std::int32_t result_code)
+{
+  (void)optimized_clear_value;
+  if (resource && result_code >= 0) {
+    record_object_create(resource, CaptureObjectKind::Resource, device, "ID3D12Resource");
+    std::lock_guard lock(g_object_mutex);
+    g_resource_gpu_virtual_addresses[resource] = {
+        lookup_object_id_locked(resource),
+        gpu_virtual_address,
+        desc ? desc->Width : 0,
+        g_sequence.load(std::memory_order_relaxed),
+    };
+  }
+  std::ostringstream payload;
+  payload << "{\"heap_type\":" << (heap_properties ? static_cast<unsigned int>(heap_properties->Type) : 0)
+          << ",\"heap_flags\":" << heap_flags
+          << ",\"initial_state\":" << initial_state
+          << ",\"gpu_virtual_address\":" << gpu_virtual_address
+          << ",\"resource_desc\":" << resource_desc_json(desc)
+          << "}";
+  const void *refs[] = {device, resource};
+  return record_call("ID3D12Device::CreateCommittedResource", payload.str().c_str(), refs, 2, nullptr, 0, result_code);
+}
+
+std::uint64_t record_create_heap(ID3D12Device *device, const D3D12_HEAP_DESC *desc, const void *heap, std::int32_t result_code)
+{
+  if (heap && result_code >= 0) {
+    record_object_create(heap, CaptureObjectKind::Resource, device, "ID3D12Heap");
+  }
+  std::ostringstream payload;
+  payload << "{\"size_in_bytes\":" << (desc ? desc->SizeInBytes : 0)
+          << ",\"alignment\":" << (desc ? desc->Alignment : 0)
+          << ",\"heap_type\":" << (desc ? static_cast<unsigned int>(desc->Properties.Type) : 0)
+          << ",\"flags\":" << (desc ? static_cast<unsigned int>(desc->Flags) : 0)
+          << "}";
+  const void *refs[] = {device, heap};
+  return record_call("ID3D12Device::CreateHeap", payload.str().c_str(), refs, 2, nullptr, 0, result_code);
+}
+
+std::uint64_t record_create_placed_resource(
+    ID3D12Device *device,
+    const void *heap,
+    std::uint64_t heap_offset,
+    const D3D12_RESOURCE_DESC *desc,
+    std::uint32_t initial_state,
+    const D3D12_CLEAR_VALUE *optimized_clear_value,
+    const void *resource,
+    std::uint64_t gpu_virtual_address,
+    std::int32_t result_code)
+{
+  (void)optimized_clear_value;
+  if (resource && result_code >= 0) {
+    record_object_create(resource, CaptureObjectKind::Resource, heap, "ID3D12Resource");
+    std::lock_guard lock(g_object_mutex);
+    g_resource_gpu_virtual_addresses[resource] = {
+        lookup_object_id_locked(resource),
+        gpu_virtual_address,
+        desc ? desc->Width : 0,
+        g_sequence.load(std::memory_order_relaxed),
+    };
+  }
+  std::ostringstream payload;
+  payload << "{\"heap_object_id\":" << object_id(heap)
+          << ",\"heap_offset\":" << heap_offset
+          << ",\"initial_state\":" << initial_state
+          << ",\"gpu_virtual_address\":" << gpu_virtual_address
+          << ",\"resource_desc\":" << resource_desc_json(desc)
+          << "}";
+  const void *refs[] = {device, heap, resource};
+  return record_call("ID3D12Device::CreatePlacedResource", payload.str().c_str(), refs, 3, nullptr, 0, result_code);
+}
+
+std::uint64_t record_create_fence(
+    ID3D12Device *device,
+    std::uint64_t initial_value,
+    std::uint32_t flags,
+    const void *fence,
+    std::int32_t result_code)
+{
+  if (fence && result_code >= 0) {
+    record_object_create(fence, CaptureObjectKind::Fence, device, "ID3D12Fence");
+  }
+  std::ostringstream payload;
+  payload << "{\"initial_value\":" << initial_value
+          << ",\"flags\":" << flags
+          << "}";
+  const void *refs[] = {device, fence};
+  return record_call("ID3D12Device::CreateFence", payload.str().c_str(), refs, 2, nullptr, 0, result_code);
+}
+
+std::uint64_t record_create_command_signature(
+    ID3D12Device *device,
+    const D3D12_COMMAND_SIGNATURE_DESC *desc,
+    const void *root_signature,
+    const void *command_signature,
+    std::int32_t result_code)
+{
+  if (result_code >= 0 && command_signature) {
+    record_object_create(
+        command_signature,
+        CaptureObjectKind::CommandSignature,
+        device,
+        "ID3D12CommandSignature");
+  }
+
+  std::ostringstream payload;
+  payload << "{\"byte_stride\":" << (desc ? desc->ByteStride : 0)
+          << ",\"argument_count\":" << (desc ? desc->NumArgumentDescs : 0)
+          << ",\"node_mask\":" << (desc ? desc->NodeMask : 0);
+  if (desc && desc->NumArgumentDescs > 0 && desc->pArgumentDescs) {
+    payload << ",\"arguments\":[";
+    for (std::uint32_t index = 0; index < desc->NumArgumentDescs; ++index) {
+      if (index) {
+        payload << ",";
+      }
+      const auto &argument = desc->pArgumentDescs[index];
+      payload << "{\"type\":" << static_cast<unsigned int>(argument.Type);
+      switch (argument.Type) {
+      case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
+        payload << ",\"slot\":" << argument.VertexBuffer.Slot;
+        break;
+      case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
+        payload << ",\"root_parameter_index\":" << argument.Constant.RootParameterIndex
+                << ",\"dest_offset_in32bit_values\":" << argument.Constant.DestOffsetIn32BitValues
+                << ",\"num32bit_values_to_set\":" << argument.Constant.Num32BitValuesToSet;
+        break;
+      case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+        payload << ",\"root_parameter_index\":" << argument.ConstantBufferView.RootParameterIndex;
+        break;
+      case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+        payload << ",\"root_parameter_index\":" << argument.ShaderResourceView.RootParameterIndex;
+        break;
+      case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW:
+        payload << ",\"root_parameter_index\":" << argument.UnorderedAccessView.RootParameterIndex;
+        break;
+      default:
+        break;
+      }
+      payload << "}";
+    }
+    payload << "]";
+  }
+  payload << "}";
+  const void *refs[] = {device, root_signature, command_signature};
+  return record_call(
+      "ID3D12Device::CreateCommandSignature",
+      payload.str().c_str(),
+      refs,
+      3,
+      nullptr,
+      0,
+      result_code);
+}
+
+std::uint64_t record_create_constant_buffer_view(
+    ID3D12Device *device,
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE descriptor,
+    const void *resolved_resource,
+    std::uint64_t resolved_resource_offset,
+    std::uint64_t resolved_resource_width)
+{
+  const bool has_buffer_location = desc && desc->BufferLocation != 0;
+  const bool has_resolved_resource = resolved_resource != nullptr;
+  std::ostringstream payload;
+  payload << "{\"descriptor\":" << cpu_descriptor_json(descriptor)
+          << ",\"descriptor_detail\":" << cpu_descriptor_detail_json(descriptor)
+          << ",\"buffer_location\":" << (desc ? desc->BufferLocation : 0)
+          << ",\"size_in_bytes\":" << (desc ? desc->SizeInBytes : 0)
+          << ",\"gpuva_resolve_status\":\""
+          << (!has_buffer_location ? "null" : (has_resolved_resource ? "mapped" : "unmapped"))
+          << "\",\"resolved_resource_object_id\":" << object_id(resolved_resource)
+          << ",\"resolved_resource_offset\":" << (has_resolved_resource ? resolved_resource_offset : 0)
+          << ",\"resolved_resource_width\":" << (has_resolved_resource ? resolved_resource_width : 0)
+          << "}";
+  const void *refs[] = {device, resolved_resource};
+  return record_call("ID3D12Device::CreateConstantBufferView", payload.str().c_str(), refs, 2);
+}
+
+std::uint64_t record_create_shader_resource_view(
+    ID3D12Device *device,
+    const void *resource,
+    const D3D12_SHADER_RESOURCE_VIEW_DESC *desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
+{
+  std::ostringstream payload;
+  payload << "{\"descriptor\":" << cpu_descriptor_json(descriptor)
+          << ",\"descriptor_detail\":" << cpu_descriptor_detail_json(descriptor)
+          << ",\"format\":" << (desc ? static_cast<unsigned int>(desc->Format) : 0)
+          << ",\"view_dimension\":" << (desc ? static_cast<unsigned int>(desc->ViewDimension) : 0)
+          << ",\"shader_4_component_mapping\":" << (desc ? desc->Shader4ComponentMapping : 0)
+          << ",\"view\":" << srv_desc_detail_json(desc)
+          << "}";
+  const void *refs[] = {device, resource};
+  return record_call("ID3D12Device::CreateShaderResourceView", payload.str().c_str(), refs, 2);
+}
+
+std::uint64_t record_create_unordered_access_view(
+    ID3D12Device *device,
+    const void *resource,
+    const void *counter_resource,
+    const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
+{
+  std::ostringstream payload;
+  payload << "{\"descriptor\":" << cpu_descriptor_json(descriptor)
+          << ",\"descriptor_detail\":" << cpu_descriptor_detail_json(descriptor)
+          << ",\"format\":" << (desc ? static_cast<unsigned int>(desc->Format) : 0)
+          << ",\"view_dimension\":" << (desc ? static_cast<unsigned int>(desc->ViewDimension) : 0)
+          << ",\"resource_object_id\":" << object_id(resource)
+          << ",\"counter_resource_object_id\":" << object_id(counter_resource)
+          << ",\"view\":" << uav_desc_detail_json(desc)
+          << "}";
+  const void *refs[] = {device, resource, counter_resource};
+  return record_call("ID3D12Device::CreateUnorderedAccessView", payload.str().c_str(), refs, 3);
+}
+
+std::uint64_t record_create_render_target_view(
+    ID3D12Device *device,
+    const void *resource,
+    const D3D12_RENDER_TARGET_VIEW_DESC *desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
+{
+  std::ostringstream payload;
+  payload << "{\"descriptor\":" << cpu_descriptor_json(descriptor)
+          << ",\"descriptor_detail\":" << cpu_descriptor_detail_json(descriptor)
+          << ",\"format\":" << (desc ? static_cast<unsigned int>(desc->Format) : 0)
+          << ",\"view_dimension\":" << (desc ? static_cast<unsigned int>(desc->ViewDimension) : 0)
+          << ",\"resource_object_id\":" << object_id(resource)
+          << ",\"view\":" << rtv_desc_detail_json(desc)
+          << "}";
+  const void *refs[] = {device, resource};
+  return record_call("ID3D12Device::CreateRenderTargetView", payload.str().c_str(), refs, 2);
+}
+
+std::uint64_t record_create_depth_stencil_view(
+    ID3D12Device *device,
+    const void *resource,
+    const D3D12_DEPTH_STENCIL_VIEW_DESC *desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
+{
+  std::ostringstream payload;
+  payload << "{\"descriptor\":" << cpu_descriptor_json(descriptor)
+          << ",\"descriptor_detail\":" << cpu_descriptor_detail_json(descriptor)
+          << ",\"format\":" << (desc ? static_cast<unsigned int>(desc->Format) : 0)
+          << ",\"view_dimension\":" << (desc ? static_cast<unsigned int>(desc->ViewDimension) : 0)
+          << ",\"flags\":" << (desc ? static_cast<unsigned int>(desc->Flags) : 0)
+          << ",\"resource_object_id\":" << object_id(resource)
+          << ",\"view\":" << dsv_desc_detail_json(desc)
+          << "}";
+  const void *refs[] = {device, resource};
+  return record_call("ID3D12Device::CreateDepthStencilView", payload.str().c_str(), refs, 2);
+}
+
+std::uint64_t record_create_sampler(
+    ID3D12Device *device,
+    const D3D12_SAMPLER_DESC *desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
+{
+  std::ostringstream payload;
+  payload << "{\"descriptor\":" << cpu_descriptor_json(descriptor);
+  payload << ",\"descriptor_detail\":" << cpu_descriptor_detail_json(descriptor);
+  if (desc) {
+    payload << ",\"filter\":" << static_cast<unsigned int>(desc->Filter)
+            << ",\"address_u\":" << static_cast<unsigned int>(desc->AddressU)
+            << ",\"address_v\":" << static_cast<unsigned int>(desc->AddressV)
+            << ",\"address_w\":" << static_cast<unsigned int>(desc->AddressW)
+            << ",\"mip_lod_bias\":" << desc->MipLODBias
+            << ",\"max_anisotropy\":" << desc->MaxAnisotropy
+            << ",\"comparison_func\":" << static_cast<unsigned int>(desc->ComparisonFunc)
+            << ",\"border_color\":["
+            << desc->BorderColor[0] << ","
+            << desc->BorderColor[1] << ","
+            << desc->BorderColor[2] << ","
+            << desc->BorderColor[3] << "]"
+            << ",\"min_lod\":" << desc->MinLOD
+            << ",\"max_lod\":" << desc->MaxLOD;
+  }
+  payload << "}";
+  const void *refs[] = {device};
+  return record_call("ID3D12Device::CreateSampler", payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_copy_descriptors(
+    ID3D12Device *device,
+    std::uint32_t dst_descriptor_range_count,
+    const D3D12_CPU_DESCRIPTOR_HANDLE *dst_descriptor_range_starts,
+    const std::uint32_t *dst_descriptor_range_sizes,
+    std::uint32_t src_descriptor_range_count,
+    const D3D12_CPU_DESCRIPTOR_HANDLE *src_descriptor_range_starts,
+    const std::uint32_t *src_descriptor_range_sizes,
+    std::uint32_t descriptor_heap_type,
+    std::uint32_t descriptor_size)
+{
+  std::ostringstream payload;
+  payload << "{\"descriptor_heap_type\":" << descriptor_heap_type
+          << ",\"descriptor_size\":" << descriptor_size
+          << ",\"dst_range_count\":" << dst_descriptor_range_count
+          << ",\"src_range_count\":" << src_descriptor_range_count;
+  append_copy_descriptor_pairs_json(
+      payload,
+      dst_descriptor_range_count,
+      dst_descriptor_range_starts,
+      dst_descriptor_range_sizes,
+      src_descriptor_range_count,
+      src_descriptor_range_starts,
+      src_descriptor_range_sizes,
+      descriptor_size);
+  payload << "}";
+  const void *refs[] = {device};
+  return record_call("ID3D12Device::CopyDescriptors", payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_copy_descriptors_simple(
+    ID3D12Device *device,
+    std::uint32_t descriptor_count,
+    D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_start,
+    D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_start,
+    std::uint32_t descriptor_heap_type,
+    std::uint32_t descriptor_size)
+{
+  return record_copy_descriptors(
+      device,
+      1,
+      &dst_descriptor_range_start,
+      &descriptor_count,
+      1,
+      &src_descriptor_range_start,
+      &descriptor_count,
+      descriptor_heap_type,
+      descriptor_size);
+}
+
+std::uint64_t record_draw_instanced(
+    const void *command_list,
+    std::uint32_t vertex_count_per_instance,
+    std::uint32_t instance_count,
+    std::uint32_t start_vertex_location,
+    std::uint32_t start_instance_location)
+{
+  std::ostringstream payload;
+  payload << "{\"vertex_count_per_instance\":" << vertex_count_per_instance
+          << ",\"instance_count\":" << instance_count
+          << ",\"start_vertex_location\":" << start_vertex_location
+          << ",\"start_instance_location\":" << start_instance_location
+          << "}";
+  const void *refs[] = {command_list};
+  return record_call("ID3D12GraphicsCommandList::DrawInstanced", payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_draw_indexed_instanced(
+    const void *command_list,
+    std::uint32_t index_count_per_instance,
+    std::uint32_t instance_count,
+    std::uint32_t start_index_location,
+    std::int32_t base_vertex_location,
+    std::uint32_t start_instance_location)
+{
+  std::ostringstream payload;
+  payload << "{\"index_count_per_instance\":" << index_count_per_instance
+          << ",\"instance_count\":" << instance_count
+          << ",\"start_index_location\":" << start_index_location
+          << ",\"base_vertex_location\":" << base_vertex_location
+          << ",\"start_instance_location\":" << start_instance_location
+          << "}";
+  const void *refs[] = {command_list};
+  return record_call("ID3D12GraphicsCommandList::DrawIndexedInstanced", payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_dispatch(const void *command_list, std::uint32_t x, std::uint32_t y, std::uint32_t z)
+{
+  std::ostringstream payload;
+  payload << "{\"thread_group_count_x\":" << x
+          << ",\"thread_group_count_y\":" << y
+          << ",\"thread_group_count_z\":" << z
+          << "}";
+  const void *refs[] = {command_list};
+  return record_call("ID3D12GraphicsCommandList::Dispatch", payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_close_command_list(const void *command_list, std::int32_t result_code)
+{
+  const void *refs[] = {command_list};
+  return record_call("ID3D12GraphicsCommandList::Close", "{}", refs, 1, nullptr, 0, result_code);
+}
+
+std::uint64_t record_reset_command_list(
+    const void *command_list,
+    const void *command_allocator,
+    const void *initial_pipeline_state,
+    std::int32_t result_code)
+{
+  std::ostringstream payload;
+  payload << "{\"command_allocator_object_id\":" << object_id(command_allocator)
+          << ",\"initial_pipeline_state_object_id\":" << object_id(initial_pipeline_state)
+          << "}";
+  const void *refs[] = {command_list, command_allocator, initial_pipeline_state};
+  return record_call(
+      "ID3D12GraphicsCommandList::Reset",
+      payload.str().c_str(),
+      refs,
+      3,
+      nullptr,
+      0,
+      result_code);
+}
+
+std::uint64_t record_execute_indirect(
+    const void *command_list,
+    const void *command_signature,
+    std::uint32_t max_command_count,
+    const void *arg_buffer,
+    std::uint64_t arg_buffer_offset,
+    const void *count_buffer,
+    std::uint64_t count_buffer_offset)
+{
+  std::ostringstream payload;
+  payload << "{\"max_command_count\":" << max_command_count
+          << ",\"arg_buffer_offset\":" << arg_buffer_offset
+          << ",\"count_buffer_offset\":" << count_buffer_offset << "}";
+  const void *refs[] = {command_list, command_signature, arg_buffer, count_buffer};
+  return record_call(
+      "ID3D12GraphicsCommandList::ExecuteIndirect",
+      payload.str().c_str(),
+      refs,
+      4);
+}
+
+std::uint64_t record_execute_bundle(const void *command_list, const void *bundle_command_list)
+{
+  std::ostringstream payload;
+  payload << "{\"bundle_command_list_object_id\":" << object_id(bundle_command_list) << "}";
+  const void *refs[] = {command_list, bundle_command_list};
+  return record_call("ID3D12GraphicsCommandList::ExecuteBundle", payload.str().c_str(), refs, 2);
+}
+
+std::uint64_t record_resource_barrier(
+    const void *command_list,
+    std::uint32_t barrier_count,
+    const D3D12_RESOURCE_BARRIER *barriers)
+{
+  std::vector<const void *> refs = {command_list};
+  std::ostringstream payload;
+  payload << "{\"barrier_count\":" << barrier_count << ",\"barriers\":[";
+  for (std::uint32_t index = 0; barriers && index < barrier_count; ++index) {
+    if (index != 0) {
+      payload << ",";
+    }
+    const auto &barrier = barriers[index];
+    payload << "{\"type\":" << static_cast<unsigned int>(barrier.Type)
+            << ",\"flags\":" << static_cast<unsigned int>(barrier.Flags);
+    if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+      refs.push_back(barrier.Transition.pResource);
+      payload << ",\"resource_object_id\":" << object_id(barrier.Transition.pResource)
+              << ",\"before\":" << static_cast<unsigned int>(barrier.Transition.StateBefore)
+              << ",\"after\":" << static_cast<unsigned int>(barrier.Transition.StateAfter)
+              << ",\"subresource\":" << barrier.Transition.Subresource;
+    } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
+      refs.push_back(barrier.Aliasing.pResourceBefore);
+      refs.push_back(barrier.Aliasing.pResourceAfter);
+      payload << ",\"resource_before_object_id\":" << object_id(barrier.Aliasing.pResourceBefore)
+              << ",\"resource_after_object_id\":" << object_id(barrier.Aliasing.pResourceAfter);
+    } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
+      refs.push_back(barrier.UAV.pResource);
+      payload << ",\"resource_object_id\":" << object_id(barrier.UAV.pResource);
+    }
+    payload << "}";
+  }
+  payload << "]}";
+  return record_call("ID3D12GraphicsCommandList::ResourceBarrier", payload.str().c_str(), refs.data(), refs.size());
+}
+
+std::uint64_t record_copy_buffer_region(
+    const char *function_name,
+    const void *command_list,
+    const void *dst_buffer,
+    std::uint64_t dst_offset,
+    const void *src_buffer,
+    std::uint64_t src_offset,
+    std::uint64_t byte_count)
+{
+  const auto sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  std::lock_guard lock(g_command_batch_mutex);
+  auto &batch = g_copy_buffer_batches[command_list];
+  batch.ops.push_back(CopyBufferBatchOp{
+      sequence,
+      function_name && *function_name ? function_name : "ID3D12GraphicsCommandList::CopyBufferRegion",
+      dst_buffer,
+      dst_offset,
+      src_buffer,
+      src_offset,
+      byte_count,
+  });
+  return sequence;
+}
+
+std::uint64_t record_copy_texture_region(
+    const void *command_list,
+    const D3D12_TEXTURE_COPY_LOCATION *dst,
+    std::uint32_t dst_x,
+    std::uint32_t dst_y,
+    std::uint32_t dst_z,
+    const D3D12_TEXTURE_COPY_LOCATION *src,
+    const D3D12_BOX *src_box)
+{
+  std::ostringstream payload;
+  payload << "{\"dst\":";
+  append_texture_copy_location_json(payload, dst);
+  payload << ",\"dst_x\":" << dst_x
+          << ",\"dst_y\":" << dst_y
+          << ",\"dst_z\":" << dst_z
+          << ",\"src\":";
+  append_texture_copy_location_json(payload, src);
+  payload << ",\"src_box\":";
+  if (src_box) {
+    append_box_json(payload, *src_box);
+  } else {
+    payload << "null";
+  }
+  payload << "}";
+  const void *refs[] = {command_list, dst ? dst->pResource : nullptr, src ? src->pResource : nullptr};
+  return record_call("ID3D12GraphicsCommandList::CopyTextureRegion", payload.str().c_str(), refs, 3);
+}
+
+std::uint64_t record_copy_resource(const void *command_list, const void *dst_resource, const void *src_resource)
+{
+  std::ostringstream payload;
+  payload << "{\"dst_resource_object_id\":" << object_id(dst_resource)
+          << ",\"src_resource_object_id\":" << object_id(src_resource)
+          << "}";
+  const void *refs[] = {command_list, dst_resource, src_resource};
+  return record_call("ID3D12GraphicsCommandList::CopyResource", payload.str().c_str(), refs, 3);
+}
+
+std::uint64_t record_resolve_subresource(
+    const void *command_list,
+    const void *dst_resource,
+    std::uint32_t dst_subresource,
+    const void *src_resource,
+    std::uint32_t src_subresource,
+    std::uint32_t format)
+{
+  std::ostringstream payload;
+  payload << "{\"dst_resource_object_id\":" << object_id(dst_resource)
+          << ",\"dst_subresource\":" << dst_subresource
+          << ",\"src_resource_object_id\":" << object_id(src_resource)
+          << ",\"src_subresource\":" << src_subresource
+          << ",\"format\":" << format
+          << "}";
+  const void *refs[] = {command_list, dst_resource, src_resource};
+  return record_call("ID3D12GraphicsCommandList::ResolveSubresource", payload.str().c_str(), refs, 3);
+}
+
+std::uint64_t record_ia_set_primitive_topology(const void *command_list, std::uint32_t primitive_topology)
+{
+  std::ostringstream payload;
+  payload << "{\"primitive_topology\":" << primitive_topology << "}";
+  const void *refs[] = {command_list};
+  return record_call("ID3D12GraphicsCommandList::IASetPrimitiveTopology", payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_rs_set_viewports(const void *command_list, std::uint32_t viewport_count, const D3D12_VIEWPORT *viewports)
+{
+  std::ostringstream payload;
+  payload << "{\"viewport_count\":" << viewport_count << ",\"viewports\":[";
+  for (std::uint32_t index = 0; viewports && index < viewport_count; ++index) {
+    if (index) payload << ",";
+    payload << "{\"x\":" << viewports[index].TopLeftX
+            << ",\"y\":" << viewports[index].TopLeftY
+            << ",\"top_left_x\":" << viewports[index].TopLeftX
+            << ",\"top_left_y\":" << viewports[index].TopLeftY
+            << ",\"width\":" << viewports[index].Width
+            << ",\"height\":" << viewports[index].Height
+            << ",\"min_depth\":" << viewports[index].MinDepth
+            << ",\"max_depth\":" << viewports[index].MaxDepth
+            << "}";
+  }
+  payload << "]}";
+  const void *refs[] = {command_list};
+  return record_call("ID3D12GraphicsCommandList::RSSetViewports", payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_rs_set_scissor_rects(const void *command_list, std::uint32_t rect_count, const void *rects)
+{
+  const auto *typed_rects = static_cast<const D3D12_RECT *>(rects);
+  std::ostringstream payload;
+  payload << "{\"rect_count\":" << rect_count << ",\"rects\":[";
+  for (std::uint32_t index = 0; typed_rects && index < rect_count; ++index) {
+    if (index) payload << ",";
+    append_rect_json(payload, typed_rects[index]);
+  }
+  payload << "]}";
+  const void *refs[] = {command_list};
+  return record_call("ID3D12GraphicsCommandList::RSSetScissorRects", payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_set_pipeline_state(const void *command_list, const void *pipeline_state)
+{
+  std::ostringstream payload;
+  payload << "{\"pipeline_state_object_id\":" << object_id(pipeline_state) << "}";
+  const void *refs[] = {command_list, pipeline_state};
+  return record_call("ID3D12GraphicsCommandList::SetPipelineState", payload.str().c_str(), refs, 2);
+}
+
+std::uint64_t record_clear_state(const void *command_list, const void *pipeline_state)
+{
+  std::ostringstream payload;
+  payload << "{\"pipeline_state_object_id\":" << object_id(pipeline_state) << "}";
+  const void *refs[] = {command_list, pipeline_state};
+  return record_call("ID3D12GraphicsCommandList::ClearState", payload.str().c_str(), refs, 2);
+}
+
+std::uint64_t record_om_set_blend_factor(const void *command_list, const float blend_factor[4])
+{
+  std::ostringstream payload;
+  payload << "{\"blend_factor\":[";
+  for (std::uint32_t index = 0; index < 4; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    payload << (blend_factor ? blend_factor[index] : 0.0f);
+  }
+  payload << "]}";
+  const void *refs[] = {command_list};
+  return record_call("ID3D12GraphicsCommandList::OMSetBlendFactor", payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_om_set_stencil_ref(const void *command_list, std::uint32_t stencil_ref)
+{
+  std::ostringstream payload;
+  payload << "{\"stencil_ref\":" << stencil_ref << "}";
+  const void *refs[] = {command_list};
+  return record_call("ID3D12GraphicsCommandList::OMSetStencilRef", payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_set_descriptor_heaps(const void *command_list, std::uint32_t heap_count, const void *const *heaps)
+{
+  std::vector<const void *> refs = {command_list};
+  std::ostringstream payload;
+  payload << "{\"heap_count\":" << heap_count << ",\"heaps\":[";
+  for (std::uint32_t index = 0; heaps && index < heap_count; ++index) {
+    if (index) payload << ",";
+    payload << object_id(heaps[index]);
+    refs.push_back(heaps[index]);
+  }
+  payload << "]}";
+  return record_call("ID3D12GraphicsCommandList::SetDescriptorHeaps", payload.str().c_str(), refs.data(), refs.size());
+}
+
+std::uint64_t record_set_root_signature(const void *command_list, bool compute, const void *root_signature)
+{
+  std::ostringstream payload;
+  payload << "{\"compute\":" << (compute ? "true" : "false")
+          << ",\"root_signature_object_id\":" << object_id(root_signature)
+          << "}";
+  const void *refs[] = {command_list, root_signature};
+  return record_call(
+      compute ? "ID3D12GraphicsCommandList::SetComputeRootSignature" : "ID3D12GraphicsCommandList::SetGraphicsRootSignature",
+      payload.str().c_str(), refs, 2);
+}
+
+std::uint64_t record_set_root_descriptor_table(
+    const void *command_list,
+    bool compute,
+    std::uint32_t root_parameter_index,
+    D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor)
+{
+  std::ostringstream payload;
+  payload << "{\"compute\":" << (compute ? "true" : "false")
+          << ",\"root_parameter_index\":" << root_parameter_index
+          << ",\"base_descriptor\":" << gpu_descriptor_json(base_descriptor)
+          << ",\"base_descriptor_detail\":" << gpu_descriptor_detail_json(base_descriptor)
+          << "}";
+  const void *refs[] = {command_list};
+  return record_call(
+      compute ? "ID3D12GraphicsCommandList::SetComputeRootDescriptorTable" : "ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable",
+      payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_set_root_32bit_constants(
+    const void *command_list,
+    bool compute,
+    std::uint32_t root_parameter_index,
+    std::uint32_t constant_count,
+    const std::uint32_t *values,
+    std::uint32_t dst_offset)
+{
+  std::ostringstream payload;
+  payload << "{\"compute\":" << (compute ? "true" : "false")
+          << ",\"root_parameter_index\":" << root_parameter_index
+          << ",\"dst_offset\":" << dst_offset
+          << ",\"values\":[";
+  for (std::uint32_t index = 0; values && index < constant_count; ++index) {
+    if (index) payload << ",";
+    payload << values[index];
+  }
+  payload << "]}";
+  const void *refs[] = {command_list};
+  return record_call(
+      compute ? "ID3D12GraphicsCommandList::SetComputeRoot32BitConstants" : "ID3D12GraphicsCommandList::SetGraphicsRoot32BitConstants",
+      payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_set_root_descriptor(
+    const void *command_list,
+    bool compute,
+    std::uint32_t parameter_type,
+    std::uint32_t root_parameter_index,
+    std::uint64_t gpu_virtual_address)
+{
+  const char *name = "ID3D12GraphicsCommandList::SetGraphicsRootConstantBufferView";
+  if (compute && parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) name = "ID3D12GraphicsCommandList::SetComputeRootConstantBufferView";
+  else if (compute && parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) name = "ID3D12GraphicsCommandList::SetComputeRootShaderResourceView";
+  else if (compute && parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) name = "ID3D12GraphicsCommandList::SetComputeRootUnorderedAccessView";
+  else if (!compute && parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) name = "ID3D12GraphicsCommandList::SetGraphicsRootShaderResourceView";
+  else if (!compute && parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) name = "ID3D12GraphicsCommandList::SetGraphicsRootUnorderedAccessView";
+  std::ostringstream payload;
+  payload << "{\"compute\":" << (compute ? "true" : "false")
+          << ",\"parameter_type\":" << parameter_type
+          << ",\"root_parameter_index\":" << root_parameter_index
+          << ",";
+  append_gpu_virtual_address_binding_json(payload, "buffer_location", gpu_virtual_address);
+  payload << "}";
+  const void *refs[] = {command_list};
+  return record_call(name, payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_ia_set_index_buffer(const void *command_list, const D3D12_INDEX_BUFFER_VIEW *view)
+{
+  std::ostringstream payload;
+  payload << "{";
+  if (view) {
+    append_gpu_virtual_address_binding_json(payload, "buffer_location", view->BufferLocation);
+    payload << ",\"size_in_bytes\":" << view->SizeInBytes
+            << ",\"format\":" << static_cast<unsigned int>(view->Format);
+  }
+  payload << "}";
+  const void *refs[] = {command_list};
+  return record_call("ID3D12GraphicsCommandList::IASetIndexBuffer", payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_ia_set_vertex_buffers(
+    const void *command_list,
+    std::uint32_t start_slot,
+    std::uint32_t view_count,
+    const D3D12_VERTEX_BUFFER_VIEW *views)
+{
+  std::ostringstream payload;
+  payload << "{\"start_slot\":" << start_slot
+          << ",\"view_count\":" << view_count
+          << ",\"views\":[";
+  for (std::uint32_t index = 0; views && index < view_count; ++index) {
+    if (index) payload << ",";
+    payload << "{";
+    append_gpu_virtual_address_binding_json(payload, "buffer_location", views[index].BufferLocation);
+    payload << ",\"size_in_bytes\":" << views[index].SizeInBytes
+            << ",\"stride_in_bytes\":" << views[index].StrideInBytes
+            << "}";
+  }
+  payload << "]}";
+  const void *refs[] = {command_list};
+  return record_call("ID3D12GraphicsCommandList::IASetVertexBuffers", payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_om_set_render_targets(
+    const void *command_list,
+    std::uint32_t render_target_descriptor_count,
+    const D3D12_CPU_DESCRIPTOR_HANDLE *render_target_descriptors,
+    bool single_descriptor_handle,
+    const D3D12_CPU_DESCRIPTOR_HANDLE *depth_stencil_descriptor)
+{
+  std::vector<const void *> refs = {command_list};
+  std::ostringstream payload;
+  payload << "{\"render_target_count\":" << render_target_descriptor_count
+          << ",\"single_handle_to_descriptor_range\":" << (single_descriptor_handle ? "true" : "false")
+          << ",\"single_descriptor_handle\":" << (single_descriptor_handle ? "true" : "false")
+          << ",\"render_targets\":[";
+  const auto descriptor_slots = single_descriptor_handle && render_target_descriptor_count > 0 ? 1 : render_target_descriptor_count;
+  for (std::uint32_t index = 0; render_target_descriptors && index < descriptor_slots; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    payload << cpu_descriptor_json(render_target_descriptors[index]);
+    refs.push_back(reinterpret_cast<const void *>(render_target_descriptors[index].ptr));
+  }
+  payload << "],\"render_target_descriptors\":[";
+  for (std::uint32_t index = 0; render_target_descriptors && index < descriptor_slots; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    payload << cpu_descriptor_detail_json(render_target_descriptors[index]);
+  }
+  payload << "]";
+  if (render_target_descriptor_count > 0 && render_target_descriptors) {
+    payload << ",\"first_rtv\":" << cpu_descriptor_json(render_target_descriptors[0]);
+  } else {
+    payload << ",\"first_rtv\":0";
+  }
+  payload << ",\"dsv\":";
+  if (depth_stencil_descriptor) {
+    payload << cpu_descriptor_json(*depth_stencil_descriptor);
+  } else {
+    payload << "0";
+  }
+  payload << ",\"depth_stencil_descriptor\":";
+  if (depth_stencil_descriptor) {
+    payload << cpu_descriptor_detail_json(*depth_stencil_descriptor);
+    refs.push_back(reinterpret_cast<const void *>(depth_stencil_descriptor->ptr));
+  } else {
+    payload << "null";
+  }
+  payload << "}";
+  return record_call("ID3D12GraphicsCommandList::OMSetRenderTargets", payload.str().c_str(), refs.data(), refs.size());
+}
+
+std::uint64_t record_clear_depth_stencil_view(
+    const void *command_list,
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv,
+    std::uint32_t flags,
+    float depth,
+    std::uint8_t stencil,
+    std::uint32_t rect_count,
+    const void *rects)
+{
+  const auto *typed_rects = static_cast<const D3D12_RECT *>(rects);
+  std::ostringstream payload;
+  payload << "{\"descriptor\":" << static_cast<std::uint64_t>(dsv.ptr)
+          << ",\"dsv\":" << cpu_descriptor_json(dsv)
+          << ",\"clear_flags\":" << flags
+          << ",\"depth\":" << depth
+          << ",\"stencil\":" << static_cast<std::uint32_t>(stencil)
+          << ",\"rect_count\":" << rect_count
+          << ",\"rects\":[";
+  for (std::uint32_t index = 0; typed_rects && index < rect_count; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    append_rect_json(payload, typed_rects[index]);
+  }
+  payload << "]}";
+  const void *refs[] = {command_list};
+  return record_call("ID3D12GraphicsCommandList::ClearDepthStencilView", payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_clear_render_target_view(
+    const void *command_list,
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv,
+    const float color[4],
+    std::uint32_t rect_count,
+    const void *rects)
+{
+  const auto *typed_rects = static_cast<const D3D12_RECT *>(rects);
+  std::ostringstream payload;
+  payload << "{\"descriptor\":" << static_cast<std::uint64_t>(rtv.ptr)
+          << ",\"rtv\":" << cpu_descriptor_json(rtv)
+          << ",\"color\":[";
+  for (std::uint32_t index = 0; index < 4; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    payload << (color ? color[index] : 0.0f);
+  }
+  payload << "],\"rect_count\":" << rect_count
+          << ",\"rects\":[";
+  for (std::uint32_t index = 0; typed_rects && index < rect_count; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    append_rect_json(payload, typed_rects[index]);
+  }
+  payload << "]}";
+  const void *refs[] = {command_list};
+  return record_call("ID3D12GraphicsCommandList::ClearRenderTargetView", payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_clear_unordered_access_view_uint(
+    const void *command_list,
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_descriptor,
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_descriptor,
+    const void *resource,
+    const std::uint32_t values[4],
+    std::uint32_t rect_count,
+    const void *rects)
+{
+  const auto *typed_rects = static_cast<const D3D12_RECT *>(rects);
+  std::ostringstream payload;
+  payload << "{\"gpu_descriptor\":" << static_cast<std::uint64_t>(gpu_descriptor.ptr)
+          << ",\"cpu_descriptor\":" << static_cast<std::uint64_t>(cpu_descriptor.ptr)
+          << ",\"values\":[";
+  for (std::uint32_t index = 0; index < 4; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    payload << (values ? values[index] : 0);
+  }
+  payload << "],\"rect_count\":" << rect_count
+          << ",\"rects\":[";
+  for (std::uint32_t index = 0; typed_rects && index < rect_count; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    append_rect_json(payload, typed_rects[index]);
+  }
+  payload << "]}";
+  const void *refs[] = {command_list, resource};
+  return record_call("ID3D12GraphicsCommandList::ClearUnorderedAccessViewUint", payload.str().c_str(), refs, 2);
+}
+
+std::uint64_t record_clear_unordered_access_view_float(
+    const void *command_list,
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_descriptor,
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_descriptor,
+    const void *resource,
+    const float values[4],
+    std::uint32_t rect_count,
+    const void *rects)
+{
+  const auto *typed_rects = static_cast<const D3D12_RECT *>(rects);
+  std::ostringstream payload;
+  payload << "{\"gpu_descriptor\":" << static_cast<std::uint64_t>(gpu_descriptor.ptr)
+          << ",\"cpu_descriptor\":" << static_cast<std::uint64_t>(cpu_descriptor.ptr)
+          << ",\"values\":[";
+  for (std::uint32_t index = 0; index < 4; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    payload << (values ? values[index] : 0.0f);
+  }
+  payload << "],\"rect_count\":" << rect_count
+          << ",\"rects\":[";
+  for (std::uint32_t index = 0; typed_rects && index < rect_count; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    append_rect_json(payload, typed_rects[index]);
+  }
+  payload << "]}";
+  const void *refs[] = {command_list, resource};
+  return record_call("ID3D12GraphicsCommandList::ClearUnorderedAccessViewFloat", payload.str().c_str(), refs, 2);
+}
+
+std::uint64_t record_discard_resource(
+    const void *command_list,
+    const void *resource,
+    std::uint32_t first_subresource,
+    std::uint32_t subresource_count,
+    std::uint32_t rect_count,
+    const void *rects)
+{
+  const auto *typed_rects = static_cast<const D3D12_RECT *>(rects);
+  std::ostringstream payload;
+  payload << "{\"first_subresource\":" << first_subresource
+          << ",\"subresource_count\":" << subresource_count
+          << ",\"rect_count\":" << rect_count
+          << ",\"rects\":[";
+  for (std::uint32_t index = 0; typed_rects && index < rect_count; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    append_rect_json(payload, typed_rects[index]);
+  }
+  payload << "]}";
+  const void *refs[] = {command_list, resource};
+  return record_call("ID3D12GraphicsCommandList::DiscardResource", payload.str().c_str(), refs, 2);
+}
+
+std::uint64_t record_begin_query(
+    const void *command_list,
+    const void *query_heap,
+    std::uint32_t type,
+    std::uint32_t index)
+{
+  std::ostringstream payload;
+  payload << "{\"query_heap_object_id\":" << object_id(query_heap)
+          << ",\"type\":" << type
+          << ",\"index\":" << index
+          << "}";
+  const void *refs[] = {command_list, query_heap};
+  return record_call("ID3D12GraphicsCommandList::BeginQuery", payload.str().c_str(), refs, 2);
+}
+
+std::uint64_t record_end_query(
+    const void *command_list,
+    const void *query_heap,
+    std::uint32_t type,
+    std::uint32_t index)
+{
+  std::ostringstream payload;
+  payload << "{\"query_heap_object_id\":" << object_id(query_heap)
+          << ",\"type\":" << type
+          << ",\"index\":" << index
+          << "}";
+  const void *refs[] = {command_list, query_heap};
+  return record_call("ID3D12GraphicsCommandList::EndQuery", payload.str().c_str(), refs, 2);
+}
+
+std::uint64_t record_resolve_query_data(
+    const void *command_list,
+    const void *query_heap,
+    std::uint32_t type,
+    std::uint32_t start_index,
+    std::uint32_t query_count,
+    const void *dst_buffer,
+    std::uint64_t aligned_dst_buffer_offset)
+{
+  std::ostringstream payload;
+  payload << "{\"query_heap_object_id\":" << object_id(query_heap)
+          << ",\"type\":" << type
+          << ",\"start_index\":" << start_index
+          << ",\"query_count\":" << query_count
+          << ",\"dst_buffer_object_id\":" << object_id(dst_buffer)
+          << ",\"aligned_dst_buffer_offset\":" << aligned_dst_buffer_offset
+          << "}";
+  const void *refs[] = {command_list, query_heap, dst_buffer};
+  return record_call("ID3D12GraphicsCommandList::ResolveQueryData", payload.str().c_str(), refs, 3);
+}
+
+std::uint64_t record_set_predication(
+    const void *command_list,
+    const void *buffer,
+    std::uint64_t aligned_buffer_offset,
+    std::uint32_t operation)
+{
+  std::ostringstream payload;
+  payload << "{\"buffer_object_id\":" << object_id(buffer)
+          << ",\"aligned_buffer_offset\":" << aligned_buffer_offset
+          << ",\"operation\":" << operation
+          << "}";
+  const void *refs[] = {command_list, buffer};
+  return record_call("ID3D12GraphicsCommandList::SetPredication", payload.str().c_str(), refs, 2);
+}
+
+std::uint64_t record_resolve_subresource_region(
+    const void *command_list,
+    const void *dst_resource,
+    std::uint32_t dst_subresource,
+    std::uint32_t dst_x,
+    std::uint32_t dst_y,
+    const void *src_resource,
+    std::uint32_t src_subresource,
+    const void *src_rect,
+    std::uint32_t format,
+    std::uint32_t mode)
+{
+  const auto *typed_src_rect = static_cast<const D3D12_RECT *>(src_rect);
+  std::ostringstream payload;
+  payload << "{\"dst_resource_object_id\":" << object_id(dst_resource)
+          << ",\"dst_subresource\":" << dst_subresource
+          << ",\"dst_x\":" << dst_x
+          << ",\"dst_y\":" << dst_y
+          << ",\"src_resource_object_id\":" << object_id(src_resource)
+          << ",\"src_subresource\":" << src_subresource
+          << ",\"src_rect\":";
+  if (typed_src_rect) {
+    append_rect_json(payload, *typed_src_rect);
+  } else {
+    payload << "null";
+  }
+  payload << ",\"format\":" << format
+          << ",\"mode\":" << mode
+          << "}";
+  const void *refs[] = {command_list, dst_resource, src_resource};
+  return record_call("ID3D12GraphicsCommandList::ResolveSubresourceRegion", payload.str().c_str(), refs, 3);
+}
+
+std::uint64_t record_write_buffer_immediate(
+    const void *command_list,
+    std::uint32_t count,
+    const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER *parameters,
+    const void *modes)
+{
+  const auto *typed_modes = static_cast<const D3D12_WRITEBUFFERIMMEDIATE_MODE *>(modes);
+  std::ostringstream payload;
+  payload << "{\"count\":" << count << ",\"writes\":[";
+  for (std::uint32_t index = 0; parameters && index < count; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    payload << "{";
+    append_gpu_virtual_address_binding_json(payload, "dest", parameters[index].Dest);
+    payload << ",\"value\":" << parameters[index].Value
+            << ",\"mode\":";
+    if (typed_modes) {
+      payload << static_cast<unsigned int>(typed_modes[index]);
+    } else {
+      payload << "null";
+    }
+    payload << "}";
+  }
+  payload << "]}";
+  const void *refs[] = {command_list};
+  return record_call("ID3D12GraphicsCommandList2::WriteBufferImmediate", payload.str().c_str(), refs, 1);
+}
+
+std::uint64_t record_begin_render_pass(
+    const void *command_list,
+    std::uint32_t render_targets_count,
+    const RenderPassRenderTargetDesc *render_targets,
+    const RenderPassDepthStencilDesc *depth_stencil,
+    std::uint32_t flags)
+{
+  std::vector<const void *> refs = {command_list};
+  std::ostringstream payload;
+  payload << "{\"render_targets_count\":" << render_targets_count
+          << ",\"render_targets\":[";
+  for (std::uint32_t index = 0; render_targets && index < render_targets_count; ++index) {
+    if (index) {
+      payload << ",";
+    }
+    payload << render_pass_render_target_json(render_targets[index], refs);
+  }
+  payload << "],\"has_depth_stencil\":" << (depth_stencil ? "true" : "false")
+          << ",\"depth_stencil\":";
+  if (depth_stencil) {
+    payload << render_pass_depth_stencil_json(*depth_stencil, refs);
+  } else {
+    payload << "null";
+  }
+  payload << ",\"flags\":" << flags
+          << "}";
+  return record_call("ID3D12GraphicsCommandList4::BeginRenderPass", payload.str().c_str(), refs.data(), refs.size());
+}
+
+std::uint64_t record_end_render_pass(const void *command_list)
+{
+  const void *refs[] = {command_list};
+  return record_call("ID3D12GraphicsCommandList4::EndRenderPass", "{}", refs, 1);
+}
+
+std::uint64_t record_temporal_upscale(
+    const void *command_list,
+    std::uint32_t input_content_width,
+    std::uint32_t input_content_height,
+    bool auto_exposure,
+    bool in_reset,
+    bool depth_reversed,
+    bool motion_vector_in_display_res,
+    const void *color,
+    const void *depth,
+    const void *motion_vector,
+    const void *output,
+    float motion_vector_scale_x,
+    float motion_vector_scale_y,
+    float pre_exposure,
+    const void *exposure_texture,
+    float jitter_offset_x,
+    float jitter_offset_y)
+{
+  std::ostringstream payload;
+  payload << "{\"input_content_width\":" << input_content_width
+          << ",\"input_content_height\":" << input_content_height
+          << ",\"auto_exposure\":" << (auto_exposure ? "true" : "false")
+          << ",\"in_reset\":" << (in_reset ? "true" : "false")
+          << ",\"depth_reversed\":" << (depth_reversed ? "true" : "false")
+          << ",\"motion_vector_in_display_res\":" << (motion_vector_in_display_res ? "true" : "false")
+          << ",\"color_object_id\":" << object_id(color)
+          << ",\"depth_object_id\":" << object_id(depth)
+          << ",\"motion_vector_object_id\":" << object_id(motion_vector)
+          << ",\"output_object_id\":" << object_id(output)
+          << ",\"motion_vector_scale_x\":" << motion_vector_scale_x
+          << ",\"motion_vector_scale_y\":" << motion_vector_scale_y
+          << ",\"pre_exposure\":" << pre_exposure
+          << ",\"exposure_texture_object_id\":" << object_id(exposure_texture)
+          << ",\"jitter_offset_x\":" << jitter_offset_x
+          << ",\"jitter_offset_y\":" << jitter_offset_y
+          << "}";
+  const void *refs[] = {command_list, color, depth, motion_vector, output, exposure_texture};
+  return record_call("ID3D12GraphicsCommandListExt::TemporalUpscale", payload.str().c_str(), refs, 6);
 }
 
 } // namespace apitrace::d3d12

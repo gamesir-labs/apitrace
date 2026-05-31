@@ -70,6 +70,29 @@ int main(int argc, char **argv)
         return 6;
     }
 
+#ifdef __APPLE__
+    void *h_metal = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_NOW);
+    if (h_metal) {
+        using PFN_void_ptr = void *(*)();
+        auto p_MTLCopyAllDevices = resolve<PFN_void_ptr>(h_metal, "MTLCopyAllDevices");
+        auto p_MTLCreateSystemDefaultDevice = resolve<PFN_void_ptr>(h_metal, "MTLCreateSystemDefaultDevice");
+        void *metal_devices = p_MTLCopyAllDevices ? p_MTLCopyAllDevices() : nullptr;
+        void *default_device = p_MTLCreateSystemDefaultDevice ? p_MTLCreateSystemDefaultDevice() : nullptr;
+        std::fprintf(stderr, "[abi-smoke] MTLCopyAllDevices=%p MTLCreateSystemDefaultDevice=%p\n",
+                     metal_devices, default_device);
+    } else {
+        std::fprintf(stderr, "[abi-smoke] dlopen(Metal.framework) failed: %s\n", dlerror());
+    }
+    using PFN_WMTCopyAllDevices_t = void *(*)();
+    using PFN_NSArrayCount_t = std::uint64_t (*)(void *);
+    auto p_WMTCopyAllDevices = resolve<PFN_WMTCopyAllDevices_t>(h_winemetal, "WMTCopyAllDevices");
+    auto p_NSArray_count = resolve<PFN_NSArrayCount_t>(h_winemetal, "NSArray_count");
+    void *wmt_devices = p_WMTCopyAllDevices ? p_WMTCopyAllDevices() : nullptr;
+    std::uint64_t wmt_count = (p_NSArray_count && wmt_devices) ? p_NSArray_count(wmt_devices) : 0;
+    std::fprintf(stderr, "[abi-smoke] WMTCopyAllDevices=%p NSArray_count=%llu\n",
+                 wmt_devices, static_cast<unsigned long long>(wmt_count));
+#endif
+
     IDXGIFactory1 *factory = nullptr;
     HRESULT hr = p_CreateDXGIFactory1(IID_IDXGIFactory1, reinterpret_cast<void **>(&factory));
     if (hr != 0 || !factory) {
@@ -87,6 +110,11 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "[abi-smoke] adapter desc VendorId=0x%x DeviceId=0x%x\n",
                      desc.VendorId, desc.DeviceId);
         probe_adapter->Release();
+    }
+    if (hr_probe == DXGI_ERROR_NOT_FOUND) {
+        std::printf("ABI_SMOKE_SKIP no Metal-backed DXGI adapter is available in this process\n");
+        factory->Release();
+        return 0;
     }
 
     ID3D12Device *device = nullptr;

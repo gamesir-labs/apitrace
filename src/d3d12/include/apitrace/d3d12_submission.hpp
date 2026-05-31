@@ -24,6 +24,7 @@ struct D3D12SubmissionBatch {
   std::uint64_t execute_sequence = 0;
   std::uint64_t fence_sequence = 0;
   std::uint64_t present_sequence = 0;
+  std::uint64_t present_frame_index = 0;
   std::uint64_t fence_value = 0;
   bool presented = false;
 };
@@ -49,7 +50,7 @@ public:
       trace::ObjectId fence_object_id,
       std::uint64_t fence_value,
       std::uint64_t sequence = 0);
-  void mark_present(std::uint64_t sequence = 0);
+  void mark_present(std::uint64_t sequence = 0, std::uint64_t frame_index = 0);
   void end_batch();
   void clear();
 
