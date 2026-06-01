@@ -25,6 +25,7 @@ trace::MetalEventRecord to_event_record(const MetalTraceRecord &record, std::uin
     event.function_name = "Metal.translatedCall";
   }
   event.payload = record.translation_link_payload.empty() ? std::string("{}") : record.translation_link_payload;
+  event.payload_refs_scanned = record.payload_refs_scanned;
   return event;
 }
 

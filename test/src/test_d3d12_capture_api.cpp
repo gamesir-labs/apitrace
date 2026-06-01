@@ -108,12 +108,25 @@ int main(int argc, char **argv)
   auto *swapchain = fake_object(0x3000);
   auto *second_swapchain = fake_object(0x4000);
   auto *descriptor_heap = fake_object(0x4500);
+  auto *command_list = fake_object(0x7000);
+  auto *copy_src = fake_object(0x7600);
+  auto *copy_dst = fake_object(0x7800);
 
-  if (apitrace::d3d12::record_d3d12_create_device(device) == 0 ||
-      apitrace::d3d12::record_dxgi_create_swapchain(factory, device, swapchain) == 0 ||
-      apitrace::d3d12::record_dxgi_create_swapchain(factory, device, second_swapchain) == 0 ||
-      apitrace::d3d12::record_present(swapchain, 1, 0) == 0 ||
-      apitrace::d3d12::record_present(second_swapchain, 0, 2) == 0) {
+  const auto device_sequence = apitrace::d3d12::record_d3d12_create_device(device);
+  const auto swapchain_sequence =
+      apitrace::d3d12::record_dxgi_create_swapchain(factory, device, swapchain);
+  const auto second_swapchain_sequence =
+      apitrace::d3d12::record_dxgi_create_swapchain(factory, device, second_swapchain);
+  const auto test_present_frame =
+      apitrace::d3d12::record_present(swapchain, 1, DXGI_PRESENT_TEST);
+  const auto first_present_frame = apitrace::d3d12::record_present(swapchain, 1, 0);
+  const auto second_present_frame = apitrace::d3d12::record_present(second_swapchain, 0, 2);
+  if (device_sequence == 0 ||
+      swapchain_sequence == 0 ||
+      second_swapchain_sequence == 0 ||
+      test_present_frame != UINT64_MAX ||
+      first_present_frame != 0 ||
+      second_present_frame != 1) {
     std::cerr << "failed to record d3d12 capture api calls\n";
     clear_trace_bundle_env();
     apitrace::runtime::shutdown_process_trace_session();
@@ -137,6 +150,68 @@ int main(int argc, char **argv)
     apitrace::runtime::shutdown_process_trace_session();
     return 1;
   }
+
+  apitrace::d3d12::record_object_create(
+      command_list,
+      apitrace::d3d12::CaptureObjectKind::CommandList,
+      device,
+      "ID3D12GraphicsCommandList");
+  D3D12_HEAP_PROPERTIES default_heap_properties = {};
+  default_heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC texture_desc = {};
+  texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  texture_desc.Width = 64;
+  texture_desc.Height = 32;
+  texture_desc.DepthOrArraySize = 1;
+  texture_desc.MipLevels = 1;
+  texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  texture_desc.SampleDesc.Count = 1;
+  texture_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  if (apitrace::d3d12::record_create_committed_resource(
+          static_cast<ID3D12Device *>(device),
+          &default_heap_properties,
+          D3D12_HEAP_FLAG_NONE,
+          &texture_desc,
+          D3D12_RESOURCE_STATE_COPY_SOURCE,
+          nullptr,
+          copy_src,
+          0,
+          S_OK) == 0 ||
+      apitrace::d3d12::record_create_committed_resource(
+          static_cast<ID3D12Device *>(device),
+          &default_heap_properties,
+          D3D12_HEAP_FLAG_NONE,
+          &texture_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST,
+          nullptr,
+          copy_dst,
+          0,
+          S_OK) == 0) {
+    std::cerr << "failed to record texture resources for batch commands\n";
+    clear_trace_bundle_env();
+    apitrace::runtime::shutdown_process_trace_session();
+    return 1;
+  }
+  D3D12_RESOURCE_BARRIER barriers[2] = {};
+  barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barriers[0].Transition.pResource = static_cast<ID3D12Resource *>(copy_src);
+  barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+  barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  barriers[1].UAV.pResource = static_cast<ID3D12Resource *>(copy_dst);
+  D3D12_TEXTURE_COPY_LOCATION copy_location_src = {};
+  copy_location_src.pResource = static_cast<ID3D12Resource *>(copy_src);
+  copy_location_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  copy_location_src.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION copy_location_dst = {};
+  copy_location_dst.pResource = static_cast<ID3D12Resource *>(copy_dst);
+  copy_location_dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  copy_location_dst.SubresourceIndex = 0;
+  D3D12_BOX copy_box = {1, 2, 0, 16, 18, 1};
+  apitrace::d3d12::record_resource_barrier(command_list, 2, barriers);
+  apitrace::d3d12::record_copy_texture_region(
+      command_list, &copy_location_dst, 4, 5, 0, &copy_location_src, &copy_box);
 
   D3D12_DESCRIPTOR_RANGE root_descriptor_range = {};
   root_descriptor_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -258,7 +333,6 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  const auto *command_list = fake_object(0x7000);
   const auto *resolve_src = fake_object(0x8000);
   const auto *resolve_dst = fake_object(0x9000);
   const auto *query_heap = fake_object(0xc000);
@@ -299,13 +373,8 @@ int main(int argc, char **argv)
     StreamSubobject<void *, PipelineStateSubobjectType::RootSignature> root_signature;
     StreamSubobject<D3D12_SHADER_BYTECODE, PipelineStateSubobjectType::CS> compute_shader;
   } compute_stream = {};
-  compute_stream.root_signature.data = fake_object(0xd000);
+  compute_stream.root_signature.data = captured_root_signature;
   compute_stream.compute_shader.data = {shader_bytes, sizeof(shader_bytes)};
-  apitrace::d3d12::record_object_create(
-      compute_stream.root_signature.data,
-      apitrace::d3d12::CaptureObjectKind::RootSignature,
-      device,
-      "ID3D12RootSignature");
   if (apitrace::d3d12::record_create_pipeline_state(
           static_cast<ID3D12Device *>(device),
           &compute_stream,
@@ -399,10 +468,10 @@ int main(int argc, char **argv)
       !has_call(reader, "ID3D12Device::CreateDescriptorHeap") ||
       !has_call(reader, "ID3D12Device::CreateRootSignature") ||
       !has_call(reader, "ID3D12Device::CreateCommittedResource") ||
-      !has_call(reader, "ID3D12Device::CopyDescriptors") ||
-      !has_call(reader, "ID3D12Device::CreateConstantBufferView") ||
-      !has_call(reader, "ID3D12Device::CreateShaderResourceView") ||
-      !has_call(reader, "ID3D12Device::CreateUnorderedAccessView") ||
+      !has_call(reader, "ID3D12Device::CopyDescriptorsBatch") ||
+      !has_call(reader, "ID3D12Device::CreateDescriptorViewBatch") ||
+      !has_call(reader, "ID3D12GraphicsCommandList::ResourceBarrierBatch") ||
+      !has_call(reader, "ID3D12GraphicsCommandList::CopyTextureRegionBatch") ||
       !has_call(reader, "ID3D12Device::CreateQueryHeap") ||
       !has_call(reader, "ID3D12Device2::CreatePipelineState") ||
       !has_call(reader, "ID3D12GraphicsCommandList::BeginQuery") ||
@@ -532,53 +601,110 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  const auto *copy_event = find_call(reader, "ID3D12Device::CopyDescriptors");
+  const auto *copy_event = find_call(reader, "ID3D12Device::CopyDescriptorsBatch");
   const auto payload = nlohmann::json::parse(copy_event->payload, nullptr, false);
   if (payload.is_discarded() ||
-      !payload.contains("descriptors") ||
-      payload["descriptors"].size() != 2 ||
-      payload["descriptors"][0].value("dst_descriptor", 0ull) != 0x4000 ||
-      payload["descriptors"][0].value("src_descriptor", 0ull) != 0x5000 ||
-      payload["descriptors"][1].value("dst_descriptor", 0ull) != 0x4020 ||
-      payload["descriptors"][1].value("src_descriptor", 0ull) != 0x6000) {
-    std::cerr << "CopyDescriptors null source range sizes were not expanded correctly\n";
+      payload.value("schema", "") != "copy-descriptors-v2" ||
+      payload.value("op_count", 0) != 1 ||
+      !payload.contains("ops") ||
+      payload["ops"].size() != 1 ||
+      payload["ops"][0].size() < 6 ||
+      payload["ops"][0][1].get<std::uint32_t>() != 0 ||
+      payload["ops"][0][2].get<std::uint32_t>() != 32 ||
+      payload["ops"][0][3].get<std::uint32_t>() != 1 ||
+      payload["ops"][0][4].get<std::uint32_t>() != 2 ||
+      payload["ops"][0][5].size() != 2 ||
+      payload["ops"][0][5][0][0].get<std::uint64_t>() != 0x4000 ||
+      payload["ops"][0][5][0][1].get<std::uint64_t>() != 0x5000 ||
+      payload["ops"][0][5][0][2].get<std::uint32_t>() != 1 ||
+      payload["ops"][0][5][1][0].get<std::uint64_t>() != 0x4020 ||
+      payload["ops"][0][5][1][1].get<std::uint64_t>() != 0x6000 ||
+      payload["ops"][0][5][1][2].get<std::uint32_t>() != 1 ||
+      copy_event->object_refs.size() != 1) {
+    std::cerr << "CopyDescriptorsBatch null source range sizes were not preserved correctly\n";
     return 1;
   }
 
-  const auto *srv_event = find_call(reader, "ID3D12Device::CreateShaderResourceView");
-  const auto srv_payload = nlohmann::json::parse(srv_event->payload, nullptr, false);
-  if (srv_payload.is_discarded() ||
-      srv_payload.value("descriptor", 0ull) != 0x7000 ||
-      !srv_payload.contains("view") ||
-      !srv_payload["view"].is_null() ||
-      srv_event->object_refs.size() != 2) {
-    std::cerr << "CreateShaderResourceView did not preserve null view metadata\n";
+  const auto *view_batch_event = find_call(reader, "ID3D12Device::CreateDescriptorViewBatch");
+  const auto view_batch_payload = nlohmann::json::parse(view_batch_event->payload, nullptr, false);
+  if (view_batch_payload.is_discarded() ||
+      view_batch_payload.value("op_count", 0) != 3 ||
+      !view_batch_payload.contains("ops") ||
+      view_batch_payload["ops"].size() != 3 ||
+      view_batch_event->object_refs.size() != 3) {
+    std::cerr << "CreateDescriptorViewBatch did not preserve descriptor view ops\n";
     return 1;
   }
-  const auto *cbv_event = find_call(reader, "ID3D12Device::CreateConstantBufferView");
-  const auto cbv_payload = nlohmann::json::parse(cbv_event->payload, nullptr, false);
-  if (cbv_payload.is_discarded() ||
-      cbv_payload.value("descriptor", 0ull) != 0x7040 ||
-      cbv_payload.value("buffer_location", 0ull) != 0x100100 ||
-      cbv_payload.value("size_in_bytes", 0ull) != 256 ||
-      cbv_payload.value("gpuva_resolve_status", "") != "mapped" ||
-      cbv_payload.value("resolved_resource_object_id", 0ull) !=
+  const auto &srv_op = view_batch_payload["ops"][0];
+  if (srv_op.size() < 16 ||
+      srv_op[1].get<int>() != 2 ||
+      srv_op[2].get<std::uint64_t>() != 0x7000 ||
+      !srv_op[15].is_null()) {
+    std::cerr << "CreateDescriptorViewBatch did not preserve null SRV metadata\n";
+    return 1;
+  }
+  const auto &uav_op = view_batch_payload["ops"][1];
+  if (uav_op.size() < 16 ||
+      uav_op[1].get<int>() != 3 ||
+      uav_op[2].get<std::uint64_t>() != 0x7020 ||
+      uav_op[4].get<std::uint64_t>() != 0 ||
+      !uav_op[15].is_null()) {
+    std::cerr << "CreateDescriptorViewBatch did not preserve null UAV metadata\n";
+    return 1;
+  }
+  const auto &cbv_op = view_batch_payload["ops"][2];
+  if (cbv_op.size() < 16 ||
+      cbv_op[1].get<int>() != 1 ||
+      cbv_op[2].get<std::uint64_t>() != 0x7040 ||
+      cbv_op[9].get<std::uint64_t>() != 0x100100 ||
+      cbv_op[10].get<std::uint64_t>() != 256 ||
+      cbv_op[11].get<std::string>() != "mapped" ||
+      cbv_op[12].get<std::uint64_t>() !=
           static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(constant_buffer_resource)) ||
-      cbv_payload.value("resolved_resource_offset", 0ull) != 0x100 ||
-      cbv_payload.value("resolved_resource_width", 0ull) != 4096 ||
-      cbv_event->object_refs.size() != 2) {
-    std::cerr << "CreateConstantBufferView did not preserve GPUVA resolve metadata\n";
+      cbv_op[13].get<std::uint64_t>() != 0x100 ||
+      cbv_op[14].get<std::uint64_t>() != 4096 ||
+      !cbv_op[15].is_null()) {
+    std::cerr << "CreateDescriptorViewBatch did not preserve CBV GPUVA resolve metadata\n";
     return 1;
   }
-  const auto *uav_event = find_call(reader, "ID3D12Device::CreateUnorderedAccessView");
-  const auto uav_payload = nlohmann::json::parse(uav_event->payload, nullptr, false);
-  if (uav_payload.is_discarded() ||
-      uav_payload.value("descriptor", 0ull) != 0x7020 ||
-      uav_payload.value("counter_resource_object_id", UINT64_MAX) != 0 ||
-      !uav_payload.contains("view") ||
-      !uav_payload["view"].is_null() ||
-      uav_event->object_refs.size() != 2) {
-    std::cerr << "CreateUnorderedAccessView did not preserve null view metadata\n";
+
+  const auto *barrier_batch_event = find_call(reader, "ID3D12GraphicsCommandList::ResourceBarrierBatch");
+  const auto barrier_batch_payload = nlohmann::json::parse(barrier_batch_event->payload, nullptr, false);
+  if (barrier_batch_payload.is_discarded() ||
+      barrier_batch_payload.value("schema", "") != "resource-barrier-v2" ||
+      barrier_batch_payload.value("barrier_count", 0) != 2 ||
+      !barrier_batch_payload.contains("barriers") ||
+      barrier_batch_payload["barriers"].size() != 2 ||
+      barrier_batch_payload["barriers"][0].size() < 9 ||
+      barrier_batch_payload["barriers"][0][1].get<std::uint32_t>() != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
+      barrier_batch_payload["barriers"][0][3].get<std::uint64_t>() !=
+          static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(copy_src)) ||
+      barrier_batch_payload["barriers"][0][4].get<std::uint32_t>() != D3D12_RESOURCE_STATE_COPY_SOURCE ||
+      barrier_batch_payload["barriers"][0][5].get<std::uint32_t>() != D3D12_RESOURCE_STATE_COPY_DEST ||
+      barrier_batch_payload["barriers"][1][1].get<std::uint32_t>() != D3D12_RESOURCE_BARRIER_TYPE_UAV ||
+      barrier_batch_payload["barriers"][1][3].get<std::uint64_t>() !=
+          static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(copy_dst))) {
+    std::cerr << "ResourceBarrierBatch did not preserve compact barrier metadata\n";
+    return 1;
+  }
+
+  const auto *copy_texture_batch_event = find_call(reader, "ID3D12GraphicsCommandList::CopyTextureRegionBatch");
+  const auto copy_texture_batch_payload = nlohmann::json::parse(copy_texture_batch_event->payload, nullptr, false);
+  if (copy_texture_batch_payload.is_discarded() ||
+      copy_texture_batch_payload.value("schema", "") != "copy-texture-region-v2" ||
+      copy_texture_batch_payload.value("op_count", 0) != 1 ||
+      !copy_texture_batch_payload.contains("ops") ||
+      copy_texture_batch_payload["ops"].size() != 1 ||
+      copy_texture_batch_payload["ops"][0].size() < 7 ||
+      copy_texture_batch_payload["ops"][0][1][0].get<std::uint64_t>() !=
+          static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(copy_dst)) ||
+      copy_texture_batch_payload["ops"][0][2].get<std::uint32_t>() != 4 ||
+      copy_texture_batch_payload["ops"][0][3].get<std::uint32_t>() != 5 ||
+      copy_texture_batch_payload["ops"][0][5][0].get<std::uint64_t>() !=
+          static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(copy_src)) ||
+      copy_texture_batch_payload["ops"][0][6][0].get<std::uint32_t>() != 1 ||
+      copy_texture_batch_payload["ops"][0][6][3].get<std::uint32_t>() != 16) {
+    std::cerr << "CopyTextureRegionBatch did not preserve compact copy metadata\n";
     return 1;
   }
 
@@ -605,21 +731,35 @@ int main(int argc, char **argv)
   }
 
   std::uint64_t expected_present_frame_index = 0;
+  std::uint64_t present_call_count = 0;
+  std::uint64_t present_test_count = 0;
   for (const auto &event : reader.events()) {
     if (event.kind != apitrace::trace::EventKind::Call ||
         event.callsite.function_name != "IDXGISwapChain::Present") {
       continue;
     }
+    ++present_call_count;
     const auto present_payload = nlohmann::json::parse(event.payload, nullptr, false);
-    if (present_payload.is_discarded() ||
-        present_payload.value("frame_index", UINT64_MAX) != expected_present_frame_index) {
+    if (present_payload.is_discarded()) {
+      std::cerr << "Present payload was not valid JSON\n";
+      return 1;
+    }
+    if (present_payload.value("present_test", false)) {
+      if (present_payload.contains("frame_index")) {
+        std::cerr << "test Present should not consume a frame_index\n";
+        return 1;
+      }
+      ++present_test_count;
+      continue;
+    }
+    if (present_payload.value("frame_index", UINT64_MAX) != expected_present_frame_index) {
       std::cerr << "Present frame_index was not globally contiguous\n";
       return 1;
     }
     ++expected_present_frame_index;
   }
-  if (expected_present_frame_index != 2) {
-    std::cerr << "capture api did not record both Present calls\n";
+  if (present_call_count != 3 || present_test_count != 1 || expected_present_frame_index != 2) {
+    std::cerr << "capture api did not preserve test Present while keeping frame indexes real-present only\n";
     return 1;
   }
 

@@ -444,6 +444,7 @@ bool D3D12ReplayBackend::index_present_frames(const trace::TraceBundleReader &re
 
 bool D3D12ReplayBackend::index_present_semantics(const trace::TraceBundleReader &reader)
 {
+  constexpr std::uint32_t kDxgiPresentTest = 0x1;
   std::uint64_t present_index = 0;
   for (const auto &event : reader.events()) {
     if (event.kind != trace::EventKind::Call || event.callsite.function_name != "IDXGISwapChain::Present") {
@@ -457,6 +458,11 @@ bool D3D12ReplayBackend::index_present_semantics(const trace::TraceBundleReader 
     if (!require_payload_key(event, payload, "sync_interval", last_error_) ||
         !require_payload_key(event, payload, "flags", last_error_)) {
       return false;
+    }
+    const auto flags = payload_u32(payload, "flags");
+    const auto present_test = payload.value("present_test", false) || ((flags & kDxgiPresentTest) != 0);
+    if (present_test && !payload.contains("frame_index")) {
+      continue;
     }
 
     if (!require_payload_key(event, payload, "frame_index", last_error_)) {
@@ -475,7 +481,7 @@ bool D3D12ReplayBackend::index_present_semantics(const trace::TraceBundleReader 
     semantic.frame_index = frame_index;
     semantic.call_sequence = event.callsite.sequence;
     semantic.sync_interval = payload_u32(payload, "sync_interval");
-    semantic.flags = payload_u32(payload, "flags");
+    semantic.flags = flags;
     semantic.result_code = event.callsite.result_code;
     semantic.has_call = true;
     ++present_index;
@@ -2221,4 +2227,3 @@ bool D3D12ReplayBackend::validate_only()
 {
   return validate_replay_closure() && validate_native_replay_readiness();
 }
-

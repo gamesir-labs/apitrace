@@ -18,6 +18,24 @@
 
 typedef struct apitrace_metal_session apitrace_metal_session_t;
 
+typedef struct apitrace_metal_copy_texture_op {
+  uint64_t source_texture_id;
+  uint64_t destination_texture_id;
+  uint64_t source_origin_x;
+  uint64_t source_origin_y;
+  uint64_t source_origin_z;
+  uint64_t source_size_width;
+  uint64_t source_size_height;
+  uint64_t source_size_depth;
+  uint32_t source_slice;
+  uint32_t source_level;
+  uint64_t destination_origin_x;
+  uint64_t destination_origin_y;
+  uint64_t destination_origin_z;
+  uint32_t destination_slice;
+  uint32_t destination_level;
+} apitrace_metal_copy_texture_op_t;
+
 typedef enum {
   APITRACE_METAL_SCOPE_COMMAND_BUFFER = 1,
   APITRACE_METAL_SCOPE_ENCODER = 2,
@@ -26,6 +44,7 @@ typedef enum {
 
 APITRACE_METAL_API apitrace_metal_session_t *apitrace_metal_session_open(const char *bundle_root);
 APITRACE_METAL_API void apitrace_metal_session_close(apitrace_metal_session_t *session);
+APITRACE_METAL_API void apitrace_metal_session_seal_checkpoint(apitrace_metal_session_t *session);
 APITRACE_METAL_API void apitrace_metal_set_current_d3d_sequence(apitrace_metal_session_t *session, uint64_t d3d_seq);
 APITRACE_METAL_API uint64_t apitrace_metal_current_metal_sequence(apitrace_metal_session_t *session);
 
@@ -69,6 +88,52 @@ APITRACE_METAL_API void apitrace_metal_blit_encoder_batch(
     uint64_t encoder_object_id,
     uint64_t command_buffer_object_id,
     const char *payload_json);
+APITRACE_METAL_API void apitrace_metal_blit_encoder_batch_with_command_buffer(
+    apitrace_metal_session_t *session,
+    uint64_t encoder_object_id,
+    uint64_t command_buffer_object_id,
+    const char *payload_json);
+APITRACE_METAL_API void apitrace_metal_blit_encoder_fence_batch(
+    apitrace_metal_session_t *session,
+    uint64_t encoder_object_id,
+    uint64_t command_buffer_object_id,
+    const uint64_t *wait_fences,
+    uint32_t wait_fence_count,
+    const uint64_t *update_fences,
+    uint32_t update_fence_count);
+APITRACE_METAL_API void apitrace_metal_blit_encoder_copy_texture_batch(
+    apitrace_metal_session_t *session,
+    uint64_t encoder_object_id,
+    uint64_t command_buffer_object_id,
+    uint64_t source_texture_id,
+    uint64_t destination_texture_id,
+    uint64_t source_origin_x,
+    uint64_t source_origin_y,
+    uint64_t source_origin_z,
+    uint64_t source_size_width,
+    uint64_t source_size_height,
+    uint64_t source_size_depth,
+    uint32_t source_slice,
+    uint32_t source_level,
+    uint64_t destination_origin_x,
+    uint64_t destination_origin_y,
+    uint64_t destination_origin_z,
+    uint32_t destination_slice,
+    uint32_t destination_level,
+    const uint64_t *wait_fences,
+    uint32_t wait_fence_count,
+    const uint64_t *update_fences,
+    uint32_t update_fence_count);
+APITRACE_METAL_API void apitrace_metal_blit_encoder_copy_texture_ops_batch(
+    apitrace_metal_session_t *session,
+    uint64_t encoder_object_id,
+    uint64_t command_buffer_object_id,
+    const apitrace_metal_copy_texture_op_t *copy_ops,
+    uint32_t copy_op_count,
+    const uint64_t *wait_fences,
+    uint32_t wait_fence_count,
+    const uint64_t *update_fences,
+    uint32_t update_fence_count);
 
 APITRACE_METAL_API void apitrace_metal_set_render_pipeline_state(
     apitrace_metal_session_t *session,
@@ -80,6 +145,14 @@ APITRACE_METAL_API void apitrace_metal_set_vertex_buffer(
     uint64_t buffer_object_id,
     uint64_t offset,
     uint32_t index);
+APITRACE_METAL_API void apitrace_metal_set_vertex_buffer_with_contents(
+    apitrace_metal_session_t *session,
+    uint64_t encoder_id,
+    uint64_t buffer_object_id,
+    uint64_t offset,
+    uint32_t index,
+    const void *bytes,
+    uint64_t bytes_size);
 APITRACE_METAL_API void apitrace_metal_set_vertex_texture(
     apitrace_metal_session_t *session,
     uint64_t encoder_id,
@@ -96,6 +169,14 @@ APITRACE_METAL_API void apitrace_metal_set_fragment_buffer(
     uint64_t buffer_object_id,
     uint64_t offset,
     uint32_t index);
+APITRACE_METAL_API void apitrace_metal_set_fragment_buffer_with_contents(
+    apitrace_metal_session_t *session,
+    uint64_t encoder_id,
+    uint64_t buffer_object_id,
+    uint64_t offset,
+    uint32_t index,
+    const void *bytes,
+    uint64_t bytes_size);
 APITRACE_METAL_API void apitrace_metal_set_fragment_texture(
     apitrace_metal_session_t *session,
     uint64_t encoder_id,
@@ -137,6 +218,14 @@ APITRACE_METAL_API void apitrace_metal_set_compute_buffer(
     uint64_t buffer_object_id,
     uint64_t offset,
     uint32_t index);
+APITRACE_METAL_API void apitrace_metal_set_compute_buffer_with_contents(
+    apitrace_metal_session_t *session,
+    uint64_t encoder_id,
+    uint64_t buffer_object_id,
+    uint64_t offset,
+    uint32_t index,
+    const void *bytes,
+    uint64_t bytes_size);
 APITRACE_METAL_API void apitrace_metal_set_compute_texture(
     apitrace_metal_session_t *session,
     uint64_t encoder_id,
@@ -209,6 +298,13 @@ APITRACE_METAL_API void apitrace_metal_blit_batch(
     apitrace_metal_session_t *session,
     uint64_t encoder_id,
     const char *payload_json);
+APITRACE_METAL_API void apitrace_metal_blit_fence_batch(
+    apitrace_metal_session_t *session,
+    uint64_t encoder_id,
+    const uint64_t *wait_fences,
+    uint32_t wait_fence_count,
+    const uint64_t *update_fences,
+    uint32_t update_fence_count);
 APITRACE_METAL_API void apitrace_metal_copy_buffer(
     apitrace_metal_session_t *session,
     uint64_t encoder_id,
@@ -282,6 +378,11 @@ APITRACE_METAL_API void apitrace_metal_dispatch_threads(
     apitrace_metal_session_t *session,
     uint64_t encoder_id,
     const char *payload_json);
+APITRACE_METAL_API void apitrace_metal_dispatch_threads_per_tile(
+    apitrace_metal_session_t *session,
+    uint64_t encoder_id,
+    uint32_t width,
+    uint32_t height);
 APITRACE_METAL_API void apitrace_metal_memory_barrier(
     apitrace_metal_session_t *session,
     uint64_t encoder_id,
@@ -306,6 +407,7 @@ APITRACE_METAL_API void apitrace_metal_present_drawable(
     apitrace_metal_session_t *session,
     uint64_t command_buffer_id,
     uint64_t drawable_id,
+    uint64_t texture_id,
     uint64_t frame_index,
     uint32_t width,
     uint32_t height,
@@ -334,9 +436,22 @@ APITRACE_METAL_API uint64_t apitrace_metal_register_buffer(
     uint32_t storage_mode,
     const void *initial_bytes,
     uint64_t initial_bytes_size);
+APITRACE_METAL_API void apitrace_metal_update_buffer_contents(
+    apitrace_metal_session_t *session,
+    uint64_t object_id,
+    uint64_t offset,
+    uint64_t length,
+    uint32_t storage_mode,
+    const void *bytes,
+    uint64_t bytes_size);
 APITRACE_METAL_API uint64_t apitrace_metal_register_texture(
     apitrace_metal_session_t *session,
     uint64_t object_id,
+    const char *descriptor_json);
+APITRACE_METAL_API uint64_t apitrace_metal_register_drawable_texture(
+    apitrace_metal_session_t *session,
+    uint64_t object_id,
+    uint64_t drawable_id,
     const char *descriptor_json);
 APITRACE_METAL_API uint64_t apitrace_metal_register_library(
     apitrace_metal_session_t *session,
@@ -349,6 +464,18 @@ APITRACE_METAL_API uint64_t apitrace_metal_register_render_pipeline(
     const char *descriptor_json,
     uint64_t vs_function_id,
     uint64_t fs_function_id);
+APITRACE_METAL_API uint64_t apitrace_metal_register_mesh_render_pipeline(
+    apitrace_metal_session_t *session,
+    uint64_t object_id,
+    const char *descriptor_json,
+    uint64_t object_function_id,
+    uint64_t mesh_function_id,
+    uint64_t fragment_function_id);
+APITRACE_METAL_API uint64_t apitrace_metal_register_tile_render_pipeline(
+    apitrace_metal_session_t *session,
+    uint64_t object_id,
+    const char *descriptor_json,
+    uint64_t tile_function_id);
 APITRACE_METAL_API uint64_t apitrace_metal_register_compute_pipeline(
     apitrace_metal_session_t *session,
     uint64_t object_id,

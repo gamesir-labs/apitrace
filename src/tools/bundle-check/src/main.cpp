@@ -202,6 +202,8 @@ struct PresentFrameStats {
   std::size_t d3d_present_calls = 0;
   std::size_t d3d_present_boundaries = 0;
   std::size_t d3d_present_frame_assets = 0;
+  std::size_t d3d_present_calls_with_frame_assets = 0;
+  std::size_t d3d_present_boundaries_with_frame_assets = 0;
   std::size_t metal_present_drawables = 0;
   std::size_t metal_present_frame_assets = 0;
 };
@@ -236,6 +238,7 @@ bool is_metal_draw_or_dispatch_call(apitrace::trace::MetalCallKind kind)
   case apitrace::trace::MetalCallKind::DispatchThreadgroups:
   case apitrace::trace::MetalCallKind::DispatchThreadgroupsIndirect:
   case apitrace::trace::MetalCallKind::DispatchThreads:
+  case apitrace::trace::MetalCallKind::DispatchThreadsPerTile:
     return true;
   default:
     return false;
@@ -269,6 +272,10 @@ std::string bundle_hash_from_records(const std::vector<apitrace::trace::Checksum
     bundle_fingerprint_source += record.relative_path.generic_string();
     bundle_fingerprint_source += "=";
     bundle_fingerprint_source += record.digest;
+    if (record.has_byte_size) {
+      bundle_fingerprint_source += "#";
+      bundle_fingerprint_source += std::to_string(record.byte_size);
+    }
     bundle_fingerprint_source += "\n";
   }
   return "sha256:" + apitrace::trace::content_hash_bytes(
@@ -281,7 +288,10 @@ void collect_asset_paths(const json &value, std::vector<std::string> &paths)
   if (value.is_object()) {
     for (const auto &[key, child] : value.items()) {
       if ((ends_with(key, "_path") || key == "path") && child.is_string()) {
-        paths.push_back(child.get<std::string>());
+        const auto path = child.get<std::string>();
+        if (!path.empty()) {
+          paths.push_back(path);
+        }
       }
       collect_asset_paths(child, paths);
     }
@@ -308,7 +318,10 @@ void collect_nested_asset_paths(const json &value, std::vector<std::string> &pat
         const auto path_key = std::string(stage) + "_path";
         const auto path = shader->find(path_key);
         if (path != shader->end() && path->is_string()) {
-          paths.push_back(path->get<std::string>());
+          const auto path_text = path->get<std::string>();
+          if (!path_text.empty()) {
+            paths.push_back(path_text);
+          }
         }
       }
       return;
@@ -316,7 +329,10 @@ void collect_nested_asset_paths(const json &value, std::vector<std::string> &pat
 
     for (const auto &[key, child] : value.items()) {
       if ((ends_with(key, "_path") || key == "path") && child.is_string()) {
-        paths.push_back(child.get<std::string>());
+        const auto path = child.get<std::string>();
+        if (!path.empty()) {
+          paths.push_back(path);
+        }
       }
       collect_nested_asset_paths(child, paths);
     }
@@ -596,15 +612,34 @@ bool verify_metal_render_pipeline_descriptor(
     return false;
   }
   const auto vertex_function = string_from_json(descriptor.value("vertex_function", json(nullptr)));
-  if (vertex_function.empty()) {
+  const auto mesh_function = string_from_json(descriptor.value("mesh_function", json(nullptr)));
+  const auto object_function = string_from_json(descriptor.value("object_function", json(nullptr)));
+  const auto pipeline_kind = string_from_json(descriptor.value("pipeline_kind", json(nullptr)));
+  const bool mesh_render_pipeline = pipeline_kind == "mesh_render" || !mesh_function.empty();
+  if (!mesh_render_pipeline && vertex_function.empty()) {
     error = label + ": render pipeline descriptor missing vertex_function";
     return false;
   }
-  const auto vertex_library_id = json_u64(
-      descriptor.value("vertex_library_id", descriptor.value("library_id", json(nullptr))));
-  if (vertex_library_id == 0 || library_ids.find(vertex_library_id) == library_ids.end()) {
-    error = label + ": render pipeline descriptor references an unknown vertex library";
-    return false;
+  if (mesh_render_pipeline) {
+    const auto object_library_id = json_u64(
+        descriptor.value("object_library_id", descriptor.value("library_id", json(nullptr))));
+    const auto mesh_library_id = json_u64(
+        descriptor.value("mesh_library_id", descriptor.value("library_id", json(nullptr))));
+    if (object_function.empty() || object_library_id == 0 || library_ids.find(object_library_id) == library_ids.end()) {
+      error = label + ": mesh render pipeline descriptor references an unknown object library";
+      return false;
+    }
+    if (mesh_function.empty() || mesh_library_id == 0 || library_ids.find(mesh_library_id) == library_ids.end()) {
+      error = label + ": mesh render pipeline descriptor references an unknown mesh library";
+      return false;
+    }
+  } else {
+    const auto vertex_library_id = json_u64(
+        descriptor.value("vertex_library_id", descriptor.value("library_id", json(nullptr))));
+    if (vertex_library_id == 0 || library_ids.find(vertex_library_id) == library_ids.end()) {
+      error = label + ": render pipeline descriptor references an unknown vertex library";
+      return false;
+    }
   }
   const auto fragment_function = string_from_json(descriptor.value("fragment_function", json(nullptr)));
   if (!fragment_function.empty()) {
@@ -769,6 +804,8 @@ bool validate_metal_render_pass_resources(
   };
 
   bool has_color_texture = false;
+  const auto colors = pass.find("colors");
+  const bool has_color_attachments = colors != pass.end() && colors->is_array() && !colors->empty();
   auto color_texture_id = object_id_field(pass, "color_texture_id");
   if (color_texture_id == 0) {
     color_texture_id = object_id_field(pass, "drawable_id");
@@ -778,14 +815,13 @@ bool validate_metal_render_pass_resources(
       error = error_prefix + "render pass references an unknown color texture";
       return false;
     }
-    if (!validate_color_attachment(pass, "render pass color attachment")) {
+    if (!has_color_attachments && !validate_color_attachment(pass, "render pass color attachment")) {
       return false;
     }
     has_color_texture = true;
   }
 
-  const auto colors = pass.find("colors");
-  if (colors != pass.end() && colors->is_array()) {
+  if (has_color_attachments) {
     for (const auto &color : *colors) {
       const auto texture_id = object_id_field(color, "texture");
       if (texture_id != 0) {
@@ -811,14 +847,11 @@ bool validate_metal_render_pass_resources(
     }
   }
 
-  if (!has_color_texture) {
-    error = error_prefix + "render pass is missing color texture metadata";
-    return false;
-  }
-
+  bool has_depth_or_stencil_texture = false;
   const auto depth = pass.find("depth");
   if (depth != pass.end() && depth->is_object()) {
     const auto depth_texture_id = object_id_field(*depth, "texture");
+    has_depth_or_stencil_texture = has_depth_or_stencil_texture || depth_texture_id != 0;
     if (depth_texture_id != 0 && texture_ids.find(depth_texture_id) == texture_ids.end()) {
       error = error_prefix + "render pass references an unknown depth texture";
       return false;
@@ -836,6 +869,17 @@ bool validate_metal_render_pass_resources(
       error = error_prefix + "render pass depth attachment is missing clear_depth";
       return false;
     }
+  }
+
+  const auto stencil = pass.find("stencil");
+  if (stencil != pass.end() && stencil->is_object()) {
+    const auto stencil_texture_id = object_id_field(*stencil, "texture");
+    has_depth_or_stencil_texture = has_depth_or_stencil_texture || stencil_texture_id != 0;
+  }
+
+  if (!has_color_texture && !has_depth_or_stencil_texture) {
+    error = error_prefix + "render pass is missing attachment texture metadata";
+    return false;
   }
   return true;
 }
@@ -1027,6 +1071,7 @@ bool validate_metal_present_payload(
     return true;
   };
   return require_integer_field("frame_index") &&
+         require_integer_field("present_texture_id") &&
          require_positive_integer_field("width") &&
          require_positive_integer_field("height") &&
          require_integer_field("sync_interval") &&
@@ -1326,12 +1371,14 @@ bool validate_metal_blit_batch_payload(
     std::string &error)
 {
   const auto ops = payload.find("ops");
-  if (ops == payload.end() || !ops->is_array() || ops->empty()) {
+  const auto fence_ops = payload.find("fence_ops");
+  if ((ops == payload.end() || !ops->is_array() || ops->empty()) &&
+      (fence_ops == payload.end() || !fence_ops->is_object())) {
     error = error_prefix + "blitBatch is missing ops";
     return false;
   }
 
-  for (const auto &op : *ops) {
+  if (ops != payload.end()) for (const auto &op : *ops) {
     if (!op.is_object()) {
       error = error_prefix + "blitBatch op must be an object";
       return false;
@@ -1360,6 +1407,44 @@ bool validate_metal_blit_batch_payload(
     } else {
       error = error_prefix + "unsupported blitBatch op " + (kind.empty() ? std::string("<missing>") : kind);
       return false;
+    }
+  }
+  if (fence_ops != payload.end()) {
+    if (string_from_json(fence_ops->value("schema", json(nullptr))) == "blit-fence-v2") {
+      for (const auto *key : {"wait_fences", "update_fences"}) {
+        const auto fences = fence_ops->find(key);
+        if (fences == fence_ops->end() || !fences->is_array()) {
+          error = error_prefix + "compact blitBatch fence list is missing";
+          return false;
+        }
+        for (const auto &fence : *fences) {
+          if (json_u64(fence) == 0) {
+            error = error_prefix + "compact blitBatch fence op is missing fence_id";
+            return false;
+          }
+        }
+      }
+    } else {
+      const auto compact_ops = fence_ops->find("ops");
+      if (compact_ops == fence_ops->end() || !compact_ops->is_array() || compact_ops->empty()) {
+        error = error_prefix + "compact blitBatch fence ops are missing ops";
+        return false;
+      }
+      for (const auto &op : *compact_ops) {
+        if (!op.is_array() || op.size() < 3) {
+          error = error_prefix + "compact blitBatch fence op must be a 3-column array";
+          return false;
+        }
+        const auto kind = json_u64(op[0]);
+        if (kind != 1 && kind != 2) {
+          error = error_prefix + "unsupported compact blitBatch fence op";
+          return false;
+        }
+        if (json_u64(op[1]) == 0) {
+          error = error_prefix + "compact blitBatch fence op is missing fence_id";
+          return false;
+        }
+      }
     }
   }
   return true;
@@ -1444,6 +1529,9 @@ bool validate_metal_work_payload(
            require_numeric_field("threads_per_group_width", "dispatchThreads") &&
            require_numeric_field("threads_per_group_height", "dispatchThreads") &&
            require_numeric_field("threads_per_group_depth", "dispatchThreads");
+  case apitrace::trace::MetalCallKind::DispatchThreadsPerTile:
+    return require_numeric_field("width", "dispatchThreadsPerTile") &&
+           require_numeric_field("height", "dispatchThreadsPerTile");
   default:
     return true;
   }
@@ -1908,6 +1996,18 @@ bool payload_present_metadata(
   return true;
 }
 
+bool payload_is_test_present(const json &payload)
+{
+  if (payload.value("present_test", false)) {
+    return true;
+  }
+  const auto flags = payload.find("flags");
+  if (flags == payload.end() || (!flags->is_number_unsigned() && !flags->is_number_integer())) {
+    return false;
+  }
+  return (flags->get<std::uint64_t>() & 1ull) != 0;
+}
+
 void collect_resolved_resource_object_ids(const json &payload, std::vector<std::uint64_t> &object_ids)
 {
   if (payload.is_object()) {
@@ -2259,6 +2359,9 @@ bool verify_bundle_references(
     }
     if (event.kind == apitrace::trace::EventKind::Call &&
         present_frame_debug_name_for_present_call(event.callsite.function_name).empty() == false) {
+      if (payload_is_test_present(payload) && !payload.contains("frame_index")) {
+        continue;
+      }
       PresentFrameMetadata metadata;
       std::string missing_key;
       if (!payload_present_metadata(payload, event.callsite.sequence, metadata, missing_key)) {
@@ -2426,9 +2529,16 @@ bool verify_bundle_references(
       return false;
     }
     if (frames.size() != d3d_present_calls.size()) {
-      error = api_name_for_present_frame_debug_name(debug_name) +
-              " present frame asset count does not match captured Present calls";
-      return false;
+      std::uint64_t last_frame = 0;
+      for (const auto &[frame_index, frame] : frames) {
+        (void)frame;
+        last_frame = std::max(last_frame, frame_index);
+      }
+      if (frames.size() != last_frame + 1) {
+        error = api_name_for_present_frame_debug_name(debug_name) +
+                " present frame assets are not contiguous from frame_index 0";
+        return false;
+      }
     }
     if (d3d_present_boundaries.size() != d3d_present_calls.size()) {
       error = api_name_for_present_frame_debug_name(debug_name) +
@@ -2572,7 +2682,17 @@ bool verify_bundle_references(
   present_stats.d3d_present_boundaries = d3d_present_boundaries.size();
   if (!d3d_present_frame_kinds.empty()) {
     const auto &debug_name = *d3d_present_frame_kinds.begin();
-    present_stats.d3d_present_frame_assets = d3d_present_frames_by_kind[debug_name].size();
+    const auto &frames = d3d_present_frames_by_kind[debug_name];
+    present_stats.d3d_present_frame_assets = frames.size();
+    for (const auto &[frame_index, frame] : frames) {
+      (void)frame;
+      if (d3d_present_calls.find(frame_index) != d3d_present_calls.end()) {
+        ++present_stats.d3d_present_calls_with_frame_assets;
+      }
+      if (d3d_present_boundaries.find(frame_index) != d3d_present_boundaries.end()) {
+        ++present_stats.d3d_present_boundaries_with_frame_assets;
+      }
+    }
   }
   present_stats.metal_present_drawables = metal_present_events.size();
   present_stats.metal_present_frame_assets = metal_present_frames.size();
@@ -2703,7 +2823,8 @@ bool verify_translation_links(
     const auto metal_sequence_begin = record.value("metal_sequence_begin", 0ull);
     const auto metal_sequence_end = record.value("metal_sequence_end", 0ull);
     const auto scope_kind = record.value("scope_kind", std::string());
-    if (d3d_sequence == 0 || d3d_sequences.find(d3d_sequence) == d3d_sequences.end()) {
+    const bool d3d_sequence_known = d3d_sequence != 0 && d3d_sequences.find(d3d_sequence) != d3d_sequences.end();
+    if (d3d_sequence == 0) {
       std::ostringstream message;
       message << "translation-links.jsonl line " << line_number
               << ": unknown d3d_sequence " << d3d_sequence;
@@ -2745,10 +2866,12 @@ bool verify_translation_links(
       if (range_has_metal_draw_or_dispatch) {
         ++stats.draw_scope_links_with_metal_work;
       }
-      const auto function_it = d3d_functions.find(d3d_sequence);
-      if (function_it != d3d_functions.end() &&
-          is_d3d12_pipeline_dependent_function(function_it->second)) {
-        ++stats.draw_scope_links_to_d3d_pipeline_work;
+      if (d3d_sequence_known) {
+        const auto function_it = d3d_functions.find(d3d_sequence);
+        if (function_it != d3d_functions.end() &&
+            is_d3d12_pipeline_dependent_function(function_it->second)) {
+          ++stats.draw_scope_links_to_d3d_pipeline_work;
+        }
       }
     }
 
@@ -3568,7 +3691,7 @@ bool verify_strict_options(
               error) ||
           !require_metal_object(
               metal_texture_ids,
-              object_id_field(payload, "drawable_id"),
+              object_id_field(payload, "present_texture_id"),
               "Metal replay closure ",
               "presentDrawable references an unknown drawable texture",
               error)) {
@@ -3719,6 +3842,19 @@ bool verify_strict_options(
         const auto encoder = metal_compute_encoder_has_pipeline.find(event.object_id);
         if (encoder == metal_compute_encoder_has_pipeline.end() || !encoder->second) {
           error = "Metal replay closure dispatch occurs before a valid compute pipeline bind";
+          return false;
+        }
+      }
+      ++metal_draw_or_dispatch_calls;
+      break;
+    case apitrace::trace::MetalCallKind::DispatchThreadsPerTile:
+      {
+        if (!validate_metal_work_payload("Metal replay closure ", event.call_kind, payload, error)) {
+          return false;
+        }
+        const auto encoder = metal_render_encoder_has_pipeline.find(event.object_id);
+        if (encoder == metal_render_encoder_has_pipeline.end() || !encoder->second) {
+          error = "Metal replay closure dispatchThreadsPerTile occurs before a valid render pipeline bind";
           return false;
         }
       }
@@ -3894,12 +4030,12 @@ bool verify_strict_options(
       error = "D3D PresentFrame validation found no D3D PresentFrame assets";
       return false;
     }
-    if (present_stats.d3d_present_frame_assets != present_stats.d3d_present_calls) {
-      error = "D3D PresentFrame asset count does not match captured Present calls";
+    if (present_stats.d3d_present_frame_assets != present_stats.d3d_present_calls_with_frame_assets) {
+      error = "D3D PresentFrame assets do not match captured Present calls for sampled frames";
       return false;
     }
-    if (present_stats.d3d_present_boundaries != present_stats.d3d_present_calls) {
-      error = "D3D PresentFrame boundary count does not match captured Present calls";
+    if (present_stats.d3d_present_frame_assets != present_stats.d3d_present_boundaries_with_frame_assets) {
+      error = "D3D PresentFrame assets do not match Present boundaries for sampled frames";
       return false;
     }
   }
@@ -4080,7 +4216,11 @@ int main(int argc, char **argv)
                 << record.relative_path.generic_string() << "\n";
       return 1;
     }
-    const auto digest = apitrace::trace::content_hash_file(absolute);
+    const auto actual_size = std::filesystem::file_size(absolute);
+    const auto use_prefix = record.has_byte_size && actual_size > record.byte_size;
+    const auto digest = use_prefix
+                            ? apitrace::trace::content_hash_file_prefix(absolute, record.byte_size)
+                            : apitrace::trace::content_hash_file(absolute);
     if (digest != record.digest) {
       std::cerr << "bundle-check failed: checksum mismatch for "
                 << record.relative_path.generic_string() << "\n";
@@ -4166,6 +4306,8 @@ int main(int argc, char **argv)
   std::cout << "d3d_present_calls=" << present_stats.d3d_present_calls << "\n";
   std::cout << "d3d_present_boundaries=" << present_stats.d3d_present_boundaries << "\n";
   std::cout << "d3d_present_frame_assets=" << present_stats.d3d_present_frame_assets << "\n";
+  std::cout << "d3d_present_calls_with_frame_assets=" << present_stats.d3d_present_calls_with_frame_assets << "\n";
+  std::cout << "d3d_present_boundaries_with_frame_assets=" << present_stats.d3d_present_boundaries_with_frame_assets << "\n";
   std::cout << "metal_present_drawables=" << present_stats.metal_present_drawables << "\n";
   std::cout << "metal_present_frame_assets=" << present_stats.metal_present_frame_assets << "\n";
   std::cout << "generic_buffer_assets=" << shared_stats.generic_buffer_assets << "\n";

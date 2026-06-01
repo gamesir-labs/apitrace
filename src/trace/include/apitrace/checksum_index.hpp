@@ -3,6 +3,7 @@
 #include "apitrace/api_types.hpp"
 
 #include <filesystem>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -12,6 +13,8 @@ struct ChecksumRecord {
   std::filesystem::path relative_path;
   std::string algorithm = "sha256";
   std::string digest;
+  std::uint64_t byte_size = 0;
+  bool has_byte_size = false;
 
   // TODO: allow per-file flags once optional or generated outputs need separate handling.
 };

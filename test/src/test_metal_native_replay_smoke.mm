@@ -585,7 +585,7 @@ bool capture_trace_frame(const std::filesystem::path &source_bundle, const std::
     return false;
   }
   const auto &stats = session.statistics();
-  if (stats.backend_name != "metal-native" || stats.metal_calls_replayed != 17 || stats.metal_presents_seen != 1) {
+  if (stats.backend_name != "metal-native" || stats.metal_calls_replayed != 19 || stats.metal_presents_seen != 1) {
     std::cerr << "unexpected metal native replay stats\n";
     return false;
   }

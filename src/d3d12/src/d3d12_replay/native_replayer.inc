@@ -18,7 +18,7 @@ std::vector<D3D12_RECT> d3d12_rects_from_payload(const json &payload)
   return rects;
 }
 
-using RecordPresentFrameFn = void(WINAPI *)(UINT, UINT, UINT, UINT, UINT, const void *, SIZE_T);
+using RecordPresentFrameFn = void(WINAPI *)(UINT64, UINT, UINT, UINT, UINT, UINT, const void *, SIZE_T);
 using RecordPresentSemanticsFn = void(WINAPI *)(UINT, UINT, HRESULT);
 using CaptureSuppressionFn = void(WINAPI *)();
 
@@ -1566,8 +1566,7 @@ private:
     if (!record) {
       return fail(error, "APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES is enabled but the capture export is missing");
     }
-    (void)frame_index;
-    record(width, height, row_pitch, sync_interval, flags, rgba_data, rgba_size);
+    record(frame_index, width, height, row_pitch, sync_interval, flags, rgba_data, rgba_size);
     return true;
   }
 #else
@@ -2525,35 +2524,56 @@ private:
       return fail(error, "ResourceBarrier missing barrier array");
     }
     std::vector<D3D12_RESOURCE_BARRIER> barriers;
-    for (const auto &barrier_json : *barriers_json) {
-      if (!payload_has(barrier_json, "type") || !payload_has(barrier_json, "flags")) {
+    for (const auto &barrier_entry : *barriers_json) {
+      json compact_barrier_storage;
+      const json *barrier_json = &barrier_entry;
+      if (barrier_entry.is_array()) {
+        if (barrier_entry.size() < 9) {
+          return fail(error, "ResourceBarrierBatch op must be a 9-column array");
+        }
+        compact_barrier_storage = {
+            {"type", json_u64(barrier_entry[1])},
+            {"flags", json_u64(barrier_entry[2])},
+            {"resource_object_id", json_u64(barrier_entry[3])},
+            {"before", json_u64(barrier_entry[4])},
+            {"after", json_u64(barrier_entry[5])},
+            {"subresource", json_u64(barrier_entry[6])},
+            {"resource_before_object_id", json_u64(barrier_entry[7])},
+            {"resource_after_object_id", json_u64(barrier_entry[8])},
+        };
+        barrier_json = &compact_barrier_storage;
+      }
+      if (!barrier_json->is_object()) {
+        return fail(error, "ResourceBarrier entry must be an object or compact array");
+      }
+      if (!payload_has(*barrier_json, "type") || !payload_has(*barrier_json, "flags")) {
         return fail(error, "ResourceBarrier missing barrier type or flags");
       }
       D3D12_RESOURCE_BARRIER barrier{};
-      barrier.Type = static_cast<D3D12_RESOURCE_BARRIER_TYPE>(payload_u32(barrier_json, "type"));
-      barrier.Flags = static_cast<D3D12_RESOURCE_BARRIER_FLAGS>(payload_u32(barrier_json, "flags"));
+      barrier.Type = static_cast<D3D12_RESOURCE_BARRIER_TYPE>(payload_u32(*barrier_json, "type"));
+      barrier.Flags = static_cast<D3D12_RESOURCE_BARRIER_FLAGS>(payload_u32(*barrier_json, "flags"));
       if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
-        if (!payload_has(barrier_json, "resource_object_id") ||
-            !payload_has(barrier_json, "before") ||
-            !payload_has(barrier_json, "after") ||
-            !payload_has(barrier_json, "subresource")) {
+        if (!payload_has(*barrier_json, "resource_object_id") ||
+            !payload_has(*barrier_json, "before") ||
+            !payload_has(*barrier_json, "after") ||
+            !payload_has(*barrier_json, "subresource")) {
           return fail(error, "ResourceBarrier missing transition payload");
         }
-        ID3D12Resource *resource = resource_for(json_object_id(barrier_json["resource_object_id"]), error);
+        ID3D12Resource *resource = resource_for(json_object_id((*barrier_json)["resource_object_id"]), error);
         if (!resource) {
           return false;
         }
         barrier.Transition.pResource = resource;
-        barrier.Transition.Subresource = payload_u32(barrier_json, "subresource");
-        barrier.Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(payload_u32(barrier_json, "before"));
-        barrier.Transition.StateAfter = static_cast<D3D12_RESOURCE_STATES>(payload_u32(barrier_json, "after"));
+        barrier.Transition.Subresource = payload_u32(*barrier_json, "subresource");
+        barrier.Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(payload_u32(*barrier_json, "before"));
+        barrier.Transition.StateAfter = static_cast<D3D12_RESOURCE_STATES>(payload_u32(*barrier_json, "after"));
       } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
-        if (!payload_has(barrier_json, "resource_before_object_id") ||
-            !payload_has(barrier_json, "resource_after_object_id")) {
+        if (!payload_has(*barrier_json, "resource_before_object_id") ||
+            !payload_has(*barrier_json, "resource_after_object_id")) {
           return fail(error, "ResourceBarrier missing aliasing payload");
         }
-        const auto before_id = json_object_id(barrier_json["resource_before_object_id"]);
-        const auto after_id = json_object_id(barrier_json["resource_after_object_id"]);
+        const auto before_id = json_object_id((*barrier_json)["resource_before_object_id"]);
+        const auto after_id = json_object_id((*barrier_json)["resource_after_object_id"]);
         barrier.Aliasing.pResourceBefore = before_id == 0 ? nullptr : resource_for(before_id, error);
         if (before_id != 0 && !barrier.Aliasing.pResourceBefore) {
           return false;
@@ -2563,10 +2583,10 @@ private:
           return false;
         }
       } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
-        if (!payload_has(barrier_json, "resource_object_id")) {
+        if (!payload_has(*barrier_json, "resource_object_id")) {
           return fail(error, "ResourceBarrier missing UAV payload");
         }
-        const auto resource_id = json_object_id(barrier_json["resource_object_id"]);
+        const auto resource_id = json_object_id((*barrier_json)["resource_object_id"]);
         barrier.UAV.pResource = resource_id == 0 ? nullptr : resource_for(resource_id, error);
         if (resource_id != 0 && !barrier.UAV.pResource) {
           return false;
@@ -3135,6 +3155,69 @@ private:
       list->CopyResource(dst, src);
       return true;
     }
+    if (command.function_name == "ID3D12GraphicsCommandList::CopyTextureRegionBatch") {
+      const auto ops = payload.find("ops");
+      if (ops == payload.end() || !ops->is_array()) {
+        return fail(error, "CopyTextureRegionBatch missing ops");
+      }
+      for (const auto &op : *ops) {
+        if (!op.is_array() || op.size() < 7 ||
+            !op[1].is_array() || op[1].size() < 9 ||
+            !op[5].is_array() || op[5].size() < 9) {
+          return fail(error, "CopyTextureRegionBatch op must use compact array payload");
+        }
+        const auto compact_texture_copy_location = [&](const json &location, D3D12_TEXTURE_COPY_LOCATION &target) -> bool {
+          const auto resource_id = json_object_id(location[0]);
+          ID3D12Resource *resource = resource_for(resource_id, error);
+          if (!resource) {
+            return false;
+          }
+          target.pResource = resource;
+          target.Type = static_cast<D3D12_TEXTURE_COPY_TYPE>(json_u64(location[1]));
+          if (target.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+            target.PlacedFootprint.Offset = json_u64(location[3]);
+            target.PlacedFootprint.Footprint.Format = static_cast<DXGI_FORMAT>(json_u64(location[4]));
+            target.PlacedFootprint.Footprint.Width = static_cast<UINT>(json_u64(location[5]));
+            target.PlacedFootprint.Footprint.Height = static_cast<UINT>(json_u64(location[6]));
+            target.PlacedFootprint.Footprint.Depth = static_cast<UINT>(json_u64(location[7]));
+            target.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(json_u64(location[8]));
+          } else if (target.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+            target.SubresourceIndex = static_cast<UINT>(json_u64(location[2]));
+          } else {
+            return fail(error, "CopyTextureRegionBatch has unsupported texture copy location type");
+          }
+          return true;
+        };
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        if (!compact_texture_copy_location(op[1], dst) ||
+            !compact_texture_copy_location(op[5], src)) {
+          return false;
+        }
+        D3D12_BOX src_box{};
+        const D3D12_BOX *src_box_ptr = nullptr;
+        if (!op[6].is_null()) {
+          if (!op[6].is_array() || op[6].size() < 6) {
+            return fail(error, "CopyTextureRegionBatch src_box must be null or a 6-column array");
+          }
+          src_box.left = static_cast<UINT>(json_u64(op[6][0]));
+          src_box.top = static_cast<UINT>(json_u64(op[6][1]));
+          src_box.front = static_cast<UINT>(json_u64(op[6][2]));
+          src_box.right = static_cast<UINT>(json_u64(op[6][3]));
+          src_box.bottom = static_cast<UINT>(json_u64(op[6][4]));
+          src_box.back = static_cast<UINT>(json_u64(op[6][5]));
+          src_box_ptr = &src_box;
+        }
+        list->CopyTextureRegion(
+            &dst,
+            static_cast<UINT>(json_u64(op[2])),
+            static_cast<UINT>(json_u64(op[3])),
+            static_cast<UINT>(json_u64(op[4])),
+            &src,
+            src_box_ptr);
+      }
+      return true;
+    }
     if (command.function_name == "ID3D12GraphicsCommandList::CopyTextureRegion") {
       D3D12_TEXTURE_COPY_LOCATION dst{};
       D3D12_TEXTURE_COPY_LOCATION src{};
@@ -3329,4 +3412,3 @@ public:
 };
 
 #endif
-

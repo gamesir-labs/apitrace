@@ -62,7 +62,7 @@ using RecordResourceBarrierFn = void (WINAPI *)(
     D3D12_RESOURCE_STATES,
     UINT
 );
-using RecordPresentFrameFn = void (WINAPI *)(UINT, UINT, UINT, UINT, UINT, const void *, SIZE_T);
+using RecordPresentFrameFn = void (WINAPI *)(UINT64, UINT, UINT, UINT, UINT, UINT, const void *, SIZE_T);
 using RecordPresentSemanticsFn = void (WINAPI *)(UINT, UINT, HRESULT);
 
 bool use_capture_bridge()
@@ -182,6 +182,7 @@ void record_resource_barrier(
 }
 
 void record_present_frame(
+    std::uint64_t frame_index,
     unsigned int width,
     unsigned int height,
     UINT sync_interval,
@@ -197,6 +198,7 @@ void record_present_frame(
     );
     if (record) {
         record(
+            frame_index,
             static_cast<UINT>(width),
             static_cast<UINT>(height),
             static_cast<UINT>(width * 4U),
@@ -638,6 +640,7 @@ void Dx12Runtime::copy_current_back_buffer_to_readback()
 void Dx12Runtime::record_current_present_frame(UINT sync_interval, UINT flags) const
 {
     record_present_frame(
+        frame_index_,
         static_cast<unsigned int>(width_),
         static_cast<unsigned int>(height_),
         sync_interval,

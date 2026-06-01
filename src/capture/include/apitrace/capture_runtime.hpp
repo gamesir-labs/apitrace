@@ -26,6 +26,7 @@ private:
 
 TraceSession *ensure_process_trace_session(trace::ApiKind api);
 TraceSession *current_process_trace_session() noexcept;
+void seal_process_trace_session_checkpoint() noexcept;
 void shutdown_process_trace_session() noexcept;
 
 } // namespace apitrace::runtime

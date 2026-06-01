@@ -348,6 +348,7 @@ bool is_metal_draw_or_dispatch(trace::MetalCallKind kind)
   case trace::MetalCallKind::DispatchThreadgroups:
   case trace::MetalCallKind::DispatchThreadgroupsIndirect:
   case trace::MetalCallKind::DispatchThreads:
+  case trace::MetalCallKind::DispatchThreadsPerTile:
     return true;
   default:
     return false;
@@ -1049,12 +1050,14 @@ bool validate_metal_blit_batch_payload(
     std::string &error)
 {
   const auto ops = payload.find("ops");
-  if (ops == payload.end() || !ops->is_array() || ops->empty()) {
+  const auto fence_ops = payload.find("fence_ops");
+  if ((ops == payload.end() || !ops->is_array() || ops->empty()) &&
+      (fence_ops == payload.end() || !fence_ops->is_object())) {
     error = event_label + ": blitBatch is missing ops";
     return false;
   }
 
-  for (const auto &op : *ops) {
+  if (ops != payload.end()) for (const auto &op : *ops) {
     if (!op.is_object()) {
       error = event_label + ": blitBatch op must be an object";
       return false;
@@ -1083,6 +1086,44 @@ bool validate_metal_blit_batch_payload(
     } else {
       error = event_label + ": unsupported blitBatch op " + (kind.empty() ? std::string("<missing>") : kind);
       return false;
+    }
+  }
+  if (fence_ops != payload.end()) {
+    if (string_from_json(fence_ops->value("schema", json(nullptr))) == "blit-fence-v2") {
+      for (const auto *key : {"wait_fences", "update_fences"}) {
+        const auto fences = fence_ops->find(key);
+        if (fences == fence_ops->end() || !fences->is_array()) {
+          error = event_label + ": compact blitBatch fence list is missing";
+          return false;
+        }
+        for (const auto &fence : *fences) {
+          if (json_u64(fence) == 0) {
+            error = event_label + ": compact blitBatch fence op is missing fence_id";
+            return false;
+          }
+        }
+      }
+    } else {
+      const auto compact_ops = fence_ops->find("ops");
+      if (compact_ops == fence_ops->end() || !compact_ops->is_array() || compact_ops->empty()) {
+        error = event_label + ": compact blitBatch fence ops are missing ops";
+        return false;
+      }
+      for (const auto &op : *compact_ops) {
+        if (!op.is_array() || op.size() < 3) {
+          error = event_label + ": compact blitBatch fence op must be a 3-column array";
+          return false;
+        }
+        const auto kind = json_u64(op[0]);
+        if (kind != 1 && kind != 2) {
+          error = event_label + ": unsupported compact blitBatch fence op";
+          return false;
+        }
+        if (json_u64(op[1]) == 0) {
+          error = event_label + ": compact blitBatch fence op is missing fence_id";
+          return false;
+        }
+      }
     }
   }
   return true;
@@ -1167,6 +1208,9 @@ bool validate_metal_work_payload(
            require_numeric_field("threads_per_group_width", "dispatchThreads") &&
            require_numeric_field("threads_per_group_height", "dispatchThreads") &&
            require_numeric_field("threads_per_group_depth", "dispatchThreads");
+  case trace::MetalCallKind::DispatchThreadsPerTile:
+    return require_numeric_field("width", "dispatchThreadsPerTile") &&
+           require_numeric_field("height", "dispatchThreadsPerTile");
   default:
     return true;
   }
@@ -1926,21 +1970,24 @@ bool validate_metal_replay_closure(
       if (event.call_kind == trace::MetalCallKind::DrawPrimitives ||
           event.call_kind == trace::MetalCallKind::DrawIndexedPrimitives ||
           event.call_kind == trace::MetalCallKind::DrawPrimitivesIndirect ||
-          event.call_kind == trace::MetalCallKind::DrawIndexedPrimitivesIndirect) {
+          event.call_kind == trace::MetalCallKind::DrawIndexedPrimitivesIndirect ||
+          event.call_kind == trace::MetalCallKind::DispatchThreadsPerTile) {
         const auto encoder = render_encoder_has_pipeline.find(event.object_id);
         if (encoder == render_encoder_has_pipeline.end() || !encoder->second) {
-          error = event_label + ": draw occurs before a valid render pipeline bind";
+          error = event_label + ": render work occurs before a valid render pipeline bind";
           return false;
         }
-        const auto viewport = render_encoder_has_viewport.find(event.object_id);
-        if (viewport == render_encoder_has_viewport.end() || !viewport->second) {
-          error = event_label + ": draw occurs before a valid viewport bind";
-          return false;
-        }
-        const auto scissor = render_encoder_has_scissor.find(event.object_id);
-        if (scissor == render_encoder_has_scissor.end() || !scissor->second) {
-          error = event_label + ": draw occurs before a valid scissor bind";
-          return false;
+        if (event.call_kind != trace::MetalCallKind::DispatchThreadsPerTile) {
+          const auto viewport = render_encoder_has_viewport.find(event.object_id);
+          if (viewport == render_encoder_has_viewport.end() || !viewport->second) {
+            error = event_label + ": draw occurs before a valid viewport bind";
+            return false;
+          }
+          const auto scissor = render_encoder_has_scissor.find(event.object_id);
+          if (scissor == render_encoder_has_scissor.end() || !scissor->second) {
+            error = event_label + ": draw occurs before a valid scissor bind";
+            return false;
+          }
         }
       } else {
         const auto encoder = compute_encoder_has_pipeline.find(event.object_id);

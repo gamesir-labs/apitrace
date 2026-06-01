@@ -136,6 +136,15 @@ TraceSession *current_process_trace_session() noexcept
   return process_capture_session().get();
 }
 
+void seal_process_trace_session_checkpoint() noexcept
+{
+  std::lock_guard<std::mutex> lock(process_capture_mutex());
+  auto &session = process_capture_session();
+  if (session && session->active()) {
+    session->seal_checkpoint();
+  }
+}
+
 void shutdown_process_trace_session() noexcept
 {
   std::lock_guard<std::mutex> lock(process_capture_mutex());

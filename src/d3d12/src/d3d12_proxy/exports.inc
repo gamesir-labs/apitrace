@@ -180,6 +180,7 @@ extern "C" void WINAPI apitrace_d3d12_record_resource_barrier(
 }
 
 extern "C" void WINAPI apitrace_d3d12_record_present_frame(
+    UINT64 frame_index,
     UINT width,
     UINT height,
     UINT row_pitch,
@@ -193,8 +194,6 @@ extern "C" void WINAPI apitrace_d3d12_record_present_frame(
   }
 
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  ensure_frame_begin_locked();
-  const auto frame_index = capture_state().frame_index;
   const auto asset = register_asset_bytes_locked(
       apitrace::trace::AssetKind::Texture,
       "d3d12-present-frame",
@@ -233,6 +232,15 @@ extern "C" void WINAPI apitrace_d3d12_record_present_semantics(
     HRESULT result)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
+  const auto present_test = (flags & DXGI_PRESENT_TEST) != 0;
+  if (present_test) {
+    std::ostringstream call_payload;
+    call_payload << "{\"sync_interval\":" << sync_interval
+                 << ",\"flags\":" << flags
+                 << ",\"present_test\":true}";
+    record_call_locked("IDXGISwapChain::Present", result, {}, {}, call_payload.str());
+    return;
+  }
   ensure_frame_begin_locked();
   const auto frame_index = capture_state().frame_index++;
   capture_state().last_present_frame_index = frame_index;

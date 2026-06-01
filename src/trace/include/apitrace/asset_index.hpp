@@ -38,6 +38,7 @@ struct AssetRecord {
 
 std::string content_hash_bytes(const void *data, std::size_t size);
 std::string content_hash_file(const std::filesystem::path &path);
+std::string content_hash_file_prefix(const std::filesystem::path &path, std::uint64_t byte_size);
 std::string fast_fingerprint_bytes(const void *data, std::size_t size);
 
 } // namespace apitrace::trace

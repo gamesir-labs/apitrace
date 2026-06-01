@@ -169,7 +169,18 @@ std::uint64_t record_execute_command_lists(
 std::uint64_t record_present(
     const void *swapchain,
     std::uint32_t sync_interval,
-    std::uint32_t flags);
+    std::uint32_t flags,
+    std::int32_t result_code,
+    bool frame_presented);
+void record_present_frame(
+    std::uint64_t frame_index,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t row_pitch,
+    std::uint32_t sync_interval,
+    std::uint32_t flags,
+    const void *rgba_data,
+    std::size_t rgba_size);
 void record_fence_dependency(
     const char *scope,
     std::uint64_t d3d_sequence,

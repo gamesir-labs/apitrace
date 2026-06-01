@@ -46,6 +46,7 @@ enum class MetalCallKind {
   SetComputeSamplerState,
   DispatchThreadgroups,
   DispatchThreadgroupsIndirect,
+  DispatchThreadsPerTile,
   BlitBatch,
   CopyBuffer,
   CopyBufferToTexture,
@@ -70,6 +71,7 @@ enum class MetalCallKind {
   PopDebugGroup,
   ObjectMetadata,
   InsertDebugSignpost,
+  BufferUpdate,
 };
 
 enum class MetalBoundaryKind {
@@ -104,6 +106,7 @@ struct MetalEventRecord {
   std::vector<BlobId> blob_refs;
   std::string function_name;
   std::string payload;
+  bool payload_refs_scanned = false;
 };
 
 } // namespace apitrace::trace

@@ -26,6 +26,7 @@ struct MetalTraceRecord {
   std::string translated_call_name;
   std::string encoder_label;
   std::string translation_link_payload;
+  bool payload_refs_scanned = false;
 
   // TODO: attach translated resource, pipeline, and encoder arguments once the recording payload shape is defined.
   // TODO: keep translation_link_payload opaque to apitrace and let the translation layer own its schema and interpretation.

@@ -134,6 +134,382 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     }
   }
 
+  const auto ingest_descriptor_payload = [&](const trace::EventRecord &source_event,
+                                           const json &descriptor_payload,
+                                           std::string function_name,
+                                           trace::ObjectId resource_object_id,
+                                           trace::ObjectId counter_resource_object_id,
+                                           std::uint64_t create_sequence) -> bool {
+    if (!require_payload_key(source_event, descriptor_payload, "descriptor", last_error_)) {
+      return false;
+    }
+    DescriptorSemanticState descriptor;
+    std::string descriptor_kind;
+    if (function_name == "ID3D12Device::CreateConstantBufferView") {
+      descriptor_kind = "ConstantBufferView";
+    } else if (function_name == "ID3D12Device::CreateShaderResourceView") {
+      descriptor_kind = "ShaderResourceView";
+    } else if (function_name == "ID3D12Device::CreateUnorderedAccessView") {
+      descriptor_kind = "UnorderedAccessView";
+    } else if (function_name == "ID3D12Device::CreateRenderTargetView") {
+      descriptor_kind = "RenderTargetView";
+    } else if (function_name == "ID3D12Device::CreateDepthStencilView") {
+      descriptor_kind = "DepthStencilView";
+    } else {
+      last_error_ = record_prefix(source_event) + ": descriptor batch op has unsupported function";
+      return false;
+    }
+    descriptor.kind = std::move(descriptor_kind);
+    descriptor.create_sequence = create_sequence;
+    descriptor.descriptor = payload_u64(descriptor_payload, "descriptor");
+    descriptor.resource_object_id = resource_object_id;
+    descriptor.counter_resource_object_id = counter_resource_object_id;
+    if (!resolve_descriptor_binding_at(descriptor.descriptor, false, create_sequence, descriptor.binding, last_error_)) {
+      last_error_ = record_prefix(source_event) + ": " + last_error_;
+      return false;
+    }
+    descriptor.format = payload_u32(descriptor_payload, "format");
+    descriptor.view_dimension = payload_u32(descriptor_payload, "view_dimension");
+    descriptor.flags = payload_u32(descriptor_payload, "flags");
+    descriptor.shader_4_component_mapping = payload_u32(descriptor_payload, "shader_4_component_mapping");
+    descriptor.buffer_location = payload_u64(descriptor_payload, "buffer_location");
+    descriptor.size_in_bytes = payload_u32(descriptor_payload, "size_in_bytes");
+    if (function_name == "ID3D12Device::CreateConstantBufferView" && descriptor.buffer_location != 0) {
+      if (!resolve_gpu_virtual_address_at(descriptor.buffer_location, create_sequence, descriptor.buffer, last_error_)) {
+        last_error_ = record_prefix(source_event) + ": " + last_error_;
+        return false;
+      }
+      if (!validate_gpu_virtual_address_resolve_payload(source_event, "descriptor buffer_location", descriptor_payload, descriptor.buffer, last_error_)) {
+        return false;
+      }
+    }
+    const auto view = descriptor_payload.find("view");
+    if (view != descriptor_payload.end()) {
+      if (!view->is_null() && !view->is_object()) {
+        last_error_ = record_prefix(source_event) + ": descriptor view payload must be an object";
+        return false;
+      }
+      if (view->is_object()) {
+        descriptor.has_view_desc = true;
+        descriptor.first_element = payload_u64(*view, "first_element");
+        descriptor.num_elements = payload_u32(*view, "num_elements");
+        descriptor.structure_byte_stride = payload_u32(*view, "structure_byte_stride");
+        descriptor.counter_offset_in_bytes = payload_u64(*view, "counter_offset_in_bytes");
+        descriptor.flags = payload_u32(*view, "flags", descriptor.flags);
+        descriptor.most_detailed_mip = payload_u32(*view, "most_detailed_mip");
+        descriptor.mip_levels = payload_u32(*view, "mip_levels");
+        descriptor.mip_slice = payload_u32(*view, "mip_slice");
+        descriptor.plane_slice = payload_u32(*view, "plane_slice");
+        descriptor.first_array_slice = payload_u32(*view, "first_array_slice");
+        descriptor.array_size = payload_u32(*view, "array_size");
+        descriptor.first_2d_array_face = payload_u32(*view, "first_2d_array_face");
+        descriptor.num_cubes = payload_u32(*view, "num_cubes");
+        descriptor.first_w_slice = payload_u32(*view, "first_w_slice");
+        descriptor.w_size = payload_u32(*view, "w_size");
+        descriptor.resource_min_lod_clamp = payload_float(*view, "resource_min_lod_clamp");
+        if (payload_has(*view, "location")) {
+          if (!resolve_gpu_virtual_address_at(payload_u64(*view, "location"), create_sequence, descriptor.raytracing_acceleration_structure, last_error_)) {
+            last_error_ = record_prefix(source_event) + ": " + last_error_;
+            return false;
+          }
+          if (!validate_gpu_virtual_address_resolve_payload(
+                  event,
+                  "descriptor view.location",
+                  *view,
+                  descriptor.raytracing_acceleration_structure,
+                  last_error_)) {
+            return false;
+          }
+        }
+      }
+    }
+    if (descriptor.resource_object_id != 0) {
+      const auto resource_it = resources_.find(descriptor.resource_object_id);
+      if (resource_it == resources_.end()) {
+        last_error_ = record_prefix(source_event) + ": descriptor references an unknown resource";
+        return false;
+      }
+      const auto &resource = resource_it->second;
+      if (function_name == "ID3D12Device::CreateConstantBufferView" && descriptor.buffer.resolved) {
+        if (descriptor.buffer.offset > resource.width ||
+            descriptor.size_in_bytes > resource.width - descriptor.buffer.offset) {
+          last_error_ = record_prefix(source_event) + ": ConstantBufferView buffer range is out of bounds";
+          return false;
+        }
+      }
+    if ((function_name == "ID3D12Device::CreateShaderResourceView" ||
+           function_name == "ID3D12Device::CreateUnorderedAccessView") &&
+          descriptor.has_view_desc &&
+          descriptor.view_dimension == 1) {
+        const auto stride = descriptor.structure_byte_stride != 0
+                                ? descriptor.structure_byte_stride
+                                : dxgi_format_element_size(descriptor.format);
+        if (stride == 0) {
+          last_error_ = record_prefix(source_event) + ": descriptor buffer view has unknown element size";
+          return false;
+        }
+        const auto view_bytes = descriptor.num_elements == 0
+                                    ? 0
+                                    : (descriptor.num_elements - 1ull) * stride + stride;
+        const auto view_offset = descriptor.first_element * static_cast<std::uint64_t>(stride);
+        if (view_offset > resource.width ||
+            view_bytes > resource.width - view_offset) {
+          last_error_ = record_prefix(source_event) + ": descriptor buffer view range is out of bounds";
+          return false;
+        }
+      }
+      const auto require_texture_dimension = [&](std::uint32_t expected_dimension) -> bool {
+        if (resource.dimension != expected_dimension) {
+          last_error_ = record_prefix(source_event) + ": descriptor texture view dimension does not match resource";
+          return false;
+        }
+        return true;
+      };
+      const auto require_mip_slice = [&](std::uint32_t mip) -> bool {
+        if (mip >= resource.mip_levels) {
+          last_error_ = record_prefix(source_event) + ": descriptor texture view mip range is out of bounds";
+          return false;
+        }
+        return true;
+      };
+      const auto require_mip_range = [&](std::uint32_t first_mip, std::uint32_t mip_count) -> bool {
+        constexpr std::uint32_t all_remaining = std::numeric_limits<std::uint32_t>::max();
+        if (first_mip >= resource.mip_levels ||
+            (mip_count != all_remaining &&
+             (mip_count == 0 || mip_count > resource.mip_levels - first_mip))) {
+          last_error_ = record_prefix(source_event) + ": descriptor texture view mip range is out of bounds";
+          return false;
+        }
+        return true;
+      };
+      const auto require_array_range = [&](std::uint32_t first_slice, std::uint32_t slice_count) -> bool {
+        constexpr std::uint32_t all_remaining = std::numeric_limits<std::uint32_t>::max();
+        if (first_slice >= resource.depth_or_array_size ||
+            (slice_count != all_remaining &&
+             (slice_count == 0 || slice_count > resource.depth_or_array_size - first_slice))) {
+          last_error_ = record_prefix(source_event) + ": descriptor texture view array range is out of bounds";
+          return false;
+        }
+        return true;
+      };
+      const auto require_w_range = [&](std::uint32_t first_slice, std::uint32_t slice_count) -> bool {
+        return require_array_range(first_slice, slice_count);
+      };
+      if (function_name == "ID3D12Device::CreateShaderResourceView" && descriptor.has_view_desc) {
+        switch (descriptor.view_dimension) {
+        case 2:
+          if (!require_texture_dimension(2) ||
+              !require_mip_range(descriptor.most_detailed_mip, descriptor.mip_levels)) {
+            return false;
+          }
+          break;
+        case 3:
+          if (!require_texture_dimension(2) ||
+              !require_mip_range(descriptor.most_detailed_mip, descriptor.mip_levels) ||
+              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
+            return false;
+          }
+          break;
+        case 4:
+          if (!require_texture_dimension(3) ||
+              !require_mip_range(descriptor.most_detailed_mip, descriptor.mip_levels)) {
+            return false;
+          }
+          break;
+        case 5:
+          if (!require_texture_dimension(3) ||
+              !require_mip_range(descriptor.most_detailed_mip, descriptor.mip_levels) ||
+              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
+            return false;
+          }
+          break;
+        case 6:
+          if (!require_texture_dimension(3)) {
+            return false;
+          }
+          break;
+        case 7:
+          if (!require_texture_dimension(3) ||
+              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
+            return false;
+          }
+          break;
+        case 8:
+          if (!require_texture_dimension(4) ||
+              !require_mip_range(descriptor.most_detailed_mip, descriptor.mip_levels)) {
+            return false;
+          }
+          break;
+        case 9:
+          if (!require_texture_dimension(3) ||
+              !require_mip_range(descriptor.most_detailed_mip, descriptor.mip_levels) ||
+              resource.depth_or_array_size < 6) {
+            last_error_ = record_prefix(source_event) + ": descriptor texture view array range is out of bounds";
+            return false;
+          }
+          break;
+        case 10:
+          if (!require_texture_dimension(3) ||
+              !require_mip_range(descriptor.most_detailed_mip, descriptor.mip_levels) ||
+              descriptor.num_cubes == 0 ||
+              descriptor.num_cubes > (std::numeric_limits<std::uint32_t>::max() / 6) ||
+              !require_array_range(descriptor.first_2d_array_face, descriptor.num_cubes * 6)) {
+            return false;
+          }
+          break;
+        default:
+          break;
+        }
+      }
+      if (function_name == "ID3D12Device::CreateUnorderedAccessView" && descriptor.has_view_desc) {
+        switch (descriptor.view_dimension) {
+        case 2:
+          if (!require_texture_dimension(2) || !require_mip_slice(descriptor.mip_slice)) {
+            return false;
+          }
+          break;
+        case 3:
+          if (!require_texture_dimension(2) ||
+              !require_mip_slice(descriptor.mip_slice) ||
+              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
+            return false;
+          }
+          break;
+        case 4:
+          if (!require_texture_dimension(3) || !require_mip_slice(descriptor.mip_slice)) {
+            return false;
+          }
+          break;
+        case 5:
+          if (!require_texture_dimension(3) ||
+              !require_mip_slice(descriptor.mip_slice) ||
+              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
+            return false;
+          }
+          break;
+        case 8:
+          if (!require_texture_dimension(4) ||
+              !require_mip_slice(descriptor.mip_slice) ||
+              !require_w_range(descriptor.first_w_slice, descriptor.w_size)) {
+            return false;
+          }
+          break;
+        default:
+          break;
+        }
+      }
+      if (function_name == "ID3D12Device::CreateRenderTargetView" && descriptor.has_view_desc) {
+        switch (descriptor.view_dimension) {
+        case 2:
+          if (!require_texture_dimension(2) || !require_mip_slice(descriptor.mip_slice)) {
+            return false;
+          }
+          break;
+        case 3:
+          if (!require_texture_dimension(2) ||
+              !require_mip_slice(descriptor.mip_slice) ||
+              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
+            return false;
+          }
+          break;
+        case 4:
+          if (!require_texture_dimension(3) || !require_mip_slice(descriptor.mip_slice)) {
+            return false;
+          }
+          break;
+        case 5:
+          if (!require_texture_dimension(3) ||
+              !require_mip_slice(descriptor.mip_slice) ||
+              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
+            return false;
+          }
+          break;
+        case 6:
+          if (!require_texture_dimension(3)) {
+            return false;
+          }
+          break;
+        case 7:
+          if (!require_texture_dimension(3) ||
+              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
+            return false;
+          }
+          break;
+        case 8:
+          if (!require_texture_dimension(4) ||
+              !require_mip_slice(descriptor.mip_slice) ||
+              !require_w_range(descriptor.first_w_slice, descriptor.w_size)) {
+            return false;
+          }
+          break;
+        default:
+          break;
+        }
+      }
+      if (function_name == "ID3D12Device::CreateDepthStencilView" && descriptor.has_view_desc) {
+        switch (descriptor.view_dimension) {
+        case 1:
+          if (!require_texture_dimension(2) || !require_mip_slice(descriptor.mip_slice)) {
+            return false;
+          }
+          break;
+        case 2:
+          if (!require_texture_dimension(2) ||
+              !require_mip_slice(descriptor.mip_slice) ||
+              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
+            return false;
+          }
+          break;
+        case 3:
+          if (!require_texture_dimension(3) || !require_mip_slice(descriptor.mip_slice)) {
+            return false;
+          }
+          break;
+        case 4:
+          if (!require_texture_dimension(3) ||
+              !require_mip_slice(descriptor.mip_slice) ||
+              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
+            return false;
+          }
+          break;
+        case 5:
+          if (!require_texture_dimension(3)) {
+            return false;
+          }
+          break;
+        case 6:
+          if (!require_texture_dimension(3) ||
+              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
+            return false;
+          }
+          break;
+        default:
+          break;
+        }
+      }
+    }
+    descriptors_.push_back(std::move(descriptor));
+    ++semantic_calls_seen_;
+    return true;
+  };
+
+  const auto descriptor_function_from_kind = [&](std::uint32_t kind) -> std::string {
+    switch (kind) {
+    case 1:
+      return "ID3D12Device::CreateConstantBufferView";
+    case 2:
+      return "ID3D12Device::CreateShaderResourceView";
+    case 3:
+      return "ID3D12Device::CreateUnorderedAccessView";
+    case 4:
+      return "ID3D12Device::CreateRenderTargetView";
+    case 5:
+      return "ID3D12Device::CreateDepthStencilView";
+    default:
+      return {};
+    }
+  };
+
   if (function_name == "D3D12CreateDevice") {
     if (event.object_refs.empty() || event.object_refs.front() == 0) {
       last_error_ = record_prefix(event) + ": D3D12CreateDevice missing device object id";
@@ -688,350 +1064,87 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     }
     resources_[resource.resource_object_id] = std::move(resource);
     ++semantic_calls_seen_;
+
   } else if (function_name == "ID3D12Device::CreateConstantBufferView" ||
              function_name == "ID3D12Device::CreateShaderResourceView" ||
              function_name == "ID3D12Device::CreateUnorderedAccessView" ||
              function_name == "ID3D12Device::CreateRenderTargetView" ||
              function_name == "ID3D12Device::CreateDepthStencilView") {
-    if (!require_payload_key(event, payload, "descriptor", last_error_)) {
+    const auto resource_object_id = event.object_refs.size() >= 2 ? event.object_refs[1] : trace::ObjectId{};
+    const auto counter_resource_object_id = event.object_refs.size() >= 3 ? event.object_refs[2] : trace::ObjectId{};
+    if (!ingest_descriptor_payload(event, payload, function_name, resource_object_id,
+                                   counter_resource_object_id, event.callsite.sequence)) {
       return false;
     }
-    DescriptorSemanticState descriptor;
-    descriptor.kind = function_name.substr(function_name.find("Create") + 6);
-    descriptor.create_sequence = event.callsite.sequence;
-    descriptor.descriptor = payload_u64(payload, "descriptor");
-    if (event.object_refs.size() >= 2) {
-      descriptor.resource_object_id = event.object_refs[1];
-    }
-    if (event.object_refs.size() >= 3) {
-      descriptor.counter_resource_object_id = event.object_refs[2];
-    }
-    if (!resolve_descriptor_binding_at(descriptor.descriptor, false, event.callsite.sequence, descriptor.binding, last_error_)) {
-      last_error_ = record_prefix(event) + ": " + last_error_;
+  } else if (function_name == "ID3D12Device::CreateDescriptorViewBatch") {
+    const auto ops = payload.find("ops");
+    if (ops == payload.end() || !ops->is_array()) {
+      last_error_ = record_prefix(event) + ": descriptor batch ops must be an array";
       return false;
     }
-    descriptor.format = payload_u32(payload, "format");
-    descriptor.view_dimension = payload_u32(payload, "view_dimension");
-    descriptor.flags = payload_u32(payload, "flags");
-    descriptor.shader_4_component_mapping = payload_u32(payload, "shader_4_component_mapping");
-    descriptor.buffer_location = payload_u64(payload, "buffer_location");
-    descriptor.size_in_bytes = payload_u32(payload, "size_in_bytes");
-    if (function_name == "ID3D12Device::CreateConstantBufferView" && descriptor.buffer_location != 0) {
-      if (!resolve_gpu_virtual_address_at(descriptor.buffer_location, event.callsite.sequence, descriptor.buffer, last_error_)) {
-        last_error_ = record_prefix(event) + ": " + last_error_;
-        return false;
-      }
-      if (!validate_gpu_virtual_address_resolve_payload(event, "descriptor buffer_location", payload, descriptor.buffer, last_error_)) {
-        return false;
-      }
-    }
-    const auto view = payload.find("view");
-    if (view != payload.end()) {
-      if (!view->is_null() && !view->is_object()) {
-        last_error_ = record_prefix(event) + ": descriptor view payload must be an object";
-        return false;
-      }
-      if (view->is_object()) {
-        descriptor.has_view_desc = true;
-        descriptor.first_element = payload_u64(*view, "first_element");
-        descriptor.num_elements = payload_u32(*view, "num_elements");
-        descriptor.structure_byte_stride = payload_u32(*view, "structure_byte_stride");
-        descriptor.counter_offset_in_bytes = payload_u64(*view, "counter_offset_in_bytes");
-        descriptor.flags = payload_u32(*view, "flags", descriptor.flags);
-        descriptor.most_detailed_mip = payload_u32(*view, "most_detailed_mip");
-        descriptor.mip_levels = payload_u32(*view, "mip_levels");
-        descriptor.mip_slice = payload_u32(*view, "mip_slice");
-        descriptor.plane_slice = payload_u32(*view, "plane_slice");
-        descriptor.first_array_slice = payload_u32(*view, "first_array_slice");
-        descriptor.array_size = payload_u32(*view, "array_size");
-        descriptor.first_2d_array_face = payload_u32(*view, "first_2d_array_face");
-        descriptor.num_cubes = payload_u32(*view, "num_cubes");
-        descriptor.first_w_slice = payload_u32(*view, "first_w_slice");
-        descriptor.w_size = payload_u32(*view, "w_size");
-        descriptor.resource_min_lod_clamp = payload_float(*view, "resource_min_lod_clamp");
-        if (payload_has(*view, "location")) {
-          if (!resolve_gpu_virtual_address_at(payload_u64(*view, "location"), event.callsite.sequence, descriptor.raytracing_acceleration_structure, last_error_)) {
-            last_error_ = record_prefix(event) + ": " + last_error_;
-            return false;
-          }
-          if (!validate_gpu_virtual_address_resolve_payload(
-                  event,
-                  "descriptor view.location",
-                  *view,
-                  descriptor.raytracing_acceleration_structure,
-                  last_error_)) {
-            return false;
-          }
+    const bool schema_v2 = payload_string(payload, "schema") == "descriptor-view-v2";
+    if (schema_v2) {
+      for (const auto &op : *ops) {
+        if (!op.is_array() || op.size() < 16) {
+          last_error_ = record_prefix(event) + ": descriptor batch v2 op must be a 16-column array";
+          return false;
         }
-      }
-    }
-    if (descriptor.resource_object_id != 0) {
-      const auto resource_it = resources_.find(descriptor.resource_object_id);
-      if (resource_it == resources_.end()) {
-        last_error_ = record_prefix(event) + ": descriptor references an unknown resource";
-        return false;
-      }
-      const auto &resource = resource_it->second;
-      if (function_name == "ID3D12Device::CreateConstantBufferView" && descriptor.buffer.resolved) {
-        if (descriptor.buffer.offset > resource.width ||
-            descriptor.size_in_bytes > resource.width - descriptor.buffer.offset) {
-          last_error_ = record_prefix(event) + ": ConstantBufferView buffer range is out of bounds";
+        const auto create_sequence = json_u64(op[0], event.callsite.sequence);
+        const auto op_function = descriptor_function_from_kind(static_cast<std::uint32_t>(json_u64(op[1])));
+        json descriptor_payload = json::object();
+        descriptor_payload["descriptor"] = json_u64(op[2]);
+        descriptor_payload["format"] = json_u64(op[5]);
+        descriptor_payload["view_dimension"] = json_u64(op[6]);
+        descriptor_payload["shader_4_component_mapping"] = json_u64(op[7]);
+        descriptor_payload["flags"] = json_u64(op[8]);
+        descriptor_payload["buffer_location"] = json_u64(op[9]);
+        descriptor_payload["size_in_bytes"] = json_u64(op[10]);
+        if (op[11].is_string() && !op[11].get<std::string>().empty()) {
+          descriptor_payload["gpuva_resolve_status"] = op[11];
+        }
+        descriptor_payload["resolved_resource_object_id"] = json_u64(op[12]);
+        descriptor_payload["resolved_resource_offset"] = json_u64(op[13]);
+        descriptor_payload["resolved_resource_width"] = json_u64(op[14]);
+        if (!op[15].is_null()) {
+          descriptor_payload["view"] = op[15];
+        }
+        const auto resource_object_id = static_cast<trace::ObjectId>(json_u64(op[3]));
+        const auto counter_resource_object_id = static_cast<trace::ObjectId>(json_u64(op[4]));
+        if (!ingest_descriptor_payload(event, descriptor_payload, op_function, resource_object_id,
+                                       counter_resource_object_id, create_sequence)) {
           return false;
         }
       }
-      if ((function_name == "ID3D12Device::CreateShaderResourceView" ||
-           function_name == "ID3D12Device::CreateUnorderedAccessView") &&
-          descriptor.has_view_desc &&
-          descriptor.view_dimension == 1) {
-        const auto stride = descriptor.structure_byte_stride != 0
-                                ? descriptor.structure_byte_stride
-                                : dxgi_format_element_size(descriptor.format);
-        if (stride == 0) {
-          last_error_ = record_prefix(event) + ": descriptor buffer view has unknown element size";
+    } else {
+      for (const auto &op : *ops) {
+        if (!op.is_object()) {
+          last_error_ = record_prefix(event) + ": descriptor batch op must be an object";
           return false;
         }
-        const auto view_bytes = descriptor.num_elements == 0
-                                    ? 0
-                                    : (descriptor.num_elements - 1ull) * stride + stride;
-        const auto view_offset = descriptor.first_element * static_cast<std::uint64_t>(stride);
-        if (view_offset > resource.width ||
-            view_bytes > resource.width - view_offset) {
-          last_error_ = record_prefix(event) + ": descriptor buffer view range is out of bounds";
+        std::string op_function = payload_string(op, "function");
+        if (op_function.empty()) {
+          const auto op_kind = payload_string(op, "kind");
+          if (op_kind == "ConstantBufferView") {
+            op_function = "ID3D12Device::CreateConstantBufferView";
+          } else if (op_kind == "ShaderResourceView") {
+            op_function = "ID3D12Device::CreateShaderResourceView";
+          } else if (op_kind == "UnorderedAccessView") {
+            op_function = "ID3D12Device::CreateUnorderedAccessView";
+          } else if (op_kind == "RenderTargetView") {
+            op_function = "ID3D12Device::CreateRenderTargetView";
+          } else if (op_kind == "DepthStencilView") {
+            op_function = "ID3D12Device::CreateDepthStencilView";
+          }
+        }
+        const auto create_sequence = payload_u64(op, "sequence", event.callsite.sequence);
+        const auto resource_object_id = static_cast<trace::ObjectId>(payload_u64(op, "resource_object_id"));
+        const auto counter_resource_object_id = static_cast<trace::ObjectId>(payload_u64(op, "counter_resource_object_id"));
+        if (!ingest_descriptor_payload(event, op, op_function, resource_object_id,
+                                       counter_resource_object_id, create_sequence)) {
           return false;
-        }
-      }
-      const auto require_texture_dimension = [&](std::uint32_t expected_dimension) -> bool {
-        if (resource.dimension != expected_dimension) {
-          last_error_ = record_prefix(event) + ": descriptor texture view dimension does not match resource";
-          return false;
-        }
-        return true;
-      };
-      const auto require_mip_slice = [&](std::uint32_t mip) -> bool {
-        if (mip >= resource.mip_levels) {
-          last_error_ = record_prefix(event) + ": descriptor texture view mip range is out of bounds";
-          return false;
-        }
-        return true;
-      };
-      const auto require_mip_range = [&](std::uint32_t first_mip, std::uint32_t mip_count) -> bool {
-        constexpr std::uint32_t all_remaining = std::numeric_limits<std::uint32_t>::max();
-        if (first_mip >= resource.mip_levels ||
-            (mip_count != all_remaining &&
-             (mip_count == 0 || mip_count > resource.mip_levels - first_mip))) {
-          last_error_ = record_prefix(event) + ": descriptor texture view mip range is out of bounds";
-          return false;
-        }
-        return true;
-      };
-      const auto require_array_range = [&](std::uint32_t first_slice, std::uint32_t slice_count) -> bool {
-        constexpr std::uint32_t all_remaining = std::numeric_limits<std::uint32_t>::max();
-        if (first_slice >= resource.depth_or_array_size ||
-            (slice_count != all_remaining &&
-             (slice_count == 0 || slice_count > resource.depth_or_array_size - first_slice))) {
-          last_error_ = record_prefix(event) + ": descriptor texture view array range is out of bounds";
-          return false;
-        }
-        return true;
-      };
-      const auto require_w_range = [&](std::uint32_t first_slice, std::uint32_t slice_count) -> bool {
-        return require_array_range(first_slice, slice_count);
-      };
-      if (function_name == "ID3D12Device::CreateShaderResourceView" && descriptor.has_view_desc) {
-        switch (descriptor.view_dimension) {
-        case 2:
-          if (!require_texture_dimension(2) ||
-              !require_mip_range(descriptor.most_detailed_mip, descriptor.mip_levels)) {
-            return false;
-          }
-          break;
-        case 3:
-          if (!require_texture_dimension(2) ||
-              !require_mip_range(descriptor.most_detailed_mip, descriptor.mip_levels) ||
-              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
-            return false;
-          }
-          break;
-        case 4:
-          if (!require_texture_dimension(3) ||
-              !require_mip_range(descriptor.most_detailed_mip, descriptor.mip_levels)) {
-            return false;
-          }
-          break;
-        case 5:
-          if (!require_texture_dimension(3) ||
-              !require_mip_range(descriptor.most_detailed_mip, descriptor.mip_levels) ||
-              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
-            return false;
-          }
-          break;
-        case 6:
-          if (!require_texture_dimension(3)) {
-            return false;
-          }
-          break;
-        case 7:
-          if (!require_texture_dimension(3) ||
-              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
-            return false;
-          }
-          break;
-        case 8:
-          if (!require_texture_dimension(4) ||
-              !require_mip_range(descriptor.most_detailed_mip, descriptor.mip_levels)) {
-            return false;
-          }
-          break;
-        case 9:
-          if (!require_texture_dimension(3) ||
-              !require_mip_range(descriptor.most_detailed_mip, descriptor.mip_levels) ||
-              resource.depth_or_array_size < 6) {
-            last_error_ = record_prefix(event) + ": descriptor texture view array range is out of bounds";
-            return false;
-          }
-          break;
-        case 10:
-          if (!require_texture_dimension(3) ||
-              !require_mip_range(descriptor.most_detailed_mip, descriptor.mip_levels) ||
-              descriptor.num_cubes == 0 ||
-              descriptor.num_cubes > (std::numeric_limits<std::uint32_t>::max() / 6) ||
-              !require_array_range(descriptor.first_2d_array_face, descriptor.num_cubes * 6)) {
-            return false;
-          }
-          break;
-        default:
-          break;
-        }
-      }
-      if (function_name == "ID3D12Device::CreateUnorderedAccessView" && descriptor.has_view_desc) {
-        switch (descriptor.view_dimension) {
-        case 2:
-          if (!require_texture_dimension(2) || !require_mip_slice(descriptor.mip_slice)) {
-            return false;
-          }
-          break;
-        case 3:
-          if (!require_texture_dimension(2) ||
-              !require_mip_slice(descriptor.mip_slice) ||
-              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
-            return false;
-          }
-          break;
-        case 4:
-          if (!require_texture_dimension(3) || !require_mip_slice(descriptor.mip_slice)) {
-            return false;
-          }
-          break;
-        case 5:
-          if (!require_texture_dimension(3) ||
-              !require_mip_slice(descriptor.mip_slice) ||
-              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
-            return false;
-          }
-          break;
-        case 8:
-          if (!require_texture_dimension(4) ||
-              !require_mip_slice(descriptor.mip_slice) ||
-              !require_w_range(descriptor.first_w_slice, descriptor.w_size)) {
-            return false;
-          }
-          break;
-        default:
-          break;
-        }
-      }
-      if (function_name == "ID3D12Device::CreateRenderTargetView" && descriptor.has_view_desc) {
-        switch (descriptor.view_dimension) {
-        case 2:
-          if (!require_texture_dimension(2) || !require_mip_slice(descriptor.mip_slice)) {
-            return false;
-          }
-          break;
-        case 3:
-          if (!require_texture_dimension(2) ||
-              !require_mip_slice(descriptor.mip_slice) ||
-              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
-            return false;
-          }
-          break;
-        case 4:
-          if (!require_texture_dimension(3) || !require_mip_slice(descriptor.mip_slice)) {
-            return false;
-          }
-          break;
-        case 5:
-          if (!require_texture_dimension(3) ||
-              !require_mip_slice(descriptor.mip_slice) ||
-              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
-            return false;
-          }
-          break;
-        case 6:
-          if (!require_texture_dimension(3)) {
-            return false;
-          }
-          break;
-        case 7:
-          if (!require_texture_dimension(3) ||
-              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
-            return false;
-          }
-          break;
-        case 8:
-          if (!require_texture_dimension(4) ||
-              !require_mip_slice(descriptor.mip_slice) ||
-              !require_w_range(descriptor.first_w_slice, descriptor.w_size)) {
-            return false;
-          }
-          break;
-        default:
-          break;
-        }
-      }
-      if (function_name == "ID3D12Device::CreateDepthStencilView" && descriptor.has_view_desc) {
-        switch (descriptor.view_dimension) {
-        case 1:
-          if (!require_texture_dimension(2) || !require_mip_slice(descriptor.mip_slice)) {
-            return false;
-          }
-          break;
-        case 2:
-          if (!require_texture_dimension(2) ||
-              !require_mip_slice(descriptor.mip_slice) ||
-              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
-            return false;
-          }
-          break;
-        case 3:
-          if (!require_texture_dimension(3) || !require_mip_slice(descriptor.mip_slice)) {
-            return false;
-          }
-          break;
-        case 4:
-          if (!require_texture_dimension(3) ||
-              !require_mip_slice(descriptor.mip_slice) ||
-              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
-            return false;
-          }
-          break;
-        case 5:
-          if (!require_texture_dimension(3)) {
-            return false;
-          }
-          break;
-        case 6:
-          if (!require_texture_dimension(3) ||
-              !require_array_range(descriptor.first_array_slice, descriptor.array_size)) {
-            return false;
-          }
-          break;
-        default:
-          break;
         }
       }
     }
-    descriptors_.push_back(std::move(descriptor));
-    ++semantic_calls_seen_;
   } else if (function_name == "ID3D12Device::CreateSampler") {
     if (!require_payload_key(event, payload, "descriptor", last_error_)) {
       return false;
@@ -1132,6 +1245,58 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     }
     query_heaps_[heap.query_heap_object_id] = std::move(heap);
     ++semantic_calls_seen_;
+  } else if (function_name == "ID3D12Device::CopyDescriptorsBatch") {
+    const auto ops = payload.find("ops");
+    if (ops == payload.end() || !ops->is_array()) {
+      last_error_ = record_prefix(event) + ": CopyDescriptorsBatch ops must be an array";
+      return false;
+    }
+    for (const auto &op : *ops) {
+      if (!op.is_array() || op.size() < 6) {
+        last_error_ = record_prefix(event) + ": CopyDescriptorsBatch op must be a 6-column array";
+        return false;
+      }
+      CopyDescriptorSemanticState copy;
+      copy.create_sequence = json_u64(op[0], event.callsite.sequence);
+      copy.descriptor_heap_type = static_cast<std::uint32_t>(json_u64(op[1]));
+      const auto descriptor_size = json_u64(op[2]);
+      if (descriptor_size == 0) {
+        last_error_ = record_prefix(event) + ": CopyDescriptorsBatch descriptor size must be non-zero";
+        return false;
+      }
+      const auto &ranges = op[5];
+      if (!ranges.is_array()) {
+        last_error_ = record_prefix(event) + ": CopyDescriptorsBatch ranges must be an array";
+        return false;
+      }
+      for (const auto &range : ranges) {
+        if (!range.is_array() || range.size() < 3) {
+          last_error_ = record_prefix(event) + ": CopyDescriptorsBatch range must be a 3-column array";
+          return false;
+        }
+        const auto dst_base = json_u64(range[0]);
+        const auto src_base = json_u64(range[1]);
+        const auto count = json_u64(range[2]);
+        if (dst_base == 0 || src_base == 0 || count == 0) {
+          last_error_ = record_prefix(event) + ": CopyDescriptorsBatch range handles and count must be non-zero";
+          return false;
+        }
+        for (std::uint64_t index = 0; index < count; ++index) {
+          CopyDescriptorPair pair;
+          pair.dst_descriptor = dst_base + index * descriptor_size;
+          pair.src_descriptor = src_base + index * descriptor_size;
+          DescriptorBinding ignored_binding;
+          if (!resolve_descriptor_binding_at(pair.dst_descriptor, false, copy.create_sequence, ignored_binding, last_error_) ||
+              !resolve_descriptor_binding_at(pair.src_descriptor, false, copy.create_sequence, ignored_binding, last_error_)) {
+            last_error_ = record_prefix(event) + ": " + last_error_;
+            return false;
+          }
+          copy.descriptors.push_back(pair);
+        }
+      }
+      descriptor_copies_.push_back(std::move(copy));
+      ++semantic_calls_seen_;
+    }
   } else if (function_name == "ID3D12Device::CopyDescriptors" ||
              function_name == "ID3D12Device::CopyDescriptorsSimple") {
     if (!require_payload_key(event, payload, "descriptor_heap_type", last_error_) ||
@@ -1988,7 +2153,8 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       command_list_state->index_buffer = binding;
     }
     ++semantic_calls_seen_;
-  } else if (function_name == "ID3D12GraphicsCommandList::ResourceBarrier") {
+  } else if (function_name == "ID3D12GraphicsCommandList::ResourceBarrier" ||
+             function_name == "ID3D12GraphicsCommandList::ResourceBarrierBatch") {
     if (!require_payload_key(event, payload, "barrier_count", last_error_) ||
         !require_payload_key(event, payload, "barriers", last_error_)) {
       return false;
@@ -2006,29 +2172,51 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       last_error_ = record_prefix(event) + ": barrier_count does not match barriers payload";
       return false;
     }
-    for (const auto &barrier : barriers) {
-      if (!barrier.is_object()) {
-        last_error_ = record_prefix(event) + ": barrier entry must be an object";
+    for (const auto &barrier_entry : barriers) {
+      json compact_barrier_storage;
+      const json *barrier = &barrier_entry;
+      if (barrier_entry.is_array()) {
+        if (barrier_entry.size() < 9) {
+          last_error_ = record_prefix(event) + ": ResourceBarrierBatch op must be a 9-column array";
+          return false;
+        }
+        compact_barrier_storage = {
+            {"type", json_u64(barrier_entry[1])},
+            {"flags", json_u64(barrier_entry[2])},
+            {"resource_object_id", json_u64(barrier_entry[3])},
+            {"before", json_u64(barrier_entry[4])},
+            {"after", json_u64(barrier_entry[5])},
+            {"subresource", json_u64(barrier_entry[6])},
+            {"resource_before_object_id", json_u64(barrier_entry[7])},
+            {"resource_after_object_id", json_u64(barrier_entry[8])},
+        };
+        barrier = &compact_barrier_storage;
+      }
+      if (!barrier->is_object()) {
+        last_error_ = record_prefix(event) + ": barrier entry must be an object or compact array";
         return false;
       }
-      if (!require_payload_key(event, barrier, "type", last_error_) ||
-          !require_payload_key(event, barrier, "flags", last_error_)) {
+      const auto barrier_sequence = barrier_entry.is_array()
+                                        ? json_u64(barrier_entry[0], event.callsite.sequence)
+                                        : event.callsite.sequence;
+      if (!require_payload_key(event, *barrier, "type", last_error_) ||
+          !require_payload_key(event, *barrier, "flags", last_error_)) {
         return false;
       }
-      const auto barrier_type = payload_u32(barrier, "type");
-      const auto flags = payload_u32(barrier, "flags");
+      const auto barrier_type = payload_u32(*barrier, "type");
+      const auto flags = payload_u32(*barrier, "flags");
       ResourceBarrierSemanticState barrier_state;
-      barrier_state.sequence = event.callsite.sequence;
+      barrier_state.sequence = barrier_sequence;
       barrier_state.command_list_object_id = command_list_id;
       barrier_state.type = barrier_type;
       barrier_state.flags = flags;
       if (barrier_type == 1) {
-        if (!require_payload_key(event, barrier, "resource_before_object_id", last_error_) ||
-            !require_payload_key(event, barrier, "resource_after_object_id", last_error_)) {
+        if (!require_payload_key(event, *barrier, "resource_before_object_id", last_error_) ||
+            !require_payload_key(event, *barrier, "resource_after_object_id", last_error_)) {
           return false;
         }
-        const auto before_id = json_object_id(barrier["resource_before_object_id"]);
-        const auto after_id = json_object_id(barrier["resource_after_object_id"]);
+        const auto before_id = json_object_id((*barrier)["resource_before_object_id"]);
+        const auto after_id = json_object_id((*barrier)["resource_after_object_id"]);
         if (before_id != 0 && resources_.find(before_id) == resources_.end()) {
           last_error_ = record_prefix(event) + ": ResourceBarrier references an unknown aliasing before resource";
           return false;
@@ -2045,10 +2233,10 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         continue;
       }
       if (barrier_type == 2) {
-        if (!require_payload_key(event, barrier, "resource_object_id", last_error_)) {
+        if (!require_payload_key(event, *barrier, "resource_object_id", last_error_)) {
           return false;
         }
-        const auto resource_object_id = json_object_id(barrier["resource_object_id"]);
+        const auto resource_object_id = json_object_id((*barrier)["resource_object_id"]);
         if (resource_object_id != 0 && resources_.find(resource_object_id) == resources_.end()) {
           last_error_ = record_prefix(event) + ": ResourceBarrier references an unknown UAV resource";
           return false;
@@ -2062,13 +2250,13 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       if (barrier_type != 0) {
         continue;
       }
-      if (!require_payload_key(event, barrier, "resource_object_id", last_error_) ||
-          !require_payload_key(event, barrier, "before", last_error_) ||
-          !require_payload_key(event, barrier, "after", last_error_) ||
-          !require_payload_key(event, barrier, "subresource", last_error_)) {
+      if (!require_payload_key(event, *barrier, "resource_object_id", last_error_) ||
+          !require_payload_key(event, *barrier, "before", last_error_) ||
+          !require_payload_key(event, *barrier, "after", last_error_) ||
+          !require_payload_key(event, *barrier, "subresource", last_error_)) {
         return false;
       }
-      const auto resource_object_id = json_object_id(barrier["resource_object_id"]);
+      const auto resource_object_id = json_object_id((*barrier)["resource_object_id"]);
       if (resource_object_id == 0) {
         continue;
       }
@@ -2082,9 +2270,9 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       constexpr std::uint32_t end_only = 0x2;
       constexpr std::uint32_t all_subresources = 0xffffffffu;
       auto &resource = resource_it->second;
-      const auto before = payload_u32(barrier, "before");
-      const auto after = payload_u32(barrier, "after");
-      const auto subresource = payload_u32(barrier, "subresource");
+      const auto before = payload_u32(*barrier, "before");
+      const auto after = payload_u32(*barrier, "after");
+      const auto subresource = payload_u32(*barrier, "subresource");
       if (subresource != all_subresources && subresource >= resource_subresource_count(resource)) {
         last_error_ = record_prefix(event) + ": ResourceBarrier subresource index is out of bounds";
         return false;
@@ -2119,14 +2307,14 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       }
 
       ResourceTransition transition;
-      transition.sequence = event.callsite.sequence;
+      transition.sequence = barrier_sequence;
       transition.command_list_object_id = command_list_id;
       transition.flags = flags;
       transition.before = before;
       transition.after = after;
       transition.subresource = subresource;
       resource.transitions.push_back(transition);
-      resource.last_transition_sequence = event.callsite.sequence;
+      resource.last_transition_sequence = barrier_sequence;
       if ((flags & begin_only) == 0) {
         if (subresource == all_subresources) {
           resource.current_state = after;
@@ -2485,6 +2673,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
   } else if (function_name == "ID3D12GraphicsCommandList::CopyBufferRegion" ||
              function_name == "ID3D12GraphicsCommandList::CopyBufferRegionBatch" ||
              function_name == "ID3D12GraphicsCommandList::CopyTextureRegion" ||
+             function_name == "ID3D12GraphicsCommandList::CopyTextureRegionBatch" ||
              function_name == "ID3D12GraphicsCommandList::CopyResource" ||
              function_name == "ID3D12GraphicsCommandList::ResolveSubresource" ||
              function_name == "ID3D12GraphicsCommandList::ResolveSubresourceRegion") {
@@ -2541,7 +2730,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
           copy.byte_count = payload_u64(op, "byte_count");
           command_list_state->buffer_copies.push_back(copy);
         }
-      } else {
+      } else if (function_name != "ID3D12GraphicsCommandList::CopyTextureRegionBatch") {
         ++command_list_state->copy_count;
       }
       if (function_name == "ID3D12GraphicsCommandList::CopyBufferRegion") {
@@ -2571,7 +2760,78 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         copy.src_offset = payload_u64(payload, "src_offset");
         copy.byte_count = payload_u64(payload, "byte_count");
         command_list_state->buffer_copies.push_back(copy);
-  } else if (function_name == "ID3D12GraphicsCommandList::CopyTextureRegion" &&
+      } else if (function_name == "ID3D12GraphicsCommandList::CopyTextureRegionBatch") {
+        if (!require_payload_key(event, payload, "op_count", last_error_) ||
+            !require_payload_key(event, payload, "ops", last_error_)) {
+          return false;
+        }
+        const auto &ops = payload["ops"];
+        if (!ops.is_array()) {
+          last_error_ = record_prefix(event) + ": CopyTextureRegionBatch ops must be an array";
+          return false;
+        }
+        if (ops.size() != payload_u64(payload, "op_count")) {
+          last_error_ = record_prefix(event) + ": CopyTextureRegionBatch op_count does not match ops payload";
+          return false;
+        }
+        command_list_state->copy_count += ops.size();
+        for (const auto &op : ops) {
+          if (!op.is_array() || op.size() < 7 ||
+              !op[1].is_array() || op[1].size() < 9 ||
+              !op[5].is_array() || op[5].size() < 9) {
+            last_error_ = record_prefix(event) + ": CopyTextureRegionBatch op must use compact array payload";
+            return false;
+          }
+          TextureCopySemanticState copy;
+          copy.sequence = json_u64(op[0], event.callsite.sequence);
+          copy.command_list_object_id = command_list_id;
+          const auto parse_location = [&](const json &location, TextureCopyLocation &target) -> bool {
+            target.resource_object_id = json_object_id(location[0]);
+            target.type = static_cast<std::uint32_t>(json_u64(location[1]));
+            target.subresource_index = static_cast<std::uint32_t>(json_u64(location[2]));
+            target.footprint_offset = json_u64(location[3]);
+            target.footprint_format = static_cast<std::uint32_t>(json_u64(location[4]));
+            target.footprint_width = static_cast<std::uint32_t>(json_u64(location[5]));
+            target.footprint_height = static_cast<std::uint32_t>(json_u64(location[6]));
+            target.footprint_depth = static_cast<std::uint32_t>(json_u64(location[7]));
+            target.footprint_row_pitch = static_cast<std::uint32_t>(json_u64(location[8]));
+            if (target.type > 1) {
+              last_error_ = record_prefix(event) + ": CopyTextureRegionBatch has unsupported texture copy location type";
+              return false;
+            }
+            return true;
+          };
+          if (!parse_location(op[1], copy.dst) ||
+              !parse_location(op[5], copy.src)) {
+            return false;
+          }
+          copy.dst_x = static_cast<std::uint32_t>(json_u64(op[2]));
+          copy.dst_y = static_cast<std::uint32_t>(json_u64(op[3]));
+          copy.dst_z = static_cast<std::uint32_t>(json_u64(op[4]));
+          if (!op[6].is_null()) {
+            if (!op[6].is_array() || op[6].size() < 6) {
+              last_error_ = record_prefix(event) + ": CopyTextureRegionBatch src_box must be null or a 6-column array";
+              return false;
+            }
+            copy.has_src_box = true;
+            copy.src_box_left = static_cast<std::uint32_t>(json_u64(op[6][0]));
+            copy.src_box_top = static_cast<std::uint32_t>(json_u64(op[6][1]));
+            copy.src_box_front = static_cast<std::uint32_t>(json_u64(op[6][2]));
+            copy.src_box_right = static_cast<std::uint32_t>(json_u64(op[6][3]));
+            copy.src_box_bottom = static_cast<std::uint32_t>(json_u64(op[6][4]));
+            copy.src_box_back = static_cast<std::uint32_t>(json_u64(op[6][5]));
+          }
+          if (copy.dst.resource_object_id != 0 && resources_.find(copy.dst.resource_object_id) == resources_.end()) {
+            last_error_ = record_prefix(event) + ": CopyTextureRegionBatch references an unknown destination resource";
+            return false;
+          }
+          if (copy.src.resource_object_id != 0 && resources_.find(copy.src.resource_object_id) == resources_.end()) {
+            last_error_ = record_prefix(event) + ": CopyTextureRegionBatch references an unknown source resource";
+            return false;
+          }
+          command_list_state->texture_copies.push_back(copy);
+        }
+      } else if (function_name == "ID3D12GraphicsCommandList::CopyTextureRegion" &&
           payload_has(payload, "dst") && payload_has(payload, "src")) {
         if (!require_payload_key(event, payload, "dst_x", last_error_) ||
             !require_payload_key(event, payload, "dst_y", last_error_) ||
@@ -2993,7 +3253,8 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
              function_name == "ID3D12Device::QueryInterface" ||
              function_name == "IDXGIFactory::CreateSwapChain" ||
              function_name == "ID3D12GraphicsCommandList::QueryInterface" ||
-             function_name == "IDXGISwapChain::Present") {
+             function_name == "IDXGISwapChain::Present" ||
+             function_name == "DXMT::FenceDependencyBatch") {
     if (function_name == "IDXGISwapChain::Present" &&
         (!require_payload_key(event, payload, "sync_interval", last_error_) ||
          !require_payload_key(event, payload, "flags", last_error_))) {
@@ -3005,4 +3266,3 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
   ++commands_replayed_;
   return true;
 }
-

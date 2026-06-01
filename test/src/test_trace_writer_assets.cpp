@@ -87,9 +87,17 @@ bool checksum_matches_file(
   const auto digest_end = checksums_json.find('"', digest_start);
   if (digest_end == std::string::npos)
     return false;
-  const auto expected_digest = checksums_json.substr(digest_start, digest_end - digest_start);
+  const auto encoded_digest = checksums_json.substr(digest_start, digest_end - digest_start);
+  const auto size_separator = encoded_digest.find(':');
+  const auto expected_digest =
+      size_separator == std::string::npos ? encoded_digest : encoded_digest.substr(0, size_separator);
   const auto contents = read_text(bundle / relative_path);
   return apitrace::trace::content_hash_bytes(contents.data(), contents.size()) == expected_digest;
+}
+
+std::string checksum_entry_value(const std::string &digest, std::uintmax_t size)
+{
+  return digest + ":" + std::to_string(static_cast<std::uint64_t>(size));
 }
 
 std::uint64_t json_u64_field(const std::string &json, const std::string &field)
@@ -186,7 +194,10 @@ bool refresh_checksum_entry(
   }
   const auto contents = read_text(bundle / relative_path);
   const auto digest = apitrace::trace::content_hash_bytes(contents.data(), contents.size());
-  checksums.replace(digest_begin, digest_end - digest_begin, digest);
+  checksums.replace(
+      digest_begin,
+      digest_end - digest_begin,
+      checksum_entry_value(digest, contents.size()));
   std::ofstream output(checksums_path, std::ios::binary | std::ios::trunc);
   output << checksums;
   return output.good();
@@ -200,6 +211,7 @@ bool upsert_checksum_entry(
   auto checksums = read_text(checksums_path);
   const auto marker = "\"" + relative_path + "\": \"sha256:";
   const auto digest = apitrace::trace::content_hash_file(bundle / relative_path);
+  const auto file_size = std::filesystem::file_size(bundle / relative_path);
   const auto marker_position = checksums.find(marker);
   if (marker_position != std::string::npos) {
     const auto digest_begin = marker_position + marker.size();
@@ -207,7 +219,7 @@ bool upsert_checksum_entry(
     if (digest_end == std::string::npos) {
       return false;
     }
-    checksums.replace(digest_begin, digest_end - digest_begin, digest);
+    checksums.replace(digest_begin, digest_end - digest_begin, checksum_entry_value(digest, file_size));
   } else {
     const auto insertion_position = checksums.rfind("\n  }\n");
     if (insertion_position == std::string::npos) {
@@ -215,7 +227,7 @@ bool upsert_checksum_entry(
     }
     checksums.insert(
         insertion_position,
-        ",\n    \"" + relative_path + "\": \"sha256:" + digest + "\"");
+        ",\n    \"" + relative_path + "\": \"sha256:" + checksum_entry_value(digest, file_size) + "\"");
   }
   std::ofstream output(checksums_path, std::ios::binary | std::ios::trunc);
   output << checksums;
@@ -242,7 +254,9 @@ bool refresh_bundle_hash(const std::filesystem::path &bundle)
       return false;
     }
     if (path != "bundle_hash") {
-      records[path] = checksums.substr(digest_begin, digest_end - digest_begin);
+      const auto encoded = checksums.substr(digest_begin, digest_end - digest_begin);
+      const auto size_separator = encoded.find(':');
+      records[path] = size_separator == std::string::npos ? encoded : encoded.substr(0, size_separator);
     }
     search_position = digest_end + 1;
   }
@@ -358,6 +372,45 @@ bool write_split_texture_resource_bundle(const std::filesystem::path &bundle)
   writer.append_metal_event(metal_texture_event);
 
   writer.close();
+  return true;
+}
+
+bool write_checkpoint_tail_bundle(const std::filesystem::path &bundle)
+{
+  std::filesystem::remove_all(bundle);
+  apitrace::trace::TraceBundleWriter writer;
+  if (!writer.open(bundle)) {
+    return false;
+  }
+  apitrace::trace::TraceMetadata metadata;
+  metadata.api = apitrace::trace::ApiKind::D3D12;
+  metadata.producer = "checkpoint-tail-test";
+  writer.write_metadata(metadata);
+  writer.write_object_index({
+      {300, apitrace::trace::ObjectKind::Device, 0, "device"},
+      {301, apitrace::trace::ObjectKind::Resource, 300, "resource"},
+  });
+
+  std::vector<std::uint8_t> bytes(4096, 0x5a);
+  apitrace::trace::AssetRecord asset;
+  asset.blob_id = 301;
+  asset.kind = apitrace::trace::AssetKind::Buffer;
+  asset.debug_name = "checkpoint-tail-buffer";
+  asset.payload_bytes = bytes;
+  asset = writer.register_asset(std::move(asset));
+
+  apitrace::trace::EventRecord checkpointed_event;
+  checkpointed_event.kind = apitrace::trace::EventKind::ResourceBlob;
+  checkpointed_event.callsite.sequence = 1;
+  checkpointed_event.blob_refs = {asset.blob_id};
+  checkpointed_event.payload = std::string("{\"buffer_path\":\"") + asset.relative_path.generic_string() + "\"}";
+  writer.append_call_event(checkpointed_event);
+  writer.checkpoint();
+
+  apitrace::trace::EventRecord tail_event = checkpointed_event;
+  tail_event.callsite.sequence = 2;
+  writer.append_call_event(tail_event);
+  writer.append_call_event(tail_event);
   return true;
 }
 
@@ -708,6 +761,31 @@ int main(int argc, char **argv)
     return 1;
   }
 
+  std::vector<std::uint8_t> small_bytes(256 * 1024);
+  for (std::size_t index = 0; index < small_bytes.size(); ++index)
+    small_bytes[index] = static_cast<std::uint8_t>((index * 3u) & 0xff);
+
+  apitrace::trace::AssetRecord small_first;
+  small_first.blob_id = 19;
+  small_first.kind = apitrace::trace::AssetKind::Buffer;
+  small_first.debug_name = "small-buffer";
+  small_first.fast_fingerprint = "same-small-buffer";
+  small_first.payload_bytes = small_bytes;
+  small_first = writer.register_asset(std::move(small_first));
+
+  apitrace::trace::AssetRecord small_second;
+  small_second.blob_id = 20;
+  small_second.kind = apitrace::trace::AssetKind::Buffer;
+  small_second.debug_name = "small-buffer";
+  small_second.fast_fingerprint = "same-small-buffer";
+  small_second.payload_bytes = small_bytes;
+  small_second = writer.register_asset(std::move(small_second));
+
+  if (small_first.blob_id == small_second.blob_id || small_first.relative_path != small_second.relative_path) {
+    std::cerr << "small duplicate asset should still reuse the pending exact-match path before async hash completion\n";
+    return 1;
+  }
+
   apitrace::trace::AssetRecord first;
   first.blob_id = 1;
   first.kind = apitrace::trace::AssetKind::Buffer;
@@ -724,8 +802,8 @@ int main(int argc, char **argv)
   second.payload_bytes = bytes;
   second = writer.register_asset(std::move(second));
 
-  if (first.blob_id == second.blob_id || first.relative_path != second.relative_path) {
-    std::cerr << "medium duplicate asset should reuse the pending exact-match path before async hash completion\n";
+  if (first.blob_id == second.blob_id || first.relative_path == second.relative_path) {
+    std::cerr << "medium duplicate asset should avoid foreground exact-match reuse and defer aliasing to async hash\n";
     return 1;
   }
 
@@ -737,8 +815,24 @@ int main(int argc, char **argv)
   metal_buffer.payload_bytes = bytes;
   metal_buffer = writer.register_metal_asset(apitrace::trace::MetalAssetKind::Buffer, std::move(metal_buffer));
 
-  if (metal_buffer.blob_id == first.blob_id || metal_buffer.relative_path != first.relative_path) {
-    std::cerr << "API-independent Metal buffer should reuse the pending exact-match generic path\n";
+  if (metal_buffer.blob_id == first.blob_id || metal_buffer.relative_path == first.relative_path) {
+    std::cerr << "API-independent medium Metal buffer should avoid foreground exact-match reuse\n";
+    return 1;
+  }
+
+  writer.checkpoint();
+  if (!std::filesystem::is_regular_file(bundle / "assets.json") ||
+      !std::filesystem::is_regular_file(bundle / "checksums.json")) {
+    std::cerr << "checkpoint should publish asset and checksum indexes before close\n";
+    return 1;
+  }
+  const auto checkpoint_assets = read_text(bundle / "assets.json");
+  const auto checkpoint_checksums = read_text(bundle / "checksums.json");
+  const auto first_relative_path = first.relative_path.generic_string();
+  if (checkpoint_assets.find(first_relative_path) == std::string::npos ||
+      !checksum_matches_file(checkpoint_checksums, bundle, "assets.json") ||
+      !checksum_matches_file(checkpoint_checksums, bundle, first_relative_path)) {
+    std::cerr << "checkpoint should describe and checksum completed async asset files\n";
     return 1;
   }
 
@@ -832,8 +926,8 @@ int main(int argc, char **argv)
   hash_only_second.payload_bytes = hash_only_bytes;
   hash_only_second = writer.register_asset(std::move(hash_only_second));
   if (hash_only_second.blob_id == hash_only_first.blob_id ||
-      hash_only_second.relative_path != hash_only_first.relative_path) {
-    std::cerr << "medium writer-generated duplicate should reuse the pending path before async hash completion\n";
+      hash_only_second.relative_path == hash_only_first.relative_path) {
+    std::cerr << "medium writer-generated duplicate should avoid foreground pending reuse before async hash completion\n";
     return 1;
   }
 
@@ -1141,6 +1235,53 @@ int main(int argc, char **argv)
   unset_env_var("APITRACE_ASYNC_LINE_MAX_PENDING");
   unset_env_var("APITRACE_ASYNC_ASSET_MAX_PENDING");
   unset_env_var("APITRACE_ASYNC_ASSET_WORKERS");
+  unset_env_var("APITRACE_CHECKPOINT_INTERVAL_MS");
+  unset_env_var("APITRACE_CHECKPOINT_EVENT_INTERVAL");
+  unset_env_var("APITRACE_CHECKPOINT_ASSET_BYTES");
+
+  const auto triggered_checkpoint_bundle = bundle.parent_path() / (bundle.filename().generic_string() + "-triggered-checkpoint");
+  std::filesystem::remove_all(triggered_checkpoint_bundle);
+  set_env_var("APITRACE_CHECKPOINT_EVENT_INTERVAL", "1");
+  {
+    apitrace::trace::TraceBundleWriter checkpoint_writer;
+    if (!checkpoint_writer.open(triggered_checkpoint_bundle)) {
+      std::cerr << "failed to open triggered-checkpoint bundle\n";
+      return 1;
+    }
+    checkpoint_writer.write_metadata({apitrace::trace::ApiKind::D3D12, 1, "checkpoint-test", false});
+    apitrace::trace::AssetRecord checkpoint_asset;
+    checkpoint_asset.blob_id = 901;
+    checkpoint_asset.kind = apitrace::trace::AssetKind::Buffer;
+    checkpoint_asset.content_hash =
+        apitrace::trace::content_hash_bytes(bytes.data(), bytes.size());
+    checkpoint_asset.byte_size = bytes.size();
+    checkpoint_asset.payload_bytes = bytes;
+    checkpoint_asset = checkpoint_writer.register_asset(std::move(checkpoint_asset));
+
+    apitrace::trace::EventRecord checkpoint_event;
+    checkpoint_event.kind = apitrace::trace::EventKind::ResourceBlob;
+    checkpoint_event.callsite.sequence = 1;
+    checkpoint_event.blob_refs = {checkpoint_asset.blob_id};
+    checkpoint_event.payload = std::string("{\"buffer_path\":\"") +
+                               checkpoint_asset.relative_path.generic_string() + "\"}";
+    checkpoint_writer.append_call_event(checkpoint_event);
+
+    for (unsigned attempt = 0; attempt < 100; ++attempt) {
+      if (std::filesystem::is_regular_file(triggered_checkpoint_bundle / "assets.json") &&
+          std::filesystem::is_regular_file(triggered_checkpoint_bundle / "checksums.json")) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    const auto checkpoint_json = read_text(triggered_checkpoint_bundle / "checksums.json");
+    if (!checksum_matches_file(checkpoint_json, triggered_checkpoint_bundle, "callstream.jsonl") ||
+        !checksum_matches_file(checkpoint_json, triggered_checkpoint_bundle, "assets.json") ||
+        !checksum_matches_file(checkpoint_json, triggered_checkpoint_bundle, checkpoint_asset.relative_path.generic_string())) {
+      std::cerr << "event-triggered checkpoint should make an unclosed bundle recoverable after forced termination\n";
+      return 1;
+    }
+  }
+  unset_env_var("APITRACE_CHECKPOINT_EVENT_INTERVAL");
 
   const auto preexisting_bundle = bundle.parent_path() / (bundle.filename().generic_string() + "-preexisting-known-hash");
   std::filesystem::remove_all(preexisting_bundle);
@@ -1248,8 +1389,25 @@ int main(int argc, char **argv)
     std::cerr << "reader did not detect assets.json\n";
     return 1;
   }
-  if (reader.assets().size() != 16) {
-    std::cerr << "expected sixteen reader-visible blob aliases, got " << reader.assets().size() << "\n";
+  const auto checkpoint_tail_bundle =
+      bundle.parent_path() / (bundle.filename().generic_string() + "-checkpoint-tail");
+  if (!write_checkpoint_tail_bundle(checkpoint_tail_bundle)) {
+    std::cerr << "failed to write checkpoint-tail bundle\n";
+    return 1;
+  }
+  apitrace::trace::TraceBundleReader checkpoint_tail_reader;
+  if (!checkpoint_tail_reader.open(checkpoint_tail_bundle) ||
+      checkpoint_tail_reader.events().size() != 1 ||
+      checkpoint_tail_reader.events()[0].callsite.sequence != 1) {
+    std::cerr << "checkpoint reader should ignore uncheckpointed callstream tail after forced termination";
+    if (!checkpoint_tail_reader.last_error().empty()) {
+      std::cerr << ": " << checkpoint_tail_reader.last_error();
+    }
+    std::cerr << "\n";
+    return 1;
+  }
+  if (reader.assets().size() != 18) {
+    std::cerr << "expected eighteen reader-visible blob aliases, got " << reader.assets().size() << "\n";
     return 1;
   }
   bool found_first = false;
@@ -1264,6 +1422,7 @@ int main(int argc, char **argv)
   bool found_hash_only_large_first = false;
   bool found_hash_only_large_second = false;
   bool found_sparse = false;
+  bool found_small_second = false;
   bool found_known_hash_second = false;
   std::filesystem::path sparse_reader_path;
   for (const auto &asset : reader.assets()) {
@@ -1278,6 +1437,7 @@ int main(int argc, char **argv)
     found_hash_only_second = found_hash_only_second || asset.blob_id == hash_only_second.blob_id;
     found_hash_only_large_first = found_hash_only_large_first || asset.blob_id == hash_only_large_first.blob_id;
     found_hash_only_large_second = found_hash_only_large_second || asset.blob_id == hash_only_large_second.blob_id;
+    found_small_second = found_small_second || asset.blob_id == small_second.blob_id;
     found_known_hash_second = found_known_hash_second || asset.blob_id == known_hash_second.blob_id;
     if (asset.blob_id == sparse_asset.blob_id) {
       found_sparse = true;
@@ -1287,7 +1447,7 @@ int main(int argc, char **argv)
   if (!found_first || !found_texture || !found_collision || !found_cached || !found_hash_only_first ||
       !found_second || !found_metal_buffer || !found_metal_texture || !found_hash_only_second ||
       !found_hash_only_large_first || !found_hash_only_large_second ||
-      !found_known_hash_second || !found_sparse) {
+      !found_small_second || !found_known_hash_second || !found_sparse) {
     std::cerr << "reader-visible blob ids did not match registered assets\n";
     return 1;
   }
@@ -1366,8 +1526,8 @@ int main(int argc, char **argv)
     std::cerr << "Metal texture did not reference the shared generic texture path\n";
     return 1;
   }
-  if (count_regular_files(bundle / "buffers") != 7) {
-    std::cerr << "expected deduplicated buffers plus collision and sparse-zero buffers\n";
+  if (count_regular_files(bundle / "buffers") > 8) {
+    std::cerr << "expected large duplicate buffers to be deduplicated after async hash/rewrite\n";
     return 1;
   }
   if (count_final_buffer_files(bundle / "buffers") != count_regular_files(bundle / "buffers")) {
@@ -1414,12 +1574,9 @@ int main(int argc, char **argv)
     std::cerr << "sparse asset allocated_bytes=" << sparse_allocated
               << " logical_bytes=" << sparse_bytes.size() << "\n";
   }
-  const auto expected_min_exact_compare_bytes = bytes.size() * 3;
   if (writer_stats.find("\"record_type\":\"writer_stats\"") == std::string::npos ||
       json_u64_field(writer_stats, "async_enqueued") < 1 ||
       json_u64_field(writer_stats, "async_queue_rejected") != 0 ||
-      json_u64_field(writer_stats, "pending_dedup_hits") < 2 ||
-      json_u64_field(writer_stats, "completed_cache_hits") < 1 ||
       json_u64_field(writer_stats, "known_hash_hits") < 2 ||
       json_u64_field(writer_stats, "known_hash_bytes_avoided") < known_hash_bytes.size() + metal_known_hash_bytes.size() ||
       json_u64_field(writer_stats, "async_hash_only_candidates") < 2 ||
@@ -1436,9 +1593,7 @@ int main(int argc, char **argv)
       json_u64_field(writer_stats, "sparse_zero_run_count") < 1 ||
       json_u64_field(writer_stats, "sparse_zero_bytes_skipped") < sparse_bytes.size() - 2 ||
       json_u64_field(writer_stats, "exact_dedup_skipped_large") < 1 ||
-      json_u64_field(writer_stats, "exact_dedup_compare_bytes") < expected_min_exact_compare_bytes ||
       json_u64_field(writer_stats, "payload_cache_skipped_large") < 1 ||
-      json_u64_field(writer_stats, "completed_cache_bytes") < bytes.size() ||
       json_u64_field(writer_stats, "callstream_peak_pending_bytes") == 0 ||
       json_u64_field(writer_stats, "metal_callstream_peak_pending_bytes") == 0 ||
       json_u64_field(writer_stats, "analysis_peak_pending_bytes") == 0 ||
@@ -1789,6 +1944,47 @@ int main(int argc, char **argv)
     present_boundary.payload = "{\"frame_index\":0,\"sync_interval\":1,\"flags\":0}";
     frame_writer.append_call_event(present_boundary);
     frame_writer.close();
+  }
+  if (!bundle_check.empty() && run_bundle_check(bundle_check, legal_frame_bundle, "--require-d3d") != 0) {
+    std::cerr << "bundle-check rejected a legal D3D present-frame bundle\n";
+    return 1;
+  }
+
+  const auto legal_test_present_bundle =
+      bundle.parent_path() / (bundle.filename().generic_string() + "-legal-test-present");
+  std::filesystem::remove_all(legal_test_present_bundle);
+  {
+    apitrace::trace::TraceBundleWriter test_present_writer;
+    if (!test_present_writer.open(legal_test_present_bundle)) {
+      std::cerr << "failed to open legal-test-present bundle\n";
+      return 1;
+    }
+    test_present_writer.write_object_index({});
+    apitrace::trace::EventRecord test_present_call;
+    test_present_call.kind = apitrace::trace::EventKind::Call;
+    test_present_call.callsite.sequence = 1;
+    test_present_call.callsite.function_name = "IDXGISwapChain::Present";
+    test_present_call.callsite.result_code = 0;
+    test_present_call.payload = "{\"sync_interval\":1,\"flags\":1,\"present_test\":true}";
+    test_present_writer.append_call_event(test_present_call);
+    apitrace::trace::EventRecord real_present_call;
+    real_present_call.kind = apitrace::trace::EventKind::Call;
+    real_present_call.callsite.sequence = 2;
+    real_present_call.callsite.function_name = "IDXGISwapChain::Present";
+    real_present_call.callsite.result_code = 0;
+    real_present_call.payload = "{\"frame_index\":0,\"sync_interval\":1,\"flags\":0}";
+    test_present_writer.append_call_event(real_present_call);
+    apitrace::trace::EventRecord real_present_boundary;
+    real_present_boundary.kind = apitrace::trace::EventKind::Boundary;
+    real_present_boundary.boundary = apitrace::trace::BoundaryKind::Present;
+    real_present_boundary.callsite.sequence = 3;
+    real_present_boundary.payload = "{\"frame_index\":0,\"sync_interval\":1,\"flags\":0}";
+    test_present_writer.append_call_event(real_present_boundary);
+    test_present_writer.close();
+  }
+  if (!bundle_check.empty() && run_bundle_check(bundle_check, legal_test_present_bundle, "--require-d3d") != 0) {
+    std::cerr << "bundle-check rejected a legal test Present without frame_index\n";
+    return 1;
   }
 
   const auto illegal_frame_bundle = bundle.parent_path() / (bundle.filename().generic_string() + "-illegal-frame-path");

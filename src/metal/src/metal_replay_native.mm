@@ -5,6 +5,17 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#if defined(__APPLE__)
+@interface MTLMeshRenderPipelineDescriptor ()
+- (void)setLogicOperationEnabled:(BOOL)enable;
+- (void)setLogicOperation:(NSUInteger)op;
+@end
+
+@interface MTLTileRenderPipelineDescriptor ()
+- (void)setThreadgroupSizeMatchesTileSize:(BOOL)enable;
+@end
+#endif
+
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -728,7 +739,7 @@ public:
     case trace::MetalCallKind::SetRenderPipelineState:
       return set_render_pipeline_state(event.object_id, payload);
     case trace::MetalCallKind::SetVertexBuffer:
-      return set_vertex_buffer(event.object_id, payload);
+      return set_vertex_buffer(event, payload);
     case trace::MetalCallKind::SetVertexTexture:
       return set_vertex_texture(event.object_id, payload);
     case trace::MetalCallKind::SetVertexSamplerState:
@@ -740,7 +751,7 @@ public:
     case trace::MetalCallKind::SetFragmentTexture:
       return set_fragment_texture(event.object_id, payload);
     case trace::MetalCallKind::SetFragmentBuffer:
-      return set_fragment_buffer(event.object_id, payload);
+      return set_fragment_buffer(event, payload);
     case trace::MetalCallKind::SetFragmentSamplerState:
       return set_fragment_sampler_state(event.object_id, payload);
     case trace::MetalCallKind::SetFragmentBytes:
@@ -762,7 +773,7 @@ public:
     case trace::MetalCallKind::SetComputePipelineState:
       return set_compute_pipeline_state(event.object_id, payload);
     case trace::MetalCallKind::SetComputeBuffer:
-      return set_compute_buffer(event.object_id, payload);
+      return set_compute_buffer(event, payload);
     case trace::MetalCallKind::SetComputeTexture:
       return set_compute_texture(event.object_id, payload);
     case trace::MetalCallKind::SetComputeSamplerState:
@@ -775,6 +786,8 @@ public:
       return set_compute_bytes(event.object_id, payload);
     case trace::MetalCallKind::DispatchThreads:
       return dispatch_threads(event.object_id, payload);
+    case trace::MetalCallKind::DispatchThreadsPerTile:
+      return dispatch_threads_per_tile(event.object_id, payload);
     case trace::MetalCallKind::DrawPrimitives:
       return draw_primitives(event.object_id, payload);
     case trace::MetalCallKind::DrawIndexedPrimitives:
@@ -819,6 +832,8 @@ public:
       return object_metadata(event.object_id, payload);
     case trace::MetalCallKind::InsertDebugSignpost:
       return handle_debug_signpost(event, payload);
+    case trace::MetalCallKind::BufferUpdate:
+      return buffer_update(event, payload);
     case trace::MetalCallKind::SetArgumentBuffer:
       return true;
     default:
@@ -1564,6 +1579,10 @@ private:
       return create_render_pipeline(event, payload);
     }
 
+    if (event.function_name == "MTLDevice.newTileRenderPipelineState") {
+      return create_tile_render_pipeline(event, payload);
+    }
+
     if (event.function_name == "MTLDevice.newComputePipelineState") {
       return create_compute_pipeline(event, payload);
     }
@@ -1837,6 +1856,9 @@ private:
     if (!descriptor.is_object()) {
       return fail("render pipeline descriptor must be a JSON object");
     }
+    if (descriptor.value("pipeline_kind", std::string()) == "mesh_render") {
+      return create_mesh_render_pipeline(event, descriptor);
+    }
     std::uint64_t vertex_library_id = 0;
     if (!required_u64(descriptor, "vertex_library_id", vertex_library_id)) {
       std::uint64_t library_id = 0;
@@ -1943,6 +1965,179 @@ private:
     id<MTLRenderPipelineState> pipeline = [device_ newRenderPipelineStateWithDescriptor:pipeline_descriptor error:&error];
     if (pipeline == nil) {
       return fail(error ? [[error localizedDescription] UTF8String] : "failed to create render pipeline");
+    }
+    [render_pipelines_ setObject:pipeline forKey:object_key(event.object_id)];
+    return true;
+  }
+
+  bool create_mesh_render_pipeline(const trace::MetalEventRecord &event, const json &descriptor)
+  {
+    std::uint64_t object_library_id = 0;
+    std::uint64_t mesh_library_id = 0;
+    std::uint64_t fragment_library_id = 0;
+    if (!required_u64(descriptor, "object_library_id", object_library_id) ||
+        !required_u64(descriptor, "mesh_library_id", mesh_library_id)) {
+      return fail("mesh render pipeline descriptor is missing object/mesh library metadata");
+    }
+    if (!required_u64(descriptor, "fragment_library_id", fragment_library_id)) {
+      fragment_library_id = mesh_library_id;
+    }
+    const auto object_function_name = descriptor.value("object_function", std::string());
+    const auto mesh_function_name = descriptor.value("mesh_function", std::string());
+    const auto fragment_function_name = descriptor.value("fragment_function", std::string());
+    if (object_function_name.empty() || mesh_function_name.empty()) {
+      return fail("mesh render pipeline descriptor is missing object or mesh function");
+    }
+    id<MTLLibrary> object_library = library_for_id(object_library_id);
+    id<MTLLibrary> mesh_library = library_for_id(mesh_library_id);
+    id<MTLLibrary> fragment_library = fragment_function_name.empty() ? nil : library_for_id(fragment_library_id);
+    if (object_library == nil || mesh_library == nil || (!fragment_function_name.empty() && fragment_library == nil)) {
+      return fail("mesh render pipeline references missing library");
+    }
+
+    auto *pipeline_descriptor = [[MTLMeshRenderPipelineDescriptor alloc] init];
+    NSError *function_error = nil;
+    pipeline_descriptor.objectFunction =
+        new_function(object_library, object_function_name, descriptor.value("object_function_constants", json::array()), &function_error);
+    if (pipeline_descriptor.objectFunction == nil) {
+      return fail(function_error ? [[function_error localizedDescription] UTF8String] : "failed to create object function");
+    }
+    function_error = nil;
+    pipeline_descriptor.meshFunction =
+        new_function(mesh_library, mesh_function_name, descriptor.value("mesh_function_constants", json::array()), &function_error);
+    if (pipeline_descriptor.meshFunction == nil) {
+      return fail(function_error ? [[function_error localizedDescription] UTF8String] : "failed to create mesh function");
+    }
+    if (!fragment_function_name.empty()) {
+      function_error = nil;
+      pipeline_descriptor.fragmentFunction =
+          new_function(fragment_library, fragment_function_name, descriptor.value("fragment_function_constants", json::array()), &function_error);
+      if (pipeline_descriptor.fragmentFunction == nil) {
+        return fail(function_error ? [[function_error localizedDescription] UTF8String] : "failed to create fragment function");
+      }
+    }
+    const auto colors = descriptor.find("colors");
+    if (colors == descriptor.end() || !colors->is_array() || colors->empty()) {
+      return fail("mesh render pipeline descriptor missing color attachment metadata");
+    }
+    std::size_t slot = 0;
+    for (const auto &color : *colors) {
+      if (slot >= 8) {
+        break;
+      }
+      auto *attachment = pipeline_descriptor.colorAttachments[slot++];
+      MTLPixelFormat color_pixel_format = MTLPixelFormatInvalid;
+      if (!pixel_format_from_json_field(color, "pixel_format", color_pixel_format)) {
+        return fail("mesh render pipeline color attachment is missing pixel_format");
+      }
+      attachment.pixelFormat = color_pixel_format;
+      attachment.blendingEnabled = color.value("blending_enabled", false);
+      attachment.writeMask = static_cast<MTLColorWriteMask>(json_u64(color.value("write_mask", json(0))));
+      attachment.rgbBlendOperation = static_cast<MTLBlendOperation>(json_u64(color.value("rgb_blend_operation", json(0))));
+      attachment.alphaBlendOperation = static_cast<MTLBlendOperation>(json_u64(color.value("alpha_blend_operation", json(0))));
+      attachment.sourceRGBBlendFactor = static_cast<MTLBlendFactor>(json_u64(color.value("src_rgb_blend_factor", json(0))));
+      attachment.destinationRGBBlendFactor = static_cast<MTLBlendFactor>(json_u64(color.value("dst_rgb_blend_factor", json(0))));
+      attachment.sourceAlphaBlendFactor = static_cast<MTLBlendFactor>(json_u64(color.value("src_alpha_blend_factor", json(0))));
+      attachment.destinationAlphaBlendFactor = static_cast<MTLBlendFactor>(json_u64(color.value("dst_alpha_blend_factor", json(0))));
+    }
+    pipeline_descriptor.rasterizationEnabled = descriptor.value("rasterization_enabled", true);
+    pipeline_descriptor.rasterSampleCount = static_cast<NSUInteger>(json_u64(descriptor.value("raster_sample_count", json(1)), 1));
+    pipeline_descriptor.payloadMemoryLength = static_cast<NSUInteger>(json_u64(descriptor.value("payload_memory_length", json(0))));
+    pipeline_descriptor.meshThreadgroupSizeIsMultipleOfThreadExecutionWidth =
+        descriptor.value("mesh_tgsize_is_multiple_of_sgwidth", false);
+    pipeline_descriptor.objectThreadgroupSizeIsMultipleOfThreadExecutionWidth =
+        descriptor.value("object_tgsize_is_multiple_of_sgwidth", false);
+    MTLPixelFormat depth_pixel_format = MTLPixelFormatInvalid;
+    MTLPixelFormat stencil_pixel_format = MTLPixelFormatInvalid;
+    if (!optional_pixel_format_from_json_field(descriptor, "depth_pixel_format", depth_pixel_format) ||
+        !optional_pixel_format_from_json_field(descriptor, "stencil_pixel_format", stencil_pixel_format)) {
+      return fail("mesh render pipeline descriptor has invalid depth/stencil pixel format");
+    }
+    pipeline_descriptor.depthAttachmentPixelFormat = depth_pixel_format;
+    pipeline_descriptor.stencilAttachmentPixelFormat = stencil_pixel_format;
+#if defined(__APPLE__)
+    if ([pipeline_descriptor respondsToSelector:@selector(setLogicOperationEnabled:)]) {
+      [pipeline_descriptor setLogicOperationEnabled:descriptor.value("logic_operation_enabled", false)];
+      [pipeline_descriptor setLogicOperation:static_cast<NSUInteger>(json_u64(descriptor.value("logic_operation", json(0))))];
+    }
+#endif
+
+    NSError *error = nil;
+    id<MTLRenderPipelineState> pipeline =
+        [device_ newRenderPipelineStateWithMeshDescriptor:pipeline_descriptor
+                                                  options:MTLPipelineOptionNone
+                                               reflection:nil
+                                                    error:&error];
+    if (pipeline == nil) {
+      return fail(error ? [[error localizedDescription] UTF8String] : "failed to create mesh render pipeline");
+    }
+    [render_pipelines_ setObject:pipeline forKey:object_key(event.object_id)];
+    return true;
+  }
+
+  bool create_tile_render_pipeline(const trace::MetalEventRecord &event, const json &payload)
+  {
+    const auto descriptor_path = payload.value("descriptor_path", std::string());
+    if (!verify_event_asset_path(event, descriptor_path, "descriptor_path")) {
+      return false;
+    }
+    const auto descriptor_bytes = read_binary_file(bundle_path(descriptor_path));
+    const auto descriptor = parse_json(std::string(descriptor_bytes.begin(), descriptor_bytes.end()));
+    if (!descriptor.is_object()) {
+      return fail("tile render pipeline descriptor must be a JSON object");
+    }
+
+    std::uint64_t library_id = 0;
+    if (!required_u64(descriptor, "tile_library_id", library_id)) {
+      return fail("tile render pipeline descriptor is missing tile_library_id");
+    }
+    id<MTLLibrary> library = library_for_id(library_id);
+    if (library == nil) {
+      return fail("tile render pipeline references missing library");
+    }
+    const auto function_name = descriptor.value("tile_function", std::string());
+    if (function_name.empty()) {
+      return fail("tile render pipeline descriptor missing tile_function");
+    }
+    NSError *function_error = nil;
+    id<MTLFunction> function = new_function(library, function_name, json::array(), &function_error);
+    if (function == nil) {
+      return fail(function_error ? [[function_error localizedDescription] UTF8String] : "failed to create tile function");
+    }
+
+    auto *pipeline_descriptor = [[MTLTileRenderPipelineDescriptor alloc] init];
+    pipeline_descriptor.tileFunction = function;
+    const auto colors = descriptor.find("colors");
+    if (colors == descriptor.end() || !colors->is_array() || colors->empty()) {
+      return fail("tile render pipeline descriptor missing color attachment metadata");
+    }
+    std::size_t slot = 0;
+    for (const auto &color : *colors) {
+      if (slot >= 8) {
+        break;
+      }
+      MTLPixelFormat color_pixel_format = MTLPixelFormatInvalid;
+      if (!pixel_format_from_json_field(color, "pixel_format", color_pixel_format)) {
+        return fail("tile render pipeline color attachment is missing pixel_format");
+      }
+      pipeline_descriptor.colorAttachments[slot++].pixelFormat = color_pixel_format;
+    }
+    pipeline_descriptor.rasterSampleCount =
+        static_cast<NSUInteger>(json_u64(descriptor.value("raster_sample_count", json(1)), 1));
+#if defined(__APPLE__)
+    if ([pipeline_descriptor respondsToSelector:@selector(setThreadgroupSizeMatchesTileSize:)]) {
+      [pipeline_descriptor setThreadgroupSizeMatchesTileSize:descriptor.value("tgsize_matches_tile_size", false)];
+    }
+#endif
+
+    NSError *error = nil;
+    id<MTLRenderPipelineState> pipeline =
+        [device_ newRenderPipelineStateWithTileDescriptor:pipeline_descriptor
+                                                  options:MTLPipelineOptionNone
+                                               reflection:nil
+                                                    error:&error];
+    if (pipeline == nil) {
+      return fail(error ? [[error localizedDescription] UTF8String] : "failed to create tile render pipeline");
     }
     [render_pipelines_ setObject:pipeline forKey:object_key(event.object_id)];
     return true;
@@ -2340,8 +2535,9 @@ private:
     return true;
   }
 
-  bool set_vertex_buffer(std::uint64_t encoder_id, const json &payload)
+  bool set_vertex_buffer(const trace::MetalEventRecord &event, const json &payload)
   {
+    const auto encoder_id = event.object_id;
     id<MTLRenderCommandEncoder> encoder = render_encoder_for_id(encoder_id);
     std::uint64_t buffer_id = 0;
     std::uint64_t offset = 0;
@@ -2354,6 +2550,9 @@ private:
     id<MTLBuffer> buffer = buffer_for_id(buffer_id);
     if (encoder == nil || (buffer_id != 0 && buffer == nil)) {
       return fail("setVertexBuffer references missing encoder or buffer");
+    }
+    if (!restore_buffer_range_from_asset(event, buffer, payload)) {
+      return false;
     }
     [encoder setVertexBuffer:buffer
                       offset:static_cast<NSUInteger>(offset)
@@ -2461,8 +2660,9 @@ private:
     return true;
   }
 
-  bool set_fragment_buffer(std::uint64_t encoder_id, const json &payload)
+  bool set_fragment_buffer(const trace::MetalEventRecord &event, const json &payload)
   {
+    const auto encoder_id = event.object_id;
     id<MTLRenderCommandEncoder> encoder = render_encoder_for_id(encoder_id);
     std::uint64_t buffer_id = 0;
     std::uint64_t offset = 0;
@@ -2475,6 +2675,9 @@ private:
     id<MTLBuffer> buffer = buffer_for_id(buffer_id);
     if (encoder == nil || (buffer_id != 0 && buffer == nil)) {
       return fail("setFragmentBuffer references missing encoder or buffer");
+    }
+    if (!restore_buffer_range_from_asset(event, buffer, payload)) {
+      return false;
     }
     [encoder setFragmentBuffer:buffer
                         offset:static_cast<NSUInteger>(offset)
@@ -3015,8 +3218,9 @@ private:
     return true;
   }
 
-  bool set_compute_buffer(std::uint64_t encoder_id, const json &payload)
+  bool set_compute_buffer(const trace::MetalEventRecord &event, const json &payload)
   {
+    const auto encoder_id = event.object_id;
     id<MTLComputeCommandEncoder> encoder = compute_encoder_for_id(encoder_id);
     std::uint64_t buffer_id = 0;
     std::uint64_t offset = 0;
@@ -3029,6 +3233,9 @@ private:
     id<MTLBuffer> buffer = buffer_for_id(buffer_id);
     if (encoder == nil || (buffer_id != 0 && buffer == nil)) {
       return fail("setComputeBuffer references missing encoder or buffer");
+    }
+    if (!restore_buffer_range_from_asset(event, buffer, payload)) {
+      return false;
     }
     [encoder setBuffer:buffer
                 offset:static_cast<NSUInteger>(offset)
@@ -3332,6 +3539,22 @@ private:
     return true;
   }
 
+  bool dispatch_threads_per_tile(std::uint64_t encoder_id, const json &payload)
+  {
+    id<MTLRenderCommandEncoder> encoder = render_encoder_for_id(encoder_id);
+    if (encoder == nil) {
+      return fail("dispatchThreadsPerTile references missing render encoder");
+    }
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    if (!required_u32(payload, "width", width) ||
+        !required_u32(payload, "height", height)) {
+      return fail("dispatchThreadsPerTile is missing replay metadata");
+    }
+    [encoder dispatchThreadsPerTile:MTLSizeMake(width, height, 1)];
+    return true;
+  }
+
   bool set_compute_bytes(std::uint64_t encoder_id, const json &payload)
   {
     id<MTLComputeCommandEncoder> encoder = compute_encoder_for_id(encoder_id);
@@ -3466,13 +3689,35 @@ private:
   {
     const auto encoder_id = event.object_id;
     const auto ops = payload.find("ops");
-    if (ops == payload.end() || !ops->is_array() || ops->empty()) {
+    const auto fence_ops = payload.find("fence_ops");
+    if ((ops == payload.end() || !ops->is_array() || ops->empty()) &&
+        (fence_ops == payload.end() || !fence_ops->is_object())) {
       return fail("blitBatch is missing ops");
     }
 
-    for (const auto &op : *ops) {
+    if (ops != payload.end()) for (const auto &op : *ops) {
       if (op.is_array()) {
-        return fail("blitBatch op must be an object");
+        if (op.size() < 2) {
+          return fail("blitBatch array op must include kind and fence id");
+        }
+        std::string kind;
+        if (op[0].is_string()) {
+          kind = op[0].get<std::string>();
+        } else {
+          const auto numeric_kind = json_u64(op[0]);
+          if (numeric_kind == 1) {
+            kind = "wait_fence";
+          } else if (numeric_kind == 2) {
+            kind = "update_fence";
+          }
+        }
+        if (kind != "wait_fence" && kind != "update_fence") {
+          return fail("unsupported blitBatch array op");
+        }
+        if (json_u64(op[1]) == 0) {
+          return fail(kind + " blitBatch op is missing fence_id");
+        }
+        continue;
       }
       if (!op.is_object()) {
         return fail("blitBatch op must be an object");
@@ -3493,6 +3738,67 @@ private:
         continue;
       } else {
         return fail("unsupported blitBatch op " + (kind.empty() ? std::string("<missing>") : kind));
+      }
+    }
+    const auto copy_texture_ops = payload.find("copy_texture_ops");
+    if (copy_texture_ops != payload.end()) {
+      if (!copy_texture_ops->is_array()) {
+        return fail("blitBatch compact copy_texture_ops must be an array");
+      }
+      for (const auto &op : *copy_texture_ops) {
+        if (!op.is_array() || op.size() < 15) {
+          return fail("blitBatch compact copy_texture op must include 15 fields");
+        }
+        json expanded = {
+            {"source_texture_id", json_u64(op[0])},
+            {"destination_texture_id", json_u64(op[1])},
+            {"payload", json{
+                            {"source_texture", json_u64(op[0])},
+                            {"destination_texture", json_u64(op[1])},
+                            {"source_origin", json::array({json_u64(op[2]), json_u64(op[3]), json_u64(op[4])})},
+                            {"source_size", json::array({json_u64(op[5]), json_u64(op[6]), json_u64(op[7])})},
+                            {"source_slice", json_u64(op[8])},
+                            {"source_level", json_u64(op[9])},
+                            {"destination_origin", json::array({json_u64(op[10]), json_u64(op[11]), json_u64(op[12])})},
+                            {"destination_slice", json_u64(op[13])},
+                            {"destination_level", json_u64(op[14])},
+                        }.dump()},
+        };
+        if (!copy_texture(encoder_id, expanded)) {
+          return false;
+        }
+      }
+    }
+    if (fence_ops != payload.end()) {
+      if (fence_ops->value("schema", std::string()) == "blit-fence-v2") {
+        for (const auto *key : {"wait_fences", "update_fences"}) {
+          const auto fences = fence_ops->find(key);
+          if (fences == fence_ops->end() || !fences->is_array()) {
+            return fail("blitBatch compact fence list is missing");
+          }
+          for (const auto &fence : *fences) {
+            if (json_u64(fence) == 0) {
+              return fail("compact blitBatch fence op is missing fence_id");
+            }
+          }
+        }
+      } else {
+        const auto compact_ops = fence_ops->find("ops");
+        if (compact_ops == fence_ops->end() || !compact_ops->is_array()) {
+          return fail("blitBatch compact fence ops must include ops");
+        }
+        for (const auto &op : *compact_ops) {
+          if (!op.is_array() || op.size() < 2) {
+            return fail("blitBatch compact fence op must include kind and fence id");
+          }
+          const auto numeric_kind = json_u64(op[0]);
+          if (numeric_kind != 1 && numeric_kind != 2) {
+            return fail("unsupported blitBatch compact fence op");
+          }
+          if (json_u64(op[1]) == 0) {
+            return fail("compact blitBatch fence op is missing fence_id");
+          }
+        }
       }
     }
     return true;
@@ -3559,6 +3865,19 @@ private:
       return create_depth_stencil_state(metadata);
     }
     return true;
+  }
+
+  bool buffer_update(const trace::MetalEventRecord &event, const json &payload)
+  {
+    std::uint64_t buffer_id = event.object_id;
+    if (payload.contains("buffer_id")) {
+      buffer_id = payload.value("buffer_id", buffer_id);
+    }
+    id<MTLBuffer> buffer = buffer_for_id(buffer_id);
+    if (buffer == nil) {
+      return fail("buffer update references missing buffer");
+    }
+    return restore_buffer_range_from_asset(event, buffer, payload);
   }
 
   bool handle_debug_signpost(const trace::MetalEventRecord &event, const json &payload)
@@ -3634,12 +3953,14 @@ private:
   bool queue_present(std::uint64_t command_buffer_id, const json &payload)
   {
     std::uint64_t drawable_id = 0;
+    std::uint64_t present_texture_id = 0;
     std::uint64_t frame_index = 0;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint32_t sync_interval = 0;
     std::uint32_t flags = 0;
-    if (!required_u64(payload, "drawable_id", drawable_id) ||
+    if (!required_u64(payload, "drawable_handle", drawable_id) ||
+        !required_u64(payload, "present_texture_id", present_texture_id) ||
         !required_u64(payload, "frame_index", frame_index) ||
         !required_u32(payload, "width", width) ||
         !required_u32(payload, "height", height) ||
@@ -3650,9 +3971,11 @@ private:
     }
     NSMutableDictionary *info = [[NSMutableDictionary alloc] init];
     info[@"drawable_id"] = object_key(drawable_id);
-    NSNumber *present_texture_id = [command_buffer_present_textures_ objectForKey:object_key(command_buffer_id)];
-    if (present_texture_id != nil) {
-      info[@"present_texture_id"] = present_texture_id;
+    NSNumber *render_pass_texture_id = [command_buffer_present_textures_ objectForKey:object_key(command_buffer_id)];
+    if (render_pass_texture_id != nil) {
+      info[@"present_texture_id"] = render_pass_texture_id;
+    } else {
+      info[@"present_texture_id"] = object_key(present_texture_id);
     }
     info[@"frame_index"] = object_key(frame_index);
     info[@"width"] = [NSNumber numberWithUnsignedInt:width];
@@ -3672,10 +3995,6 @@ private:
     const auto present_texture_id =
         static_cast<std::uint64_t>([present_info[@"present_texture_id"] unsignedLongLongValue]);
     id<MTLTexture> texture = texture_for_id(present_texture_id);
-    if (texture == nil) {
-      const auto drawable_id = static_cast<std::uint64_t>([present_info[@"drawable_id"] unsignedLongLongValue]);
-      texture = texture_for_id(drawable_id);
-    }
     if (texture == nil) {
       return fail("present references missing drawable texture");
     }

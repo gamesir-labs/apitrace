@@ -89,6 +89,8 @@ std::string_view metal_call_kind_name(MetalCallKind kind)
     return "dispatch_threadgroups";
   case MetalCallKind::DispatchThreadgroupsIndirect:
     return "dispatch_threadgroups_indirect";
+  case MetalCallKind::DispatchThreadsPerTile:
+    return "dispatch_threads_per_tile";
   case MetalCallKind::BlitBatch:
     return "blit_batch";
   case MetalCallKind::CopyBuffer:
@@ -137,6 +139,8 @@ std::string_view metal_call_kind_name(MetalCallKind kind)
     return "object_metadata";
   case MetalCallKind::InsertDebugSignpost:
     return "insert_debug_signpost";
+  case MetalCallKind::BufferUpdate:
+    return "buffer_update";
   }
   return "unknown";
 }
@@ -181,6 +185,7 @@ bool metal_call_kind_from_name(std::string_view name, MetalCallKind &kind)
       MetalCallKind::SetComputeSamplerState,
       MetalCallKind::DispatchThreadgroups,
       MetalCallKind::DispatchThreadgroupsIndirect,
+      MetalCallKind::DispatchThreadsPerTile,
       MetalCallKind::BlitBatch,
       MetalCallKind::CopyBuffer,
       MetalCallKind::CopyBufferToTexture,
@@ -205,6 +210,7 @@ bool metal_call_kind_from_name(std::string_view name, MetalCallKind &kind)
       MetalCallKind::PopDebugGroup,
       MetalCallKind::ObjectMetadata,
       MetalCallKind::InsertDebugSignpost,
+      MetalCallKind::BufferUpdate,
   };
 
   for (const auto candidate : kKinds) {
@@ -242,6 +248,9 @@ std::string metal_event_record_json(const MetalEventRecord &event)
   if (!event.function_name.empty()) {
     record << ",\"function\":\"" << event.function_name << "\"";
   }
+  if (event.payload_refs_scanned) {
+    record << ",\"payload_refs_scanned\":true";
+  }
   record << ",\"payload\":"
          << (event.payload.empty() ? "{}" : event.payload)
          << "}";
@@ -251,7 +260,8 @@ std::string metal_event_record_json(const MetalEventRecord &event)
 bool parse_metal_callstream(
     const std::filesystem::path &callstream_path,
     std::vector<MetalEventRecord> &events,
-    std::string &error)
+    std::string &error,
+    std::uint64_t byte_limit)
 {
   std::ifstream input(callstream_path);
   if (!input.is_open()) {
@@ -262,7 +272,13 @@ bool parse_metal_callstream(
   events.clear();
   std::string line;
   std::size_t line_number = 0;
+  std::uint64_t consumed_bytes = 0;
   while (std::getline(input, line)) {
+    const auto line_bytes = static_cast<std::uint64_t>(line.size() + 1);
+    if (consumed_bytes + line_bytes > byte_limit) {
+      break;
+    }
+    consumed_bytes += line_bytes;
     ++line_number;
     if (line.empty()) {
       continue;
@@ -295,6 +311,7 @@ bool parse_metal_callstream(
     event.frame_id = record.value("frame_id", 0ull);
     event.object_id = record.value("object_id", 0ull);
     event.function_name = record.value("function", std::string());
+    event.payload_refs_scanned = record.value("payload_refs_scanned", false);
     if (event.metal_sequence == 0) {
       std::ostringstream message;
       message << callstream_path.filename().generic_string() << ": line " << line_number

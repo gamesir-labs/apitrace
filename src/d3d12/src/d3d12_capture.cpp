@@ -12,7 +12,9 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -77,9 +79,11 @@ struct ViewInstancingDesc {
 std::atomic<std::uint64_t> g_sequence{0};
 std::atomic<std::uint64_t> g_blob_id{0};
 std::mutex g_object_mutex;
+std::mutex g_event_order_mutex;
 std::mutex g_command_batch_mutex;
 std::mutex g_present_mutex;
 std::unordered_map<const void *, trace::ObjectId> g_object_ids;
+std::unordered_map<const void *, trace::ObjectKind> g_object_kinds;
 
 struct ResourceGpuVirtualAddressState {
   trace::ObjectId object_id = 0;
@@ -116,9 +120,200 @@ struct CopyBufferBatchFlush {
   PendingCopyBufferBatch batch;
 };
 
+struct ResourceBarrierBatchOp {
+  std::uint64_t sequence = 0;
+  std::uint32_t type = 0;
+  std::uint32_t flags = 0;
+  trace::ObjectId resource_object_id = 0;
+  std::uint32_t before = 0;
+  std::uint32_t after = 0;
+  std::uint32_t subresource = 0;
+  trace::ObjectId resource_before_object_id = 0;
+  trace::ObjectId resource_after_object_id = 0;
+};
+
+struct PendingResourceBarrierBatch {
+  std::vector<ResourceBarrierBatchOp> ops;
+};
+
+struct ResourceBarrierBatchFlush {
+  const void *command_list = nullptr;
+  PendingResourceBarrierBatch batch;
+};
+
+struct TextureCopyLocationCompact {
+  trace::ObjectId resource_object_id = 0;
+  std::uint32_t type = 0;
+  std::uint32_t subresource_index = 0;
+  std::uint64_t footprint_offset = 0;
+  std::uint32_t footprint_format = 0;
+  std::uint32_t footprint_width = 0;
+  std::uint32_t footprint_height = 0;
+  std::uint32_t footprint_depth = 0;
+  std::uint32_t footprint_row_pitch = 0;
+};
+
+struct CopyTextureRegionBatchOp {
+  std::uint64_t sequence = 0;
+  TextureCopyLocationCompact dst;
+  std::uint32_t dst_x = 0;
+  std::uint32_t dst_y = 0;
+  std::uint32_t dst_z = 0;
+  TextureCopyLocationCompact src;
+  bool has_src_box = false;
+  std::uint32_t src_box_left = 0;
+  std::uint32_t src_box_top = 0;
+  std::uint32_t src_box_front = 0;
+  std::uint32_t src_box_right = 0;
+  std::uint32_t src_box_bottom = 0;
+  std::uint32_t src_box_back = 0;
+};
+
+struct PendingCopyTextureRegionBatch {
+  std::vector<CopyTextureRegionBatchOp> ops;
+};
+
+struct CopyTextureRegionBatchFlush {
+  const void *command_list = nullptr;
+  PendingCopyTextureRegionBatch batch;
+};
+
+struct FenceDependencyOp {
+  std::uint64_t sequence = 0;
+  std::string scope;
+  std::uint64_t d3d_sequence = 0;
+  std::uint64_t encoder_id = 0;
+  bool implicit_pre_raster_wait = false;
+  std::uint32_t strong_count = 0;
+  std::uint32_t full_count = 0;
+  std::uint32_t minimal_count = 0;
+  std::uint32_t mask_count = 0;
+};
+
+struct PendingFenceDependencyBatch {
+  std::vector<FenceDependencyOp> ops;
+};
+
+struct DescriptorViewOp {
+  std::uint64_t sequence = 0;
+  std::uint32_t kind = 0;
+  trace::ObjectId device_object_id = 0;
+  trace::ObjectId resource_object_id = 0;
+  trace::ObjectId counter_resource_object_id = 0;
+  std::uint64_t descriptor = 0;
+  std::uint32_t format = 0;
+  std::uint32_t view_dimension = 0;
+  std::uint32_t shader_4_component_mapping = 0;
+  std::uint32_t flags = 0;
+  std::uint64_t buffer_location = 0;
+  std::uint32_t size_in_bytes = 0;
+  std::string gpuva_resolve_status;
+  trace::ObjectId resolved_resource_object_id = 0;
+  std::uint64_t resolved_resource_offset = 0;
+  std::uint64_t resolved_resource_width = 0;
+  std::string view_payload;
+};
+
+struct PendingDescriptorViewBatch {
+  std::vector<DescriptorViewOp> ops;
+};
+
+struct CopyDescriptorRange {
+  std::uint64_t dst_descriptor = 0;
+  std::uint64_t src_descriptor = 0;
+  std::uint32_t count = 0;
+};
+
+struct CopyDescriptorOp {
+  std::uint64_t sequence = 0;
+  trace::ObjectId device_object_id = 0;
+  std::uint32_t descriptor_heap_type = 0;
+  std::uint32_t descriptor_size = 0;
+  std::uint32_t dst_range_count = 0;
+  std::uint32_t src_range_count = 0;
+  std::vector<CopyDescriptorRange> ranges;
+};
+
+struct PendingCopyDescriptorBatch {
+  std::vector<CopyDescriptorOp> ops;
+};
+
+enum class PendingBatchKind {
+  CopyBuffer,
+  ResourceBarrier,
+  CopyTextureRegion,
+  FenceDependency,
+  DescriptorView,
+  CopyDescriptor,
+};
+
+struct PendingBatchFlush {
+  PendingBatchKind kind = PendingBatchKind::CopyBuffer;
+  std::uint64_t sequence = UINT64_MAX;
+  const void *command_list = nullptr;
+  PendingCopyBufferBatch copy_buffer;
+  PendingResourceBarrierBatch resource_barrier;
+  PendingCopyTextureRegionBatch copy_texture_region;
+  PendingFenceDependencyBatch fence_dependency;
+  PendingDescriptorViewBatch descriptor_view;
+  PendingCopyDescriptorBatch copy_descriptor;
+};
+
 std::unordered_map<const void *, PendingCopyBufferBatch> g_copy_buffer_batches;
+std::unordered_map<const void *, PendingResourceBarrierBatch> g_resource_barrier_batches;
+std::unordered_map<const void *, PendingCopyTextureRegionBatch> g_copy_texture_region_batches;
+std::mutex g_diagnostic_batch_mutex;
+PendingFenceDependencyBatch g_fence_dependency_batch;
+PendingDescriptorViewBatch g_descriptor_view_batch;
+PendingCopyDescriptorBatch g_copy_descriptor_batch;
 TraceSession *g_present_session = nullptr;
 std::uint64_t g_present_frame_index = 0;
+constexpr std::size_t kDescriptorViewBatchMaxOps = 1024;
+constexpr std::size_t kCopyDescriptorBatchMaxOps = 1024;
+constexpr std::size_t kCommandListBatchMaxOps = 1024;
+
+std::uint32_t fence_dependency_scope_id(std::string_view scope)
+{
+  if (scope == "blit") {
+    return 1;
+  }
+  if (scope == "clear") {
+    return 2;
+  }
+  if (scope == "render_vertex") {
+    return 3;
+  }
+  if (scope == "render_fragment") {
+    return 4;
+  }
+  if (scope == "compute") {
+    return 5;
+  }
+  return 0;
+}
+
+std::uint32_t descriptor_view_kind_for_function(const char *function_name)
+{
+  if (!function_name) {
+    return 0;
+  }
+  if (std::strcmp(function_name, "ID3D12Device::CreateConstantBufferView") == 0) {
+    return 1;
+  }
+  if (std::strcmp(function_name, "ID3D12Device::CreateShaderResourceView") == 0) {
+    return 2;
+  }
+  if (std::strcmp(function_name, "ID3D12Device::CreateUnorderedAccessView") == 0) {
+    return 3;
+  }
+  if (std::strcmp(function_name, "ID3D12Device::CreateRenderTargetView") == 0) {
+    return 4;
+  }
+  if (std::strcmp(function_name, "ID3D12Device::CreateDepthStencilView") == 0) {
+    return 5;
+  }
+  return 0;
+}
 
 trace::ApiKind classify_api(const char *opname)
 {
@@ -304,6 +499,47 @@ std::uint64_t next_present_frame_index()
   return g_present_frame_index++;
 }
 
+std::uint64_t seal_checkpoint_after_present_frame()
+{
+  static std::atomic<bool> configured{false};
+  static std::atomic<std::uint64_t> target{std::numeric_limits<std::uint64_t>::max()};
+
+  if (!configured.load(std::memory_order_acquire)) {
+    auto parsed = std::numeric_limits<std::uint64_t>::max();
+    if (const char *value = std::getenv("APITRACE_D3D12_SEAL_CHECKPOINT_AFTER_FRAME")) {
+      char *end = nullptr;
+      const auto requested = std::strtoull(value, &end, 10);
+      if (end != value && requested > 0) {
+        parsed = static_cast<std::uint64_t>(requested);
+      }
+    }
+    target.store(parsed, std::memory_order_release);
+    configured.store(true, std::memory_order_release);
+  }
+
+  return target.load(std::memory_order_acquire);
+}
+
+void maybe_seal_checkpoint_after_present_frame(std::uint64_t frame_index)
+{
+  static std::atomic<bool> sealed{false};
+  const auto target = seal_checkpoint_after_present_frame();
+  if (target == std::numeric_limits<std::uint64_t>::max() || frame_index + 1 < target) {
+    return;
+  }
+  if (sealed.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+  if (auto *session = session_for(trace::ApiKind::D3D12)) {
+    session->seal_checkpoint();
+  }
+}
+
+bool is_present_test(std::uint32_t flags)
+{
+  return (flags & DXGI_PRESENT_TEST) != 0;
+}
+
 trace::ObjectId lookup_object_id_locked(const void *object)
 {
   if (!object) {
@@ -316,6 +552,15 @@ trace::ObjectId lookup_object_id_locked(const void *object)
   const auto id = static_cast<trace::ObjectId>(reinterpret_cast<std::uintptr_t>(object));
   g_object_ids.emplace(object, id);
   return id;
+}
+
+bool object_kind_known_locked(const void *object, trace::ObjectKind kind)
+{
+  if (!object) {
+    return true;
+  }
+  const auto found = g_object_kinds.find(object);
+  return found != g_object_kinds.end() && found->second == kind;
 }
 
 GpuVirtualAddressResolve resolve_gpu_virtual_address_locked(std::uint64_t address)
@@ -367,6 +612,28 @@ void append_gpu_virtual_address_binding_json(std::ostringstream &payload, const 
   append_gpu_virtual_address_resolve_json(payload, resolve_gpu_virtual_address_locked(address));
 }
 
+void append_object_ref_id(std::vector<trace::ObjectId> &refs, trace::ObjectId object_id)
+{
+  if (object_id == 0 || std::find(refs.begin(), refs.end(), object_id) != refs.end()) {
+    return;
+  }
+  refs.push_back(object_id);
+}
+
+GpuVirtualAddressResolve append_gpu_virtual_address_binding_json_with_ref(
+    std::ostringstream &payload,
+    const char *key,
+    std::uint64_t address,
+    std::vector<trace::ObjectId> &refs)
+{
+  std::lock_guard lock(g_object_mutex);
+  payload << "\"" << key << "\":" << address;
+  auto resolve = resolve_gpu_virtual_address_locked(address);
+  append_gpu_virtual_address_resolve_json(payload, resolve);
+  append_object_ref_id(refs, resolve.object_id);
+  return resolve;
+}
+
 std::vector<trace::ObjectId> collect_object_refs(const void *const *objects, std::uint32_t object_count)
 {
   std::vector<trace::ObjectId> refs;
@@ -376,9 +643,7 @@ std::vector<trace::ObjectId> collect_object_refs(const void *const *objects, std
   refs.reserve(object_count);
   std::lock_guard lock(g_object_mutex);
   for (std::uint32_t index = 0; index < object_count; ++index) {
-    if (const auto id = lookup_object_id_locked(objects[index])) {
-      refs.push_back(id);
-    }
+    append_object_ref_id(refs, lookup_object_id_locked(objects[index]));
   }
   return refs;
 }
@@ -418,6 +683,167 @@ void append_copy_buffer_batch_payload(std::ostringstream &payload, const Pending
   payload << "]}";
 }
 
+void append_resource_barrier_batch_payload(std::ostringstream &payload, const PendingResourceBarrierBatch &batch)
+{
+  payload << "{\"schema\":\"resource-barrier-v2\",\"barrier_count\":" << batch.ops.size()
+          << ",\"columns\":[\"sequence\",\"type\",\"flags\",\"resource\",\"before\",\"after\",\"subresource\","
+          << "\"resource_before\",\"resource_after\"],\"barriers\":[";
+  for (std::size_t index = 0; index < batch.ops.size(); ++index) {
+    if (index != 0) {
+      payload << ",";
+    }
+    const auto &op = batch.ops[index];
+    payload << "[" << op.sequence
+            << "," << op.type
+            << "," << op.flags
+            << "," << op.resource_object_id
+            << "," << op.before
+            << "," << op.after
+            << "," << op.subresource
+            << "," << op.resource_before_object_id
+            << "," << op.resource_after_object_id
+            << "]";
+  }
+  payload << "]}";
+}
+
+void append_texture_copy_location_compact_json(std::ostringstream &payload, const TextureCopyLocationCompact &location)
+{
+  payload << "[" << location.resource_object_id
+          << "," << location.type
+          << "," << location.subresource_index
+          << "," << location.footprint_offset
+          << "," << location.footprint_format
+          << "," << location.footprint_width
+          << "," << location.footprint_height
+          << "," << location.footprint_depth
+          << "," << location.footprint_row_pitch
+          << "]";
+}
+
+void append_copy_texture_region_batch_payload(std::ostringstream &payload, const PendingCopyTextureRegionBatch &batch)
+{
+  payload << "{\"schema\":\"copy-texture-region-v2\",\"op_count\":" << batch.ops.size()
+          << ",\"columns\":[\"sequence\",\"dst\",\"dst_x\",\"dst_y\",\"dst_z\",\"src\",\"src_box\"],"
+          << "\"location_columns\":[\"resource\",\"type\",\"subresource_index\",\"footprint_offset\","
+          << "\"footprint_format\",\"footprint_width\",\"footprint_height\",\"footprint_depth\","
+          << "\"footprint_row_pitch\"],\"ops\":[";
+  for (std::size_t index = 0; index < batch.ops.size(); ++index) {
+    if (index != 0) {
+      payload << ",";
+    }
+    const auto &op = batch.ops[index];
+    payload << "[" << op.sequence << ",";
+    append_texture_copy_location_compact_json(payload, op.dst);
+    payload << "," << op.dst_x
+            << "," << op.dst_y
+            << "," << op.dst_z
+            << ",";
+    append_texture_copy_location_compact_json(payload, op.src);
+    payload << ",";
+    if (op.has_src_box) {
+      payload << "[" << op.src_box_left
+              << "," << op.src_box_top
+              << "," << op.src_box_front
+              << "," << op.src_box_right
+              << "," << op.src_box_bottom
+              << "," << op.src_box_back
+              << "]";
+    } else {
+      payload << "null";
+    }
+    payload << "]";
+  }
+  payload << "]}";
+}
+
+void append_fence_dependency_batch_payload(std::ostringstream &payload, const PendingFenceDependencyBatch &batch)
+{
+  payload << "{\"schema\":\"fence-dependency-v2\",\"op_count\":" << batch.ops.size()
+          << ",\"columns\":[\"sequence\",\"scope\",\"d3d_sequence\",\"encoder_id\","
+          << "\"implicit_pre_raster_wait\",\"strong_count\",\"full_count\",\"minimal_count\",\"mask_count\"],\"ops\":[";
+  for (std::size_t index = 0; index < batch.ops.size(); ++index) {
+    if (index != 0) {
+      payload << ",";
+    }
+    const auto &op = batch.ops[index];
+    payload << "[" << op.sequence
+            << "," << fence_dependency_scope_id(op.scope)
+            << "," << op.d3d_sequence
+            << "," << op.encoder_id
+            << "," << (op.implicit_pre_raster_wait ? 1 : 0)
+            << "," << op.strong_count
+            << "," << op.full_count
+            << "," << op.minimal_count
+            << "," << op.mask_count
+            << "]";
+  }
+  payload << "]}";
+}
+
+void append_descriptor_view_batch_payload(std::ostringstream &payload, const PendingDescriptorViewBatch &batch)
+{
+  payload << "{\"schema\":\"descriptor-view-v2\",\"op_count\":" << batch.ops.size()
+          << ",\"columns\":[\"sequence\",\"kind\",\"descriptor\",\"resource\",\"counter_resource\","
+          << "\"format\",\"dimension\",\"mapping\",\"flags\",\"buffer_location\",\"size\","
+          << "\"gpuva_status\",\"resolved_resource\",\"resolved_offset\",\"resolved_width\",\"view\"],\"ops\":[";
+  for (std::size_t index = 0; index < batch.ops.size(); ++index) {
+    if (index != 0) {
+      payload << ",";
+    }
+    const auto &op = batch.ops[index];
+    payload << "[" << op.sequence
+            << "," << op.kind
+            << "," << op.descriptor
+            << "," << op.resource_object_id
+            << "," << op.counter_resource_object_id
+            << "," << op.format
+            << "," << op.view_dimension
+            << "," << op.shader_4_component_mapping
+            << "," << op.flags
+            << "," << op.buffer_location
+            << "," << op.size_in_bytes
+            << ",\"" << escape_json_string(op.gpuva_resolve_status) << "\""
+            << "," << op.resolved_resource_object_id
+            << "," << op.resolved_resource_offset
+            << "," << op.resolved_resource_width
+            << "," << (op.view_payload.empty() ? "null" : op.view_payload)
+            << "]";
+  }
+  payload << "]}";
+}
+
+void append_copy_descriptor_batch_payload(std::ostringstream &payload, const PendingCopyDescriptorBatch &batch)
+{
+  payload << "{\"schema\":\"copy-descriptors-v2\",\"op_count\":" << batch.ops.size()
+          << ",\"columns\":[\"sequence\",\"heap_type\",\"descriptor_size\",\"dst_range_count\","
+          << "\"src_range_count\",\"ranges\"],\"ops\":[";
+  for (std::size_t index = 0; index < batch.ops.size(); ++index) {
+    if (index != 0) {
+      payload << ",";
+    }
+    const auto &op = batch.ops[index];
+    payload << "[" << op.sequence
+            << "," << op.descriptor_heap_type
+            << "," << op.descriptor_size
+            << "," << op.dst_range_count
+            << "," << op.src_range_count
+            << ",[";
+    for (std::size_t range_index = 0; range_index < op.ranges.size(); ++range_index) {
+      if (range_index != 0) {
+        payload << ",";
+      }
+      const auto &range = op.ranges[range_index];
+      payload << "[" << range.dst_descriptor
+              << "," << range.src_descriptor
+              << "," << range.count
+              << "]";
+    }
+    payload << "]]";
+  }
+  payload << "]}";
+}
+
 void record_call_event_unbatched(
     std::uint64_t sequence,
     const char *opname,
@@ -439,6 +865,196 @@ void record_call_event_unbatched(
     event.payload = payload_json && *payload_json ? payload_json : "{}";
     session->append_call_event(event);
   }
+}
+
+void record_call_event_unbatched_with_object_ids(
+    std::uint64_t sequence,
+    const char *opname,
+    const char *payload_json,
+    std::vector<trace::ObjectId> object_refs,
+    const std::uint64_t *blob_refs,
+    std::uint32_t blob_ref_count,
+    std::int32_t result_code)
+{
+  if (auto *session = session_for(classify_api(opname))) {
+    trace::EventRecord event;
+    event.kind = trace::EventKind::Call;
+    event.callsite.sequence = sequence;
+    event.callsite.function_name = opname ? opname : "";
+    event.callsite.result_code = result_code;
+    event.object_refs = std::move(object_refs);
+    event.blob_refs = collect_blob_refs(blob_refs, blob_ref_count);
+    event.payload = payload_json && *payload_json ? payload_json : "{}";
+    session->append_call_event(event);
+  }
+}
+
+PendingFenceDependencyBatch collect_fence_dependency_batch()
+{
+  std::lock_guard lock(g_diagnostic_batch_mutex);
+  PendingFenceDependencyBatch batch = std::move(g_fence_dependency_batch);
+  g_fence_dependency_batch = PendingFenceDependencyBatch{};
+  return batch;
+}
+
+void flush_fence_dependency_batch(PendingFenceDependencyBatch batch)
+{
+  if (batch.ops.empty()) {
+    return;
+  }
+
+  std::ostringstream payload;
+  append_fence_dependency_batch_payload(payload, batch);
+  record_call_event_unbatched(
+      batch.ops.front().sequence,
+      "DXMT::FenceDependencyBatch",
+      payload.str().c_str(),
+      nullptr,
+      0,
+      nullptr,
+      0,
+      0);
+}
+
+void flush_fence_dependency_batch()
+{
+  flush_fence_dependency_batch(collect_fence_dependency_batch());
+}
+
+PendingDescriptorViewBatch collect_descriptor_view_batch()
+{
+  std::lock_guard lock(g_diagnostic_batch_mutex);
+  PendingDescriptorViewBatch batch = std::move(g_descriptor_view_batch);
+  g_descriptor_view_batch = PendingDescriptorViewBatch{};
+  return batch;
+}
+
+std::uint64_t descriptor_view_batch_sequence(const PendingDescriptorViewBatch &batch)
+{
+  return batch.ops.empty() ? UINT64_MAX : batch.ops.front().sequence;
+}
+
+std::uint64_t copy_descriptor_batch_sequence(const PendingCopyDescriptorBatch &batch)
+{
+  return batch.ops.empty() ? UINT64_MAX : batch.ops.front().sequence;
+}
+
+std::uint64_t fence_dependency_batch_sequence(const PendingFenceDependencyBatch &batch)
+{
+  return batch.ops.empty() ? UINT64_MAX : batch.ops.front().sequence;
+}
+
+std::uint64_t copy_buffer_batch_sequence(const PendingCopyBufferBatch &batch)
+{
+  return batch.ops.empty() ? UINT64_MAX : batch.ops.front().sequence;
+}
+
+std::uint64_t resource_barrier_batch_sequence(const PendingResourceBarrierBatch &batch)
+{
+  return batch.ops.empty() ? UINT64_MAX : batch.ops.front().sequence;
+}
+
+std::uint64_t copy_texture_region_batch_sequence(const PendingCopyTextureRegionBatch &batch)
+{
+  return batch.ops.empty() ? UINT64_MAX : batch.ops.front().sequence;
+}
+
+void flush_descriptor_view_batch(PendingDescriptorViewBatch batch)
+{
+  if (batch.ops.empty()) {
+    return;
+  }
+
+  std::vector<trace::ObjectId> refs;
+  refs.reserve(batch.ops.size() * 3);
+  for (const auto &op : batch.ops) {
+    if (op.device_object_id) {
+      refs.push_back(op.device_object_id);
+    }
+    if (op.resource_object_id) {
+      refs.push_back(op.resource_object_id);
+    }
+    if (op.counter_resource_object_id) {
+      refs.push_back(op.counter_resource_object_id);
+    }
+  }
+  std::sort(refs.begin(), refs.end());
+  refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
+
+  std::ostringstream payload;
+  append_descriptor_view_batch_payload(payload, batch);
+  record_call_event_unbatched_with_object_ids(
+      batch.ops.front().sequence,
+      "ID3D12Device::CreateDescriptorViewBatch",
+      payload.str().c_str(),
+      refs,
+      nullptr,
+      0,
+      0);
+}
+
+PendingCopyDescriptorBatch collect_copy_descriptor_batch()
+{
+  std::lock_guard lock(g_diagnostic_batch_mutex);
+  PendingCopyDescriptorBatch batch = std::move(g_copy_descriptor_batch);
+  g_copy_descriptor_batch = PendingCopyDescriptorBatch{};
+  return batch;
+}
+
+void flush_copy_descriptor_batch(PendingCopyDescriptorBatch batch)
+{
+  if (batch.ops.empty()) {
+    return;
+  }
+
+  std::vector<trace::ObjectId> refs;
+  refs.reserve(batch.ops.size());
+  for (const auto &op : batch.ops) {
+    if (op.device_object_id) {
+      refs.push_back(op.device_object_id);
+    }
+  }
+  std::sort(refs.begin(), refs.end());
+  refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
+
+  std::ostringstream payload;
+  append_copy_descriptor_batch_payload(payload, batch);
+  record_call_event_unbatched_with_object_ids(
+      batch.ops.front().sequence,
+      "ID3D12Device::CopyDescriptorsBatch",
+      payload.str().c_str(),
+      refs,
+      nullptr,
+      0,
+      0);
+}
+
+void flush_diagnostic_batches();
+
+std::uint64_t record_descriptor_view_batched(
+    const char *function_name,
+    trace::ObjectId device_object_id,
+    trace::ObjectId resource_object_id,
+    trace::ObjectId counter_resource_object_id,
+    DescriptorViewOp op)
+{
+  std::lock_guard event_lock(g_event_order_mutex);
+  const auto sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  op.sequence = sequence;
+  op.kind = descriptor_view_kind_for_function(function_name);
+  op.device_object_id = device_object_id;
+  op.resource_object_id = resource_object_id;
+  op.counter_resource_object_id = counter_resource_object_id;
+  bool should_flush = false;
+  {
+    std::lock_guard lock(g_diagnostic_batch_mutex);
+    g_descriptor_view_batch.ops.push_back(std::move(op));
+    should_flush = g_descriptor_view_batch.ops.size() >= kDescriptorViewBatchMaxOps;
+  }
+  if (should_flush) {
+    flush_diagnostic_batches();
+  }
+  return sequence;
 }
 
 void record_boundary_event_unbatched(
@@ -480,6 +1096,69 @@ void record_copy_buffer_batch_event(const void *command_list, const PendingCopyB
       0);
 }
 
+void record_resource_barrier_batch_event(const void *command_list, const PendingResourceBarrierBatch &batch)
+{
+  std::vector<trace::ObjectId> refs;
+  refs.reserve(1 + batch.ops.size() * 3);
+  if (const auto command_list_id = object_id(command_list)) {
+    refs.push_back(command_list_id);
+  }
+  for (const auto &op : batch.ops) {
+    if (op.resource_object_id) {
+      refs.push_back(op.resource_object_id);
+    }
+    if (op.resource_before_object_id) {
+      refs.push_back(op.resource_before_object_id);
+    }
+    if (op.resource_after_object_id) {
+      refs.push_back(op.resource_after_object_id);
+    }
+  }
+  std::sort(refs.begin(), refs.end());
+  refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
+
+  std::ostringstream payload;
+  append_resource_barrier_batch_payload(payload, batch);
+  record_call_event_unbatched_with_object_ids(
+      batch.ops.front().sequence,
+      "ID3D12GraphicsCommandList::ResourceBarrierBatch",
+      payload.str().c_str(),
+      refs,
+      nullptr,
+      0,
+      0);
+}
+
+void record_copy_texture_region_batch_event(const void *command_list, const PendingCopyTextureRegionBatch &batch)
+{
+  std::vector<trace::ObjectId> refs;
+  refs.reserve(1 + batch.ops.size() * 2);
+  if (const auto command_list_id = object_id(command_list)) {
+    refs.push_back(command_list_id);
+  }
+  for (const auto &op : batch.ops) {
+    if (op.dst.resource_object_id) {
+      refs.push_back(op.dst.resource_object_id);
+    }
+    if (op.src.resource_object_id) {
+      refs.push_back(op.src.resource_object_id);
+    }
+  }
+  std::sort(refs.begin(), refs.end());
+  refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
+
+  std::ostringstream payload;
+  append_copy_texture_region_batch_payload(payload, batch);
+  record_call_event_unbatched_with_object_ids(
+      batch.ops.front().sequence,
+      "ID3D12GraphicsCommandList::CopyTextureRegionBatch",
+      payload.str().c_str(),
+      refs,
+      nullptr,
+      0,
+      0);
+}
+
 std::vector<CopyBufferBatchFlush> collect_copy_buffer_batches(const void *command_list)
 {
   std::lock_guard lock(g_command_batch_mutex);
@@ -505,12 +1184,214 @@ std::vector<CopyBufferBatchFlush> collect_copy_buffer_batches(const void *comman
   return batches;
 }
 
+std::vector<ResourceBarrierBatchFlush> collect_resource_barrier_batches(const void *command_list)
+{
+  std::lock_guard lock(g_command_batch_mutex);
+  std::vector<ResourceBarrierBatchFlush> batches;
+  if (command_list) {
+    auto found = g_resource_barrier_batches.find(command_list);
+    if (found != g_resource_barrier_batches.end() && !found->second.ops.empty()) {
+      batches.push_back(ResourceBarrierBatchFlush{command_list, std::move(found->second)});
+      g_resource_barrier_batches.erase(found);
+    }
+  } else {
+    batches.reserve(g_resource_barrier_batches.size());
+    for (auto &entry : g_resource_barrier_batches) {
+      if (!entry.second.ops.empty()) {
+        batches.push_back(ResourceBarrierBatchFlush{entry.first, std::move(entry.second)});
+      }
+    }
+    g_resource_barrier_batches.clear();
+  }
+  std::sort(batches.begin(), batches.end(), [](const auto &lhs, const auto &rhs) {
+    return lhs.batch.ops.front().sequence < rhs.batch.ops.front().sequence;
+  });
+  return batches;
+}
+
+std::vector<CopyTextureRegionBatchFlush> collect_copy_texture_region_batches(const void *command_list)
+{
+  std::lock_guard lock(g_command_batch_mutex);
+  std::vector<CopyTextureRegionBatchFlush> batches;
+  if (command_list) {
+    auto found = g_copy_texture_region_batches.find(command_list);
+    if (found != g_copy_texture_region_batches.end() && !found->second.ops.empty()) {
+      batches.push_back(CopyTextureRegionBatchFlush{command_list, std::move(found->second)});
+      g_copy_texture_region_batches.erase(found);
+    }
+  } else {
+    batches.reserve(g_copy_texture_region_batches.size());
+    for (auto &entry : g_copy_texture_region_batches) {
+      if (!entry.second.ops.empty()) {
+        batches.push_back(CopyTextureRegionBatchFlush{entry.first, std::move(entry.second)});
+      }
+    }
+    g_copy_texture_region_batches.clear();
+  }
+  std::sort(batches.begin(), batches.end(), [](const auto &lhs, const auto &rhs) {
+    return lhs.batch.ops.front().sequence < rhs.batch.ops.front().sequence;
+  });
+  return batches;
+}
+
 void flush_copy_buffer_batches(const void *command_list = nullptr)
 {
   auto batches = collect_copy_buffer_batches(command_list);
   for (const auto &batch : batches) {
     record_copy_buffer_batch_event(batch.command_list, batch.batch);
   }
+}
+
+void flush_resource_barrier_batches(const void *command_list = nullptr)
+{
+  auto batches = collect_resource_barrier_batches(command_list);
+  for (const auto &batch : batches) {
+    record_resource_barrier_batch_event(batch.command_list, batch.batch);
+  }
+}
+
+void flush_copy_texture_region_batches(const void *command_list = nullptr)
+{
+  auto batches = collect_copy_texture_region_batches(command_list);
+  for (const auto &batch : batches) {
+    record_copy_texture_region_batch_event(batch.command_list, batch.batch);
+  }
+}
+
+void flush_command_list_batches(const void *command_list = nullptr)
+{
+  flush_copy_buffer_batches(command_list);
+  flush_resource_barrier_batches(command_list);
+  flush_copy_texture_region_batches(command_list);
+}
+
+void append_pending_batch_flush(std::vector<PendingBatchFlush> &pending, CopyBufferBatchFlush batch)
+{
+  if (batch.batch.ops.empty()) {
+    return;
+  }
+  PendingBatchFlush flush;
+  flush.kind = PendingBatchKind::CopyBuffer;
+  flush.sequence = copy_buffer_batch_sequence(batch.batch);
+  flush.command_list = batch.command_list;
+  flush.copy_buffer = std::move(batch.batch);
+  pending.push_back(std::move(flush));
+}
+
+void append_pending_batch_flush(std::vector<PendingBatchFlush> &pending, ResourceBarrierBatchFlush batch)
+{
+  if (batch.batch.ops.empty()) {
+    return;
+  }
+  PendingBatchFlush flush;
+  flush.kind = PendingBatchKind::ResourceBarrier;
+  flush.sequence = resource_barrier_batch_sequence(batch.batch);
+  flush.command_list = batch.command_list;
+  flush.resource_barrier = std::move(batch.batch);
+  pending.push_back(std::move(flush));
+}
+
+void append_pending_batch_flush(std::vector<PendingBatchFlush> &pending, CopyTextureRegionBatchFlush batch)
+{
+  if (batch.batch.ops.empty()) {
+    return;
+  }
+  PendingBatchFlush flush;
+  flush.kind = PendingBatchKind::CopyTextureRegion;
+  flush.sequence = copy_texture_region_batch_sequence(batch.batch);
+  flush.command_list = batch.command_list;
+  flush.copy_texture_region = std::move(batch.batch);
+  pending.push_back(std::move(flush));
+}
+
+void append_pending_batch_flush(std::vector<PendingBatchFlush> &pending, PendingFenceDependencyBatch batch)
+{
+  if (batch.ops.empty()) {
+    return;
+  }
+  PendingBatchFlush flush;
+  flush.kind = PendingBatchKind::FenceDependency;
+  flush.sequence = fence_dependency_batch_sequence(batch);
+  flush.fence_dependency = std::move(batch);
+  pending.push_back(std::move(flush));
+}
+
+void append_pending_batch_flush(std::vector<PendingBatchFlush> &pending, PendingDescriptorViewBatch batch)
+{
+  if (batch.ops.empty()) {
+    return;
+  }
+  PendingBatchFlush flush;
+  flush.kind = PendingBatchKind::DescriptorView;
+  flush.sequence = descriptor_view_batch_sequence(batch);
+  flush.descriptor_view = std::move(batch);
+  pending.push_back(std::move(flush));
+}
+
+void append_pending_batch_flush(std::vector<PendingBatchFlush> &pending, PendingCopyDescriptorBatch batch)
+{
+  if (batch.ops.empty()) {
+    return;
+  }
+  PendingBatchFlush flush;
+  flush.kind = PendingBatchKind::CopyDescriptor;
+  flush.sequence = copy_descriptor_batch_sequence(batch);
+  flush.copy_descriptor = std::move(batch);
+  pending.push_back(std::move(flush));
+}
+
+void emit_pending_batch_flush(PendingBatchFlush &flush)
+{
+  switch (flush.kind) {
+  case PendingBatchKind::CopyBuffer:
+    record_copy_buffer_batch_event(flush.command_list, flush.copy_buffer);
+    break;
+  case PendingBatchKind::ResourceBarrier:
+    record_resource_barrier_batch_event(flush.command_list, flush.resource_barrier);
+    break;
+  case PendingBatchKind::CopyTextureRegion:
+    record_copy_texture_region_batch_event(flush.command_list, flush.copy_texture_region);
+    break;
+  case PendingBatchKind::FenceDependency:
+    flush_fence_dependency_batch(std::move(flush.fence_dependency));
+    break;
+  case PendingBatchKind::DescriptorView:
+    flush_descriptor_view_batch(std::move(flush.descriptor_view));
+    break;
+  case PendingBatchKind::CopyDescriptor:
+    flush_copy_descriptor_batch(std::move(flush.copy_descriptor));
+    break;
+  }
+}
+
+void flush_pending_batches(const void *command_list = nullptr)
+{
+  std::vector<PendingBatchFlush> pending;
+  for (auto &batch : collect_copy_buffer_batches(command_list)) {
+    append_pending_batch_flush(pending, std::move(batch));
+  }
+  for (auto &batch : collect_resource_barrier_batches(command_list)) {
+    append_pending_batch_flush(pending, std::move(batch));
+  }
+  for (auto &batch : collect_copy_texture_region_batches(command_list)) {
+    append_pending_batch_flush(pending, std::move(batch));
+  }
+  if (!command_list) {
+    append_pending_batch_flush(pending, collect_fence_dependency_batch());
+    append_pending_batch_flush(pending, collect_descriptor_view_batch());
+    append_pending_batch_flush(pending, collect_copy_descriptor_batch());
+  }
+  std::sort(pending.begin(), pending.end(), [](const auto &lhs, const auto &rhs) {
+    return lhs.sequence < rhs.sequence;
+  });
+  for (auto &batch : pending) {
+    emit_pending_batch_flush(batch);
+  }
+}
+
+void flush_diagnostic_batches()
+{
+  flush_pending_batches();
 }
 
 trace::AssetRecord register_asset_bytes(
@@ -534,6 +1415,9 @@ trace::AssetRecord register_asset_bytes(
   asset.fast_fingerprint = trace::fast_fingerprint_bytes(data, size);
   const auto *bytes = static_cast<const std::uint8_t *>(data);
   asset.payload_bytes.assign(bytes, bytes + size);
+  if (kind == trace::AssetKind::Texture && asset.debug_name == "d3d12-present-frame") {
+    asset.content_hash = trace::content_hash_bytes(data, size);
+  }
   if (auto *session = session_for(trace::ApiKind::D3D12)) {
     asset = session->register_asset(std::move(asset));
   }
@@ -804,6 +1688,109 @@ std::string srv_desc_detail_json(const D3D12_SHADER_RESOURCE_VIEW_DESC *desc)
   return payload.str();
 }
 
+void append_json_u64_field(std::ostringstream &payload, bool &first, const char *name, std::uint64_t value)
+{
+  if (value == 0) {
+    return;
+  }
+  if (!first) {
+    payload << ",";
+  }
+  first = false;
+  payload << "\"" << name << "\":" << value;
+}
+
+void append_json_u32_field(std::ostringstream &payload, bool &first, const char *name, std::uint32_t value)
+{
+  append_json_u64_field(payload, first, name, value);
+}
+
+void append_json_float_field(std::ostringstream &payload, bool &first, const char *name, float value)
+{
+  if (value == 0.0f) {
+    return;
+  }
+  if (!first) {
+    payload << ",";
+  }
+  first = false;
+  payload << "\"" << name << "\":" << value;
+}
+
+std::string srv_desc_detail_sparse_json(const D3D12_SHADER_RESOURCE_VIEW_DESC *desc)
+{
+  if (!desc) {
+    return "null";
+  }
+  std::ostringstream payload;
+  bool first = true;
+  payload << "{";
+  switch (desc->ViewDimension) {
+  case D3D12_SRV_DIMENSION_BUFFER:
+    append_json_u64_field(payload, first, "first_element", desc->Buffer.FirstElement);
+    append_json_u32_field(payload, first, "num_elements", desc->Buffer.NumElements);
+    append_json_u32_field(payload, first, "structure_byte_stride", desc->Buffer.StructureByteStride);
+    append_json_u32_field(payload, first, "flags", static_cast<unsigned int>(desc->Buffer.Flags));
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURE1D:
+    append_json_u32_field(payload, first, "most_detailed_mip", desc->Texture1D.MostDetailedMip);
+    append_json_u32_field(payload, first, "mip_levels", desc->Texture1D.MipLevels);
+    append_json_float_field(payload, first, "resource_min_lod_clamp", desc->Texture1D.ResourceMinLODClamp);
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+    append_json_u32_field(payload, first, "most_detailed_mip", desc->Texture1DArray.MostDetailedMip);
+    append_json_u32_field(payload, first, "mip_levels", desc->Texture1DArray.MipLevels);
+    append_json_u32_field(payload, first, "first_array_slice", desc->Texture1DArray.FirstArraySlice);
+    append_json_u32_field(payload, first, "array_size", desc->Texture1DArray.ArraySize);
+    append_json_float_field(payload, first, "resource_min_lod_clamp", desc->Texture1DArray.ResourceMinLODClamp);
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURE2D:
+    append_json_u32_field(payload, first, "most_detailed_mip", desc->Texture2D.MostDetailedMip);
+    append_json_u32_field(payload, first, "mip_levels", desc->Texture2D.MipLevels);
+    append_json_u32_field(payload, first, "plane_slice", desc->Texture2D.PlaneSlice);
+    append_json_float_field(payload, first, "resource_min_lod_clamp", desc->Texture2D.ResourceMinLODClamp);
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+    append_json_u32_field(payload, first, "most_detailed_mip", desc->Texture2DArray.MostDetailedMip);
+    append_json_u32_field(payload, first, "mip_levels", desc->Texture2DArray.MipLevels);
+    append_json_u32_field(payload, first, "first_array_slice", desc->Texture2DArray.FirstArraySlice);
+    append_json_u32_field(payload, first, "array_size", desc->Texture2DArray.ArraySize);
+    append_json_u32_field(payload, first, "plane_slice", desc->Texture2DArray.PlaneSlice);
+    append_json_float_field(payload, first, "resource_min_lod_clamp", desc->Texture2DArray.ResourceMinLODClamp);
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+    append_json_u32_field(payload, first, "first_array_slice", desc->Texture2DMSArray.FirstArraySlice);
+    append_json_u32_field(payload, first, "array_size", desc->Texture2DMSArray.ArraySize);
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURE3D:
+    append_json_u32_field(payload, first, "most_detailed_mip", desc->Texture3D.MostDetailedMip);
+    append_json_u32_field(payload, first, "mip_levels", desc->Texture3D.MipLevels);
+    append_json_float_field(payload, first, "resource_min_lod_clamp", desc->Texture3D.ResourceMinLODClamp);
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURECUBE:
+    append_json_u32_field(payload, first, "most_detailed_mip", desc->TextureCube.MostDetailedMip);
+    append_json_u32_field(payload, first, "mip_levels", desc->TextureCube.MipLevels);
+    append_json_float_field(payload, first, "resource_min_lod_clamp", desc->TextureCube.ResourceMinLODClamp);
+    break;
+  case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+    append_json_u32_field(payload, first, "most_detailed_mip", desc->TextureCubeArray.MostDetailedMip);
+    append_json_u32_field(payload, first, "mip_levels", desc->TextureCubeArray.MipLevels);
+    append_json_u32_field(payload, first, "first_2d_array_face", desc->TextureCubeArray.First2DArrayFace);
+    append_json_u32_field(payload, first, "num_cubes", desc->TextureCubeArray.NumCubes);
+    append_json_float_field(payload, first, "resource_min_lod_clamp", desc->TextureCubeArray.ResourceMinLODClamp);
+    break;
+#ifdef D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE
+  case D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE:
+    append_json_u64_field(payload, first, "location", desc->RaytracingAccelerationStructure.Location);
+    break;
+#endif
+  default:
+    break;
+  }
+  payload << "}";
+  return payload.str();
+}
+
 std::string uav_desc_detail_json(const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc)
 {
   if (!desc) {
@@ -841,6 +1828,52 @@ std::string uav_desc_detail_json(const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc)
     payload << "\"mip_slice\":" << desc->Texture3D.MipSlice
             << ",\"first_w_slice\":" << desc->Texture3D.FirstWSlice
             << ",\"w_size\":" << desc->Texture3D.WSize;
+    break;
+  default:
+    break;
+  }
+  payload << "}";
+  return payload.str();
+}
+
+std::string uav_desc_detail_sparse_json(const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc)
+{
+  if (!desc) {
+    return "null";
+  }
+  std::ostringstream payload;
+  bool first = true;
+  payload << "{";
+  switch (desc->ViewDimension) {
+  case D3D12_UAV_DIMENSION_BUFFER:
+    append_json_u64_field(payload, first, "first_element", desc->Buffer.FirstElement);
+    append_json_u32_field(payload, first, "num_elements", desc->Buffer.NumElements);
+    append_json_u32_field(payload, first, "structure_byte_stride", desc->Buffer.StructureByteStride);
+    append_json_u64_field(payload, first, "counter_offset_in_bytes", desc->Buffer.CounterOffsetInBytes);
+    append_json_u32_field(payload, first, "flags", static_cast<unsigned int>(desc->Buffer.Flags));
+    break;
+  case D3D12_UAV_DIMENSION_TEXTURE1D:
+    append_json_u32_field(payload, first, "mip_slice", desc->Texture1D.MipSlice);
+    break;
+  case D3D12_UAV_DIMENSION_TEXTURE1DARRAY:
+    append_json_u32_field(payload, first, "mip_slice", desc->Texture1DArray.MipSlice);
+    append_json_u32_field(payload, first, "first_array_slice", desc->Texture1DArray.FirstArraySlice);
+    append_json_u32_field(payload, first, "array_size", desc->Texture1DArray.ArraySize);
+    break;
+  case D3D12_UAV_DIMENSION_TEXTURE2D:
+    append_json_u32_field(payload, first, "mip_slice", desc->Texture2D.MipSlice);
+    append_json_u32_field(payload, first, "plane_slice", desc->Texture2D.PlaneSlice);
+    break;
+  case D3D12_UAV_DIMENSION_TEXTURE2DARRAY:
+    append_json_u32_field(payload, first, "mip_slice", desc->Texture2DArray.MipSlice);
+    append_json_u32_field(payload, first, "first_array_slice", desc->Texture2DArray.FirstArraySlice);
+    append_json_u32_field(payload, first, "array_size", desc->Texture2DArray.ArraySize);
+    append_json_u32_field(payload, first, "plane_slice", desc->Texture2DArray.PlaneSlice);
+    break;
+  case D3D12_UAV_DIMENSION_TEXTURE3D:
+    append_json_u32_field(payload, first, "mip_slice", desc->Texture3D.MipSlice);
+    append_json_u32_field(payload, first, "first_w_slice", desc->Texture3D.FirstWSlice);
+    append_json_u32_field(payload, first, "w_size", desc->Texture3D.WSize);
     break;
   default:
     break;
@@ -895,6 +1928,53 @@ std::string rtv_desc_detail_json(const D3D12_RENDER_TARGET_VIEW_DESC *desc)
   return payload.str();
 }
 
+std::string rtv_desc_detail_sparse_json(const D3D12_RENDER_TARGET_VIEW_DESC *desc)
+{
+  if (!desc) {
+    return "null";
+  }
+  std::ostringstream payload;
+  bool first = true;
+  payload << "{";
+  switch (desc->ViewDimension) {
+  case D3D12_RTV_DIMENSION_BUFFER:
+    append_json_u64_field(payload, first, "first_element", desc->Buffer.FirstElement);
+    append_json_u32_field(payload, first, "num_elements", desc->Buffer.NumElements);
+    break;
+  case D3D12_RTV_DIMENSION_TEXTURE1D:
+    append_json_u32_field(payload, first, "mip_slice", desc->Texture1D.MipSlice);
+    break;
+  case D3D12_RTV_DIMENSION_TEXTURE1DARRAY:
+    append_json_u32_field(payload, first, "mip_slice", desc->Texture1DArray.MipSlice);
+    append_json_u32_field(payload, first, "first_array_slice", desc->Texture1DArray.FirstArraySlice);
+    append_json_u32_field(payload, first, "array_size", desc->Texture1DArray.ArraySize);
+    break;
+  case D3D12_RTV_DIMENSION_TEXTURE2D:
+    append_json_u32_field(payload, first, "mip_slice", desc->Texture2D.MipSlice);
+    append_json_u32_field(payload, first, "plane_slice", desc->Texture2D.PlaneSlice);
+    break;
+  case D3D12_RTV_DIMENSION_TEXTURE2DARRAY:
+    append_json_u32_field(payload, first, "mip_slice", desc->Texture2DArray.MipSlice);
+    append_json_u32_field(payload, first, "first_array_slice", desc->Texture2DArray.FirstArraySlice);
+    append_json_u32_field(payload, first, "array_size", desc->Texture2DArray.ArraySize);
+    append_json_u32_field(payload, first, "plane_slice", desc->Texture2DArray.PlaneSlice);
+    break;
+  case D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY:
+    append_json_u32_field(payload, first, "first_array_slice", desc->Texture2DMSArray.FirstArraySlice);
+    append_json_u32_field(payload, first, "array_size", desc->Texture2DMSArray.ArraySize);
+    break;
+  case D3D12_RTV_DIMENSION_TEXTURE3D:
+    append_json_u32_field(payload, first, "mip_slice", desc->Texture3D.MipSlice);
+    append_json_u32_field(payload, first, "first_w_slice", desc->Texture3D.FirstWSlice);
+    append_json_u32_field(payload, first, "w_size", desc->Texture3D.WSize);
+    break;
+  default:
+    break;
+  }
+  payload << "}";
+  return payload.str();
+}
+
 std::string dsv_desc_detail_json(const D3D12_DEPTH_STENCIL_VIEW_DESC *desc)
 {
   if (!desc) {
@@ -922,6 +2002,42 @@ std::string dsv_desc_detail_json(const D3D12_DEPTH_STENCIL_VIEW_DESC *desc)
   case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY:
     payload << "\"first_array_slice\":" << desc->Texture2DMSArray.FirstArraySlice
             << ",\"array_size\":" << desc->Texture2DMSArray.ArraySize;
+    break;
+  default:
+    break;
+  }
+  payload << "}";
+  return payload.str();
+}
+
+std::string dsv_desc_detail_sparse_json(const D3D12_DEPTH_STENCIL_VIEW_DESC *desc)
+{
+  if (!desc) {
+    return "null";
+  }
+  std::ostringstream payload;
+  bool first = true;
+  payload << "{";
+  switch (desc->ViewDimension) {
+  case D3D12_DSV_DIMENSION_TEXTURE1D:
+    append_json_u32_field(payload, first, "mip_slice", desc->Texture1D.MipSlice);
+    break;
+  case D3D12_DSV_DIMENSION_TEXTURE1DARRAY:
+    append_json_u32_field(payload, first, "mip_slice", desc->Texture1DArray.MipSlice);
+    append_json_u32_field(payload, first, "first_array_slice", desc->Texture1DArray.FirstArraySlice);
+    append_json_u32_field(payload, first, "array_size", desc->Texture1DArray.ArraySize);
+    break;
+  case D3D12_DSV_DIMENSION_TEXTURE2D:
+    append_json_u32_field(payload, first, "mip_slice", desc->Texture2D.MipSlice);
+    break;
+  case D3D12_DSV_DIMENSION_TEXTURE2DARRAY:
+    append_json_u32_field(payload, first, "mip_slice", desc->Texture2DArray.MipSlice);
+    append_json_u32_field(payload, first, "first_array_slice", desc->Texture2DArray.FirstArraySlice);
+    append_json_u32_field(payload, first, "array_size", desc->Texture2DArray.ArraySize);
+    break;
+  case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY:
+    append_json_u32_field(payload, first, "first_array_slice", desc->Texture2DMSArray.FirstArraySlice);
+    append_json_u32_field(payload, first, "array_size", desc->Texture2DMSArray.ArraySize);
     break;
   default:
     break;
@@ -1077,7 +2193,7 @@ std::string cpu_descriptor_detail_json(D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
 {
   std::ostringstream payload;
   payload << "{\"ptr\":" << static_cast<std::uint64_t>(descriptor.ptr)
-          << ",\"object_id\":" << object_id(reinterpret_cast<const void *>(descriptor.ptr))
+          << ",\"descriptor_id\":" << object_id(reinterpret_cast<const void *>(descriptor.ptr))
           << "}";
   return payload.str();
 }
@@ -1143,6 +2259,64 @@ void append_copy_descriptor_pairs_json(
     ++src_offset;
   }
   payload << "]";
+}
+
+std::vector<CopyDescriptorRange> collect_copy_descriptor_ranges(
+    std::uint32_t dst_descriptor_range_count,
+    const D3D12_CPU_DESCRIPTOR_HANDLE *dst_descriptor_range_starts,
+    const std::uint32_t *dst_descriptor_range_sizes,
+    std::uint32_t src_descriptor_range_count,
+    const D3D12_CPU_DESCRIPTOR_HANDLE *src_descriptor_range_starts,
+    const std::uint32_t *src_descriptor_range_sizes,
+    std::uint32_t descriptor_size)
+{
+  std::vector<CopyDescriptorRange> ranges;
+  std::uint32_t dst_range_index = 0;
+  std::uint32_t src_range_index = 0;
+  std::uint32_t dst_offset = 0;
+  std::uint32_t src_offset = 0;
+  while (dst_descriptor_range_starts &&
+         src_descriptor_range_starts &&
+         dst_range_index < dst_descriptor_range_count &&
+         src_range_index < src_descriptor_range_count) {
+    const std::uint32_t dst_range_size =
+        dst_descriptor_range_sizes ? dst_descriptor_range_sizes[dst_range_index] : 1;
+    const std::uint32_t src_range_size =
+        src_descriptor_range_sizes ? src_descriptor_range_sizes[src_range_index] : 1;
+    if (dst_offset >= dst_range_size) {
+      ++dst_range_index;
+      dst_offset = 0;
+      continue;
+    }
+    if (src_offset >= src_range_size) {
+      ++src_range_index;
+      src_offset = 0;
+      continue;
+    }
+
+    const std::uint64_t dst_descriptor =
+        static_cast<std::uint64_t>(dst_descriptor_range_starts[dst_range_index].ptr) +
+        static_cast<std::uint64_t>(dst_offset) * descriptor_size;
+    const std::uint64_t src_descriptor =
+        static_cast<std::uint64_t>(src_descriptor_range_starts[src_range_index].ptr) +
+        static_cast<std::uint64_t>(src_offset) * descriptor_size;
+    if (!ranges.empty()) {
+      auto &previous = ranges.back();
+      const auto previous_count = static_cast<std::uint64_t>(previous.count);
+      if (previous.dst_descriptor + previous_count * descriptor_size == dst_descriptor &&
+          previous.src_descriptor + previous_count * descriptor_size == src_descriptor) {
+        ++previous.count;
+        ++dst_offset;
+        ++src_offset;
+        continue;
+      }
+    }
+
+    ranges.push_back(CopyDescriptorRange{dst_descriptor, src_descriptor, 1});
+    ++dst_offset;
+    ++src_offset;
+  }
+  return ranges;
 }
 
 void append_rect_json(std::ostringstream &payload, const D3D12_RECT &rect)
@@ -1284,6 +2458,27 @@ void append_texture_copy_location_json(std::ostringstream &payload, const D3D12_
   payload << "}";
 }
 
+TextureCopyLocationCompact compact_texture_copy_location(const D3D12_TEXTURE_COPY_LOCATION *location)
+{
+  TextureCopyLocationCompact compact;
+  if (!location) {
+    return compact;
+  }
+  compact.resource_object_id = object_id(location->pResource);
+  compact.type = static_cast<std::uint32_t>(location->Type);
+  if (location->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+    compact.footprint_offset = location->PlacedFootprint.Offset;
+    compact.footprint_format = static_cast<std::uint32_t>(location->PlacedFootprint.Footprint.Format);
+    compact.footprint_width = location->PlacedFootprint.Footprint.Width;
+    compact.footprint_height = location->PlacedFootprint.Footprint.Height;
+    compact.footprint_depth = location->PlacedFootprint.Footprint.Depth;
+    compact.footprint_row_pitch = location->PlacedFootprint.Footprint.RowPitch;
+  } else {
+    compact.subresource_index = location->SubresourceIndex;
+  }
+  return compact;
+}
+
 } // namespace
 
 D3D12CaptureHooks::D3D12CaptureHooks() = default;
@@ -1331,6 +2526,61 @@ std::uint64_t object_id(const void *object)
   return lookup_object_id_locked(object);
 }
 
+void record_external_object_create_if_needed(
+    const void *object,
+    CaptureObjectKind kind,
+    const char *debug_name,
+    const char *payload_json = "{}")
+{
+  if (!object) {
+    return;
+  }
+  {
+    std::lock_guard lock(g_object_mutex);
+    if (object_kind_known_locked(object, to_trace_object_kind(kind))) {
+      return;
+    }
+  }
+  record_object_create(object, kind, nullptr, debug_name, payload_json);
+}
+
+void ensure_external_resource_object(const void *resource, const char *reason)
+{
+  if (!resource) {
+    return;
+  }
+  std::ostringstream payload;
+  payload << "{\"external_resource\":true";
+  if (reason && *reason) {
+    payload << ",\"reason\":\"" << escape_json_string(reason) << "\"";
+  }
+  payload << "}";
+  record_external_object_create_if_needed(
+      resource,
+      CaptureObjectKind::Resource,
+      "ExternalD3D12Resource",
+      payload.str().c_str());
+}
+
+void ensure_external_swapchain_object(const void *swapchain, const char *reason)
+{
+  if (!swapchain) {
+    return;
+  }
+  std::ostringstream payload;
+  payload << "{\"external_swapchain\":true";
+  if (reason && *reason) {
+    payload << ",\"reason\":\"" << escape_json_string(reason) << "\"";
+  }
+  payload << "}";
+  record_external_object_create_if_needed(
+      swapchain,
+      CaptureObjectKind::SwapChain,
+      "ExternalDXGISwapChain",
+      payload.str().c_str());
+}
+
+
 std::uint64_t register_blob(const char *debug_name, const void *data, std::size_t size)
 {
   return register_asset_bytes(trace::AssetKind::Unknown, debug_name, data, size).blob_id;
@@ -1345,14 +2595,39 @@ std::uint64_t record_call(
     std::uint32_t blob_ref_count,
     std::int32_t result_code)
 {
+  std::lock_guard event_lock(g_event_order_mutex);
+  flush_diagnostic_batches();
+  flush_command_list_batches();
   const auto sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-  flush_copy_buffer_batches();
   record_call_with_sequence(
       sequence,
       opname,
       payload_json,
       object_refs,
       object_ref_count,
+      blob_refs,
+      blob_ref_count,
+      result_code);
+  return sequence;
+}
+
+std::uint64_t record_call_with_object_ids(
+    const char *opname,
+    const char *payload_json,
+    std::vector<trace::ObjectId> object_refs,
+    const std::uint64_t *blob_refs = nullptr,
+    std::uint32_t blob_ref_count = 0,
+    std::int32_t result_code = 0)
+{
+  std::lock_guard event_lock(g_event_order_mutex);
+  flush_diagnostic_batches();
+  flush_command_list_batches();
+  const auto sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  record_call_event_unbatched_with_object_ids(
+      sequence,
+      opname,
+      payload_json,
+      std::move(object_refs),
       blob_refs,
       blob_ref_count,
       result_code);
@@ -1369,7 +2644,6 @@ void record_call_with_sequence(
     std::uint32_t blob_ref_count,
     std::int32_t result_code)
 {
-  flush_copy_buffer_batches();
   record_call_event_unbatched(
       sequence,
       opname,
@@ -1397,13 +2671,16 @@ void record_object_create(
     std::lock_guard lock(g_object_mutex);
     object_record.object_id = lookup_object_id_locked(object);
     object_record.parent_object_id = lookup_object_id_locked(parent_object);
+    g_object_kinds[object] = to_trace_object_kind(kind);
   }
   object_record.kind = to_trace_object_kind(kind);
   object_record.debug_name = debug_name ? debug_name : "";
 
   if (auto *session = session_for(trace::ApiKind::D3D12)) {
+    std::lock_guard event_lock(g_event_order_mutex);
     session->record_object(object_record);
-    flush_copy_buffer_batches();
+    flush_diagnostic_batches();
+    flush_command_list_batches();
     trace::EventRecord event;
     event.kind = trace::EventKind::ObjectCreate;
     event.callsite.sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1424,7 +2701,9 @@ void record_object_destroy(const void *object, CaptureObjectKind kind, const cha
     return;
   }
   if (auto *session = session_for(trace::ApiKind::D3D12)) {
-    flush_copy_buffer_batches();
+    std::lock_guard event_lock(g_event_order_mutex);
+    flush_diagnostic_batches();
+    flush_command_list_batches();
     trace::EventRecord event;
     event.kind = trace::EventKind::ObjectDestroy;
     event.callsite.sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1437,6 +2716,7 @@ void record_object_destroy(const void *object, CaptureObjectKind kind, const cha
   if (kind == CaptureObjectKind::Resource) {
     std::lock_guard lock(g_object_mutex);
     g_resource_gpu_virtual_addresses.erase(object);
+    g_object_kinds.erase(object);
   }
 }
 
@@ -1447,7 +2727,9 @@ void record_resource_blob(
     const char *payload_json)
 {
   if (auto *session = session_for(trace::ApiKind::D3D12)) {
-    flush_copy_buffer_batches();
+    std::lock_guard event_lock(g_event_order_mutex);
+    flush_diagnostic_batches();
+    flush_command_list_batches();
     trace::EventRecord event;
     event.kind = trace::EventKind::ResourceBlob;
     event.callsite.sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1500,26 +2782,46 @@ std::uint64_t record_execute_command_lists(const void *queue, const void *comman
   return record_call("ID3D12CommandQueue::ExecuteCommandLists", "{}", refs, 2);
 }
 
-std::uint64_t record_present(const void *swapchain, std::uint32_t sync_interval, std::uint32_t flags)
+std::uint64_t record_present(
+    const void *swapchain,
+    std::uint32_t sync_interval,
+    std::uint32_t flags,
+    std::int32_t result_code,
+    bool frame_presented)
 {
   if (!swapchain) {
     return 0;
   }
-  flush_copy_buffer_batches();
-  const auto frame_index = next_present_frame_index();
-  const auto frame_begin_sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-  std::ostringstream frame_begin_payload;
-  frame_begin_payload << "{\"label\":\"FrameBegin\",\"frame_index\":" << frame_index << "}";
-  record_boundary_event_unbatched(
-      frame_begin_sequence,
-      trace::BoundaryKind::Frame,
-      frame_begin_payload.str().c_str());
+  ensure_external_swapchain_object(swapchain, "Present");
+  std::lock_guard event_lock(g_event_order_mutex);
+  flush_diagnostic_batches();
+  flush_command_list_batches();
+  const auto present_test = is_present_test(flags);
+  const auto has_frame_index = frame_presented && !present_test && result_code == 0;
+  const auto frame_index = has_frame_index ? next_present_frame_index() : UINT64_MAX;
+  if (has_frame_index) {
+    const auto frame_begin_sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::ostringstream frame_begin_payload;
+    frame_begin_payload << "{\"label\":\"FrameBegin\",\"frame_index\":" << frame_index << "}";
+    record_boundary_event_unbatched(
+        frame_begin_sequence,
+        trace::BoundaryKind::Frame,
+        frame_begin_payload.str().c_str());
+  }
 
   std::ostringstream payload;
-  payload << "{\"frame_index\":" << frame_index
-          << ",\"sync_interval\":" << sync_interval
-          << ",\"flags\":" << flags
-          << "}";
+  payload << "{";
+  if (has_frame_index) {
+    payload << "\"frame_index\":" << frame_index << ",";
+  }
+  payload << "\"sync_interval\":" << sync_interval
+          << ",\"flags\":" << flags;
+  if (present_test) {
+    payload << ",\"present_test\":true";
+  } else if (!has_frame_index) {
+    payload << ",\"frame_presented\":false";
+  }
+  payload << "}";
   const void *refs[] = {swapchain};
   const auto present_sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
   record_call_event_unbatched(
@@ -1530,7 +2832,10 @@ std::uint64_t record_present(const void *swapchain, std::uint32_t sync_interval,
       1,
       nullptr,
       0,
-      0);
+      result_code);
+  if (!has_frame_index) {
+    return UINT64_MAX;
+  }
 
   std::ostringstream present_boundary_payload;
   present_boundary_payload << "{\"label\":\"Present\",\"frame_index\":" << frame_index
@@ -1549,7 +2854,43 @@ std::uint64_t record_present(const void *swapchain, std::uint32_t sync_interval,
       frame_end_sequence,
       trace::BoundaryKind::Frame,
       frame_end_payload.str().c_str());
-  return present_sequence;
+  return frame_index;
+}
+
+void record_present_frame(
+    std::uint64_t frame_index,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t row_pitch,
+    std::uint32_t sync_interval,
+    std::uint32_t flags,
+    const void *rgba_data,
+    std::size_t rgba_size)
+{
+  if (frame_index == UINT64_MAX ||
+      !rgba_data || width == 0 || height == 0 || row_pitch == 0 || rgba_size == 0) {
+    return;
+  }
+
+  const auto asset = register_asset_bytes(
+      trace::AssetKind::Texture,
+      "d3d12-present-frame",
+      rgba_data,
+      rgba_size);
+
+  std::ostringstream payload;
+  payload << "{\"frame_index\":" << frame_index
+          << ",\"width\":" << width
+          << ",\"height\":" << height
+          << ",\"row_pitch\":" << row_pitch
+          << ",\"sync_interval\":" << sync_interval
+          << ",\"flags\":" << flags
+          << ",\"format\":\"rgba8\""
+          << ",\"frame_path\":\"" << asset.relative_path.generic_string() << "\""
+          << "}";
+  const auto blob_id = static_cast<std::uint64_t>(asset.blob_id);
+  record_resource_blob("D3D12PresentFrame", &blob_id, 1, payload.str().c_str());
+  maybe_seal_checkpoint_after_present_frame(frame_index);
 }
 
 void record_fence_dependency(
@@ -1565,21 +2906,22 @@ void record_fence_dependency(
     std::uint32_t minimal_count,
     std::uint32_t mask_count)
 {
+  std::lock_guard event_lock(g_event_order_mutex);
   (void)strong_masks;
   (void)full_masks;
   (void)minimal_masks;
-  std::ostringstream payload;
-  payload << "{\"kind\":\"fence_dependency\""
-          << ",\"scope\":\"" << (scope ? scope : "unknown") << "\""
-          << ",\"d3d_sequence\":" << d3d_sequence
-          << ",\"encoder_id\":" << encoder_id
-          << ",\"implicit_pre_raster_wait\":" << (implicit_pre_raster_wait ? "true" : "false")
-          << ",\"strong_count\":" << strong_count
-          << ",\"full_count\":" << full_count
-          << ",\"minimal_count\":" << minimal_count
-          << ",\"mask_count\":" << mask_count
-          << "}";
-  record_call_with_sequence(d3d_sequence, "DXMT::FenceDependency", payload.str().c_str());
+  FenceDependencyOp op;
+  op.sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  op.scope = scope ? scope : "unknown";
+  op.d3d_sequence = d3d_sequence;
+  op.encoder_id = encoder_id;
+  op.implicit_pre_raster_wait = implicit_pre_raster_wait;
+  op.strong_count = strong_count;
+  op.full_count = full_count;
+  op.minimal_count = minimal_count;
+  op.mask_count = mask_count;
+  std::lock_guard lock(g_diagnostic_batch_mutex);
+  g_fence_dependency_batch.ops.push_back(std::move(op));
 }
 
 std::uint64_t record_create_command_queue(
@@ -1775,6 +3117,9 @@ std::uint64_t record_create_pipeline_state(
 
   std::vector<trace::BlobId> shader_blob_refs;
   std::vector<trace::BlobId> blob_refs;
+  std::vector<const void *> refs;
+  refs.push_back(device);
+  refs.push_back(pipeline_state);
   std::ostringstream payload;
   payload << "{";
   if (stream_data && stream_size > 0) {
@@ -1826,6 +3171,7 @@ std::uint64_t record_create_pipeline_state(
         const auto root_signature = *reinterpret_cast<ID3D12RootSignature *const *>(subobject);
         graphics.pRootSignature = root_signature;
         compute.pRootSignature = root_signature;
+        refs.push_back(root_signature);
         stream << ",\"root_signature_object_id\":" << object_id(root_signature);
         break;
       }
@@ -2064,12 +3410,11 @@ std::uint64_t record_create_pipeline_state(
             << ",\"stream_metadata\":" << stream.str() << "}";
   }
   payload << "}";
-  const void *refs[] = {device, pipeline_state};
   return record_call(
       "ID3D12Device2::CreatePipelineState",
       payload.str().c_str(),
-      refs,
-      2,
+      refs.data(),
+      refs.size(),
       reinterpret_cast<const std::uint64_t *>(blob_refs.data()),
       blob_refs.size(),
       result_code);
@@ -2332,19 +3677,27 @@ std::uint64_t record_create_constant_buffer_view(
 {
   const bool has_buffer_location = desc && desc->BufferLocation != 0;
   const bool has_resolved_resource = resolved_resource != nullptr;
-  std::ostringstream payload;
-  payload << "{\"descriptor\":" << cpu_descriptor_json(descriptor)
-          << ",\"descriptor_detail\":" << cpu_descriptor_detail_json(descriptor)
-          << ",\"buffer_location\":" << (desc ? desc->BufferLocation : 0)
-          << ",\"size_in_bytes\":" << (desc ? desc->SizeInBytes : 0)
-          << ",\"gpuva_resolve_status\":\""
-          << (!has_buffer_location ? "null" : (has_resolved_resource ? "mapped" : "unmapped"))
-          << "\",\"resolved_resource_object_id\":" << object_id(resolved_resource)
-          << ",\"resolved_resource_offset\":" << (has_resolved_resource ? resolved_resource_offset : 0)
-          << ",\"resolved_resource_width\":" << (has_resolved_resource ? resolved_resource_width : 0)
-          << "}";
-  const void *refs[] = {device, resolved_resource};
-  return record_call("ID3D12Device::CreateConstantBufferView", payload.str().c_str(), refs, 2);
+  ensure_external_resource_object(resolved_resource, "CreateConstantBufferViewGpuVA");
+  DescriptorViewOp op;
+  op.descriptor = descriptor.ptr;
+  if (has_buffer_location) {
+    op.buffer_location = desc->BufferLocation;
+    op.size_in_bytes = desc->SizeInBytes;
+    op.gpuva_resolve_status = has_resolved_resource ? "mapped" : "unmapped";
+    if (has_resolved_resource) {
+      op.resolved_resource_object_id = object_id(resolved_resource);
+      op.resolved_resource_offset = resolved_resource_offset;
+      op.resolved_resource_width = resolved_resource_width;
+    }
+  } else if (desc && desc->SizeInBytes != 0) {
+    op.size_in_bytes = desc->SizeInBytes;
+  }
+  return record_descriptor_view_batched(
+      "ID3D12Device::CreateConstantBufferView",
+      object_id(device),
+      object_id(resolved_resource),
+      0,
+      std::move(op));
 }
 
 std::uint64_t record_create_shader_resource_view(
@@ -2353,16 +3706,19 @@ std::uint64_t record_create_shader_resource_view(
     const D3D12_SHADER_RESOURCE_VIEW_DESC *desc,
     D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
 {
-  std::ostringstream payload;
-  payload << "{\"descriptor\":" << cpu_descriptor_json(descriptor)
-          << ",\"descriptor_detail\":" << cpu_descriptor_detail_json(descriptor)
-          << ",\"format\":" << (desc ? static_cast<unsigned int>(desc->Format) : 0)
-          << ",\"view_dimension\":" << (desc ? static_cast<unsigned int>(desc->ViewDimension) : 0)
-          << ",\"shader_4_component_mapping\":" << (desc ? desc->Shader4ComponentMapping : 0)
-          << ",\"view\":" << srv_desc_detail_json(desc)
-          << "}";
-  const void *refs[] = {device, resource};
-  return record_call("ID3D12Device::CreateShaderResourceView", payload.str().c_str(), refs, 2);
+  ensure_external_resource_object(resource, "CreateShaderResourceView");
+  DescriptorViewOp op;
+  op.descriptor = descriptor.ptr;
+  op.format = desc ? static_cast<unsigned int>(desc->Format) : 0;
+  op.view_dimension = desc ? static_cast<unsigned int>(desc->ViewDimension) : 0;
+  op.shader_4_component_mapping = desc ? desc->Shader4ComponentMapping : 0;
+  op.view_payload = srv_desc_detail_sparse_json(desc);
+  return record_descriptor_view_batched(
+      "ID3D12Device::CreateShaderResourceView",
+      object_id(device),
+      object_id(resource),
+      0,
+      std::move(op));
 }
 
 std::uint64_t record_create_unordered_access_view(
@@ -2372,17 +3728,19 @@ std::uint64_t record_create_unordered_access_view(
     const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc,
     D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
 {
-  std::ostringstream payload;
-  payload << "{\"descriptor\":" << cpu_descriptor_json(descriptor)
-          << ",\"descriptor_detail\":" << cpu_descriptor_detail_json(descriptor)
-          << ",\"format\":" << (desc ? static_cast<unsigned int>(desc->Format) : 0)
-          << ",\"view_dimension\":" << (desc ? static_cast<unsigned int>(desc->ViewDimension) : 0)
-          << ",\"resource_object_id\":" << object_id(resource)
-          << ",\"counter_resource_object_id\":" << object_id(counter_resource)
-          << ",\"view\":" << uav_desc_detail_json(desc)
-          << "}";
-  const void *refs[] = {device, resource, counter_resource};
-  return record_call("ID3D12Device::CreateUnorderedAccessView", payload.str().c_str(), refs, 3);
+  ensure_external_resource_object(resource, "CreateUnorderedAccessView");
+  ensure_external_resource_object(counter_resource, "CreateUnorderedAccessViewCounter");
+  DescriptorViewOp op;
+  op.descriptor = descriptor.ptr;
+  op.format = desc ? static_cast<unsigned int>(desc->Format) : 0;
+  op.view_dimension = desc ? static_cast<unsigned int>(desc->ViewDimension) : 0;
+  op.view_payload = uav_desc_detail_sparse_json(desc);
+  return record_descriptor_view_batched(
+      "ID3D12Device::CreateUnorderedAccessView",
+      object_id(device),
+      object_id(resource),
+      object_id(counter_resource),
+      std::move(op));
 }
 
 std::uint64_t record_create_render_target_view(
@@ -2391,16 +3749,18 @@ std::uint64_t record_create_render_target_view(
     const D3D12_RENDER_TARGET_VIEW_DESC *desc,
     D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
 {
-  std::ostringstream payload;
-  payload << "{\"descriptor\":" << cpu_descriptor_json(descriptor)
-          << ",\"descriptor_detail\":" << cpu_descriptor_detail_json(descriptor)
-          << ",\"format\":" << (desc ? static_cast<unsigned int>(desc->Format) : 0)
-          << ",\"view_dimension\":" << (desc ? static_cast<unsigned int>(desc->ViewDimension) : 0)
-          << ",\"resource_object_id\":" << object_id(resource)
-          << ",\"view\":" << rtv_desc_detail_json(desc)
-          << "}";
-  const void *refs[] = {device, resource};
-  return record_call("ID3D12Device::CreateRenderTargetView", payload.str().c_str(), refs, 2);
+  ensure_external_resource_object(resource, "CreateRenderTargetView");
+  DescriptorViewOp op;
+  op.descriptor = descriptor.ptr;
+  op.format = desc ? static_cast<unsigned int>(desc->Format) : 0;
+  op.view_dimension = desc ? static_cast<unsigned int>(desc->ViewDimension) : 0;
+  op.view_payload = rtv_desc_detail_sparse_json(desc);
+  return record_descriptor_view_batched(
+      "ID3D12Device::CreateRenderTargetView",
+      object_id(device),
+      object_id(resource),
+      0,
+      std::move(op));
 }
 
 std::uint64_t record_create_depth_stencil_view(
@@ -2409,17 +3769,19 @@ std::uint64_t record_create_depth_stencil_view(
     const D3D12_DEPTH_STENCIL_VIEW_DESC *desc,
     D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
 {
-  std::ostringstream payload;
-  payload << "{\"descriptor\":" << cpu_descriptor_json(descriptor)
-          << ",\"descriptor_detail\":" << cpu_descriptor_detail_json(descriptor)
-          << ",\"format\":" << (desc ? static_cast<unsigned int>(desc->Format) : 0)
-          << ",\"view_dimension\":" << (desc ? static_cast<unsigned int>(desc->ViewDimension) : 0)
-          << ",\"flags\":" << (desc ? static_cast<unsigned int>(desc->Flags) : 0)
-          << ",\"resource_object_id\":" << object_id(resource)
-          << ",\"view\":" << dsv_desc_detail_json(desc)
-          << "}";
-  const void *refs[] = {device, resource};
-  return record_call("ID3D12Device::CreateDepthStencilView", payload.str().c_str(), refs, 2);
+  ensure_external_resource_object(resource, "CreateDepthStencilView");
+  DescriptorViewOp op;
+  op.descriptor = descriptor.ptr;
+  op.format = desc ? static_cast<unsigned int>(desc->Format) : 0;
+  op.view_dimension = desc ? static_cast<unsigned int>(desc->ViewDimension) : 0;
+  op.flags = desc ? static_cast<unsigned int>(desc->Flags) : 0;
+  op.view_payload = dsv_desc_detail_sparse_json(desc);
+  return record_descriptor_view_batched(
+      "ID3D12Device::CreateDepthStencilView",
+      object_id(device),
+      object_id(resource),
+      0,
+      std::move(op));
 }
 
 std::uint64_t record_create_sampler(
@@ -2462,13 +3824,14 @@ std::uint64_t record_copy_descriptors(
     std::uint32_t descriptor_heap_type,
     std::uint32_t descriptor_size)
 {
-  std::ostringstream payload;
-  payload << "{\"descriptor_heap_type\":" << descriptor_heap_type
-          << ",\"descriptor_size\":" << descriptor_size
-          << ",\"dst_range_count\":" << dst_descriptor_range_count
-          << ",\"src_range_count\":" << src_descriptor_range_count;
-  append_copy_descriptor_pairs_json(
-      payload,
+  std::lock_guard event_lock(g_event_order_mutex);
+  CopyDescriptorOp op;
+  op.device_object_id = object_id(device);
+  op.descriptor_heap_type = descriptor_heap_type;
+  op.descriptor_size = descriptor_size;
+  op.dst_range_count = dst_descriptor_range_count;
+  op.src_range_count = src_descriptor_range_count;
+  op.ranges = collect_copy_descriptor_ranges(
       dst_descriptor_range_count,
       dst_descriptor_range_starts,
       dst_descriptor_range_sizes,
@@ -2476,9 +3839,19 @@ std::uint64_t record_copy_descriptors(
       src_descriptor_range_starts,
       src_descriptor_range_sizes,
       descriptor_size);
-  payload << "}";
-  const void *refs[] = {device};
-  return record_call("ID3D12Device::CopyDescriptors", payload.str().c_str(), refs, 1);
+
+  const auto sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  op.sequence = sequence;
+  bool should_flush = false;
+  {
+    std::lock_guard lock(g_diagnostic_batch_mutex);
+    g_copy_descriptor_batch.ops.push_back(std::move(op));
+    should_flush = g_copy_descriptor_batch.ops.size() >= kCopyDescriptorBatchMaxOps;
+  }
+  if (should_flush) {
+    flush_diagnostic_batches();
+  }
+  return sequence;
 }
 
 std::uint64_t record_copy_descriptors_simple(
@@ -2609,35 +3982,62 @@ std::uint64_t record_resource_barrier(
     std::uint32_t barrier_count,
     const D3D12_RESOURCE_BARRIER *barriers)
 {
-  std::vector<const void *> refs = {command_list};
-  std::ostringstream payload;
-  payload << "{\"barrier_count\":" << barrier_count << ",\"barriers\":[";
-  for (std::uint32_t index = 0; barriers && index < barrier_count; ++index) {
-    if (index != 0) {
-      payload << ",";
+  if (barriers && barrier_count != 0) {
+    for (std::uint32_t index = 0; index < barrier_count; ++index) {
+      const auto &barrier = barriers[index];
+      if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+        ensure_external_resource_object(barrier.Transition.pResource, "ResourceBarrier");
+      } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
+        ensure_external_resource_object(barrier.Aliasing.pResourceBefore, "ResourceBarrierAliasingBefore");
+        ensure_external_resource_object(barrier.Aliasing.pResourceAfter, "ResourceBarrierAliasingAfter");
+      } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
+        ensure_external_resource_object(barrier.UAV.pResource, "ResourceBarrierUAV");
+      }
     }
-    const auto &barrier = barriers[index];
-    payload << "{\"type\":" << static_cast<unsigned int>(barrier.Type)
-            << ",\"flags\":" << static_cast<unsigned int>(barrier.Flags);
-    if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
-      refs.push_back(barrier.Transition.pResource);
-      payload << ",\"resource_object_id\":" << object_id(barrier.Transition.pResource)
-              << ",\"before\":" << static_cast<unsigned int>(barrier.Transition.StateBefore)
-              << ",\"after\":" << static_cast<unsigned int>(barrier.Transition.StateAfter)
-              << ",\"subresource\":" << barrier.Transition.Subresource;
-    } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
-      refs.push_back(barrier.Aliasing.pResourceBefore);
-      refs.push_back(barrier.Aliasing.pResourceAfter);
-      payload << ",\"resource_before_object_id\":" << object_id(barrier.Aliasing.pResourceBefore)
-              << ",\"resource_after_object_id\":" << object_id(barrier.Aliasing.pResourceAfter);
-    } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
-      refs.push_back(barrier.UAV.pResource);
-      payload << ",\"resource_object_id\":" << object_id(barrier.UAV.pResource);
-    }
-    payload << "}";
   }
-  payload << "]}";
-  return record_call("ID3D12GraphicsCommandList::ResourceBarrier", payload.str().c_str(), refs.data(), refs.size());
+  std::lock_guard event_lock(g_event_order_mutex);
+  flush_diagnostic_batches();
+  const auto first_sequence = g_sequence.fetch_add(barrier_count ? barrier_count : 1, std::memory_order_relaxed) + 1;
+  if (!command_list || !barriers || barrier_count == 0) {
+    return first_sequence;
+  }
+
+  flush_copy_buffer_batches(command_list);
+  flush_copy_texture_region_batches(command_list);
+
+  PendingResourceBarrierBatch flush_batch;
+  {
+    std::lock_guard lock(g_command_batch_mutex);
+    auto &batch = g_resource_barrier_batches[command_list];
+    batch.ops.reserve(batch.ops.size() + barrier_count);
+    for (std::uint32_t index = 0; index < barrier_count; ++index) {
+      ResourceBarrierBatchOp op;
+      op.sequence = first_sequence + index;
+      const auto &barrier = barriers[index];
+      op.type = static_cast<std::uint32_t>(barrier.Type);
+      op.flags = static_cast<std::uint32_t>(barrier.Flags);
+      if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+        op.resource_object_id = object_id(barrier.Transition.pResource);
+        op.before = static_cast<std::uint32_t>(barrier.Transition.StateBefore);
+        op.after = static_cast<std::uint32_t>(barrier.Transition.StateAfter);
+        op.subresource = barrier.Transition.Subresource;
+      } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
+        op.resource_before_object_id = object_id(barrier.Aliasing.pResourceBefore);
+        op.resource_after_object_id = object_id(barrier.Aliasing.pResourceAfter);
+      } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
+        op.resource_object_id = object_id(barrier.UAV.pResource);
+      }
+      batch.ops.push_back(op);
+    }
+    if (batch.ops.size() >= kCommandListBatchMaxOps) {
+      flush_batch = std::move(batch);
+      g_resource_barrier_batches.erase(command_list);
+    }
+  }
+  if (!flush_batch.ops.empty()) {
+    record_resource_barrier_batch_event(command_list, flush_batch);
+  }
+  return first_sequence;
 }
 
 std::uint64_t record_copy_buffer_region(
@@ -2649,7 +4049,14 @@ std::uint64_t record_copy_buffer_region(
     std::uint64_t src_offset,
     std::uint64_t byte_count)
 {
+  ensure_external_resource_object(dst_buffer, "CopyBufferRegionDst");
+  ensure_external_resource_object(src_buffer, "CopyBufferRegionSrc");
+  std::lock_guard event_lock(g_event_order_mutex);
+  flush_diagnostic_batches();
   const auto sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  flush_resource_barrier_batches(command_list);
+  flush_copy_texture_region_batches(command_list);
+
   std::lock_guard lock(g_command_batch_mutex);
   auto &batch = g_copy_buffer_batches[command_list];
   batch.ops.push_back(CopyBufferBatchOp{
@@ -2673,23 +4080,49 @@ std::uint64_t record_copy_texture_region(
     const D3D12_TEXTURE_COPY_LOCATION *src,
     const D3D12_BOX *src_box)
 {
-  std::ostringstream payload;
-  payload << "{\"dst\":";
-  append_texture_copy_location_json(payload, dst);
-  payload << ",\"dst_x\":" << dst_x
-          << ",\"dst_y\":" << dst_y
-          << ",\"dst_z\":" << dst_z
-          << ",\"src\":";
-  append_texture_copy_location_json(payload, src);
-  payload << ",\"src_box\":";
-  if (src_box) {
-    append_box_json(payload, *src_box);
-  } else {
-    payload << "null";
+  ensure_external_resource_object(dst ? dst->pResource : nullptr, "CopyTextureRegionDst");
+  ensure_external_resource_object(src ? src->pResource : nullptr, "CopyTextureRegionSrc");
+  std::lock_guard event_lock(g_event_order_mutex);
+  flush_diagnostic_batches();
+  const auto sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (!command_list) {
+    return sequence;
   }
-  payload << "}";
-  const void *refs[] = {command_list, dst ? dst->pResource : nullptr, src ? src->pResource : nullptr};
-  return record_call("ID3D12GraphicsCommandList::CopyTextureRegion", payload.str().c_str(), refs, 3);
+
+  flush_copy_buffer_batches(command_list);
+  flush_resource_barrier_batches(command_list);
+
+  CopyTextureRegionBatchOp op;
+  op.sequence = sequence;
+  op.dst = compact_texture_copy_location(dst);
+  op.dst_x = dst_x;
+  op.dst_y = dst_y;
+  op.dst_z = dst_z;
+  op.src = compact_texture_copy_location(src);
+  if (src_box) {
+    op.has_src_box = true;
+    op.src_box_left = src_box->left;
+    op.src_box_top = src_box->top;
+    op.src_box_front = src_box->front;
+    op.src_box_right = src_box->right;
+    op.src_box_bottom = src_box->bottom;
+    op.src_box_back = src_box->back;
+  }
+
+  PendingCopyTextureRegionBatch flush_batch;
+  {
+    std::lock_guard lock(g_command_batch_mutex);
+    auto &batch = g_copy_texture_region_batches[command_list];
+    batch.ops.push_back(op);
+    if (batch.ops.size() >= kCommandListBatchMaxOps) {
+      flush_batch = std::move(batch);
+      g_copy_texture_region_batches.erase(command_list);
+    }
+  }
+  if (!flush_batch.ops.empty()) {
+    record_copy_texture_region_batch_event(command_list, flush_batch);
+  }
+  return sequence;
 }
 
 std::uint64_t record_copy_resource(const void *command_list, const void *dst_resource, const void *src_resource)
@@ -2884,29 +4317,37 @@ std::uint64_t record_set_root_descriptor(
   else if (compute && parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) name = "ID3D12GraphicsCommandList::SetComputeRootUnorderedAccessView";
   else if (!compute && parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) name = "ID3D12GraphicsCommandList::SetGraphicsRootShaderResourceView";
   else if (!compute && parameter_type == D3D12_ROOT_PARAMETER_TYPE_UAV) name = "ID3D12GraphicsCommandList::SetGraphicsRootUnorderedAccessView";
+  std::vector<trace::ObjectId> refs;
+  append_object_ref_id(refs, object_id(command_list));
   std::ostringstream payload;
   payload << "{\"compute\":" << (compute ? "true" : "false")
           << ",\"parameter_type\":" << parameter_type
           << ",\"root_parameter_index\":" << root_parameter_index
           << ",";
-  append_gpu_virtual_address_binding_json(payload, "buffer_location", gpu_virtual_address);
+  append_gpu_virtual_address_binding_json_with_ref(payload, "buffer_location", gpu_virtual_address, refs);
   payload << "}";
-  const void *refs[] = {command_list};
-  return record_call(name, payload.str().c_str(), refs, 1);
+  return record_call_with_object_ids(
+      name,
+      payload.str().c_str(),
+      std::move(refs));
 }
 
 std::uint64_t record_ia_set_index_buffer(const void *command_list, const D3D12_INDEX_BUFFER_VIEW *view)
 {
+  std::vector<trace::ObjectId> refs;
+  append_object_ref_id(refs, object_id(command_list));
   std::ostringstream payload;
   payload << "{";
   if (view) {
-    append_gpu_virtual_address_binding_json(payload, "buffer_location", view->BufferLocation);
+    append_gpu_virtual_address_binding_json_with_ref(payload, "buffer_location", view->BufferLocation, refs);
     payload << ",\"size_in_bytes\":" << view->SizeInBytes
             << ",\"format\":" << static_cast<unsigned int>(view->Format);
   }
   payload << "}";
-  const void *refs[] = {command_list};
-  return record_call("ID3D12GraphicsCommandList::IASetIndexBuffer", payload.str().c_str(), refs, 1);
+  return record_call_with_object_ids(
+      "ID3D12GraphicsCommandList::IASetIndexBuffer",
+      payload.str().c_str(),
+      std::move(refs));
 }
 
 std::uint64_t record_ia_set_vertex_buffers(
@@ -2915,6 +4356,8 @@ std::uint64_t record_ia_set_vertex_buffers(
     std::uint32_t view_count,
     const D3D12_VERTEX_BUFFER_VIEW *views)
 {
+  std::vector<trace::ObjectId> refs;
+  append_object_ref_id(refs, object_id(command_list));
   std::ostringstream payload;
   payload << "{\"start_slot\":" << start_slot
           << ",\"view_count\":" << view_count
@@ -2922,14 +4365,16 @@ std::uint64_t record_ia_set_vertex_buffers(
   for (std::uint32_t index = 0; views && index < view_count; ++index) {
     if (index) payload << ",";
     payload << "{";
-    append_gpu_virtual_address_binding_json(payload, "buffer_location", views[index].BufferLocation);
+    append_gpu_virtual_address_binding_json_with_ref(payload, "buffer_location", views[index].BufferLocation, refs);
     payload << ",\"size_in_bytes\":" << views[index].SizeInBytes
             << ",\"stride_in_bytes\":" << views[index].StrideInBytes
             << "}";
   }
   payload << "]}";
-  const void *refs[] = {command_list};
-  return record_call("ID3D12GraphicsCommandList::IASetVertexBuffers", payload.str().c_str(), refs, 1);
+  return record_call_with_object_ids(
+      "ID3D12GraphicsCommandList::IASetVertexBuffers",
+      payload.str().c_str(),
+      std::move(refs));
 }
 
 std::uint64_t record_om_set_render_targets(
@@ -2951,7 +4396,6 @@ std::uint64_t record_om_set_render_targets(
       payload << ",";
     }
     payload << cpu_descriptor_json(render_target_descriptors[index]);
-    refs.push_back(reinterpret_cast<const void *>(render_target_descriptors[index].ptr));
   }
   payload << "],\"render_target_descriptors\":[";
   for (std::uint32_t index = 0; render_target_descriptors && index < descriptor_slots; ++index) {
@@ -2975,7 +4419,6 @@ std::uint64_t record_om_set_render_targets(
   payload << ",\"depth_stencil_descriptor\":";
   if (depth_stencil_descriptor) {
     payload << cpu_descriptor_detail_json(*depth_stencil_descriptor);
-    refs.push_back(reinterpret_cast<const void *>(depth_stencil_descriptor->ptr));
   } else {
     payload << "null";
   }
@@ -3240,6 +4683,8 @@ std::uint64_t record_write_buffer_immediate(
     const void *modes)
 {
   const auto *typed_modes = static_cast<const D3D12_WRITEBUFFERIMMEDIATE_MODE *>(modes);
+  std::vector<trace::ObjectId> refs;
+  append_object_ref_id(refs, object_id(command_list));
   std::ostringstream payload;
   payload << "{\"count\":" << count << ",\"writes\":[";
   for (std::uint32_t index = 0; parameters && index < count; ++index) {
@@ -3247,7 +4692,7 @@ std::uint64_t record_write_buffer_immediate(
       payload << ",";
     }
     payload << "{";
-    append_gpu_virtual_address_binding_json(payload, "dest", parameters[index].Dest);
+    append_gpu_virtual_address_binding_json_with_ref(payload, "dest", parameters[index].Dest, refs);
     payload << ",\"value\":" << parameters[index].Value
             << ",\"mode\":";
     if (typed_modes) {
@@ -3258,8 +4703,10 @@ std::uint64_t record_write_buffer_immediate(
     payload << "}";
   }
   payload << "]}";
-  const void *refs[] = {command_list};
-  return record_call("ID3D12GraphicsCommandList2::WriteBufferImmediate", payload.str().c_str(), refs, 1);
+  return record_call_with_object_ids(
+      "ID3D12GraphicsCommandList2::WriteBufferImmediate",
+      payload.str().c_str(),
+      std::move(refs));
 }
 
 std::uint64_t record_begin_render_pass(

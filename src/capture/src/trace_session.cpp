@@ -30,6 +30,11 @@ void TraceSession::end()
   impl_->state.end();
 }
 
+void TraceSession::seal_checkpoint()
+{
+  impl_->state.seal_checkpoint();
+}
+
 void TraceSession::append_call_event(const trace::EventRecord &event)
 {
   impl_->state.append_call_event(event);

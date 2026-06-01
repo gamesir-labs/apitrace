@@ -333,7 +333,10 @@ void TranslationTraceRecorder::record_metal_call(const MetalTraceRecord &record)
   if (normalized.object_id == 0) {
     normalized.object_id = impl_->current_encoder_id;
   }
-  trace::append_payload_text_object_refs(normalized.translation_link_payload, normalized.object_refs);
+  if (!normalized.payload_refs_scanned) {
+    trace::append_payload_text_object_refs(normalized.translation_link_payload, normalized.object_refs);
+    normalized.payload_refs_scanned = true;
+  }
   impl_->metal_trace_backend.record_translated_call(normalized);
 
   if (impl_->enable_per_call_links && impl_->options.enable_link_sideband && normalized.d3d_sequence != 0) {

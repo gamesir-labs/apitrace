@@ -641,6 +641,7 @@ bool is_supported_d3d12_call(std::string_view function_name)
          function_name == "ID3D12Device::CreateRenderTargetView" ||
          function_name == "ID3D12Device::CreateDepthStencilView" ||
          function_name == "ID3D12Device::CreateSampler" ||
+         function_name == "ID3D12Device::CopyDescriptorsBatch" ||
          function_name == "ID3D12Device::CopyDescriptors" ||
          function_name == "ID3D12Device::CopyDescriptorsSimple" ||
          function_name == "ID3D12CommandAllocator::Reset" ||
@@ -680,6 +681,7 @@ bool is_supported_d3d12_call(std::string_view function_name)
          function_name == "ID3D12GraphicsCommandList::IASetVertexBuffers" ||
          function_name == "ID3D12GraphicsCommandList::IASetIndexBuffer" ||
          function_name == "ID3D12GraphicsCommandList::ResourceBarrier" ||
+         function_name == "ID3D12GraphicsCommandList::ResourceBarrierBatch" ||
          function_name == "ID3D12GraphicsCommandList::SetDescriptorHeaps" ||
          function_name == "ID3D12GraphicsCommandList::DrawInstanced" ||
          function_name == "ID3D12GraphicsCommandList::DrawIndexedInstanced" ||
@@ -689,6 +691,7 @@ bool is_supported_d3d12_call(std::string_view function_name)
          function_name == "ID3D12GraphicsCommandList::CopyBufferRegion" ||
          function_name == "ID3D12GraphicsCommandList::CopyBufferRegionBatch" ||
          function_name == "ID3D12GraphicsCommandList::CopyTextureRegion" ||
+         function_name == "ID3D12GraphicsCommandList::CopyTextureRegionBatch" ||
          function_name == "ID3D12GraphicsCommandList::CopyResource" ||
          function_name == "ID3D12GraphicsCommandList::ResolveSubresource" ||
          function_name == "ID3D12GraphicsCommandList::BeginQuery" ||
@@ -1100,7 +1103,8 @@ D3D12ReplayBackend::ReplayCommandKind replay_command_kind_for(std::string_view f
   if (function_name == "ID3D12GraphicsCommandList::IASetIndexBuffer") {
     return Kind::SetIndexBuffer;
   }
-  if (function_name == "ID3D12GraphicsCommandList::ResourceBarrier") {
+  if (function_name == "ID3D12GraphicsCommandList::ResourceBarrier" ||
+      function_name == "ID3D12GraphicsCommandList::ResourceBarrierBatch") {
     return Kind::ResourceBarrier;
   }
   if (function_name == "ID3D12GraphicsCommandList::ClearState" ||
@@ -1144,6 +1148,7 @@ D3D12ReplayBackend::ReplayCommandKind replay_command_kind_for(std::string_view f
   if (function_name == "ID3D12GraphicsCommandList::CopyBufferRegion" ||
       function_name == "ID3D12GraphicsCommandList::CopyBufferRegionBatch" ||
       function_name == "ID3D12GraphicsCommandList::CopyTextureRegion" ||
+      function_name == "ID3D12GraphicsCommandList::CopyTextureRegionBatch" ||
       function_name == "ID3D12GraphicsCommandList::CopyResource") {
     return Kind::Copy;
   }

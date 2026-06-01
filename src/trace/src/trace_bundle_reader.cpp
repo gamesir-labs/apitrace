@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -194,6 +195,32 @@ std::string sha256_file(const std::filesystem::path &path)
   return sha256.final_hex();
 }
 
+std::string sha256_file_prefix(const std::filesystem::path &path, std::uint64_t byte_size)
+{
+  std::ifstream input(path, std::ios::binary);
+  Sha256 sha256;
+  std::vector<std::uint8_t> buffer(1024 * 1024);
+  std::uint64_t remaining = byte_size;
+  while (input.good() && remaining != 0) {
+    const auto chunk_size = static_cast<std::streamsize>(
+        std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(buffer.size())));
+    input.read(reinterpret_cast<char *>(buffer.data()), chunk_size);
+    const auto read_count = static_cast<std::size_t>(input.gcount());
+    if (read_count != 0) {
+      sha256.update(buffer.data(), read_count);
+      remaining -= read_count;
+    }
+  }
+  return sha256.final_hex();
+}
+
+std::uint64_t file_size_or_max(const std::filesystem::path &path)
+{
+  std::error_code error;
+  const auto size = std::filesystem::file_size(path, error);
+  return error ? std::numeric_limits<std::uint64_t>::max() : static_cast<std::uint64_t>(size);
+}
+
 std::optional<ApiKind> api_kind_from_name(std::string_view name)
 {
   if (name == "D3D11") {
@@ -302,7 +329,9 @@ void collect_asset_paths(const json &value, std::vector<std::string> &paths)
   if (value.is_object()) {
     for (const auto &[key, child] : value.items()) {
       if ((ends_with(key, "_path") || key == "path") && child.is_string()) {
-        paths.push_back(child.get<std::string>());
+        const auto path = child.get<std::string>();
+        if (!path.empty())
+          paths.push_back(path);
       }
       collect_asset_paths(child, paths);
     }
@@ -329,7 +358,9 @@ void collect_nested_asset_paths(const json &value, std::vector<std::string> &pat
         const auto path_key = std::string(stage) + "_path";
         const auto path = shader->find(path_key);
         if (path != shader->end() && path->is_string()) {
-          paths.push_back(path->get<std::string>());
+          const auto path_text = path->get<std::string>();
+          if (!path_text.empty())
+            paths.push_back(path_text);
         }
       }
       return;
@@ -337,7 +368,9 @@ void collect_nested_asset_paths(const json &value, std::vector<std::string> &pat
 
     for (const auto &[key, child] : value.items()) {
       if ((ends_with(key, "_path") || key == "path") && child.is_string()) {
-        paths.push_back(child.get<std::string>());
+        const auto path = child.get<std::string>();
+        if (!path.empty())
+          paths.push_back(path);
       }
       collect_nested_asset_paths(child, paths);
     }
@@ -453,11 +486,14 @@ bool parse_checksums(
 
   lookup.clear();
   for (const auto &[relative_path, digest_value] : files_it->items()) {
-    if (!digest_value.is_string()) {
+    if (!digest_value.is_string() && !digest_value.is_object()) {
       error = file_label(checksums_path) + ": file digest must be a string";
       return false;
     }
-    const std::string encoded = digest_value.get<std::string>();
+    const std::string encoded =
+        digest_value.is_string()
+            ? digest_value.get<std::string>()
+            : digest_value.value("digest", std::string());
     const auto separator = encoded.find(':');
     if (separator == std::string::npos || separator == 0 || separator + 1 >= encoded.size()) {
       error = file_label(checksums_path) + ": malformed digest entry for " + relative_path;
@@ -467,7 +503,25 @@ bool parse_checksums(
     ChecksumRecord record;
     record.relative_path = relative_path;
     record.algorithm = encoded.substr(0, separator);
-    record.digest = encoded.substr(separator + 1);
+    const auto size_separator = encoded.find(':', separator + 1);
+    record.digest = encoded.substr(
+        separator + 1,
+        size_separator == std::string::npos ? std::string::npos : size_separator - separator - 1);
+    if (size_separator != std::string::npos) {
+      try {
+        record.byte_size = std::stoull(encoded.substr(size_separator + 1));
+        record.has_byte_size = true;
+      } catch (const std::exception &) {
+        error = file_label(checksums_path) + ": malformed byte size for " + relative_path;
+        return false;
+      }
+    }
+    if (digest_value.is_object()) {
+      if (digest_value.contains("byte_size") && digest_value["byte_size"].is_number_unsigned()) {
+        record.byte_size = digest_value["byte_size"].get<std::uint64_t>();
+        record.has_byte_size = true;
+      }
+    }
     checksums.files.push_back(record);
     lookup.emplace(record.relative_path.generic_string(), record);
   }
@@ -781,7 +835,15 @@ bool validate_checksum_entry(
     return false;
   }
 
-  if (sha256_file(absolute_path) != checksum_it->second.digest) {
+  const auto actual_size = file_size_or_max(absolute_path);
+  const auto use_prefix =
+      checksum_it->second.has_byte_size &&
+      actual_size != std::numeric_limits<std::uint64_t>::max() &&
+      actual_size > checksum_it->second.byte_size;
+  const auto digest = use_prefix
+                          ? sha256_file_prefix(absolute_path, checksum_it->second.byte_size)
+                          : sha256_file(absolute_path);
+  if (digest != checksum_it->second.digest) {
     error = "checksum mismatch for " + key;
     return false;
   }
@@ -942,8 +1004,24 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
   }
   impl_->has_asset_index = std::filesystem::is_regular_file(impl_->layout.asset_index_path);
 
+  auto checksum_byte_limit = [&](const std::filesystem::path &relative_path) {
+    const auto entry = checksum_lookup.find(relative_path.generic_string());
+    if (entry == checksum_lookup.end() || !entry->second.has_byte_size) {
+      return std::numeric_limits<std::uint64_t>::max();
+    }
+    return entry->second.byte_size;
+  };
+  const auto metal_callstream_byte_limit =
+      checksum_byte_limit(std::filesystem::path(kMetalCallstreamFileName));
+  const auto callstream_byte_limit =
+      checksum_byte_limit(std::filesystem::path(kCallstreamFileName));
+
   if (std::filesystem::is_regular_file(impl_->layout.metal_callstream_path) &&
-      !detail::parse_metal_callstream(impl_->layout.metal_callstream_path, impl_->metal_events, impl_->last_error)) {
+      !detail::parse_metal_callstream(
+          impl_->layout.metal_callstream_path,
+          impl_->metal_events,
+          impl_->last_error,
+          metal_callstream_byte_limit)) {
     return false;
   }
 
@@ -1058,7 +1136,13 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
   if (std::filesystem::is_regular_file(impl_->layout.metal_callstream_path)) {
     std::ifstream metal_input(impl_->layout.metal_callstream_path);
     std::string metal_line;
+    std::uint64_t consumed_metal_callstream_bytes = 0;
     while (std::getline(metal_input, metal_line)) {
+      const auto line_bytes = static_cast<std::uint64_t>(metal_line.size() + 1);
+      if (consumed_metal_callstream_bytes + line_bytes > metal_callstream_byte_limit) {
+        break;
+      }
+      consumed_metal_callstream_bytes += line_bytes;
       if (metal_line.empty()) {
         continue;
       }
@@ -1079,7 +1163,13 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
   bool header_seen = false;
   std::string line;
   std::size_t line_number = 0;
+  std::uint64_t consumed_callstream_bytes = 0;
   while (std::getline(callstream_input, line)) {
+    const auto line_bytes = static_cast<std::uint64_t>(line.size() + 1);
+    if (consumed_callstream_bytes + line_bytes > callstream_byte_limit) {
+      break;
+    }
+    consumed_callstream_bytes += line_bytes;
     ++line_number;
     if (line.empty()) {
       continue;

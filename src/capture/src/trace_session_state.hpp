@@ -50,6 +50,7 @@ public:
 
   void begin();
   void end();
+  void seal_checkpoint();
   void append_call_event(const trace::EventRecord &event);
   trace::AssetRecord register_asset(const trace::AssetRecord &asset);
   trace::AssetRecord register_asset(trace::AssetRecord &&asset);

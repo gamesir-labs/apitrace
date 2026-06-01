@@ -358,6 +358,7 @@ void MetalRuntime::commit_command_buffer(
             trace_session_,
             command_buffer.object_id,
             drawable_object_id_,
+            drawable_object_id_,
             command_buffer.frame_id,
             width_,
             height_,

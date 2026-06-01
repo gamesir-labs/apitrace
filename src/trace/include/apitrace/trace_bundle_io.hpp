@@ -49,6 +49,8 @@ public:
   void append_analysis_line(std::string_view stream_name, std::string_view json_line);
   void append_analysis_record(const AnalysisRecord &record);
   void write_checksum_index(const ChecksumIndex &checksums);
+  void checkpoint();
+  void seal_checkpoint();
   void close();
 
   bool is_open() const noexcept;

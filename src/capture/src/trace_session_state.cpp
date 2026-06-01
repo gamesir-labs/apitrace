@@ -35,6 +35,14 @@ void BundleCaptureSink::finalize_bundle()
   writer_.close();
 }
 
+void TraceSessionState::seal_checkpoint()
+{
+  if (!active_) {
+    return;
+  }
+  bundle_sink_.writer().seal_checkpoint();
+}
+
 trace::TraceBundleWriter &BundleCaptureSink::writer() noexcept
 {
   return writer_;
