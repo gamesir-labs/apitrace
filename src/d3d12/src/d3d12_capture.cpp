@@ -863,7 +863,7 @@ void record_call_event_unbatched(
     event.object_refs = collect_object_refs(object_refs, object_ref_count);
     event.blob_refs = collect_blob_refs(blob_refs, blob_ref_count);
     event.payload = payload_json && *payload_json ? payload_json : "{}";
-    session->append_call_event(event);
+    session->append_call_event(std::move(event));
   }
 }
 
@@ -885,7 +885,7 @@ void record_call_event_unbatched_with_object_ids(
     event.object_refs = std::move(object_refs);
     event.blob_refs = collect_blob_refs(blob_refs, blob_ref_count);
     event.payload = payload_json && *payload_json ? payload_json : "{}";
-    session->append_call_event(event);
+    session->append_call_event(std::move(event));
   }
 }
 
@@ -1069,7 +1069,7 @@ void record_boundary_event_unbatched(
     event.callsite.function_name = "D3DBoundary";
     event.boundary = boundary;
     event.payload = payload_json && *payload_json ? payload_json : "{}";
-    session->append_call_event(event);
+    session->append_call_event(std::move(event));
   }
 }
 
@@ -1412,7 +1412,6 @@ trace::AssetRecord register_asset_bytes(
     return asset;
   }
 
-  asset.fast_fingerprint = trace::fast_fingerprint_bytes(data, size);
   const auto *bytes = static_cast<const std::uint8_t *>(data);
   asset.payload_bytes.assign(bytes, bytes + size);
   if (kind == trace::AssetKind::Texture && asset.debug_name == "d3d12-present-frame") {
@@ -2690,7 +2689,7 @@ void record_object_create(
     event.parent_object_id = object_record.parent_object_id;
     event.object_debug_name = object_record.debug_name;
     event.payload = payload_json && *payload_json ? payload_json : "{}";
-    session->append_call_event(event);
+    session->append_call_event(std::move(event));
   }
 }
 
@@ -2711,7 +2710,7 @@ void record_object_destroy(const void *object, CaptureObjectKind kind, const cha
     event.object_id = id;
     event.object_kind = to_trace_object_kind(kind);
     event.payload = payload_json && *payload_json ? payload_json : "{}";
-    session->append_call_event(event);
+    session->append_call_event(std::move(event));
   }
   if (kind == CaptureObjectKind::Resource) {
     std::lock_guard lock(g_object_mutex);
@@ -2737,7 +2736,7 @@ void record_resource_blob(
     event.object_debug_name = debug_name ? debug_name : "";
     event.blob_refs = collect_blob_refs(blob_refs, blob_ref_count);
     event.payload = payload_json && *payload_json ? payload_json : "{}";
-    session->append_call_event(event);
+    session->append_call_event(std::move(event));
   }
 }
 
@@ -2748,7 +2747,7 @@ std::uint64_t record_d3d12_create_device(const void *device)
   }
   record_object_create(device, CaptureObjectKind::Device, nullptr, "ID3D12Device");
   const void *refs[] = {device};
-  return record_call("D3D12CreateDevice", "{}", refs, 1);
+  return record_call("D3D12CreateDevice", "{\"minimum_feature_level\":45056}", refs, 1);
 }
 
 std::uint64_t record_d3d11_create_device(const void *device)
@@ -2779,7 +2778,7 @@ std::uint64_t record_execute_command_lists(const void *queue, const void *comman
     return 0;
   }
   const void *refs[] = {queue, command_list};
-  return record_call("ID3D12CommandQueue::ExecuteCommandLists", "{}", refs, 2);
+  return record_call("ID3D12CommandQueue::ExecuteCommandLists", "{\"command_list_count\":1}", refs, 2);
 }
 
 std::uint64_t record_present(

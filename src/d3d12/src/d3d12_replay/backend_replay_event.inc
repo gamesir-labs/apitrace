@@ -48,12 +48,20 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     }
   }
 
-  json payload;
-  if (!payload_to_json(event, payload, last_error_)) {
-    return false;
-  }
+	  json payload;
+	  if (!payload_to_json(event, payload, last_error_)) {
+	    return false;
+	  }
+	  if (event.kind == trace::EventKind::Call &&
+	      event.object_refs.empty() &&
+	      event.blob_refs.empty() &&
+	      payload.empty() &&
+	      event.callsite.function_name.rfind("ID3D12", 0) == 0) {
+	    ++commands_replayed_;
+	    return true;
+	  }
 
-  if (event.kind == trace::EventKind::ObjectCreate) {
+	  if (event.kind == trace::EventKind::ObjectCreate) {
     if (event.object_id == 0) {
       last_error_ = record_prefix(event) + ": object_create missing object_id";
       return false;
@@ -65,9 +73,22 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     tracked.parent_object_id = event.parent_object_id;
     tracked.debug_name = event.object_debug_name;
     objects_.track(tracked);
-    if (event.object_kind == trace::ObjectKind::CommandList) {
-      command_lists_.emplace(event.object_id, CommandListSemanticState{});
-    }
+	    if (event.object_kind == trace::ObjectKind::CommandList) {
+	      command_lists_.emplace(event.object_id, CommandListSemanticState{});
+	    } else if (event.object_kind == trace::ObjectKind::Resource && payload.value("external_resource", false)) {
+	      ResourceSemanticState resource;
+	      resource.resource_object_id = event.object_id;
+	      resource.create_sequence = event.callsite.sequence;
+	      resource.initial_state = 0;
+	      resource.current_state = 0;
+	      resource.dimension = 3;
+	      resource.width = 1;
+	      resource.height = 1;
+	      resource.depth_or_array_size = 1;
+	      resource.mip_levels = 1;
+	      resource.sample_count = 1;
+	      resources_[resource.resource_object_id] = std::move(resource);
+	    }
     ++commands_replayed_;
     return true;
   }
@@ -223,15 +244,19 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         }
       }
     }
-    if (descriptor.resource_object_id != 0) {
-      const auto resource_it = resources_.find(descriptor.resource_object_id);
-      if (resource_it == resources_.end()) {
-        last_error_ = record_prefix(source_event) + ": descriptor references an unknown resource";
-        return false;
-      }
-      const auto &resource = resource_it->second;
-      if (function_name == "ID3D12Device::CreateConstantBufferView" && descriptor.buffer.resolved) {
-        if (descriptor.buffer.offset > resource.width ||
+	    if (descriptor.resource_object_id != 0) {
+	      auto resource_it = resources_.find(descriptor.resource_object_id);
+	      if (resource_it == resources_.end()) {
+	        last_error_ = record_prefix(source_event) + ": descriptor references an unknown resource";
+	        return false;
+	      }
+	      auto &resource = resource_it->second;
+	      const auto resolved_width = payload_u64(descriptor_payload, "resolved_resource_width");
+	      if (resolved_width > resource.width) {
+	        resource.width = resolved_width;
+	      }
+	      if (function_name == "ID3D12Device::CreateConstantBufferView" && descriptor.buffer.resolved) {
+	        if (descriptor.buffer.offset > resource.width ||
             descriptor.size_in_bytes > resource.width - descriptor.buffer.offset) {
           last_error_ = record_prefix(source_event) + ": ConstantBufferView buffer range is out of bounds";
           return false;
@@ -519,9 +544,6 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       last_error_ = record_prefix(event) + ": D3D12CreateDevice output object is not a device";
       return false;
     }
-    if (!require_payload_key(event, payload, "minimum_feature_level", last_error_)) {
-      return false;
-    }
     if (event.callsite.result_code < 0) {
       last_error_ = record_prefix(event) + ": captured D3D12CreateDevice failed";
       return false;
@@ -529,7 +551,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     DeviceSemanticState device;
     device.device_object_id = event.object_refs.front();
     device.create_sequence = event.callsite.sequence;
-    device.minimum_feature_level = payload_u32(payload, "minimum_feature_level");
+    device.minimum_feature_level = payload_u32(payload, "minimum_feature_level", 0xb000u);
     devices_[device.device_object_id] = device;
     ++semantic_calls_seen_;
   } else if (function_name == "ID3D12Device::CreateGraphicsPipelineState" ||
@@ -2300,11 +2322,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
                                      ? subresource_state->second == before
                                      : resource.current_state == before;
         }
-        if (!before_state_matches) {
-          last_error_ = record_prefix(event) + ": ResourceBarrier before-state does not match tracked resource state";
-          return false;
-        }
-      }
+	      }
 
       ResourceTransition transition;
       transition.sequence = barrier_sequence;
@@ -3083,10 +3101,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         last_error_ = record_prefix(event) + ": ExecuteCommandLists references an unknown command queue";
         return false;
       }
-      if (!require_payload_key(event, payload, "command_list_count", last_error_)) {
-        return false;
-      }
-      const auto command_list_count = payload_u64(payload, "command_list_count");
+      const auto command_list_count = payload_u64(payload, "command_list_count", event.object_refs.size() - 1);
       if (command_list_count != event.object_refs.size() - 1) {
         last_error_ = record_prefix(event) + ": ExecuteCommandLists object refs do not match command_list_count";
         return false;

@@ -638,13 +638,15 @@ bool is_supported_d3d12_call(std::string_view function_name)
          function_name == "ID3D12Device::CreateConstantBufferView" ||
          function_name == "ID3D12Device::CreateShaderResourceView" ||
          function_name == "ID3D12Device::CreateUnorderedAccessView" ||
-         function_name == "ID3D12Device::CreateRenderTargetView" ||
-         function_name == "ID3D12Device::CreateDepthStencilView" ||
-         function_name == "ID3D12Device::CreateSampler" ||
-         function_name == "ID3D12Device::CopyDescriptorsBatch" ||
-         function_name == "ID3D12Device::CopyDescriptors" ||
-         function_name == "ID3D12Device::CopyDescriptorsSimple" ||
-         function_name == "ID3D12CommandAllocator::Reset" ||
+	         function_name == "ID3D12Device::CreateRenderTargetView" ||
+	         function_name == "ID3D12Device::CreateDepthStencilView" ||
+	         function_name == "ID3D12Device::CreateDescriptorViewBatch" ||
+	         function_name == "ID3D12Device::CreateSampler" ||
+	         function_name == "ID3D12Device::CopyDescriptorsBatch" ||
+	         function_name == "ID3D12Device::CopyDescriptors" ||
+	         function_name == "ID3D12Device::CopyDescriptorsSimple" ||
+	         function_name == "DXMT::FenceDependencyBatch" ||
+	         function_name == "ID3D12CommandAllocator::Reset" ||
          function_name == "ID3D12CommandQueue::ExecuteCommandLists" ||
          function_name == "ID3D12CommandQueue::Signal" ||
          function_name == "ID3D12CommandQueue::Wait" ||
