@@ -1541,9 +1541,10 @@ private:
       return true;
     }
 
-    if (event.function_name == "MTLDevice.newTexture") {
-      return create_texture(event.object_id, parse_nested_json(payload, "descriptor"));
-    }
+	    if (event.function_name == "MTLDevice.newTexture" ||
+	        event.function_name == "CAMetalDrawable.texture") {
+	      return create_texture(event.object_id, parse_nested_json(payload, "descriptor"));
+	    }
 
     if (event.function_name == "MTLDevice.newLibrary") {
       const auto library_path = payload.value("library_path", std::string());
@@ -1904,7 +1905,8 @@ private:
         return fail(function_error ? [[function_error localizedDescription] UTF8String] : "failed to create fragment function");
       }
     }
-    const auto colors = descriptor.find("colors");
+	    const bool rasterization_enabled = descriptor.value("rasterization_enabled", true);
+	    const auto colors = descriptor.find("colors");
     if (colors == descriptor.end() || !colors->is_array() || colors->empty()) {
       return fail("render pipeline descriptor missing color attachment metadata");
     }
@@ -1933,14 +1935,14 @@ private:
           !required_u64(color, "dst_alpha_blend_factor", dst_alpha_blend_factor)) {
         return fail("render pipeline color attachment is missing replay metadata");
       }
-      MTLPixelFormat color_pixel_format = MTLPixelFormatInvalid;
-      if (!pixel_format_from_json_field(color, "pixel_format", color_pixel_format)) {
-        return fail("render pipeline color attachment is missing pixel_format");
-      }
-      attachment.pixelFormat = color_pixel_format;
-      if (attachment.pixelFormat == MTLPixelFormatInvalid) {
-        return fail("render pipeline color attachment is missing pixel_format");
-      }
+	      MTLPixelFormat color_pixel_format = MTLPixelFormatInvalid;
+	      if (!pixel_format_from_json_field(color, "pixel_format", color_pixel_format)) {
+	        return fail("render pipeline color attachment is missing pixel_format");
+	      }
+	      if (color_pixel_format == MTLPixelFormatInvalid && rasterization_enabled) {
+	        continue;
+	      }
+	      attachment.pixelFormat = color_pixel_format;
       attachment.blendingEnabled = blending_enabled_it->get<bool>();
       attachment.writeMask = static_cast<MTLColorWriteMask>(write_mask);
       attachment.rgbBlendOperation = static_cast<MTLBlendOperation>(rgb_blend_operation);
@@ -2234,22 +2236,20 @@ private:
     }
     auto *descriptor = [MTLRenderPassDescriptor renderPassDescriptor];
     std::uint64_t color_texture_id = pass.value("color_texture_id", pass.value("drawable_id", 0ull));
-    if (color_texture_id == 0) {
-      const auto colors = pass.find("colors");
-      if (colors != pass.end() && colors->is_array() && !colors->empty()) {
+	    if (color_texture_id == 0) {
+	      const auto colors = pass.find("colors");
+	      if (colors != pass.end() && colors->is_array() && !colors->empty()) {
         const auto &first_color = (*colors)[0];
         color_texture_id = first_color.value("texture", 0ull);
         if (color_texture_id == 0) {
           color_texture_id = first_color.value("resolve_texture", 0ull);
-        }
-      }
-    }
-    if (color_texture_id == 0) {
-      return fail("render pass is missing color_texture_id");
-    }
+	        }
+	      }
+	    }
+	    const bool has_color_texture = color_texture_id != 0;
 
-    if (command_buffer_id != 0 &&
-        pass.value("render_target_width", 0u) == 0 &&
+	    if (command_buffer_id != 0 &&
+	        pass.value("render_target_width", 0u) == 0 &&
         pass.value("render_target_height", 0u) == 0) {
       NSDictionary *present_size = [command_buffer_present_sizes_ objectForKey:object_key(command_buffer_id)];
       if (present_size != nil) {
@@ -2257,10 +2257,10 @@ private:
         pass["render_target_height"] = static_cast<std::uint32_t>([present_size[@"height"] unsignedIntValue]);
       }
     }
-    if (command_buffer_id != 0) {
-      [command_buffer_present_textures_ setObject:object_key(color_texture_id)
-                                           forKey:object_key(command_buffer_id)];
-    }
+	    if (command_buffer_id != 0 && has_color_texture) {
+	      [command_buffer_present_textures_ setObject:object_key(color_texture_id)
+	                                           forKey:object_key(command_buffer_id)];
+	    }
 
     id<MTLTexture> first_color_texture = nil;
     const auto colors = pass.find("colors");
@@ -2332,8 +2332,8 @@ private:
           attachment.resolveDepthPlane = static_cast<NSUInteger>(resolve_depth_plane);
         }
       }
-    } else {
-      id<MTLTexture> color_texture = texture_for_id(color_texture_id);
+	    } else if (has_color_texture) {
+	      id<MTLTexture> color_texture = texture_for_id(color_texture_id);
       if (color_texture == nil) {
         if (!create_texture(color_texture_id, pass)) {
           return false;

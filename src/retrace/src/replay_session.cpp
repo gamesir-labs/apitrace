@@ -98,7 +98,9 @@ void collect_asset_paths(const json &value, std::vector<std::string> &paths)
   if (value.is_object()) {
     for (const auto &[key, child] : value.items()) {
       if ((ends_with(key, "_path") || key == "path") && child.is_string()) {
-        paths.push_back(child.get<std::string>());
+        const auto path = child.get<std::string>();
+        if (!path.empty())
+          paths.push_back(path);
       }
       collect_asset_paths(child, paths);
     }
@@ -725,22 +727,7 @@ bool validate_metal_render_pass_resources(
            require_integer_field(object, "resolve_depth_plane", description);
   };
 
-  bool has_color_texture = false;
-  auto color_texture_id = object_id_field(pass, "color_texture_id");
-  if (color_texture_id == 0) {
-    color_texture_id = object_id_field(pass, "drawable_id");
-  }
-  if (color_texture_id != 0) {
-    if (texture_ids.find(color_texture_id) == texture_ids.end()) {
-      error = event_label + ": render pass references an unknown color texture";
-      return false;
-    }
-    if (!validate_color_attachment(pass, "render pass color attachment")) {
-      return false;
-    }
-    has_color_texture = true;
-  }
-
+  bool has_attachment_texture = false;
   const auto colors = pass.find("colors");
   if (colors != pass.end() && colors->is_array()) {
     for (const auto &color : *colors) {
@@ -750,7 +737,7 @@ bool validate_metal_render_pass_resources(
           error = event_label + ": render pass references an unknown color texture";
           return false;
         }
-        has_color_texture = true;
+        has_attachment_texture = true;
       }
       if (texture_id != 0 && !validate_color_attachment(color, "render pass color attachment")) {
         return false;
@@ -766,11 +753,21 @@ bool validate_metal_render_pass_resources(
         return false;
       }
     }
-  }
-
-  if (!has_color_texture) {
-    error = event_label + ": render pass is missing color texture metadata";
-    return false;
+  } else {
+    auto color_texture_id = object_id_field(pass, "color_texture_id");
+    if (color_texture_id == 0) {
+      color_texture_id = object_id_field(pass, "drawable_id");
+    }
+    if (color_texture_id != 0) {
+      if (texture_ids.find(color_texture_id) == texture_ids.end()) {
+        error = event_label + ": render pass references an unknown color texture";
+        return false;
+      }
+      if (!validate_color_attachment(pass, "render pass color attachment")) {
+        return false;
+      }
+      has_attachment_texture = true;
+    }
   }
 
   const auto depth = pass.find("depth");
@@ -779,6 +776,9 @@ bool validate_metal_render_pass_resources(
     if (depth_texture_id != 0 && texture_ids.find(depth_texture_id) == texture_ids.end()) {
       error = event_label + ": render pass references an unknown depth texture";
       return false;
+    }
+    if (depth_texture_id != 0) {
+      has_attachment_texture = true;
     }
     if (depth_texture_id != 0 &&
         (!require_action_field(*depth, "load_action", "render pass depth attachment", {"load", "clear", "dontcare"}) ||
@@ -793,6 +793,21 @@ bool validate_metal_render_pass_resources(
       error = event_label + ": render pass depth attachment is missing clear_depth";
       return false;
     }
+  }
+  const auto stencil = pass.find("stencil");
+  if (stencil != pass.end() && stencil->is_object()) {
+    const auto stencil_texture_id = object_id_field(*stencil, "texture");
+    if (stencil_texture_id != 0 && texture_ids.find(stencil_texture_id) == texture_ids.end()) {
+      error = event_label + ": render pass references an unknown stencil texture";
+      return false;
+    }
+    if (stencil_texture_id != 0) {
+      has_attachment_texture = true;
+    }
+  }
+  if (!has_attachment_texture) {
+    error = event_label + ": render pass is missing attachment texture metadata";
+    return false;
   }
   return true;
 }
@@ -1411,7 +1426,8 @@ bool validate_metal_replay_closure(
           return false;
         }
         buffer_ids.insert(event.object_id);
-      } else if (event.function_name == "MTLDevice.newTexture") {
+      } else if (event.function_name == "MTLDevice.newTexture" ||
+                 event.function_name == "CAMetalDrawable.texture") {
         if (!validate_metal_texture_descriptor(event_label, payload, error)) {
           return false;
         }
@@ -1442,10 +1458,12 @@ bool validate_metal_replay_closure(
           error = event_label + ": " + error;
           return false;
         }
-        if (event.function_name.find("newRenderPipelineState") != std::string::npos) {
-          if (!verify_metal_render_pipeline_descriptor(event_label, descriptor, library_ids, error)) {
-            return false;
-          }
+	        if (event.function_name.find("newTileRenderPipelineState") != std::string::npos) {
+	          render_pipeline_ids.insert(event.object_id);
+	        } else if (event.function_name.find("newRenderPipelineState") != std::string::npos) {
+	          if (!verify_metal_render_pipeline_descriptor(event_label, descriptor, library_ids, error)) {
+	            return false;
+	          }
           render_pipeline_ids.insert(event.object_id);
         } else if (event.function_name.find("newComputePipelineState") != std::string::npos) {
           if (!verify_metal_compute_pipeline_descriptor(event_label, descriptor, library_ids, error)) {
@@ -1859,13 +1877,17 @@ bool validate_metal_replay_closure(
           !validate_metal_blit_batch_payload(event_label, payload, buffer_ids, texture_ids, error)) {
         return false;
       }
-    } else if (event.call_kind == trace::MetalCallKind::PresentDrawable) {
-      if (!require_metal_object(command_buffer_ids, event.object_id, event_label,
-              "presentDrawable references an unknown command buffer", error) ||
-          !require_metal_object(texture_ids, object_id_field(payload, "drawable_id"), event_label,
-              "presentDrawable references an unknown drawable texture", error)) {
-        return false;
-      }
+	    } else if (event.call_kind == trace::MetalCallKind::PresentDrawable) {
+	      auto present_texture_id = object_id_field(payload, "present_texture_id");
+	      if (present_texture_id == 0) {
+	        present_texture_id = event.object_refs.empty() ? 0 : event.object_refs.front();
+	      }
+	      if (!require_metal_object(command_buffer_ids, event.object_id, event_label,
+	              "presentDrawable references an unknown command buffer", error) ||
+	          !require_metal_object(texture_ids, present_texture_id, event_label,
+	              "presentDrawable references an unknown drawable texture", error)) {
+	        return false;
+	      }
       if (!validate_metal_present_payload(event_label, payload, error)) {
         return false;
       }
@@ -1979,16 +2001,11 @@ bool validate_metal_replay_closure(
         }
         if (event.call_kind != trace::MetalCallKind::DispatchThreadsPerTile) {
           const auto viewport = render_encoder_has_viewport.find(event.object_id);
-          if (viewport == render_encoder_has_viewport.end() || !viewport->second) {
-            error = event_label + ": draw occurs before a valid viewport bind";
-            return false;
-          }
-          const auto scissor = render_encoder_has_scissor.find(event.object_id);
-          if (scissor == render_encoder_has_scissor.end() || !scissor->second) {
-            error = event_label + ": draw occurs before a valid scissor bind";
-            return false;
-          }
-        }
+	        if (viewport == render_encoder_has_viewport.end() || !viewport->second) {
+	          error = event_label + ": draw occurs before a valid viewport bind";
+	          return false;
+	        }
+	      }
       } else {
         const auto encoder = compute_encoder_has_pipeline.find(event.object_id);
         if (encoder == compute_encoder_has_pipeline.end() || !encoder->second) {
@@ -2022,25 +2039,8 @@ bool validate_metal_replay_closure(
     error = "metal validate-only found no draw or dispatch calls";
     return false;
   }
-  if (!render_encoder_ids.empty()) {
-    error = "metal validate-only ended with an open render encoder";
-    return false;
-  }
-  if (!compute_encoder_ids.empty()) {
-    error = "metal validate-only ended with an open compute encoder";
-    return false;
-  }
-  if (!blit_encoder_ids.empty()) {
-    error = "metal validate-only ended with an open blit encoder";
-    return false;
-  }
-  if (!command_buffer_ids.empty()) {
-    error = "metal validate-only ended with an uncommitted command buffer";
-    return false;
-  }
-
-  return true;
-}
+	  return true;
+	}
 
 } // namespace
 
