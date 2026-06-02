@@ -74,6 +74,7 @@ public:
   void end_encoder();
   void emit_marker(const TranslationMarkerInfo &info);
   void record_metal_call(const MetalTraceRecord &record);
+  void record_metal_call(MetalTraceRecord &&record);
   void append_link_record(const trace::TranslationLinkRecord &record);
   void close();
 

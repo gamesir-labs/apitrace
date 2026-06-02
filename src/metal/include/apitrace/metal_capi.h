@@ -329,6 +329,12 @@ APITRACE_METAL_API void apitrace_metal_copy_buffer_to_texture_with_contents(
     const char *payload_json,
     const void *source_bytes,
     uint64_t source_bytes_size);
+APITRACE_METAL_API void apitrace_metal_copy_buffer_to_texture(
+    apitrace_metal_session_t *session,
+    uint64_t encoder_id,
+    uint64_t source_buffer_id,
+    uint64_t destination_texture_id,
+    const char *payload_json);
 APITRACE_METAL_API void apitrace_metal_copy_texture(
     apitrace_metal_session_t *session,
     uint64_t encoder_id,

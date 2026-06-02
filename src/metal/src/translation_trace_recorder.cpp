@@ -317,11 +317,17 @@ void TranslationTraceRecorder::emit_marker(const TranslationMarkerInfo &info)
 
 void TranslationTraceRecorder::record_metal_call(const MetalTraceRecord &record)
 {
+  MetalTraceRecord copy = record;
+  record_metal_call(std::move(copy));
+}
+
+void TranslationTraceRecorder::record_metal_call(MetalTraceRecord &&record)
+{
   if (!impl_->open || !impl_->options.enable_metal_trace) {
     return;
   }
 
-  MetalTraceRecord normalized = record;
+  MetalTraceRecord normalized = std::move(record);
   if (normalized.d3d_sequence != 0) {
     impl_->current_d3d_sequence = normalized.d3d_sequence;
   } else {
@@ -337,17 +343,25 @@ void TranslationTraceRecorder::record_metal_call(const MetalTraceRecord &record)
     trace::append_payload_text_object_refs(normalized.translation_link_payload, normalized.object_refs);
     normalized.payload_refs_scanned = true;
   }
-  impl_->metal_trace_backend.record_translated_call(normalized);
 
-  if (impl_->enable_per_call_links && impl_->options.enable_link_sideband && normalized.d3d_sequence != 0) {
+  const bool emit_link = impl_->enable_per_call_links &&
+                         impl_->options.enable_link_sideband &&
+                         normalized.d3d_sequence != 0;
+  const auto link_d3d_sequence = normalized.d3d_sequence;
+  const auto link_frame_id = normalized.frame_id;
+  const auto link_payload = emit_link ? normalized.translation_link_payload : std::string();
+
+  impl_->metal_trace_backend.record_translated_call(std::move(normalized));
+
+  if (emit_link) {
     trace::TranslationLinkRecord link_record;
     link_record.record_type = "scope";
     link_record.scope_kind = "draw_to_metal_calls";
-    link_record.d3d_sequence = normalized.d3d_sequence;
+    link_record.d3d_sequence = link_d3d_sequence;
     link_record.metal_sequence_begin = impl_->metal_trace_backend.current_metal_sequence();
     link_record.metal_sequence_end = impl_->metal_trace_backend.current_metal_sequence();
-    link_record.frame_id = normalized.frame_id;
-    link_record.payload = normalized.translation_link_payload;
+    link_record.frame_id = link_frame_id;
+    link_record.payload = link_payload;
     impl_->link_writer.append_record(link_record);
   }
 }

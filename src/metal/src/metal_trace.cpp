@@ -29,6 +29,25 @@ trace::MetalEventRecord to_event_record(const MetalTraceRecord &record, std::uin
   return event;
 }
 
+trace::MetalEventRecord to_event_record(MetalTraceRecord &&record, std::uint64_t sequence)
+{
+  trace::MetalEventRecord event;
+  event.call_kind = record.call_kind;
+  event.metal_sequence = sequence;
+  event.d3d_sequence = record.d3d_sequence;
+  event.frame_id = record.frame_id;
+  event.object_id = record.object_id;
+  event.object_refs = std::move(record.object_refs);
+  event.blob_refs = std::move(record.blob_refs);
+  event.function_name = std::move(record.translated_call_name);
+  if (event.function_name.empty()) {
+    event.function_name = "Metal.translatedCall";
+  }
+  event.payload = record.translation_link_payload.empty() ? std::string("{}") : std::move(record.translation_link_payload);
+  event.payload_refs_scanned = record.payload_refs_scanned;
+  return event;
+}
+
 } // namespace
 
 MetalTraceBackend::MetalTraceBackend(MetalTraceOptions options)
@@ -68,6 +87,15 @@ void MetalTraceBackend::record_translated_call(const MetalTraceRecord &record)
   }
 
   bundle_writer_->append_metal_event(to_event_record(record, ++last_sequence_));
+}
+
+void MetalTraceBackend::record_translated_call(MetalTraceRecord &&record)
+{
+  if (!active_ || bundle_writer_ == nullptr) {
+    return;
+  }
+
+  bundle_writer_->append_metal_event(to_event_record(std::move(record), ++last_sequence_));
 }
 
 void MetalTraceBackend::record_frame_boundary(std::string_view frame_label)

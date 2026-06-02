@@ -39,6 +39,7 @@ public:
   bool initialize(trace::TraceBundleWriter &bundle_writer, MetalBridge &bridge);
   void begin_trace();
   void record_translated_call(const MetalTraceRecord &record);
+  void record_translated_call(MetalTraceRecord &&record);
   void record_frame_boundary(std::string_view frame_label);
   void record_command_buffer(std::string_view command_buffer_label);
   void end_trace();
