@@ -141,6 +141,8 @@ std::string_view metal_call_kind_name(MetalCallKind kind)
     return "insert_debug_signpost";
   case MetalCallKind::BufferUpdate:
     return "buffer_update";
+  case MetalCallKind::TextureUpdate:
+    return "texture_update";
   }
   return "unknown";
 }
@@ -211,6 +213,7 @@ bool metal_call_kind_from_name(std::string_view name, MetalCallKind &kind)
       MetalCallKind::ObjectMetadata,
       MetalCallKind::InsertDebugSignpost,
       MetalCallKind::BufferUpdate,
+      MetalCallKind::TextureUpdate,
   };
 
   for (const auto candidate : kKinds) {

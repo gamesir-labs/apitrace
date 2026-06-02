@@ -409,7 +409,17 @@ private:
       const auto desc = resource_desc(resource);
       const auto optimized_clear = resource.has_optimized_clear_value ? clear_value(resource) : D3D12_CLEAR_VALUE{};
       HRESULT hr = S_OK;
-      if (resource.heap_object_id != 0) {
+      if (resource.reserved_resource) {
+        hr = device_->CreateReservedResource(
+            &desc,
+            static_cast<D3D12_RESOURCE_STATES>(resource.initial_state),
+            resource.has_optimized_clear_value ? &optimized_clear : nullptr,
+            IID_PPV_ARGS(native.resource.put()));
+        if (FAILED(hr)) {
+          error = hresult_error("CreateReservedResource", hr);
+          return false;
+        }
+      } else if (resource.heap_object_id != 0) {
         const auto heap_it = heaps_.find(resource.heap_object_id);
         if (heap_it == heaps_.end()) {
           return fail(error, "placed resource references an unknown heap");

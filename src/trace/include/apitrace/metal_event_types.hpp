@@ -72,6 +72,7 @@ enum class MetalCallKind {
   ObjectMetadata,
   InsertDebugSignpost,
   BufferUpdate,
+  TextureUpdate,
 };
 
 enum class MetalBoundaryKind {

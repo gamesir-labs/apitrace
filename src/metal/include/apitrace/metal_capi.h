@@ -450,6 +450,21 @@ APITRACE_METAL_API void apitrace_metal_update_buffer_contents(
     uint32_t storage_mode,
     const void *bytes,
     uint64_t bytes_size);
+APITRACE_METAL_API void apitrace_metal_replace_texture_region(
+    apitrace_metal_session_t *session,
+    uint64_t texture_id,
+    uint64_t origin_x,
+    uint64_t origin_y,
+    uint64_t origin_z,
+    uint64_t size_width,
+    uint64_t size_height,
+    uint64_t size_depth,
+    uint32_t level,
+    uint32_t slice,
+    uint64_t bytes_per_row,
+    uint64_t bytes_per_image,
+    const void *bytes,
+    uint64_t bytes_size);
 APITRACE_METAL_API uint64_t apitrace_metal_register_texture(
     apitrace_metal_session_t *session,
     uint64_t object_id,

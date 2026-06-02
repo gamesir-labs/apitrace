@@ -2892,6 +2892,43 @@ void record_present_frame(
   maybe_seal_checkpoint_after_present_frame(frame_index);
 }
 
+void record_resource_unmap(
+    const void *resource,
+    std::uint32_t subresource,
+    std::uint64_t written_begin,
+    std::uint64_t written_end,
+    const void *written_data,
+    std::size_t written_size)
+{
+  if (!resource || !written_data || written_size == 0 || written_end <= written_begin) {
+    return;
+  }
+
+  const auto asset = register_asset_bytes(
+      trace::AssetKind::Buffer,
+      "d3d12-resource-unmap",
+      written_data,
+      written_size);
+
+  std::ostringstream payload;
+  payload << "{\"resource_object_id\":" << object_id(resource)
+          << ",\"subresource\":" << subresource
+          << ",\"written_begin\":" << written_begin
+          << ",\"written_end\":" << written_end
+          << ",\"written_size\":" << static_cast<std::uint64_t>(written_size)
+          << ",\"buffer_path\":\"" << asset.relative_path.generic_string() << "\""
+          << "}";
+  const void *refs[] = {resource};
+  const auto blob_id = static_cast<std::uint64_t>(asset.blob_id);
+  record_call(
+      "ID3D12Resource::Unmap",
+      payload.str().c_str(),
+      refs,
+      1,
+      &blob_id,
+      1);
+}
+
 void record_fence_dependency(
     const char *scope,
     std::uint64_t d3d_sequence,
@@ -3582,6 +3619,36 @@ std::uint64_t record_create_placed_resource(
           << "}";
   const void *refs[] = {device, heap, resource};
   return record_call("ID3D12Device::CreatePlacedResource", payload.str().c_str(), refs, 3, nullptr, 0, result_code);
+}
+
+std::uint64_t record_create_reserved_resource(
+    ID3D12Device *device,
+    const D3D12_RESOURCE_DESC *desc,
+    std::uint32_t initial_state,
+    const D3D12_CLEAR_VALUE *optimized_clear_value,
+    const void *resource,
+    std::uint64_t gpu_virtual_address,
+    std::int32_t result_code)
+{
+  (void)optimized_clear_value;
+  if (resource && result_code >= 0) {
+    record_object_create(resource, CaptureObjectKind::Resource, device, "ID3D12Resource");
+    std::lock_guard lock(g_object_mutex);
+    g_resource_gpu_virtual_addresses[resource] = {
+        lookup_object_id_locked(resource),
+        gpu_virtual_address,
+        desc ? desc->Width : 0,
+        g_sequence.load(std::memory_order_relaxed),
+    };
+  }
+  std::ostringstream payload;
+  payload << "{\"initial_state\":" << initial_state
+          << ",\"gpu_virtual_address\":" << gpu_virtual_address
+          << ",\"reserved_resource\":true"
+          << ",\"resource_desc\":" << resource_desc_json(desc)
+          << "}";
+  const void *refs[] = {device, resource};
+  return record_call("ID3D12Device::CreateReservedResource", payload.str().c_str(), refs, 2, nullptr, 0, result_code);
 }
 
 std::uint64_t record_create_fence(

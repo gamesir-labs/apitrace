@@ -834,6 +834,8 @@ public:
       return handle_debug_signpost(event, payload);
     case trace::MetalCallKind::BufferUpdate:
       return buffer_update(event, payload);
+    case trace::MetalCallKind::TextureUpdate:
+      return texture_update(event, payload);
     case trace::MetalCallKind::SetArgumentBuffer:
       return true;
     default:
@@ -1094,6 +1096,55 @@ private:
     if (buffer.storageMode == MTLStorageModeManaged) {
       [buffer didModifyRange:NSMakeRange(static_cast<NSUInteger>(source_offset), static_cast<NSUInteger>(expected_size))];
     }
+    return true;
+  }
+
+  bool restore_texture_region_from_asset(
+      const trace::MetalEventRecord &event,
+      id<MTLTexture> texture,
+      const json &payload)
+  {
+    const auto asset_path = payload.value("source_asset_path", std::string());
+    if (asset_path.empty()) {
+      return true;
+    }
+    if (!verify_event_asset_path(event, asset_path, "source_asset_path")) {
+      return false;
+    }
+    if (texture == nil) {
+      return fail("texture region asset references missing texture");
+    }
+
+    std::uint64_t expected_size = 0;
+    std::uint64_t bytes_per_row = 0;
+    std::uint64_t bytes_per_image = 0;
+    std::uint32_t level = 0;
+    std::uint32_t slice = 0;
+    if (!required_u64(payload, "source_asset_size", expected_size) ||
+        !required_u64(payload, "bytes_per_row", bytes_per_row) ||
+        !required_u64(payload, "bytes_per_image", bytes_per_image) ||
+        !required_u32(payload, "level", level) ||
+        !required_u32(payload, "slice", slice)) {
+      return fail("texture region asset is missing replay metadata");
+    }
+
+    MTLOrigin origin = {};
+    MTLSize size = {};
+    if (!origin_from_json_array(payload, "origin", origin) ||
+        !size_from_json_array(payload, "size", size)) {
+      return fail("texture region asset is missing region metadata");
+    }
+
+    const auto bytes = read_binary_file(bundle_path(asset_path));
+    if (bytes.size() < expected_size) {
+      return fail("texture region asset is truncated: " + asset_path);
+    }
+    [texture replaceRegion:MTLRegionMake3D(origin.x, origin.y, origin.z, size.width, size.height, size.depth)
+               mipmapLevel:static_cast<NSUInteger>(level)
+                     slice:static_cast<NSUInteger>(slice)
+                 withBytes:bytes.data()
+               bytesPerRow:static_cast<NSUInteger>(bytes_per_row)
+             bytesPerImage:static_cast<NSUInteger>(bytes_per_image)];
     return true;
   }
 
@@ -3878,6 +3929,19 @@ private:
       return fail("buffer update references missing buffer");
     }
     return restore_buffer_range_from_asset(event, buffer, payload);
+  }
+
+  bool texture_update(const trace::MetalEventRecord &event, const json &payload)
+  {
+    std::uint64_t texture_id = event.object_id;
+    if (payload.contains("texture_id")) {
+      texture_id = payload.value("texture_id", texture_id);
+    }
+    id<MTLTexture> texture = texture_for_id(texture_id);
+    if (texture == nil) {
+      return fail("texture update references missing texture");
+    }
+    return restore_texture_region_from_asset(event, texture, payload);
   }
 
   bool handle_debug_signpost(const trace::MetalEventRecord &event, const json &payload)

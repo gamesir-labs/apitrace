@@ -967,6 +967,94 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     }
     resources_[resource.resource_object_id] = std::move(resource);
     ++semantic_calls_seen_;
+  } else if (function_name == "ID3D12Device::CreateReservedResource") {
+    if (!require_payload_key(event, payload, "resource_desc", last_error_) ||
+        !require_payload_key(event, payload, "initial_state", last_error_)) {
+      return false;
+    }
+    if (event.object_refs.size() < 2 || event.object_refs[1] == 0) {
+      last_error_ = record_prefix(event) + ": CreateReservedResource missing resource object id";
+      return false;
+    }
+    const auto &resource_desc = payload["resource_desc"];
+    if (!resource_desc.is_object()) {
+      last_error_ = record_prefix(event) + ": resource_desc must be an object";
+      return false;
+    }
+    static constexpr const char *required_resource_desc_keys[] = {
+        "dimension",
+        "alignment",
+        "width",
+        "height",
+        "depth_or_array_size",
+        "mip_levels",
+        "format",
+        "sample_count",
+        "sample_quality",
+        "layout",
+        "flags",
+    };
+    for (const char *key : required_resource_desc_keys) {
+      if (!require_payload_key(event, resource_desc, key, last_error_)) {
+        return false;
+      }
+    }
+    ResourceSemanticState resource;
+    resource.resource_object_id = event.object_refs[1];
+    resource.create_sequence = event.callsite.sequence;
+    resource.initial_state = payload_u32(payload, "initial_state");
+    resource.current_state = resource.initial_state;
+    resource.gpu_virtual_address = payload_u64(payload, "gpu_virtual_address");
+    resource.reserved_resource = payload.value("reserved_resource", true);
+    resource.width = payload_u64(resource_desc, "width");
+    resource.alignment = payload_u64(resource_desc, "alignment");
+    resource.dimension = payload_u32(resource_desc, "dimension");
+    resource.height = payload_u32(resource_desc, "height");
+    resource.depth_or_array_size = payload_u32(resource_desc, "depth_or_array_size");
+    resource.mip_levels = payload_u32(resource_desc, "mip_levels");
+    resource.format = payload_u32(resource_desc, "format");
+    resource.sample_count = payload_u32(resource_desc, "sample_count");
+    resource.sample_quality = payload_u32(resource_desc, "sample_quality");
+    resource.layout = payload_u32(resource_desc, "layout");
+    resource.flags = payload_u32(resource_desc, "flags");
+    if (resource.width == 0 || resource.height == 0 || resource.depth_or_array_size == 0 ||
+        resource.mip_levels == 0 || resource.sample_count == 0) {
+      last_error_ = record_prefix(event) + ": resource_desc has invalid dimensions or sample count";
+      return false;
+    }
+    const auto optimized_clear_value = payload.find("optimized_clear_value");
+    if (optimized_clear_value != payload.end()) {
+      if (!optimized_clear_value->is_null() && !optimized_clear_value->is_object()) {
+        last_error_ = record_prefix(event) + ": optimized_clear_value must be null or an object";
+        return false;
+      }
+      if (optimized_clear_value->is_object()) {
+        if (!require_payload_key(event, *optimized_clear_value, "format", last_error_) ||
+            !require_payload_key(event, *optimized_clear_value, "color", last_error_) ||
+            !require_payload_key(event, *optimized_clear_value, "depth", last_error_) ||
+            !require_payload_key(event, *optimized_clear_value, "stencil", last_error_)) {
+          return false;
+        }
+        const auto color = optimized_clear_value->find("color");
+        if (!color->is_array() || color->size() != 4) {
+          last_error_ = record_prefix(event) + ": optimized_clear_value color must be an array of four numbers";
+          return false;
+        }
+        resource.has_optimized_clear_value = true;
+        resource.optimized_clear_format = payload_u32(*optimized_clear_value, "format");
+        for (std::size_t index = 0; index < 4; ++index) {
+          if (!(*color)[index].is_number()) {
+            last_error_ = record_prefix(event) + ": optimized_clear_value color entries must be numeric";
+            return false;
+          }
+          resource.optimized_clear_color[index] = (*color)[index].get<float>();
+        }
+        resource.optimized_clear_depth = payload_float(*optimized_clear_value, "depth");
+        resource.optimized_clear_stencil = payload_u32(*optimized_clear_value, "stencil");
+      }
+    }
+    resources_[resource.resource_object_id] = std::move(resource);
+    ++semantic_calls_seen_;
   } else if (function_name == "ID3D12Device::CreateHeap") {
     if (event.object_refs.size() < 2 || event.object_refs[1] == 0) {
       last_error_ = record_prefix(event) + ": CreateHeap missing heap object id";

@@ -181,6 +181,13 @@ void record_present_frame(
     std::uint32_t flags,
     const void *rgba_data,
     std::size_t rgba_size);
+void record_resource_unmap(
+    const void *resource,
+    std::uint32_t subresource,
+    std::uint64_t written_begin,
+    std::uint64_t written_end,
+    const void *written_data,
+    std::size_t written_size);
 void record_fence_dependency(
     const char *scope,
     std::uint64_t d3d_sequence,
@@ -287,6 +294,15 @@ std::uint64_t record_create_placed_resource(
     ID3D12Device *device,
     const void *heap,
     std::uint64_t heap_offset,
+    const D3D12_RESOURCE_DESC *desc,
+    std::uint32_t initial_state,
+    const D3D12_CLEAR_VALUE *optimized_clear_value,
+    const void *resource,
+    std::uint64_t gpu_virtual_address,
+    std::int32_t result_code);
+
+std::uint64_t record_create_reserved_resource(
+    ID3D12Device *device,
     const D3D12_RESOURCE_DESC *desc,
     std::uint32_t initial_state,
     const D3D12_CLEAR_VALUE *optimized_clear_value,

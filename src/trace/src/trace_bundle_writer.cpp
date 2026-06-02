@@ -59,6 +59,48 @@ void update_atomic_max(std::atomic_uint64_t &target, std::uint64_t value)
   }
 }
 
+bool is_bundle_relative_path(const std::filesystem::path &path)
+{
+  if (path.empty() || path == std::filesystem::path(".") || path.is_absolute()) {
+    return false;
+  }
+
+  for (const auto &component : path) {
+    if (component == std::filesystem::path("..")) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+std::optional<std::filesystem::path> bundle_relative_path(
+    const std::filesystem::path &path,
+    const std::filesystem::path &root)
+{
+  if (path.empty() || root.empty()) {
+    return std::nullopt;
+  }
+
+  const auto lexical_relative = path.lexically_normal().lexically_relative(root.lexically_normal());
+  if (is_bundle_relative_path(lexical_relative)) {
+    return lexical_relative;
+  }
+
+  std::error_code error;
+  auto relative = std::filesystem::relative(path, root, error);
+  if (error) {
+    return std::nullopt;
+  }
+
+  relative = relative.lexically_normal();
+  if (!is_bundle_relative_path(relative)) {
+    return std::nullopt;
+  }
+
+  return relative;
+}
+
 struct AsyncStreamStats {
   std::uint64_t mutex_lock_count = 0;
   std::uint64_t mutex_wait_ns = 0;
@@ -821,11 +863,11 @@ void add_checksum_candidate_absolute(
     return;
   }
 
-  const auto relative_path = std::filesystem::relative(absolute_path, layout.root_path, error);
-  if (error) {
+  const auto relative_path = bundle_relative_path(absolute_path, layout.root_path);
+  if (!relative_path) {
     return;
   }
-  add_checksum_candidate(relative_paths, seen, relative_path);
+  add_checksum_candidate(relative_paths, seen, *relative_path);
 }
 
 std::vector<std::filesystem::path> collect_bundle_relative_paths_full_scan(const BundleLayout &layout)
@@ -840,11 +882,11 @@ std::vector<std::filesystem::path> collect_bundle_relative_paths_full_scan(const
       continue;
     }
 
-    const auto relative_path = std::filesystem::relative(entry.path(), layout.root_path);
-    if (relative_path == std::filesystem::path(kChecksumsFileName)) {
+    const auto relative_path = bundle_relative_path(entry.path(), layout.root_path);
+    if (!relative_path || *relative_path == std::filesystem::path(kChecksumsFileName)) {
       continue;
     }
-    relative_paths.push_back(relative_path);
+    relative_paths.push_back(*relative_path);
   }
 
   std::sort(relative_paths.begin(), relative_paths.end());
@@ -3430,9 +3472,11 @@ RewriteAssetReferenceResult rewrite_bundle_asset_references(
           error);
       std::filesystem::remove(temporary_path);
     }
-    const auto relative_path = std::filesystem::relative(source_path, layout.root_path);
-    result.rewritten_relative_paths.push_back(relative_path);
-    result.rewritten_digests[relative_path.generic_string()] = rewritten_digest.final_hex();
+    const auto relative_path = bundle_relative_path(source_path, layout.root_path);
+    if (relative_path) {
+      result.rewritten_relative_paths.push_back(*relative_path);
+      result.rewritten_digests[relative_path->generic_string()] = rewritten_digest.final_hex();
+    }
   }
   return result;
 }
@@ -3885,8 +3929,11 @@ struct TraceBundleWriter::Impl {
     output << stats_json << "\n";
     output.close();
     digest = sha256_file(stats_path);
-    TimedWriterLock lock(asset_mutex, writer_stats ? &asset_lock_stats : nullptr);
-    known_file_digests[std::filesystem::relative(stats_path, layout.root_path).generic_string()] = digest;
+    const auto relative_path = bundle_relative_path(stats_path, layout.root_path);
+    if (relative_path) {
+      TimedWriterLock lock(asset_mutex, writer_stats ? &asset_lock_stats : nullptr);
+      known_file_digests[relative_path->generic_string()] = digest;
+    }
     return stats_path;
   }
 
@@ -4323,9 +4370,9 @@ struct TraceBundleWriter::Impl {
     for (const auto &entry : analysis_stream_snapshot) {
       std::error_code error;
       if (std::filesystem::is_regular_file(entry.path, error) && !error) {
-        const auto relative_path = std::filesystem::relative(entry.path, layout.root_path, error);
-        if (!error) {
-          known_file_digests_snapshot[relative_path.generic_string()] =
+        const auto relative_path = bundle_relative_path(entry.path, layout.root_path);
+        if (relative_path) {
+          known_file_digests_snapshot[relative_path->generic_string()] =
               !entry.digest.empty() ? entry.digest : sha256_file(entry.path);
         }
       }
@@ -5335,9 +5382,12 @@ void TraceBundleWriter::write_object_index(const std::vector<ObjectRecord> &obje
   output << json;
   output.flush();
   {
-    TimedWriterLock lock(impl_->asset_mutex, impl_->writer_stats ? &impl_->asset_lock_stats : nullptr);
-    impl_->known_file_digests[std::filesystem::relative(impl_->layout.object_index_path, impl_->layout.root_path).generic_string()] =
-        content_hash_bytes(json.data(), json.size());
+    const auto relative_path = bundle_relative_path(impl_->layout.object_index_path, impl_->layout.root_path);
+    if (relative_path) {
+      TimedWriterLock lock(impl_->asset_mutex, impl_->writer_stats ? &impl_->asset_lock_stats : nullptr);
+      impl_->known_file_digests[relative_path->generic_string()] =
+          content_hash_bytes(json.data(), json.size());
+    }
   }
 }
 
@@ -5453,11 +5503,13 @@ void TraceBundleWriter::close()
         entry.second.close();
         const auto digest = entry.second.digest();
         if (!digest.empty()) {
-          const auto relative_path = std::filesystem::relative(
+          const auto relative_path = bundle_relative_path(
               analysis_path_for_stream(impl_->layout, entry.first),
               impl_->layout.root_path);
-          TimedWriterLock lock(impl_->asset_mutex, impl_->writer_stats ? &impl_->asset_lock_stats : nullptr);
-          impl_->known_file_digests[relative_path.generic_string()] = digest;
+          if (relative_path) {
+            TimedWriterLock lock(impl_->asset_mutex, impl_->writer_stats ? &impl_->asset_lock_stats : nullptr);
+            impl_->known_file_digests[relative_path->generic_string()] = digest;
+          }
         }
       }
     }

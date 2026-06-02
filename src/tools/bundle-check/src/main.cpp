@@ -959,6 +959,130 @@ bool validate_metal_inline_bytes(
   return true;
 }
 
+bool asset_file_has_bytes(
+    const apitrace::trace::TraceBundleReader &reader,
+    const std::string &error_prefix,
+    const std::string &relative_path_text,
+    std::uint64_t required_size,
+    const char *description,
+    std::string &error)
+{
+  if (relative_path_text.empty()) {
+    error = error_prefix + description + " is missing source_asset_path";
+    return false;
+  }
+  const std::filesystem::path relative_path(relative_path_text);
+  if (!path_is_safe(relative_path)) {
+    error = error_prefix + description + " has unsafe source_asset_path";
+    return false;
+  }
+  std::error_code stat_error;
+  const auto actual_size = std::filesystem::file_size(reader.layout().root_path / relative_path, stat_error);
+  if (stat_error) {
+    error = error_prefix + description + " source_asset_path is missing";
+    return false;
+  }
+  if (actual_size < required_size) {
+    error = error_prefix + description + " source_asset_path is truncated";
+    return false;
+  }
+  return true;
+}
+
+bool validate_metal_buffer_update_payload(
+    const apitrace::trace::TraceBundleReader &reader,
+    const std::string &error_prefix,
+    const json &payload,
+    std::string &error)
+{
+  const auto require_integer_field = [&](const char *field) -> bool {
+    const auto it = payload.find(field);
+    if (it == payload.end() || (!it->is_number_unsigned() && !it->is_number_integer())) {
+      error = error_prefix + "buffer update is missing " + field;
+      return false;
+    }
+    return true;
+  };
+  if (!require_integer_field("buffer_id") ||
+      !require_integer_field("offset") ||
+      !require_integer_field("length") ||
+      !require_integer_field("source_offset") ||
+      !require_integer_field("source_asset_size") ||
+      !require_integer_field("storage_mode")) {
+    return false;
+  }
+  const auto offset = json_u64(payload["offset"]);
+  const auto length = json_u64(payload["length"]);
+  const auto source_offset = json_u64(payload["source_offset"]);
+  const auto source_asset_size = json_u64(payload["source_asset_size"]);
+  if (length == 0 || source_asset_size != length || source_offset != offset) {
+    error = error_prefix + "buffer update range does not match captured asset";
+    return false;
+  }
+  const auto source_asset_path = string_from_json(payload.value("source_asset_path", json(nullptr)));
+  return asset_file_has_bytes(reader, error_prefix, source_asset_path, source_asset_size, "buffer update", error);
+}
+
+bool validate_metal_texture_update_payload(
+    const apitrace::trace::TraceBundleReader &reader,
+    const std::string &error_prefix,
+    const json &payload,
+    std::string &error)
+{
+  const auto require_integer_field = [&](const char *field) -> bool {
+    const auto it = payload.find(field);
+    if (it == payload.end() || (!it->is_number_unsigned() && !it->is_number_integer())) {
+      error = error_prefix + "texture update is missing " + field;
+      return false;
+    }
+    return true;
+  };
+  const auto require_u64_triplet = [&](const char *field, bool positive) -> bool {
+    const auto it = payload.find(field);
+    if (it == payload.end() || !it->is_array() || it->size() != 3) {
+      error = error_prefix + "texture update has invalid " + field;
+      return false;
+    }
+    for (std::size_t index = 0; index < 3; ++index) {
+      if (!(*it)[index].is_number_unsigned() && !(*it)[index].is_number_integer()) {
+        error = error_prefix + "texture update has invalid " + field;
+        return false;
+      }
+      if (positive && json_u64((*it)[index]) == 0) {
+        error = error_prefix + "texture update has zero " + field;
+        return false;
+      }
+    }
+    return true;
+  };
+  if (!require_integer_field("texture_id") ||
+      !require_integer_field("level") ||
+      !require_integer_field("slice") ||
+      !require_integer_field("bytes_per_row") ||
+      !require_integer_field("bytes_per_image") ||
+      !require_integer_field("source_asset_size") ||
+      !require_u64_triplet("origin", false) ||
+      !require_u64_triplet("size", true)) {
+    return false;
+  }
+  const auto bytes_per_row = json_u64(payload["bytes_per_row"]);
+  const auto bytes_per_image = json_u64(payload["bytes_per_image"]);
+  const auto source_asset_size = json_u64(payload["source_asset_size"]);
+  const auto height = json_u64(payload["size"][1]);
+  const auto depth = json_u64(payload["size"][2]);
+  if (bytes_per_row == 0 || source_asset_size == 0) {
+    error = error_prefix + "texture update has invalid byte layout";
+    return false;
+  }
+  const std::uint64_t expected_size = depth > 1 ? bytes_per_image * depth : bytes_per_row * height;
+  if ((depth > 1 && bytes_per_image == 0) || expected_size == 0 || source_asset_size < expected_size) {
+    error = error_prefix + "texture update asset is smaller than the described region";
+    return false;
+  }
+  const auto source_asset_path = string_from_json(payload.value("source_asset_path", json(nullptr)));
+  return asset_file_has_bytes(reader, error_prefix, source_asset_path, source_asset_size, "texture update", error);
+}
+
 bool validate_metal_bind_payload(
     const std::string &error_prefix,
     const json &payload,
@@ -3680,6 +3804,38 @@ bool verify_strict_options(
               error) ||
           !validate_metal_blit_batch_payload(
               "Metal replay closure ", payload, metal_buffer_ids, metal_texture_ids, error)) {
+        return false;
+      }
+    } else if (event.call_kind == apitrace::trace::MetalCallKind::BufferUpdate) {
+      auto buffer_id = object_id_field(payload, "buffer_id");
+      if (buffer_id == 0) {
+        buffer_id = event.object_id;
+      }
+      if (!require_metal_object(
+              metal_buffer_ids,
+              buffer_id,
+              "Metal replay closure ",
+              "buffer update references an unknown buffer",
+              error)) {
+        return false;
+      }
+      if (!validate_metal_buffer_update_payload(reader, "Metal replay closure ", payload, error)) {
+        return false;
+      }
+    } else if (event.call_kind == apitrace::trace::MetalCallKind::TextureUpdate) {
+      auto texture_id = object_id_field(payload, "texture_id");
+      if (texture_id == 0) {
+        texture_id = event.object_id;
+      }
+      if (!require_metal_object(
+              metal_texture_ids,
+              texture_id,
+              "Metal replay closure ",
+              "texture update references an unknown texture",
+              error)) {
+        return false;
+      }
+      if (!validate_metal_texture_update_payload(reader, "Metal replay closure ", payload, error)) {
         return false;
       }
     } else if (event.call_kind == apitrace::trace::MetalCallKind::PresentDrawable) {

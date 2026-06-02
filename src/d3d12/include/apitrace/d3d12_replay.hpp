@@ -616,6 +616,7 @@ public:
     std::uint32_t layout = 0;
     std::uint32_t flags = 0;
     bool has_optimized_clear_value = false;
+    bool reserved_resource = false;
     bool swapchain_back_buffer = false;
     std::uint32_t swapchain_buffer_index = 0;
     std::uint32_t optimized_clear_format = 0;

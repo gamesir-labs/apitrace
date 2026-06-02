@@ -625,6 +625,46 @@ void attach_buffer_range_asset(
   blob_refs.insert(blob_refs.end(), refs.begin(), refs.end());
 }
 
+trace::AssetRecord register_texture_region_asset_locked(
+    SessionState &state,
+    std::uint64_t object_id,
+    const char *debug_name,
+    const void *bytes,
+    std::uint64_t size)
+{
+  (void)object_id;
+  const auto next_blob_id = current_metal_sequence(state) + 1;
+  auto asset = make_asset_record(
+      next_blob_id,
+      debug_name == nullptr ? "metal-texture-region" : debug_name,
+      bytes,
+      size);
+  asset.kind = trace::AssetKind::Texture;
+  return state.writer.register_asset(std::move(asset));
+}
+
+void attach_texture_region_asset(
+    SessionState &state,
+    json &payload,
+    std::vector<trace::BlobId> &blob_refs,
+    std::uint64_t object_id,
+    const char *debug_name,
+    const void *bytes,
+    std::uint64_t size)
+{
+  if (bytes == nullptr || size == 0) {
+    return;
+  }
+
+  const auto asset = register_texture_region_asset_locked(state, object_id, debug_name, bytes, size);
+  if (!asset.relative_path.empty()) {
+    payload["source_asset_path"] = asset.relative_path.generic_string();
+    payload["source_asset_size"] = size;
+  }
+  const auto refs = blob_refs_for_asset(asset);
+  blob_refs.insert(blob_refs.end(), refs.begin(), refs.end());
+}
+
 void record_present_frame_locked(
     SessionState &state,
     std::uint64_t frame_index,
@@ -2247,6 +2287,7 @@ APITRACE_METAL_API void apitrace_metal_update_buffer_contents(
   auto payload = json{{"buffer_id", object_id},
                       {"offset", offset},
                       {"length", length},
+                      {"source_offset", offset},
                       {"storage_mode", storage_mode}};
   std::vector<apitrace::trace::BlobId> blob_refs;
   apitrace::metal::detail::attach_buffer_range_asset(
@@ -2263,6 +2304,53 @@ APITRACE_METAL_API void apitrace_metal_update_buffer_contents(
       "MTLBuffer.updateContents",
       object_id,
       apitrace::metal::detail::object_refs({object_id}),
+      std::move(blob_refs),
+      payload);
+}
+
+APITRACE_METAL_API void apitrace_metal_replace_texture_region(
+    apitrace_metal_session_t *session,
+    uint64_t texture_id,
+    uint64_t origin_x,
+    uint64_t origin_y,
+    uint64_t origin_z,
+    uint64_t size_width,
+    uint64_t size_height,
+    uint64_t size_depth,
+    uint32_t level,
+    uint32_t slice,
+    uint64_t bytes_per_row,
+    uint64_t bytes_per_image,
+    const void *bytes,
+    uint64_t bytes_size)
+{
+  if (session == nullptr) {
+    return;
+  }
+
+  apitrace::metal::detail::TimedSessionLock lock(session->state.mutex);
+  auto payload = json{{"texture_id", texture_id},
+                      {"origin", {origin_x, origin_y, origin_z}},
+                      {"size", {size_width, size_height, size_depth}},
+                      {"level", level},
+                      {"slice", slice},
+                      {"bytes_per_row", bytes_per_row},
+                      {"bytes_per_image", bytes_per_image}};
+  std::vector<apitrace::trace::BlobId> blob_refs;
+  apitrace::metal::detail::attach_texture_region_asset(
+      session->state,
+      payload,
+      blob_refs,
+      texture_id,
+      "metal-texture-replace-region",
+      bytes,
+      bytes_size);
+  apitrace::metal::detail::record_metal_call(
+      session->state,
+      apitrace::trace::MetalCallKind::TextureUpdate,
+      "MTLTexture.replaceRegion",
+      texture_id,
+      apitrace::metal::detail::object_refs({texture_id}),
       std::move(blob_refs),
       payload);
 }
