@@ -40,6 +40,16 @@ void TraceSession::append_call_event(const trace::EventRecord &event)
   impl_->state.append_call_event(event);
 }
 
+void TraceSession::append_call_event(trace::EventRecord &&event)
+{
+  impl_->state.append_call_event(std::move(event));
+}
+
+void TraceSession::append_analysis_line(std::string_view stream_name, std::string_view json_line)
+{
+  impl_->state.append_analysis_line(stream_name, json_line);
+}
+
 trace::AssetRecord TraceSession::register_asset(const trace::AssetRecord &asset)
 {
   return impl_->state.register_asset(asset);

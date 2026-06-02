@@ -21,7 +21,7 @@
 
 ## 当前阶段说明
 
-- 当前只保留 `retrace` 工具
+- 当前保留 `retrace` 和 `bundle-finalize` 工具
 - 以后如果增加 inspect、validate 等工具，也应各自独立成子目录
 
 ## 相关文档

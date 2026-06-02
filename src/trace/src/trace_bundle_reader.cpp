@@ -1043,15 +1043,16 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
     metal_asset_indices_by_path.emplace(impl_->metal_assets[index].relative_path.generic_string(), index);
     metal_asset_blob_keys.insert(impl_->metal_assets[index].relative_path.generic_string() + "#" + std::to_string(impl_->metal_assets[index].blob_id));
   }
-  auto register_asset_path = [&](const std::filesystem::path &relative_path, BlobId blob_id, bool metal) -> bool {
-    if (!is_safe_bundle_relative_path(relative_path)) {
-      impl_->last_error = "unsafe asset path reference: " + relative_path.generic_string();
-      return false;
-    }
-    if (impl_->has_asset_index && blob_id != 0) {
-      const auto indexed_path = indexed_blob_paths.find(blob_id);
-      if (indexed_path == indexed_blob_paths.end()) {
-        impl_->last_error = "blob_ref missing from asset index: " + std::to_string(blob_id);
+	  auto register_asset_path = [&](const std::filesystem::path &relative_path, BlobId blob_id, bool metal) -> bool {
+	    if (!is_safe_bundle_relative_path(relative_path)) {
+	      impl_->last_error = "unsafe asset path reference: " + relative_path.generic_string();
+	      return false;
+	    }
+	    const bool enforce_asset_index = impl_->has_asset_index && !indexed_blob_paths.empty();
+	    if (enforce_asset_index && blob_id != 0) {
+	      const auto indexed_path = indexed_blob_paths.find(blob_id);
+	      if (indexed_path == indexed_blob_paths.end()) {
+	        impl_->last_error = "blob_ref missing from asset index: " + std::to_string(blob_id);
         return false;
       }
       if (indexed_path->second != relative_path) {
@@ -1066,11 +1067,11 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
     asset.blob_id = blob_id;
     asset.relative_path = relative_path;
 
-    auto &indices_by_path = metal ? metal_asset_indices_by_path : asset_indices_by_path;
-    auto &blob_keys = metal ? metal_asset_blob_keys : asset_blob_keys;
-    auto &asset_list = metal ? impl_->metal_assets : impl_->assets;
-    const auto key = asset.relative_path.generic_string();
-    const auto blob_key = key + "#" + std::to_string(blob_id);
+	    auto &indices_by_path = metal ? metal_asset_indices_by_path : asset_indices_by_path;
+	    auto &blob_keys = metal ? metal_asset_blob_keys : asset_blob_keys;
+	    auto &asset_list = metal ? impl_->metal_assets : impl_->assets;
+	    const auto key = asset.relative_path.generic_string();
+	    const auto blob_key = key + "#" + std::to_string(blob_id);
     if (blob_id != 0 && !blob_keys.insert(blob_key).second) {
       return true;
     }
@@ -1121,7 +1122,9 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
             break;
           }
         }
-      } else if (legacy_blob_ref_index < blob_refs.size()) {
+      }
+      if (blob_id == 0 && (!impl_->has_asset_index || indexed_blob_paths.empty()) &&
+          legacy_blob_ref_index < blob_refs.size()) {
         blob_id = blob_refs[legacy_blob_ref_index];
       }
       const bool metal_asset = detail::is_metal_asset_path(relative_path, &metal_kind);

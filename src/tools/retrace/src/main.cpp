@@ -1,5 +1,7 @@
 #include "apitrace/api.hpp"
 
+#include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -14,7 +16,7 @@ void print_usage(std::string_view argv0)
 {
   const std::string message =
       "usage: " + std::string(argv0) +
-      " [--validate-only] [--metal] [--metal-backend <name>] <trace-path>\n";
+      " [--validate-only] [--finalize-first] [--metal] [--metal-backend <name>] <trace-path>\n";
 #ifdef _WIN32
   DWORD written = 0;
   const HANDLE handle = GetStdHandle(STD_ERROR_HANDLE);
@@ -63,11 +65,55 @@ std::string format_statistics(const apitrace::replay::ReplayStatistics &statisti
       "metal_presents_seen: " + std::to_string(statistics.metal_presents_seen) + "\n";
 }
 
+std::string shell_quote(const std::string &value)
+{
+#ifdef _WIN32
+  std::string quoted = "\"";
+  for (const char ch : value) {
+    if (ch == '"' || ch == '\\') {
+      quoted += '\\';
+    }
+    quoted += ch;
+  }
+  quoted += "\"";
+  return quoted;
+#else
+  std::string quoted = "'";
+  for (const char ch : value) {
+    if (ch == '\'') {
+      quoted += "'\\''";
+    } else {
+      quoted += ch;
+    }
+  }
+  quoted += "'";
+  return quoted;
+#endif
+}
+
+bool finalize_bundle(std::string_view argv0, const std::string &trace_path)
+{
+  auto executable_path = std::filesystem::path("bundle-finalize");
+  const auto retrace_path = std::filesystem::path(std::string(argv0));
+  if (retrace_path.has_parent_path()) {
+    const auto sibling = retrace_path.parent_path() / "bundle-finalize";
+    if (std::filesystem::exists(sibling)) {
+      executable_path = sibling;
+    }
+  }
+  if (!std::filesystem::exists(executable_path)) {
+    executable_path = "bundle-finalize";
+  }
+  const auto command = shell_quote(executable_path.string()) + " " + shell_quote(trace_path);
+  return std::system(command.c_str()) == 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
 {
   std::string trace_path;
+  bool finalize_first = false;
   apitrace::replay::ReplayOptions options;
 #if defined(APITRACE_HAS_D3D_NATIVE) && !defined(_WIN32)
   options.backend = apitrace::replay::BackendKind::NativeD3D12;
@@ -75,6 +121,10 @@ int main(int argc, char **argv)
 
   for (int index = 1; index < argc; ++index) {
     const std::string_view arg(argv[index]);
+    if (arg == "-h" || arg == "--help") {
+      print_usage(argc > 0 ? argv[0] : "retrace");
+      return 0;
+    }
     if (arg == "--metal") {
       options.enable_metal_retrace = true;
       options.backend = apitrace::replay::BackendKind::MetalTranslation;
@@ -82,6 +132,10 @@ int main(int argc, char **argv)
     }
     if (arg == "--validate-only") {
       options.validate_only = true;
+      continue;
+    }
+    if (arg == "--finalize-first") {
+      finalize_first = true;
       continue;
     }
     if (arg == "--metal-backend") {
@@ -106,6 +160,10 @@ int main(int argc, char **argv)
   }
 
   options.bundle_root = trace_path;
+  if (finalize_first && !finalize_bundle(argc > 0 ? argv[0] : "retrace", trace_path)) {
+    write_stderr("retrace failed: bundle-finalize failed\n");
+    return 1;
+  }
 
   apitrace::replay::ReplaySession session(options);
   if (!session.run()) {

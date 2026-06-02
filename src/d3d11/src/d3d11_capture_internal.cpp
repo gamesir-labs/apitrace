@@ -470,7 +470,6 @@ trace::AssetRecord register_asset_bytes(
   asset.blob_id = ++state.next_blob_id;
   asset.kind = kind;
   asset.debug_name = std::move(debug_name);
-  asset.fast_fingerprint = trace::fast_fingerprint_bytes(data, size);
   asset.payload_bytes.resize(size);
   if (size != 0) {
     std::memcpy(asset.payload_bytes.data(), data, size);

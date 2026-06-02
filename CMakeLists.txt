@@ -5,6 +5,8 @@ project(apitrace VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 
 option(APITRACE_BUILD_TOOLS "Build command-line tools" ON)
+option(APITRACE_BUILD_BUNDLE_FINALIZE "Build offline trace bundle finalization tool" ON)
+option(APITRACE_BUILD_D3D12_NATIVE_ASSET_DUMP "Build standalone D3D12 native asset dump diagnostic tool" OFF)
 option(APITRACE_BUILD_WINDOWS_DLLS "Build Windows proxy DLLs when supported" ON)
 option(APITRACE_BUILD_METAL_BACKEND "Build Metal backend sources when supported" ON)
 # Produce the PE-side capture units (d3d11/d3d12 capture + core) as STATIC
@@ -279,6 +281,17 @@ if(APITRACE_BUILD_TOOLS AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
     target_compile_features(apitrace_bundle_check PRIVATE cxx_std_17)
 endif()
 
+if(APITRACE_BUILD_TOOLS AND APITRACE_BUILD_BUNDLE_FINALIZE AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
+    add_executable(apitrace_bundle_finalize src/tools/bundle-finalize/src/main.cpp)
+    set_target_properties(apitrace_bundle_finalize PROPERTIES OUTPUT_NAME bundle-finalize)
+    target_link_libraries(apitrace_bundle_finalize PRIVATE apitrace_core apitrace_nlohmann_json)
+    if(APPLE AND APITRACE_BUILD_D3D_NATIVE_RETRACE)
+        target_link_libraries(apitrace_bundle_finalize PRIVATE apitrace_platform_macos)
+    endif()
+    target_include_directories(apitrace_bundle_finalize PRIVATE ${APITRACE_PUBLIC_INCLUDE_DIRS} ${APITRACE_PRIVATE_INCLUDE_DIRS})
+    target_compile_features(apitrace_bundle_finalize PRIVATE cxx_std_17)
+endif()
+
 if(NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
     add_executable(apitrace_test_trace_writer_assets test/src/test_trace_writer_assets.cpp)
     target_link_libraries(apitrace_test_trace_writer_assets PRIVATE apitrace_core)
@@ -308,7 +321,7 @@ if(NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
     endif()
     target_compile_features(apitrace_test_d3d12_native_replay_smoke PRIVATE cxx_std_17)
 
-    if(APPLE AND APITRACE_DXC_INCLUDE_DIR)
+    if(APPLE AND APITRACE_BUILD_D3D12_NATIVE_ASSET_DUMP AND APITRACE_DXC_INCLUDE_DIR)
         add_executable(apitrace_d3d12_native_asset_dump test/src/d3d12_native_asset_dump.cpp)
         target_include_directories(apitrace_d3d12_native_asset_dump PRIVATE "${APITRACE_DXC_INCLUDE_DIR}")
         target_compile_features(apitrace_d3d12_native_asset_dump PRIVATE cxx_std_17)
@@ -384,6 +397,10 @@ install(TARGETS apitrace_core
 
 if(APITRACE_BUILD_TOOLS AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
     install(TARGETS apitrace_retrace RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
+if(APITRACE_BUILD_TOOLS AND APITRACE_BUILD_BUNDLE_FINALIZE AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
+    install(TARGETS apitrace_bundle_finalize RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 if(WIN32 AND APITRACE_BUILD_WINDOWS_DLLS AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)

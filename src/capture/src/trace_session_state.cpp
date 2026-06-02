@@ -123,6 +123,16 @@ void TraceSessionState::append_call_event(const trace::EventRecord &event)
   bundle_sink_.writer().append_call_event(event);
 }
 
+void TraceSessionState::append_call_event(trace::EventRecord &&event)
+{
+  bundle_sink_.writer().append_call_event(std::move(event));
+}
+
+void TraceSessionState::append_analysis_line(std::string_view stream_name, std::string_view json_line)
+{
+  bundle_sink_.writer().append_analysis_line(stream_name, json_line);
+}
+
 trace::AssetRecord TraceSessionState::register_asset(const trace::AssetRecord &asset)
 {
   return bundle_sink_.writer().register_asset(asset);

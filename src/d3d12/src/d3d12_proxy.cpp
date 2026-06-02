@@ -1774,7 +1774,6 @@ apitrace::trace::AssetRecord register_asset_bytes_locked(
   asset.blob_id = ++capture_state().next_blob_id;
   asset.kind = kind;
   asset.debug_name = std::move(debug_name);
-  asset.fast_fingerprint = apitrace::trace::fast_fingerprint_bytes(data, size);
   asset.payload_bytes.resize(size);
   if (size != 0 && data) {
     std::memcpy(asset.payload_bytes.data(), data, size);

@@ -39,6 +39,7 @@ public:
       TraceBundleOpenMode mode = TraceBundleOpenMode::Primary);
   void write_metadata(const TraceMetadata &metadata);
   void append_call_event(const EventRecord &event);
+  void append_call_event(EventRecord &&event);
   void append_metal_event(const MetalEventRecord &event);
   AssetRecord register_asset(const AssetRecord &asset);
   AssetRecord register_asset(AssetRecord &&asset);

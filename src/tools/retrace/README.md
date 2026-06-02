@@ -8,6 +8,7 @@
 
 - 最小命令行参数解析
 - 构造 `ReplayOptions`
+- 可选调用同目录或 PATH 中的 `bundle-finalize`
 - 调用 `ReplaySession`
 - 返回进程退出码和基本错误输出
 
@@ -24,7 +25,7 @@
 
 ## 当前阶段说明
 
-- 当前目标是保持 CLI 足够窄：一个 bundle 输入，执行 replay
+- 当前目标是保持 CLI 足够窄：一个 bundle 输入，按需先离线最终化，再执行 replay
 - 后续如果参数变多，也应先确保 CLI 仍只是薄包装，不要把逻辑灌进工具入口
 
 ## 相关文档
