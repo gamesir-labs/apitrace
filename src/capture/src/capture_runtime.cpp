@@ -4,6 +4,7 @@
 #include "capture_runtime_state.hpp"
 
 #include <chrono>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
@@ -11,6 +12,13 @@
 #include <sstream>
 #include <string>
 #include <utility>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace apitrace::runtime {
 
@@ -63,6 +71,82 @@ void shutdown_process_capture_impl()
   }
   session.reset();
 }
+
+void seal_process_capture_for_crash() noexcept
+{
+  static std::atomic<bool> sealing{false};
+  if (sealing.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+
+  std::unique_lock<std::mutex> lock(process_capture_mutex(), std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return;
+  }
+
+  auto &session = process_capture_session();
+  if (session && session->active()) {
+    session->seal_checkpoint();
+  }
+}
+
+#ifdef _WIN32
+LONG WINAPI apitrace_unhandled_exception_filter(EXCEPTION_POINTERS *)
+{
+  seal_process_capture_for_crash();
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+LONG WINAPI apitrace_vectored_exception_handler(EXCEPTION_POINTERS *exception_info)
+{
+  if (!exception_info || !exception_info->ExceptionRecord) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+
+  switch (exception_info->ExceptionRecord->ExceptionCode) {
+  case EXCEPTION_ACCESS_VIOLATION:
+  case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+  case EXCEPTION_DATATYPE_MISALIGNMENT:
+  case EXCEPTION_FLT_DENORMAL_OPERAND:
+  case EXCEPTION_FLT_DIVIDE_BY_ZERO:
+  case EXCEPTION_FLT_INEXACT_RESULT:
+  case EXCEPTION_FLT_INVALID_OPERATION:
+  case EXCEPTION_FLT_OVERFLOW:
+  case EXCEPTION_FLT_STACK_CHECK:
+  case EXCEPTION_FLT_UNDERFLOW:
+  case EXCEPTION_ILLEGAL_INSTRUCTION:
+  case EXCEPTION_IN_PAGE_ERROR:
+  case EXCEPTION_INT_DIVIDE_BY_ZERO:
+  case EXCEPTION_INT_OVERFLOW:
+  case EXCEPTION_INVALID_DISPOSITION:
+  case EXCEPTION_NONCONTINUABLE_EXCEPTION:
+  case EXCEPTION_PRIV_INSTRUCTION:
+  case EXCEPTION_STACK_OVERFLOW:
+    seal_process_capture_for_crash();
+    break;
+  default:
+    break;
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void register_process_capture_crash_handlers()
+{
+  static bool registered = false;
+  if (registered) {
+    return;
+  }
+
+  if (const char *value = std::getenv("APITRACE_CRASH_SEAL_FIRST_CHANCE");
+      value && *value && *value != '0') {
+    AddVectoredExceptionHandler(1, apitrace_vectored_exception_handler);
+  }
+  SetUnhandledExceptionFilter(apitrace_unhandled_exception_filter);
+  registered = true;
+}
+#else
+void register_process_capture_crash_handlers() {}
+#endif
 
 void register_process_capture_shutdown()
 {
@@ -126,6 +210,7 @@ TraceSession *ensure_process_trace_session(trace::ApiKind api)
     session = std::make_unique<TraceSession>(std::move(options));
     session->begin();
     register_process_capture_shutdown();
+    register_process_capture_crash_handlers();
   }
   return session.get();
 }
@@ -134,6 +219,15 @@ TraceSession *current_process_trace_session() noexcept
 {
   std::lock_guard<std::mutex> lock(process_capture_mutex());
   return process_capture_session().get();
+}
+
+void flush_process_trace_session() noexcept
+{
+  std::lock_guard<std::mutex> lock(process_capture_mutex());
+  auto &session = process_capture_session();
+  if (session && session->active()) {
+    session->flush();
+  }
 }
 
 void seal_process_trace_session_checkpoint() noexcept

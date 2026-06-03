@@ -35,6 +35,14 @@ void BundleCaptureSink::finalize_bundle()
   writer_.close();
 }
 
+void TraceSessionState::flush()
+{
+  if (!active_) {
+    return;
+  }
+  bundle_sink_.writer().flush();
+}
+
 void TraceSessionState::seal_checkpoint()
 {
   if (!active_) {

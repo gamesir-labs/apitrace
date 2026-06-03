@@ -1,12 +1,13 @@
 int main(int argc, char **argv)
 {
-  if (argc != 2 && argc != 3) {
-    std::cerr << "usage: test_d3d12_replay_semantics <bundle> [bundle-check]\n";
+  if (argc != 3 && argc != 4) {
+    std::cerr << "usage: test_d3d12_replay_semantics <bundle> <bundle-finalize> [bundle-check]\n";
     return 2;
   }
 
   const std::filesystem::path bundle = argv[1];
-  const std::filesystem::path bundle_check = argc == 3 ? std::filesystem::path(argv[2]) : std::filesystem::path();
+  g_bundle_finalize = std::filesystem::path(argv[2]);
+  const std::filesystem::path bundle_check = argc == 4 ? std::filesystem::path(argv[3]) : std::filesystem::path();
   std::filesystem::remove_all(bundle);
 
   apitrace::trace::TraceBundleWriter writer;
@@ -66,7 +67,7 @@ int main(int argc, char **argv)
       "\"mip_lod_bias\":0.5,\"max_anisotropy\":4,\"comparison_func\":1,"
       "\"border_color\":[0.1,0.2,0.3,0.4],\"min_lod\":0,\"max_lod\":16}"));
 
-  append(writer, object_create(next_sequence(), 3, ObjectKind::Resource, 1, "ID3D12Heap"));
+  append(writer, object_create(next_sequence(), 3, ObjectKind::Heap, 1, "ID3D12Heap"));
   append(writer, call(
       next_sequence(),
       "ID3D12Device::CreateHeap",
@@ -652,6 +653,26 @@ int main(int argc, char **argv)
       "{\"query_heap_object_id\":18,\"type\":0,\"start_index\":1,"
       "\"query_count\":1,\"dst_buffer_object_id\":5,\"aligned_dst_buffer_offset\":256}"));
 
+  apitrace::trace::AssetRecord query_result_asset;
+  if (!write_asset(
+          writer,
+          apitrace::trace::AssetKind::Buffer,
+          "query-result",
+          std::string("\x2a\x00\x00\x00\x00\x00\x00\x00", 8),
+          query_result_asset)) {
+    std::cerr << "failed to write query resolve result asset\n";
+    return 1;
+  }
+  append(writer, call(
+      next_sequence(),
+      "ID3D12GraphicsCommandList::ResolveQueryDataResult",
+      {15, 18, 5},
+      "{\"query_heap_object_id\":18,\"type\":0,\"start_index\":1,"
+      "\"query_count\":1,\"dst_buffer_object_id\":5,"
+      "\"aligned_dst_buffer_offset\":256,\"resolved_size\":8,"
+      "\"buffer_path\":\"" + query_result_asset.relative_path.generic_string() + "\"}",
+      {query_result_asset.blob_id}));
+
   append(writer, call(
       next_sequence(),
       "ID3D12GraphicsCommandList::SetPredication",
@@ -811,8 +832,8 @@ int main(int argc, char **argv)
   writer.close();
 
   apitrace::trace::TraceBundleReader reader;
-  if (!reader.open(bundle)) {
-    std::cerr << "reader failed to reopen bundle: " << reader.last_error() << "\n";
+  if (!open_finalized_bundle(reader, bundle)) {
+    std::cerr << "reader failed to reopen bundle: " << g_open_bundle_error << "\n";
     return 1;
   }
 
@@ -946,6 +967,20 @@ int main(int argc, char **argv)
     std::cerr << "predication semantic state was not preserved\n";
     return 1;
   }
+  const auto *resource5 = apitrace::d3d12::D3D12ReplayBackendTestHook::resource_state(backend, 5);
+  if (!resource5 ||
+      resource5->data_updates.size() != 1 ||
+      resource5->data_updates[0].written_begin != 256 ||
+      resource5->data_updates[0].written_end != 264 ||
+      resource5->data_updates[0].blob_refs.size() != 1 ||
+      resource5->data_updates[0].blob_refs[0] != query_result_asset.blob_id ||
+      resource5->data_updates[0].relative_path.empty() ||
+      !std::filesystem::is_regular_file(bundle / resource5->data_updates[0].relative_path) ||
+      resource5->data_updates[0].bytes.size() != 8 ||
+      resource5->data_updates[0].bytes[0] != 0x2a) {
+    std::cerr << "ResolveQueryDataResult resource data update was not preserved\n";
+    return 1;
+  }
   if (list->vertex_buffers.size() != 1 ||
       list->vertex_buffers[0].slot != 0 ||
       list->vertex_buffers[0].address.resource_object_id != 5 ||
@@ -1055,12 +1090,12 @@ int main(int argc, char **argv)
   if (backend.present_frames_.size() != 1 ||
       backend.present_semantics_.size() != 1 ||
       backend.frame_semantics_.size() != 1 ||
-      backend.present_frames_.begin()->second.relative_path != present_frame_asset.relative_path) {
+      backend.present_frames_.begin()->second.relative_path.empty() ||
+      !std::filesystem::is_regular_file(bundle / backend.present_frames_.begin()->second.relative_path)) {
     std::cerr << "diagnostic PresentFrame metadata was not indexed without becoming replay input\n";
     return 1;
   }
   if (backend.replay_commands().empty() ||
-      backend.present_frames_.begin()->second.relative_path.empty() ||
       present_frame_asset.debug_name != "poisoned-diagnostic-present-frame") {
     std::cerr << "poisoned diagnostic PresentFrame should remain metadata-only replay evidence\n";
     return 1;
@@ -1207,7 +1242,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader draw_without_bound_pipeline_reader;
-  if (!draw_without_bound_pipeline_reader.open(draw_without_bound_pipeline_bundle)) {
+  if (!open_finalized_bundle(draw_without_bound_pipeline_reader, draw_without_bound_pipeline_bundle)) {
     std::cerr << "reader failed to reopen draw-without-bound-pipeline bundle: "
               << draw_without_bound_pipeline_reader.last_error() << "\n";
     return 1;
@@ -1238,7 +1273,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader draw_without_bound_root_signature_reader;
-  if (!draw_without_bound_root_signature_reader.open(draw_without_bound_root_signature_bundle)) {
+  if (!open_finalized_bundle(draw_without_bound_root_signature_reader, draw_without_bound_root_signature_bundle)) {
     std::cerr << "reader failed to reopen draw-without-bound-root-signature bundle: "
               << draw_without_bound_root_signature_reader.last_error() << "\n";
     return 1;
@@ -1269,7 +1304,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader draw_with_mismatched_root_parameter_type_reader;
-  if (!draw_with_mismatched_root_parameter_type_reader.open(draw_with_mismatched_root_parameter_type_bundle)) {
+  if (!open_finalized_bundle(draw_with_mismatched_root_parameter_type_reader, draw_with_mismatched_root_parameter_type_bundle)) {
     std::cerr << "reader failed to reopen draw-with-mismatched-root-parameter-type bundle: "
               << draw_with_mismatched_root_parameter_type_reader.last_error() << "\n";
     return 1;
@@ -1297,7 +1332,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader dispatch_without_bound_pipeline_reader;
-  if (!dispatch_without_bound_pipeline_reader.open(dispatch_without_bound_pipeline_bundle)) {
+  if (!open_finalized_bundle(dispatch_without_bound_pipeline_reader, dispatch_without_bound_pipeline_bundle)) {
     std::cerr << "reader failed to reopen dispatch-without-bound-pipeline bundle: "
               << dispatch_without_bound_pipeline_reader.last_error() << "\n";
     return 1;
@@ -1328,7 +1363,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader execute_indirect_without_bound_pipeline_reader;
-  if (!execute_indirect_without_bound_pipeline_reader.open(execute_indirect_without_bound_pipeline_bundle)) {
+  if (!open_finalized_bundle(execute_indirect_without_bound_pipeline_reader, execute_indirect_without_bound_pipeline_bundle)) {
     std::cerr << "reader failed to reopen ExecuteIndirect-without-bound-pipeline bundle: "
               << execute_indirect_without_bound_pipeline_reader.last_error() << "\n";
     return 1;
@@ -1359,7 +1394,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader execute_indirect_argument_buffer_out_of_bounds_reader;
-  if (!execute_indirect_argument_buffer_out_of_bounds_reader.open(execute_indirect_argument_buffer_out_of_bounds_bundle)) {
+  if (!open_finalized_bundle(execute_indirect_argument_buffer_out_of_bounds_reader, execute_indirect_argument_buffer_out_of_bounds_bundle)) {
     std::cerr << "reader failed to reopen ExecuteIndirect argument-buffer-out-of-bounds bundle: "
               << execute_indirect_argument_buffer_out_of_bounds_reader.last_error() << "\n";
     return 1;
@@ -1428,7 +1463,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader clear_rtv_with_srv_descriptor_reader;
-  if (!clear_rtv_with_srv_descriptor_reader.open(clear_rtv_with_srv_descriptor_bundle)) {
+  if (!open_finalized_bundle(clear_rtv_with_srv_descriptor_reader, clear_rtv_with_srv_descriptor_bundle)) {
     std::cerr << "reader failed to reopen clear-RTV-with-SRV-descriptor bundle: "
               << clear_rtv_with_srv_descriptor_reader.last_error() << "\n";
     return 1;
@@ -1498,7 +1533,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader clear_rtv_rect_out_of_bounds_reader;
-  if (!clear_rtv_rect_out_of_bounds_reader.open(clear_rtv_rect_out_of_bounds_bundle)) {
+  if (!open_finalized_bundle(clear_rtv_rect_out_of_bounds_reader, clear_rtv_rect_out_of_bounds_bundle)) {
     std::cerr << "reader failed to reopen clear-RTV-rect-out-of-bounds bundle: "
               << clear_rtv_rect_out_of_bounds_reader.last_error() << "\n";
     return 1;
@@ -1529,7 +1564,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader query_range_out_of_bounds_reader;
-  if (!query_range_out_of_bounds_reader.open(query_range_out_of_bounds_bundle)) {
+  if (!open_finalized_bundle(query_range_out_of_bounds_reader, query_range_out_of_bounds_bundle)) {
     std::cerr << "reader failed to reopen query range-out-of-bounds bundle: "
               << query_range_out_of_bounds_reader.last_error() << "\n";
     return 1;
@@ -1560,7 +1595,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader clear_state_unknown_pipeline_reader;
-  if (!clear_state_unknown_pipeline_reader.open(clear_state_unknown_pipeline_bundle)) {
+  if (!open_finalized_bundle(clear_state_unknown_pipeline_reader, clear_state_unknown_pipeline_bundle)) {
     std::cerr << "reader failed to reopen ClearState unknown-pipeline bundle: "
               << clear_state_unknown_pipeline_reader.last_error() << "\n";
     return 1;
@@ -1591,7 +1626,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader predication_range_out_of_bounds_reader;
-  if (!predication_range_out_of_bounds_reader.open(predication_range_out_of_bounds_bundle)) {
+  if (!open_finalized_bundle(predication_range_out_of_bounds_reader, predication_range_out_of_bounds_bundle)) {
     std::cerr << "reader failed to reopen predication range-out-of-bounds bundle: "
               << predication_range_out_of_bounds_reader.last_error() << "\n";
     return 1;
@@ -1622,7 +1657,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader fence_signal_reader;
-  if (!fence_signal_reader.open(fence_signal_bundle)) {
+  if (!open_finalized_bundle(fence_signal_reader, fence_signal_bundle)) {
     std::cerr << "reader failed to reopen fence signal bundle: "
               << fence_signal_reader.last_error() << "\n";
     return 1;
@@ -1657,6 +1692,17 @@ int main(int argc, char **argv)
     return 1;
   }
 
+  const auto resolve_query_wrong_blob_ref_bundle =
+      bundle.parent_path() / (bundle.filename().generic_string() + "-resolve-query-result-wrong-blob-ref");
+  if (!write_resolve_query_data_result_wrong_blob_ref_bundle(resolve_query_wrong_blob_ref_bundle)) {
+    std::cerr << "failed to write ResolveQueryDataResult wrong-blob-ref bundle\n";
+    return 1;
+  }
+  if (!expect_d3d12_replay_failure(resolve_query_wrong_blob_ref_bundle, "asset path is not covered by blob_refs")) {
+    std::cerr << "D3D12 replay accepted a ResolveQueryDataResult buffer path missing from blob_refs\n";
+    return 1;
+  }
+
   const auto create_command_list1_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-create-command-list1");
   if (!write_create_command_list1_bundle(create_command_list1_bundle)) {
@@ -1664,7 +1710,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader create_list1_reader;
-  if (!create_list1_reader.open(create_command_list1_bundle)) {
+  if (!open_finalized_bundle(create_list1_reader, create_command_list1_bundle)) {
     std::cerr << "reader failed to reopen CreateCommandList1 bundle: "
               << create_list1_reader.last_error() << "\n";
     return 1;
@@ -1720,7 +1766,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader table_rebind_clears_reader;
-  if (!table_rebind_clears_reader.open(table_rebind_clears_bundle)) {
+  if (!open_finalized_bundle(table_rebind_clears_reader, table_rebind_clears_bundle)) {
     std::cerr << "reader failed to reopen descriptor-table rebind-clears bundle: "
               << table_rebind_clears_reader.last_error() << "\n";
     return 1;
@@ -1753,7 +1799,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader draw_with_late_descriptor_table_reader;
-  if (!draw_with_late_descriptor_table_reader.open(draw_with_late_descriptor_table_bundle)) {
+  if (!open_finalized_bundle(draw_with_late_descriptor_table_reader, draw_with_late_descriptor_table_bundle)) {
     std::cerr << "reader failed to reopen draw with late descriptor-table bundle: "
               << draw_with_late_descriptor_table_reader.last_error() << "\n";
     return 1;
@@ -1784,7 +1830,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader incomplete_descriptor_table_range_reader;
-  if (!incomplete_descriptor_table_range_reader.open(incomplete_descriptor_table_range_bundle)) {
+  if (!open_finalized_bundle(incomplete_descriptor_table_range_reader, incomplete_descriptor_table_range_bundle)) {
     std::cerr << "reader failed to reopen incomplete descriptor-table range bundle: "
               << incomplete_descriptor_table_range_reader.last_error() << "\n";
     return 1;
@@ -1815,7 +1861,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader draw_with_late_render_target_reader;
-  if (!draw_with_late_render_target_reader.open(draw_with_late_render_target_bundle)) {
+  if (!open_finalized_bundle(draw_with_late_render_target_reader, draw_with_late_render_target_bundle)) {
     std::cerr << "reader failed to reopen draw with late render-target bundle: "
               << draw_with_late_render_target_reader.last_error() << "\n";
     return 1;
@@ -1884,7 +1930,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader render_pass_with_late_render_target_reader;
-  if (!render_pass_with_late_render_target_reader.open(render_pass_with_late_render_target_bundle)) {
+  if (!open_finalized_bundle(render_pass_with_late_render_target_reader, render_pass_with_late_render_target_bundle)) {
     std::cerr << "reader failed to reopen render pass with late render-target bundle: "
               << render_pass_with_late_render_target_reader.last_error() << "\n";
     return 1;
@@ -1915,7 +1961,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader write_buffer_immediate_reader;
-  if (!write_buffer_immediate_reader.open(write_buffer_immediate_bundle)) {
+  if (!open_finalized_bundle(write_buffer_immediate_reader, write_buffer_immediate_bundle)) {
     std::cerr << "reader failed to reopen WriteBufferImmediate bundle: "
               << write_buffer_immediate_reader.last_error() << "\n";
     return 1;
@@ -1960,7 +2006,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader write_buffer_immediate_out_of_bounds_reader;
-  if (!write_buffer_immediate_out_of_bounds_reader.open(write_buffer_immediate_out_of_bounds_bundle)) {
+  if (!open_finalized_bundle(write_buffer_immediate_out_of_bounds_reader, write_buffer_immediate_out_of_bounds_bundle)) {
     std::cerr << "reader failed to reopen WriteBufferImmediate out-of-bounds bundle: "
               << write_buffer_immediate_out_of_bounds_reader.last_error() << "\n";
     return 1;
@@ -1991,7 +2037,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader copy_buffer_range_out_of_bounds_reader;
-  if (!copy_buffer_range_out_of_bounds_reader.open(copy_buffer_range_out_of_bounds_bundle)) {
+  if (!open_finalized_bundle(copy_buffer_range_out_of_bounds_reader, copy_buffer_range_out_of_bounds_bundle)) {
     std::cerr << "reader failed to reopen copy-buffer range out-of-bounds bundle: "
               << copy_buffer_range_out_of_bounds_reader.last_error() << "\n";
     return 1;
@@ -2022,7 +2068,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader execute_bundle_copy_buffer_reader;
-  if (!execute_bundle_copy_buffer_reader.open(execute_bundle_copy_buffer_bundle)) {
+  if (!open_finalized_bundle(execute_bundle_copy_buffer_reader, execute_bundle_copy_buffer_bundle)) {
     std::cerr << "reader failed to reopen ExecuteBundle copy-buffer bundle: "
               << execute_bundle_copy_buffer_reader.last_error() << "\n";
     return 1;
@@ -2056,7 +2102,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader copy_texture_source_box_out_of_bounds_reader;
-  if (!copy_texture_source_box_out_of_bounds_reader.open(copy_texture_source_box_out_of_bounds_bundle)) {
+  if (!open_finalized_bundle(copy_texture_source_box_out_of_bounds_reader, copy_texture_source_box_out_of_bounds_bundle)) {
     std::cerr << "reader failed to reopen copy-texture source-box out-of-bounds bundle: "
               << copy_texture_source_box_out_of_bounds_reader.last_error() << "\n";
     return 1;
@@ -2087,7 +2133,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader copy_texture_full_copy_out_of_bounds_reader;
-  if (!copy_texture_full_copy_out_of_bounds_reader.open(copy_texture_full_copy_out_of_bounds_bundle)) {
+  if (!open_finalized_bundle(copy_texture_full_copy_out_of_bounds_reader, copy_texture_full_copy_out_of_bounds_bundle)) {
     std::cerr << "reader failed to reopen copy-texture full-copy out-of-bounds bundle: "
               << copy_texture_full_copy_out_of_bounds_reader.last_error() << "\n";
     return 1;
@@ -2156,7 +2202,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader omset_depth_only_reader;
-  if (!omset_depth_only_reader.open(omset_depth_only_bundle)) {
+  if (!open_finalized_bundle(omset_depth_only_reader, omset_depth_only_bundle)) {
     std::cerr << "reader failed to reopen OMSetRenderTargets depth-only bundle: "
               << omset_depth_only_reader.last_error() << "\n";
     return 1;
@@ -2251,7 +2297,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader discard_resource_rect_out_of_bounds_reader;
-  if (!discard_resource_rect_out_of_bounds_reader.open(discard_resource_rect_out_of_bounds_bundle)) {
+  if (!open_finalized_bundle(discard_resource_rect_out_of_bounds_reader, discard_resource_rect_out_of_bounds_bundle)) {
     std::cerr << "reader failed to reopen DiscardResource rect out-of-bounds bundle: "
               << discard_resource_rect_out_of_bounds_reader.last_error() << "\n";
     return 1;
@@ -2282,7 +2328,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader resolve_subresource_out_of_bounds_reader;
-  if (!resolve_subresource_out_of_bounds_reader.open(resolve_subresource_out_of_bounds_bundle)) {
+  if (!open_finalized_bundle(resolve_subresource_out_of_bounds_reader, resolve_subresource_out_of_bounds_bundle)) {
     std::cerr << "reader failed to reopen ResolveSubresource out-of-bounds bundle: "
               << resolve_subresource_out_of_bounds_reader.last_error() << "\n";
     return 1;
@@ -2313,7 +2359,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader resolve_region_rect_out_of_bounds_reader;
-  if (!resolve_region_rect_out_of_bounds_reader.open(resolve_region_rect_out_of_bounds_bundle)) {
+  if (!open_finalized_bundle(resolve_region_rect_out_of_bounds_reader, resolve_region_rect_out_of_bounds_bundle)) {
     std::cerr << "reader failed to reopen ResolveSubresourceRegion rect out-of-bounds bundle: "
               << resolve_region_rect_out_of_bounds_reader.last_error() << "\n";
     return 1;
@@ -2344,7 +2390,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader vertex_buffer_range_out_of_bounds_reader;
-  if (!vertex_buffer_range_out_of_bounds_reader.open(vertex_buffer_range_out_of_bounds_bundle)) {
+  if (!open_finalized_bundle(vertex_buffer_range_out_of_bounds_reader, vertex_buffer_range_out_of_bounds_bundle)) {
     std::cerr << "reader failed to reopen vertex buffer range out-of-bounds bundle: "
               << vertex_buffer_range_out_of_bounds_reader.last_error() << "\n";
     return 1;
@@ -2375,7 +2421,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader index_buffer_range_out_of_bounds_reader;
-  if (!index_buffer_range_out_of_bounds_reader.open(index_buffer_range_out_of_bounds_bundle)) {
+  if (!open_finalized_bundle(index_buffer_range_out_of_bounds_reader, index_buffer_range_out_of_bounds_bundle)) {
     std::cerr << "reader failed to reopen index buffer range out-of-bounds bundle: "
               << index_buffer_range_out_of_bounds_reader.last_error() << "\n";
     return 1;
@@ -2406,7 +2452,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader copy_resource_reader;
-  if (!copy_resource_reader.open(copy_resource_bundle)) {
+  if (!open_finalized_bundle(copy_resource_reader, copy_resource_bundle)) {
     std::cerr << "reader failed to reopen CopyResource bundle: "
               << copy_resource_reader.last_error() << "\n";
     return 1;
@@ -2438,7 +2484,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader copy_resource_mismatched_desc_reader;
-  if (!copy_resource_mismatched_desc_reader.open(copy_resource_mismatched_desc_bundle)) {
+  if (!open_finalized_bundle(copy_resource_mismatched_desc_reader, copy_resource_mismatched_desc_bundle)) {
     std::cerr << "reader failed to reopen CopyResource mismatched-desc bundle: "
               << copy_resource_mismatched_desc_reader.last_error() << "\n";
     return 1;
@@ -2469,7 +2515,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader resolve_region_reader;
-  if (!resolve_region_reader.open(resolve_region_requires_list1_bundle)) {
+  if (!open_finalized_bundle(resolve_region_reader, resolve_region_requires_list1_bundle)) {
     std::cerr << "reader failed to reopen ResolveSubresourceRegion requires-list1 bundle: "
               << resolve_region_reader.last_error() << "\n";
     return 1;
@@ -2511,7 +2557,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader dispatch_rays_reader;
-  if (!dispatch_rays_reader.open(dispatch_rays_bundle)) {
+  if (!open_finalized_bundle(dispatch_rays_reader, dispatch_rays_bundle)) {
     std::cerr << "reader failed to reopen DispatchRays bundle: " << dispatch_rays_reader.last_error() << "\n";
     return 1;
   }
@@ -2558,7 +2604,7 @@ int main(int argc, char **argv)
     return 1;
   }
   apitrace::trace::TraceBundleReader temporal_reader;
-  if (!temporal_reader.open(temporal_bundle)) {
+  if (!open_finalized_bundle(temporal_reader, temporal_bundle)) {
     std::cerr << "reader failed to reopen TemporalUpscale bundle: " << temporal_reader.last_error() << "\n";
     return 1;
   }
@@ -2699,7 +2745,7 @@ int main(int argc, char **argv)
     mesh_writer.close();
   }
   apitrace::trace::TraceBundleReader mesh_reader;
-  if (!mesh_reader.open(mesh_bundle)) {
+  if (!open_finalized_bundle(mesh_reader, mesh_bundle)) {
     std::cerr << "reader failed to reopen mesh stream pipeline bundle: " << mesh_reader.last_error() << "\n";
     return 1;
   }
@@ -2764,13 +2810,15 @@ int main(int argc, char **argv)
     mismatch_writer.close();
   }
   apitrace::trace::TraceBundleReader mismatch_reader;
-  if (!mismatch_reader.open(mismatch_bundle)) {
+  if (!open_finalized_bundle(mismatch_reader, mismatch_bundle)) {
     std::cerr << "reader failed to reopen gpuva mismatch bundle: " << mismatch_reader.last_error() << "\n";
     return 1;
   }
   apitrace::d3d12::D3D12ReplayBackend mismatch_backend;
   if (replay_all_events(mismatch_reader, mismatch_backend) ||
-      mismatch_backend.last_error().find("resolved_resource_object_id mismatch") == std::string::npos) {
+      !error_contains_any(
+          mismatch_backend.last_error(),
+          {"resolved_resource_object_id mismatch", "payload references unknown object id 999"})) {
     std::cerr << "GPUVA mismatch bundle was not rejected: " << mismatch_backend.last_error() << "\n";
     return 1;
   }
@@ -2820,13 +2868,15 @@ int main(int argc, char **argv)
     root_mismatch_writer.close();
   }
   apitrace::trace::TraceBundleReader root_mismatch_reader;
-  if (!root_mismatch_reader.open(root_mismatch_bundle)) {
+  if (!open_finalized_bundle(root_mismatch_reader, root_mismatch_bundle)) {
     std::cerr << "reader failed to reopen root gpuva mismatch bundle: " << root_mismatch_reader.last_error() << "\n";
     return 1;
   }
   apitrace::d3d12::D3D12ReplayBackend root_mismatch_backend;
   if (replay_all_events(root_mismatch_reader, root_mismatch_backend) ||
-      root_mismatch_backend.last_error().find("root buffer_location resolved_resource_object_id mismatch") == std::string::npos) {
+      !error_contains_any(
+          root_mismatch_backend.last_error(),
+          {"root buffer_location resolved_resource_object_id mismatch", "payload references unknown object id 999"})) {
     std::cerr << "root GPUVA mismatch bundle was not rejected: " << root_mismatch_backend.last_error() << "\n";
     return 1;
   }
@@ -2877,13 +2927,15 @@ int main(int argc, char **argv)
     vertex_mismatch_writer.close();
   }
   apitrace::trace::TraceBundleReader vertex_mismatch_reader;
-  if (!vertex_mismatch_reader.open(vertex_mismatch_bundle)) {
+  if (!open_finalized_bundle(vertex_mismatch_reader, vertex_mismatch_bundle)) {
     std::cerr << "reader failed to reopen vertex gpuva mismatch bundle: " << vertex_mismatch_reader.last_error() << "\n";
     return 1;
   }
   apitrace::d3d12::D3D12ReplayBackend vertex_mismatch_backend;
   if (replay_all_events(vertex_mismatch_reader, vertex_mismatch_backend) ||
-      vertex_mismatch_backend.last_error().find("vertex buffer_location resolved_resource_object_id mismatch") == std::string::npos) {
+      !error_contains_any(
+          vertex_mismatch_backend.last_error(),
+          {"vertex buffer_location resolved_resource_object_id mismatch", "payload references unknown object id 999"})) {
     std::cerr << "vertex GPUVA mismatch bundle was not rejected: " << vertex_mismatch_backend.last_error() << "\n";
     return 1;
   }
@@ -2981,7 +3033,7 @@ int main(int argc, char **argv)
     root_unmapped_writer.close();
   }
   apitrace::trace::TraceBundleReader root_unmapped_reader;
-  if (!root_unmapped_reader.open(root_unmapped_bundle)) {
+  if (!open_finalized_bundle(root_unmapped_reader, root_unmapped_bundle)) {
     std::cerr << "reader failed to reopen root gpuva unmapped bundle: " << root_unmapped_reader.last_error() << "\n";
     return 1;
   }

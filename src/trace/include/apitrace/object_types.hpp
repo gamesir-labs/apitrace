@@ -18,6 +18,7 @@ enum class ObjectKind {
   CommandSignature,
   Fence,
   SwapChain,
+  Heap,
   Resource,
   View,
   Shader,

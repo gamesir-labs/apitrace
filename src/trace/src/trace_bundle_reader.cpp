@@ -264,6 +264,9 @@ std::optional<ObjectKind> object_kind_from_name(std::string_view name)
   if (name == "SwapChain") {
     return ObjectKind::SwapChain;
   }
+  if (name == "Heap") {
+    return ObjectKind::Heap;
+  }
   if (name == "Resource") {
     return ObjectKind::Resource;
   }

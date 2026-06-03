@@ -10,7 +10,8 @@ asset shards. This tool performs the expensive publish-time work afterwards:
 - hash asset files outside the game process
 - deduplicate identical assets into content-addressed paths
 - rewrite JSON/JSONL asset path references
-- remove duplicate asset files by default
+- remove duplicate asset files by default, while preserving any alias path that
+  is still referenced after rewriting
 - regenerate root `assets.json`
 - regenerate `checksums.json`
 
@@ -25,8 +26,13 @@ cmake --build build-finalize --target apitrace_bundle_finalize
 Usage:
 
 ```sh
-bundle-finalize [--dry-run] [--keep-duplicates] [--jobs N] <trace-bundle>
+bundle-finalize [--dry-run] [--keep-duplicates] [--jobs N] [--no-progress] <trace-bundle>
 ```
 
 Run `--dry-run` first on large captures to inspect the expected rewrite and
 removal counts before modifying the bundle.
+
+When stderr is an interactive TTY, `bundle-finalize` prints stage progress to
+stderr by default. The final `bundle-finalize:` summary remains on stdout for
+scripts. Use `--no-progress` to suppress interactive progress, or `--progress`
+to force it when stderr is not detected as a TTY.

@@ -3181,6 +3181,58 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     resource_it->second.mapped = false;
     resource_it->second.map_sequence = 0;
     ++semantic_calls_seen_;
+  } else if (function_name == "ID3D12GraphicsCommandList::ResolveQueryDataResult") {
+    if (!require_payload_key(event, payload, "dst_buffer_object_id", last_error_) ||
+        !require_payload_key(event, payload, "aligned_dst_buffer_offset", last_error_)) {
+      return false;
+    }
+    const auto dst_buffer_object_id = payload_u64(payload, "dst_buffer_object_id");
+    auto resource_it = resources_.find(dst_buffer_object_id);
+    if (resource_it == resources_.end()) {
+      last_error_ = record_prefix(event) + ": ResolveQueryDataResult references an unknown destination buffer";
+      return false;
+    }
+    const auto buffer_path = payload_string(payload, "buffer_path");
+    if (buffer_path.empty()) {
+      last_error_ = record_prefix(event) + ": ResolveQueryDataResult missing buffer asset path";
+      return false;
+    }
+    const auto resolved_size = payload_u64(payload, "resolved_size");
+    const auto dst_offset = payload_u64(payload, "aligned_dst_buffer_offset");
+    std::vector<std::uint8_t> bytes;
+    std::string asset_error;
+    bool loaded_from_asset = false;
+    if (std::filesystem::is_regular_file(bundle_root_ / buffer_path)) {
+      if (event.blob_refs.empty()) {
+        asset_error = "ResolveQueryDataResult buffer asset is missing blob_refs";
+      } else {
+        std::string blob_ref_error;
+        if (verify_event_blob_refs_cover_paths(event, {std::filesystem::path(buffer_path)}, blob_paths_, blob_ref_error)) {
+          loaded_from_asset = read_exact_asset_bytes(bundle_root_ / buffer_path, resolved_size, bytes, asset_error);
+        } else {
+          asset_error = blob_ref_error;
+        }
+      }
+    } else {
+      asset_error = "missing query resolve asset " + buffer_path;
+    }
+    if (!loaded_from_asset) {
+      const auto inline_hex = payload_string(payload, "resolved_data_hex");
+      if (inline_hex.empty() || !decode_hex_bytes(inline_hex, resolved_size, bytes, asset_error)) {
+        last_error_ = record_prefix(event) + ": " + asset_error;
+        return false;
+      }
+    }
+    ResourceDataUpdate update;
+    update.sequence = event.callsite.sequence;
+    update.subresource = 0;
+    update.written_begin = dst_offset;
+    update.written_end = dst_offset + resolved_size;
+    update.relative_path = buffer_path;
+    update.blob_refs = event.blob_refs;
+    update.bytes = std::move(bytes);
+    resource_it->second.data_updates.push_back(std::move(update));
+    ++semantic_calls_seen_;
   } else if (function_name == "ID3D12CommandQueue::ExecuteCommandLists") {
     if (!event.object_refs.empty()) {
       const auto queue_object_id = event.object_refs.front();

@@ -715,6 +715,8 @@ std::string object_kind_name(ObjectKind kind)
     return "Fence";
   case ObjectKind::SwapChain:
     return "SwapChain";
+  case ObjectKind::Heap:
+    return "Heap";
   case ObjectKind::Resource:
     return "Resource";
   case ObjectKind::View:
@@ -5446,6 +5448,23 @@ void TraceBundleWriter::append_analysis_line(std::string_view stream_name, std::
 void TraceBundleWriter::write_checksum_index(const ChecksumIndex &checksums)
 {
   impl_->checksums = checksums;
+}
+
+void TraceBundleWriter::flush()
+{
+  if (!impl_ || !impl_->open) {
+    return;
+  }
+
+  for (auto &entry : impl_->analysis_stream_files) {
+    entry.second.flush();
+  }
+  if (impl_->callstream_stream.is_open()) {
+    impl_->callstream_stream.flush();
+  }
+  if (impl_->metal_callstream_stream.is_open()) {
+    impl_->metal_callstream_stream.flush();
+  }
 }
 
 void TraceBundleWriter::checkpoint()

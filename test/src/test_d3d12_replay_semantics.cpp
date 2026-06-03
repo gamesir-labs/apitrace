@@ -22,6 +22,17 @@ using apitrace::trace::ObjectKind;
 namespace apitrace::d3d12 {
 
 struct D3D12ReplayBackendTestHook {
+  static const D3D12ReplayBackend::ResourceSemanticState *resource_state(
+      const D3D12ReplayBackend &backend,
+      apitrace::trace::ObjectId resource_object_id)
+  {
+    const auto it = backend.resources_.find(resource_object_id);
+    if (it == backend.resources_.end()) {
+      return nullptr;
+    }
+    return &it->second;
+  }
+
   static void seed_unbound_root_descriptor_table(D3D12ReplayBackend &backend)
   {
     using Backend = D3D12ReplayBackend;
@@ -193,6 +204,56 @@ bool write_asset(
   return !out.relative_path.empty();
 }
 
+std::string asset_kind_name(apitrace::trace::AssetKind kind)
+{
+  switch (kind) {
+  case apitrace::trace::AssetKind::ShaderDxbc:
+    return "ShaderDxbc";
+  case apitrace::trace::AssetKind::ShaderDxil:
+    return "ShaderDxil";
+  case apitrace::trace::AssetKind::RootSignature:
+    return "RootSignature";
+  case apitrace::trace::AssetKind::Texture:
+    return "Texture";
+  case apitrace::trace::AssetKind::Buffer:
+    return "Buffer";
+  case apitrace::trace::AssetKind::Pipeline:
+    return "Pipeline";
+  case apitrace::trace::AssetKind::ObjectIndex:
+    return "ObjectIndex";
+  case apitrace::trace::AssetKind::Analysis:
+    return "Analysis";
+  case apitrace::trace::AssetKind::Unknown:
+    break;
+  }
+  return "Unknown";
+}
+
+bool write_asset_index_file(
+    const std::filesystem::path &bundle,
+    const std::vector<apitrace::trace::AssetRecord> &assets)
+{
+  std::ofstream output(bundle / apitrace::trace::kAssetIndexFileName, std::ios::binary | std::ios::trunc);
+  if (!output.is_open()) {
+    return false;
+  }
+  output << "{\n  \"assets\": [\n";
+  for (std::size_t index = 0; index < assets.size(); ++index) {
+    const auto &asset = assets[index];
+    output << "    {\"blob_id\":" << asset.blob_id
+           << ",\"path\":\"" << asset.relative_path.generic_string()
+           << "\",\"kind\":\"" << asset_kind_name(asset.kind)
+           << "\",\"metal\":false,\"binary_payload\":true,\"byte_size\":" << asset.byte_size
+           << "}";
+    if (index + 1 != assets.size()) {
+      output << ",";
+    }
+    output << "\n";
+  }
+  output << "  ]\n}\n";
+  return true;
+}
+
 bool replace_file_text(
     const std::filesystem::path &path,
     const std::string &from,
@@ -231,14 +292,59 @@ bool replay_all_events(apitrace::trace::TraceBundleReader &reader, apitrace::d3d
   return true;
 }
 
+std::string shell_quote_path(const std::filesystem::path &path)
+{
+  std::string quoted = "'";
+  for (const char ch : path.string()) {
+    if (ch == '\'') {
+      quoted += "'\\''";
+    } else {
+      quoted += ch;
+    }
+  }
+  quoted += "'";
+  return quoted;
+}
+
+std::filesystem::path g_bundle_finalize;
+std::string g_open_bundle_error;
+
+bool finalize_bundle(const std::filesystem::path &bundle)
+{
+  if (g_bundle_finalize.empty()) {
+    g_open_bundle_error = "missing bundle-finalize path";
+    return false;
+  }
+  const auto command = shell_quote_path(g_bundle_finalize) + " --jobs 1 " + shell_quote_path(bundle);
+  const auto result = std::system(command.c_str());
+  if (result != 0) {
+    g_open_bundle_error = "bundle-finalize failed for " + bundle.string();
+    return false;
+  }
+  return true;
+}
+
+bool open_finalized_bundle(apitrace::trace::TraceBundleReader &reader, const std::filesystem::path &bundle)
+{
+  if (!finalize_bundle(bundle)) {
+    return false;
+  }
+  if (!reader.open(bundle)) {
+    g_open_bundle_error = reader.last_error();
+    return false;
+  }
+  g_open_bundle_error.clear();
+  return true;
+}
+
 bool expect_d3d12_native_readiness_failure(
     const std::filesystem::path &bundle,
     const std::string &error_substring,
     std::string &error)
 {
   apitrace::trace::TraceBundleReader reader;
-  if (!reader.open(bundle)) {
-    error = "reader failed to reopen bundle: " + reader.last_error();
+  if (!open_finalized_bundle(reader, bundle)) {
+    error = "reader failed to reopen bundle: " + g_open_bundle_error;
     return false;
   }
   apitrace::d3d12::D3D12ReplayBackend backend;
@@ -262,11 +368,11 @@ bool expect_d3d12_replay_failure(
     const std::string &expected_error)
 {
   apitrace::trace::TraceBundleReader reader;
-  if (!reader.open(bundle)) {
-    if (reader.last_error().find(expected_error) != std::string::npos) {
+  if (!open_finalized_bundle(reader, bundle)) {
+    if (g_open_bundle_error.find(expected_error) != std::string::npos) {
       return true;
     }
-    std::cerr << "reader failed with unexpected error: " << reader.last_error() << "\n";
+    std::cerr << "reader failed with unexpected error: " << g_open_bundle_error << "\n";
     return false;
   }
   apitrace::d3d12::D3D12ReplayBackend backend;
@@ -281,18 +387,14 @@ bool expect_d3d12_replay_failure(
   return true;
 }
 
-std::string shell_quote_path(const std::filesystem::path &path)
+bool error_contains_any(const std::string &error, std::initializer_list<const char *> needles)
 {
-  std::string quoted = "'";
-  for (const char ch : path.string()) {
-    if (ch == '\'') {
-      quoted += "'\\''";
-    } else {
-      quoted += ch;
+  for (const char *needle : needles) {
+    if (error.find(needle) != std::string::npos) {
+      return true;
     }
   }
-  quoted += "'";
-  return quoted;
+  return false;
 }
 
 int run_bundle_check(
@@ -300,6 +402,10 @@ int run_bundle_check(
     const std::filesystem::path &bundle,
     const std::string &options)
 {
+  if (!finalize_bundle(bundle)) {
+    std::cerr << g_open_bundle_error << "\n";
+    return 1;
+  }
   const auto command = shell_quote_path(bundle_check) + " " + options + " " + shell_quote_path(bundle);
   return std::system(command.c_str());
 }
@@ -2090,6 +2196,9 @@ bool write_root_signature_wrong_blob_ref_bundle(const std::filesystem::path &bun
       !write_asset(writer, apitrace::trace::AssetKind::Buffer, "wrong", "wrong!!", wrong_asset)) {
     return false;
   }
+  if (!write_asset_index_file(bundle, {root_signature_asset, wrong_asset})) {
+    return false;
+  }
 
   std::uint64_t sequence = 1;
   append(writer, object_create(sequence++, 1, ObjectKind::Device, 0, "ID3D12Device"));
@@ -3326,6 +3435,9 @@ bool write_unmap_wrong_blob_ref_bundle(const std::filesystem::path &bundle)
       !write_asset(writer, apitrace::trace::AssetKind::Buffer, "wrong", "bad!", wrong_asset)) {
     return false;
   }
+  if (!write_asset_index_file(bundle, {buffer_asset, wrong_asset})) {
+    return false;
+  }
 
   std::uint64_t sequence = 1;
   append(writer, object_create(sequence++, 1, ObjectKind::Device, 0, "ID3D12Device"));
@@ -3348,6 +3460,60 @@ bool write_unmap_wrong_blob_ref_bundle(const std::filesystem::path &bundle)
       {2},
       "{\"subresource\":0,\"written_begin\":0,\"written_end\":4,\"buffer_path\":\"" +
           buffer_asset.relative_path.generic_string() + "\"}",
+      {wrong_asset.blob_id}));
+
+  writer.close();
+  return true;
+}
+
+bool write_resolve_query_data_result_wrong_blob_ref_bundle(const std::filesystem::path &bundle)
+{
+  std::filesystem::remove_all(bundle);
+  apitrace::trace::TraceBundleWriter writer;
+  if (!writer.open(bundle)) {
+    return false;
+  }
+
+  apitrace::trace::TraceMetadata metadata;
+  metadata.api = apitrace::trace::ApiKind::D3D12;
+  metadata.producer = "test_d3d12_resolve_query_data_result_wrong_blob_ref";
+  writer.write_metadata(metadata);
+
+  apitrace::trace::AssetRecord query_result_asset;
+  apitrace::trace::AssetRecord wrong_asset;
+  if (!write_asset(writer, apitrace::trace::AssetKind::Buffer, "query-result", "queryres", query_result_asset) ||
+      !write_asset(writer, apitrace::trace::AssetKind::Buffer, "wrong", "wrongqry", wrong_asset)) {
+    return false;
+  }
+  if (!write_asset_index_file(bundle, {query_result_asset, wrong_asset})) {
+    return false;
+  }
+
+  std::uint64_t sequence = 1;
+  append(writer, object_create(sequence++, 1, ObjectKind::Device, 0, "ID3D12Device"));
+  append(writer, call(sequence++, "D3D12CreateDevice", {1}, "{\"minimum_feature_level\":45056}"));
+  append(writer, object_create(sequence++, 2, ObjectKind::Resource, 1, "ID3D12Resource"));
+  append(writer, call(
+      sequence++,
+      "ID3D12Device::CreateCommittedResource",
+      {1, 2},
+      "{\"heap_type\":1,\"heap_flags\":0,\"initial_state\":0,\"gpu_virtual_address\":4096,"
+      "\"resource_desc\":" + buffer_desc_json(64) + ",\"optimized_clear_value\":null}"));
+  append(writer, object_create(sequence++, 3, ObjectKind::QueryHeap, 1, "ID3D12QueryHeap"));
+  append(writer, call(
+      sequence++,
+      "ID3D12Device::CreateQueryHeap",
+      {1, 3},
+      "{\"type\":0,\"count\":1,\"node_mask\":0}"));
+  append(writer, object_create(sequence++, 4, ObjectKind::CommandList, 1, "ID3D12GraphicsCommandList"));
+  append(writer, call(
+      sequence++,
+      "ID3D12GraphicsCommandList::ResolveQueryDataResult",
+      {4, 3, 2},
+      "{\"query_heap_object_id\":3,\"type\":0,\"start_index\":0,"
+      "\"query_count\":1,\"dst_buffer_object_id\":2,"
+      "\"aligned_dst_buffer_offset\":16,\"resolved_size\":8,"
+      "\"buffer_path\":\"" + query_result_asset.relative_path.generic_string() + "\"}",
       {wrong_asset.blob_id}));
 
   writer.close();

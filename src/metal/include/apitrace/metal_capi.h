@@ -44,6 +44,7 @@ typedef enum {
 
 APITRACE_METAL_API apitrace_metal_session_t *apitrace_metal_session_open(const char *bundle_root);
 APITRACE_METAL_API void apitrace_metal_session_close(apitrace_metal_session_t *session);
+APITRACE_METAL_API void apitrace_metal_session_flush(apitrace_metal_session_t *session);
 APITRACE_METAL_API void apitrace_metal_session_seal_checkpoint(apitrace_metal_session_t *session);
 APITRACE_METAL_API void apitrace_metal_set_current_d3d_sequence(apitrace_metal_session_t *session, uint64_t d3d_seq);
 APITRACE_METAL_API uint64_t apitrace_metal_current_metal_sequence(apitrace_metal_session_t *session);

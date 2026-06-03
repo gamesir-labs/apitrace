@@ -93,6 +93,7 @@ enum class CaptureObjectKind {
   CommandSignature,
   Fence,
   SwapChain,
+  Heap,
   Resource,
   View,
   Shader,
@@ -188,6 +189,24 @@ void record_resource_unmap(
     std::uint64_t written_end,
     const void *written_data,
     std::size_t written_size);
+std::uint64_t record_resource_map(
+    const void *resource,
+    std::uint32_t subresource,
+    bool has_read_range,
+    std::uint64_t read_begin,
+    std::uint64_t read_end,
+    bool mapped,
+    std::int32_t result_code);
+void record_resolve_query_data_result(
+    const void *command_list,
+    const void *query_heap,
+    std::uint32_t type,
+    std::uint32_t start_index,
+    std::uint32_t query_count,
+    const void *dst_buffer,
+    std::uint64_t aligned_dst_buffer_offset,
+    const void *resolved_data,
+    std::size_t resolved_size);
 void record_fence_dependency(
     const char *scope,
     std::uint64_t d3d_sequence,

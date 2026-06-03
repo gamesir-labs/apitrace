@@ -4242,7 +4242,11 @@ bool verify_d3d_native_readiness(
     }
   }
   d3d_native_replay_commands = backend.replay_commands().size();
-  if (!backend.validate_only()) {
+  if (!backend.validate_replay_closure()) {
+    error = backend.last_error().empty() ? "D3D12 replay closure validation failed" : backend.last_error();
+    return false;
+  }
+  if (!backend.validate_native_replay_readiness()) {
     error = backend.last_error().empty() ? "D3D12 native readiness validation failed" : backend.last_error();
     return false;
   }

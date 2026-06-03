@@ -334,7 +334,7 @@ HRESULT STDMETHODCALLTYPE hook_device_create_heap(
   if (SUCCEEDED(hr) && heap && *heap) {
     std::lock_guard<std::mutex> lock(capture_state().mutex);
     const auto parent = lookup_object_id_locked(self);
-    register_fresh_object_locked(*heap, apitrace::trace::ObjectKind::Resource, "ID3D12Heap", parent);
+    register_fresh_object_locked(*heap, apitrace::trace::ObjectKind::Heap, "ID3D12Heap", parent);
     capture_state().heap_types[static_cast<ID3D12Heap *>(*heap)] =
         desc ? static_cast<UINT>(desc->Properties.Type) : 0;
     std::ostringstream payload;
@@ -2085,4 +2085,3 @@ void process_detach() noexcept
 {
   apitrace::runtime::shutdown_process_trace_session();
 }
-

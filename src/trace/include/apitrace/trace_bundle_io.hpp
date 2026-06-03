@@ -38,6 +38,10 @@ public:
       const std::filesystem::path &bundle_root,
       TraceBundleOpenMode mode = TraceBundleOpenMode::Primary);
   void write_metadata(const TraceMetadata &metadata);
+  // Runtime capture producers should enqueue raw evidence records only. Derived
+  // semantic assets, expensive hashing, deduplication, and crash-tail repair are
+  // finalized offline by the bundle tools so API threads do not wait on publish
+  // work.
   void append_call_event(const EventRecord &event);
   void append_call_event(EventRecord &&event);
   void append_metal_event(const MetalEventRecord &event);
@@ -50,6 +54,7 @@ public:
   void append_analysis_line(std::string_view stream_name, std::string_view json_line);
   void append_analysis_record(const AnalysisRecord &record);
   void write_checksum_index(const ChecksumIndex &checksums);
+  void flush();
   void checkpoint();
   void seal_checkpoint();
   void close();

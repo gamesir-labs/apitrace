@@ -615,6 +615,51 @@ bool read_exact_asset_bytes(
   return true;
 }
 
+std::uint8_t hex_digit_value(char digit)
+{
+  if (digit >= '0' && digit <= '9') {
+    return static_cast<std::uint8_t>(digit - '0');
+  }
+  if (digit >= 'a' && digit <= 'f') {
+    return static_cast<std::uint8_t>(digit - 'a' + 10);
+  }
+  if (digit >= 'A' && digit <= 'F') {
+    return static_cast<std::uint8_t>(digit - 'A' + 10);
+  }
+  return 0xff;
+}
+
+bool decode_hex_bytes(
+    std::string_view encoded,
+    std::uint64_t expected_size,
+    std::vector<std::uint8_t> &bytes,
+    std::string &error)
+{
+  if (expected_size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    error = "inline payload is too large for replay memory";
+    return false;
+  }
+  if (expected_size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max() / 2)) {
+    error = "inline payload hex length is too large for replay memory";
+    return false;
+  }
+  if (encoded.size() != static_cast<std::size_t>(expected_size) * 2) {
+    error = "inline payload size does not match resolved_size";
+    return false;
+  }
+  bytes.assign(static_cast<std::size_t>(expected_size), 0);
+  for (std::size_t index = 0; index < bytes.size(); ++index) {
+    const auto high = hex_digit_value(encoded[index * 2]);
+    const auto low = hex_digit_value(encoded[index * 2 + 1]);
+    if (high > 0xf || low > 0xf) {
+      error = "inline payload contains a non-hex digit";
+      return false;
+    }
+    bytes[index] = static_cast<std::uint8_t>((high << 4) | low);
+  }
+  return true;
+}
+
 bool is_supported_d3d12_call(std::string_view function_name)
 {
   return function_name == "D3D12CreateDevice" ||
@@ -700,6 +745,7 @@ bool is_supported_d3d12_call(std::string_view function_name)
          function_name == "ID3D12GraphicsCommandList::BeginQuery" ||
          function_name == "ID3D12GraphicsCommandList::EndQuery" ||
          function_name == "ID3D12GraphicsCommandList::ResolveQueryData" ||
+         function_name == "ID3D12GraphicsCommandList::ResolveQueryDataResult" ||
          function_name == "ID3D12GraphicsCommandList::SetPredication" ||
          function_name == "ID3D12GraphicsCommandList::ResolveSubresourceRegion" ||
          function_name == "ID3D12GraphicsCommandList2::WriteBufferImmediate" ||

@@ -49,6 +49,13 @@ public:
     }
   }
 
+  void flush() const
+  {
+    if (session_ != nullptr) {
+      apitrace_metal_session_flush(session_);
+    }
+  }
+
   void set_current_d3d_sequence(std::uint64_t sequence) const
   {
     apitrace_metal_set_current_d3d_sequence(session_, sequence);

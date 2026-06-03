@@ -463,6 +463,8 @@ trace::ObjectKind to_trace_object_kind(CaptureObjectKind kind)
     return trace::ObjectKind::Fence;
   case CaptureObjectKind::SwapChain:
     return trace::ObjectKind::SwapChain;
+  case CaptureObjectKind::Heap:
+    return trace::ObjectKind::Heap;
   case CaptureObjectKind::Resource:
     return trace::ObjectKind::Resource;
   case CaptureObjectKind::View:
@@ -1427,6 +1429,19 @@ trace::AssetRecord register_asset_bytes(
 trace::AssetRecord register_asset_text(trace::AssetKind kind, const char *debug_name, const std::string &text)
 {
   return register_asset_bytes(kind, debug_name, text.data(), text.size());
+}
+
+std::string hex_encode_bytes(const void *data, std::size_t size)
+{
+  static constexpr char kHex[] = "0123456789abcdef";
+  const auto *bytes = static_cast<const std::uint8_t *>(data);
+  std::string encoded;
+  encoded.resize(size * 2);
+  for (std::size_t index = 0; index < size; ++index) {
+    encoded[index * 2] = kHex[bytes[index] >> 4];
+    encoded[index * 2 + 1] = kHex[bytes[index] & 0xf];
+  }
+  return encoded;
 }
 
 std::size_t align_stream_offset(std::size_t value, std::size_t alignment)
@@ -2929,6 +2944,78 @@ void record_resource_unmap(
       1);
 }
 
+std::uint64_t record_resource_map(
+    const void *resource,
+    std::uint32_t subresource,
+    bool has_read_range,
+    std::uint64_t read_begin,
+    std::uint64_t read_end,
+    bool mapped,
+    std::int32_t result_code)
+{
+  std::ostringstream payload;
+  payload << "{\"subresource\":" << subresource;
+  if (has_read_range) {
+    payload << ",\"read_begin\":" << read_begin
+            << ",\"read_end\":" << read_end;
+  } else {
+    payload << ",\"read_range\":null";
+  }
+  payload << ",\"mapped\":" << (mapped ? "true" : "false") << "}";
+  const void *refs[] = {resource};
+  return record_call(
+      "ID3D12Resource::Map",
+      payload.str().c_str(),
+      refs,
+      1,
+      nullptr,
+      0,
+      result_code);
+}
+
+void record_resolve_query_data_result(
+    const void *command_list,
+    const void *query_heap,
+    std::uint32_t type,
+    std::uint32_t start_index,
+    std::uint32_t query_count,
+    const void *dst_buffer,
+    std::uint64_t aligned_dst_buffer_offset,
+    const void *resolved_data,
+    std::size_t resolved_size)
+{
+  if (!dst_buffer || !resolved_data || resolved_size == 0) {
+    return;
+  }
+
+  const auto asset = register_asset_bytes(
+      trace::AssetKind::Buffer,
+      "d3d12-query-resolve",
+      resolved_data,
+      resolved_size);
+
+  std::ostringstream payload;
+  payload << "{\"query_heap_object_id\":" << object_id(query_heap)
+          << ",\"type\":" << type
+          << ",\"start_index\":" << start_index
+          << ",\"query_count\":" << query_count
+          << ",\"dst_buffer_object_id\":" << object_id(dst_buffer)
+          << ",\"aligned_dst_buffer_offset\":" << aligned_dst_buffer_offset
+          << ",\"resolved_size\":" << static_cast<std::uint64_t>(resolved_size)
+          << ",\"buffer_path\":\"" << asset.relative_path.generic_string() << "\""
+          << ",\"resolved_data_hex\":\"" << hex_encode_bytes(resolved_data, resolved_size) << "\""
+          << "}";
+  const void *refs[] = {command_list, query_heap, dst_buffer};
+  const auto blob_id = static_cast<std::uint64_t>(asset.blob_id);
+  record_call(
+      "ID3D12GraphicsCommandList::ResolveQueryDataResult",
+      payload.str().c_str(),
+      refs,
+      3,
+      &blob_id,
+      1);
+}
+
 void record_fence_dependency(
     const char *scope,
     std::uint64_t d3d_sequence,
@@ -3576,7 +3663,7 @@ std::uint64_t record_create_committed_resource(
 std::uint64_t record_create_heap(ID3D12Device *device, const D3D12_HEAP_DESC *desc, const void *heap, std::int32_t result_code)
 {
   if (heap && result_code >= 0) {
-    record_object_create(heap, CaptureObjectKind::Resource, device, "ID3D12Heap");
+    record_object_create(heap, CaptureObjectKind::Heap, device, "ID3D12Heap");
   }
   std::ostringstream payload;
   payload << "{\"size_in_bytes\":" << (desc ? desc->SizeInBytes : 0)

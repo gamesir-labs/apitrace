@@ -826,6 +826,19 @@ APITRACE_METAL_API void apitrace_metal_session_close(apitrace_metal_session_t *s
   delete session;
 }
 
+APITRACE_METAL_API void apitrace_metal_session_flush(apitrace_metal_session_t *session)
+{
+  if (session == nullptr) {
+    return;
+  }
+
+  auto &state = session->state;
+  apitrace::metal::detail::TimedSessionLock lock(state.mutex);
+  if (state.open) {
+    state.writer.flush();
+  }
+}
+
 APITRACE_METAL_API void apitrace_metal_session_seal_checkpoint(apitrace_metal_session_t *session)
 {
   if (session == nullptr) {

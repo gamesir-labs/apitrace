@@ -184,14 +184,26 @@ bool validate_gpu_virtual_address_resolve_payload(
     }
   }
 
-	  if (payload_has(payload, "resolved_resource_object_id")) {
-	    const auto recorded_resource = payload_u64(payload, "resolved_resource_object_id");
-	    (void)recorded_resource;
-	  }
-	  if (payload_has(payload, "resolved_resource_offset")) {
-	    const auto recorded_offset = payload_u64(payload, "resolved_resource_offset");
-	    (void)recorded_offset;
-	  }
+  if (payload_has(payload, "resolved_resource_object_id")) {
+    const auto recorded_resource = payload_u64(payload, "resolved_resource_object_id");
+    if (recorded_resource != binding.resource_object_id) {
+      error = record_prefix(event) + ": " + payload_label +
+              " resolved_resource_object_id mismatch: recorded " +
+              std::to_string(recorded_resource) + ", replay resolved " +
+              std::to_string(binding.resource_object_id);
+      return false;
+    }
+  }
+  if (payload_has(payload, "resolved_resource_offset")) {
+    const auto recorded_offset = payload_u64(payload, "resolved_resource_offset");
+    if (recorded_offset != binding.offset) {
+      error = record_prefix(event) + ": " + payload_label +
+              " resolved_resource_offset mismatch: recorded " +
+              std::to_string(recorded_offset) + ", replay resolved " +
+              std::to_string(binding.offset);
+      return false;
+    }
+  }
   return true;
 }
 

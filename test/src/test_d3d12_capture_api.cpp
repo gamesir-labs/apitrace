@@ -118,9 +118,9 @@ int main(int argc, char **argv)
   const auto second_swapchain_sequence =
       apitrace::d3d12::record_dxgi_create_swapchain(factory, device, second_swapchain);
   const auto test_present_frame =
-      apitrace::d3d12::record_present(swapchain, 1, DXGI_PRESENT_TEST);
-  const auto first_present_frame = apitrace::d3d12::record_present(swapchain, 1, 0);
-  const auto second_present_frame = apitrace::d3d12::record_present(second_swapchain, 0, 2);
+      apitrace::d3d12::record_present(swapchain, 1, DXGI_PRESENT_TEST, 0, false);
+  const auto first_present_frame = apitrace::d3d12::record_present(swapchain, 1, 0, 0, true);
+  const auto second_present_frame = apitrace::d3d12::record_present(second_swapchain, 0, 2, 0, true);
   if (device_sequence == 0 ||
       swapchain_sequence == 0 ||
       second_swapchain_sequence == 0 ||

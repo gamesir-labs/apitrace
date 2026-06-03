@@ -30,6 +30,11 @@ void TraceSession::end()
   impl_->state.end();
 }
 
+void TraceSession::flush()
+{
+  impl_->state.flush();
+}
+
 void TraceSession::seal_checkpoint()
 {
   impl_->state.seal_checkpoint();

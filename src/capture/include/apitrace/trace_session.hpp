@@ -15,6 +15,7 @@ public:
 
   void begin();
   void end();
+  void flush();
   void seal_checkpoint();
   void append_call_event(const trace::EventRecord &event);
   void append_call_event(trace::EventRecord &&event);
