@@ -379,6 +379,26 @@ extern "C" HRESULT WINAPI D3D12EnableExperimentalFeatures(
   return downstream.enable_experimental_features(feature_count, iids, configurations, configurations_sizes);
 }
 
+extern "C" DWORD WINAPI GetBehaviorValue()
+{
+  return 0;
+}
+
+extern "C" HRESULT WINAPI D3D12CoreCreateLayeredDevice()
+{
+  return E_NOTIMPL;
+}
+
+extern "C" SIZE_T WINAPI D3D12CoreGetLayeredDeviceSize()
+{
+  return 0;
+}
+
+extern "C" HRESULT WINAPI D3D12CoreRegisterLayers()
+{
+  return E_NOTIMPL;
+}
+
 extern "C" void WINAPI apitrace_bootstrap_d3d12()
 {
   process_attach();

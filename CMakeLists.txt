@@ -153,6 +153,7 @@ else()
 
     add_library(apitrace_platform_windows_d3d12 SHARED
         src/d3d12/src/d3d12_proxy.cpp
+        src/d3d12/src/d3d12_proxy/d3d12.def
     )
 endif()
 
@@ -211,6 +212,9 @@ target_compile_features(apitrace_platform_apple_metal PUBLIC cxx_std_17)
 if(WIN32 AND APITRACE_BUILD_WINDOWS_DLLS AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
     set_target_properties(apitrace_platform_windows_d3d11 PROPERTIES OUTPUT_NAME d3d11 PREFIX "")
     set_target_properties(apitrace_platform_windows_d3d12 PROPERTIES OUTPUT_NAME d3d12 PREFIX "")
+    if(MINGW)
+        target_link_options(apitrace_platform_windows_d3d12 PRIVATE -Wl,--exclude-all-symbols)
+    endif()
     if(MINGW AND CMAKE_SIZEOF_VOID_P EQUAL 4)
         target_link_options(apitrace_platform_windows_d3d11 PRIVATE -Wl,--add-stdcall-alias)
         target_link_options(apitrace_platform_windows_d3d12 PRIVATE -Wl,--add-stdcall-alias)

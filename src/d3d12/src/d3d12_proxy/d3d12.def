@@ -1,0 +1,26 @@
+LIBRARY d3d12.dll
+EXPORTS
+    GetBehaviorValue @100
+    D3D12CreateDevice @101
+    D3D12GetDebugInterface @102
+    D3D12CoreCreateLayeredDevice
+    D3D12CoreGetLayeredDeviceSize
+    D3D12CoreRegisterLayers
+    D3D12CreateRootSignatureDeserializer
+    D3D12CreateVersionedRootSignatureDeserializer
+    D3D12EnableExperimentalFeatures
+    D3D12SerializeRootSignature
+    D3D12SerializeVersionedRootSignature
+    apitrace_bootstrap_d3d12
+    apitrace_d3d12_begin_capture_suppression
+    apitrace_d3d12_emit_scene_marker
+    apitrace_d3d12_end_capture_suppression
+    apitrace_d3d12_record_compute_pipeline
+    apitrace_d3d12_record_descriptor_heap
+    apitrace_d3d12_record_execute_command_lists
+    apitrace_d3d12_record_graphics_pipeline
+    apitrace_d3d12_record_present_frame
+    apitrace_d3d12_record_present_semantics
+    apitrace_d3d12_record_resource_barrier
+    apitrace_d3d12_record_runtime_objects
+    apitrace_d3d12_record_swapchain_back_buffer
