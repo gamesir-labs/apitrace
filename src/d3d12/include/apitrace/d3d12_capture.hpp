@@ -307,7 +307,8 @@ std::uint64_t record_create_heap(
     ID3D12Device *device,
     const D3D12_HEAP_DESC *desc,
     const void *heap,
-    std::int32_t result_code);
+    std::int32_t result_code,
+    const char *function_name = nullptr);
 
 std::uint64_t record_create_placed_resource(
     ID3D12Device *device,

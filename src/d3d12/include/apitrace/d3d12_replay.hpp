@@ -370,6 +370,10 @@ public:
     std::uint64_t size_in_bytes = 0;
     std::uint64_t alignment = 0;
     std::uint32_t heap_type = 0;
+    std::uint32_t cpu_page_property = 0;
+    std::uint32_t memory_pool_preference = 0;
+    std::uint32_t creation_node_mask = 1;
+    std::uint32_t visible_node_mask = 1;
     std::uint32_t flags = 0;
   };
 

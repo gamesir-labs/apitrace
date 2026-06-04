@@ -54,6 +54,7 @@ using D3D12CreateVersionedRootSignatureDeserializerFn =
     HRESULT(WINAPI *)(const void *, SIZE_T, REFIID, void **);
 using D3D12EnableExperimentalFeaturesFn = HRESULT(WINAPI *)(UINT, const IID *, void *, UINT *);
 
+constexpr GUID kIidD3D12Heap = {0x6b3b2502, 0x6e51, 0x45b3, {0x90, 0xee, 0x98, 0x84, 0x26, 0x5e, 0x8d, 0xf3}};
 constexpr GUID kIidD3D12Device = {0x189819f1, 0x1db6, 0x4b57, {0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7}};
 constexpr GUID kIidD3D12Device1 = {0x77acce80, 0x638e, 0x4e65, {0x88, 0x95, 0xc1, 0xf2, 0x33, 0x86, 0x86, 0x3e}};
 constexpr GUID kIidD3D12Device2 = {0x30baa41e, 0xb15b, 0x475c, {0xa0, 0xbb, 0x1a, 0xf5, 0xc5, 0xb6, 0x43, 0x28}};
@@ -185,6 +186,11 @@ HRESULT STDMETHODCALLTYPE hook_device_create_heap1(
     ID3D12Device4 *self,
     const D3D12_HEAP_DESC *desc,
     ID3D12ProtectedResourceSession *protected_session,
+    REFIID riid,
+    void **heap);
+HRESULT STDMETHODCALLTYPE hook_device_open_existing_heap_from_address(
+    ID3D12Device3 *self,
+    const void *address,
     REFIID riid,
     void **heap);
 HRESULT STDMETHODCALLTYPE hook_device_set_background_processing_mode(
@@ -636,6 +642,11 @@ struct Device2HookState {
   decltype(std::declval<ID3D12Device2Vtbl>().CreatePipelineState) create_pipeline_state = nullptr;
 };
 
+struct Device3HookState {
+  ID3D12Device3Vtbl *vtable = nullptr;
+  decltype(std::declval<ID3D12Device3Vtbl>().OpenExistingHeapFromAddress) open_existing_heap_from_address = nullptr;
+};
+
 struct Device4HookState {
   ID3D12Device4Vtbl *vtable = nullptr;
   decltype(std::declval<ID3D12Device4Vtbl>().CreateCommandList1) create_command_list1 = nullptr;
@@ -798,6 +809,7 @@ struct CaptureState {
   std::unordered_map<const void *, ObjectInfo> objects;
   std::unordered_map<ID3D12DeviceVtbl *, DeviceHookState> device_hooks;
   std::unordered_map<ID3D12Device2Vtbl *, Device2HookState> device2_hooks;
+  std::unordered_map<ID3D12Device3Vtbl *, Device3HookState> device3_hooks;
   std::unordered_map<ID3D12Device4Vtbl *, Device4HookState> device4_hooks;
   std::unordered_map<ID3D12Device6Vtbl *, Device6HookState> device6_hooks;
   std::unordered_map<ID3D12Device7Vtbl *, Device7HookState> device7_hooks;
@@ -1955,6 +1967,20 @@ std::uint64_t resource_gpu_virtual_address(ID3D12Resource *resource)
   return static_cast<std::uint64_t>(resource->lpVtbl->GetGPUVirtualAddress(resource));
 }
 
+D3D12_HEAP_DESC heap_desc(ID3D12Heap *heap)
+{
+  D3D12_HEAP_DESC desc{};
+  if (!heap || !heap->lpVtbl || !heap->lpVtbl->GetDesc) {
+    return desc;
+  }
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+  heap->lpVtbl->GetDesc(heap, &desc);
+  return desc;
+#else
+  return heap->lpVtbl->GetDesc(heap);
+#endif
+}
+
 GpuVirtualAddressResolve resolve_gpu_virtual_address_locked(std::uint64_t address)
 {
   GpuVirtualAddressResolve resolve;
@@ -2908,6 +2934,13 @@ Device2HookState device2_hook_for(ID3D12Device2 *device)
   return it == capture_state().device2_hooks.end() ? Device2HookState{} : it->second;
 }
 
+Device3HookState device3_hook_for(ID3D12Device3 *device)
+{
+  std::lock_guard<std::mutex> lock(capture_state().mutex);
+  const auto it = capture_state().device3_hooks.find(device ? device->lpVtbl : nullptr);
+  return it == capture_state().device3_hooks.end() ? Device3HookState{} : it->second;
+}
+
 Device4HookState device4_hook_for(ID3D12Device4 *device)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
@@ -3055,6 +3088,15 @@ void patch_device(ID3D12Device *device, std::size_t vtable_size)
     hook2.create_pipeline_state = original_vtable2->CreatePipelineState;
     capture_state().device2_hooks.emplace(vtable2, hook2);
     patch_vtable_field(vtable2, &ID3D12Device2Vtbl::CreatePipelineState, hook_device_create_pipeline_state);
+  }
+  if (vtable_size >= sizeof(ID3D12Device3Vtbl)) {
+    auto *original_vtable3 = reinterpret_cast<ID3D12Device3Vtbl *>(original_vtable);
+    auto *vtable3 = reinterpret_cast<ID3D12Device3Vtbl *>(vtable);
+    Device3HookState hook3;
+    hook3.vtable = original_vtable3;
+    hook3.open_existing_heap_from_address = original_vtable3->OpenExistingHeapFromAddress;
+    capture_state().device3_hooks.emplace(vtable3, hook3);
+    patch_vtable_field(vtable3, &ID3D12Device3Vtbl::OpenExistingHeapFromAddress, hook_device_open_existing_heap_from_address);
   }
   if (vtable_size >= sizeof(ID3D12Device4Vtbl)) {
     auto *original_vtable4 = reinterpret_cast<ID3D12Device4Vtbl *>(original_vtable);
@@ -4256,10 +4298,57 @@ HRESULT STDMETHODCALLTYPE hook_device_create_heap1(
     payload << "{\"size_in_bytes\":" << (desc ? desc->SizeInBytes : 0)
             << ",\"alignment\":" << (desc ? desc->Alignment : 0)
             << ",\"heap_type\":" << (desc ? static_cast<unsigned int>(desc->Properties.Type) : 0)
+            << ",\"cpu_page_property\":" << (desc ? static_cast<unsigned int>(desc->Properties.CPUPageProperty) : 0)
+            << ",\"memory_pool_preference\":" << (desc ? static_cast<unsigned int>(desc->Properties.MemoryPoolPreference) : 0)
+            << ",\"creation_node_mask\":" << (desc ? desc->Properties.CreationNodeMask : 0)
+            << ",\"visible_node_mask\":" << (desc ? desc->Properties.VisibleNodeMask : 0)
             << ",\"flags\":" << (desc ? static_cast<unsigned int>(desc->Flags) : 0)
             << ",\"protected_session_object_id\":" << object_id_json(protected_session_object_id)
             << "}";
     record_call_locked("ID3D12Device4::CreateHeap1", hr, {self, *heap, protected_session}, {}, payload.str());
+  }
+  return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_device_open_existing_heap_from_address(
+    ID3D12Device3 *self,
+    const void *address,
+    REFIID riid,
+    void **heap)
+{
+  const auto hook = device3_hook_for(self);
+  if (!hook.open_existing_heap_from_address) {
+    return E_FAIL;
+  }
+  ScopedOriginalVTable<ID3D12Device3, ID3D12Device3Vtbl> original_vtable(self, hook.vtable);
+  const HRESULT hr = hook.open_existing_heap_from_address(self, address, riid, heap);
+  if (SUCCEEDED(hr) && heap && *heap) {
+    ID3D12Heap *created_heap = nullptr;
+    auto *unknown = static_cast<IUnknown *>(*heap);
+    if (!unknown->lpVtbl || FAILED(unknown->lpVtbl->QueryInterface(unknown, kIidD3D12Heap, reinterpret_cast<void **>(&created_heap))) || !created_heap) {
+      return hr;
+    }
+    const D3D12_HEAP_DESC desc = heap_desc(created_heap);
+    {
+      std::lock_guard<std::mutex> lock(capture_state().mutex);
+      const auto parent = lookup_object_id_locked(self);
+      register_fresh_object_locked(created_heap, apitrace::trace::ObjectKind::Heap, "ID3D12Heap", parent);
+      remember_object_alias_locked(*heap, created_heap);
+      capture_state().heap_types[created_heap] = static_cast<UINT>(desc.Properties.Type);
+      capture_state().heap_types[static_cast<ID3D12Heap *>(*heap)] = static_cast<UINT>(desc.Properties.Type);
+      std::ostringstream payload;
+      payload << "{\"size_in_bytes\":" << desc.SizeInBytes
+              << ",\"alignment\":" << desc.Alignment
+              << ",\"heap_type\":" << static_cast<unsigned int>(desc.Properties.Type)
+              << ",\"cpu_page_property\":" << static_cast<unsigned int>(desc.Properties.CPUPageProperty)
+              << ",\"memory_pool_preference\":" << static_cast<unsigned int>(desc.Properties.MemoryPoolPreference)
+              << ",\"creation_node_mask\":" << desc.Properties.CreationNodeMask
+              << ",\"visible_node_mask\":" << desc.Properties.VisibleNodeMask
+              << ",\"flags\":" << static_cast<unsigned int>(desc.Flags)
+              << "}";
+      record_call_locked("ID3D12Device3::OpenExistingHeapFromAddress", hr, {self, created_heap}, {}, payload.str());
+    }
+    created_heap->lpVtbl->Release(created_heap);
   }
   return hr;
 }

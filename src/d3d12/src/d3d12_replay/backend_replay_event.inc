@@ -1070,6 +1070,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     resources_[resource.resource_object_id] = std::move(resource);
     ++semantic_calls_seen_;
   } else if (function_name == "ID3D12Device::CreateHeap" ||
+             function_name == "ID3D12Device3::OpenExistingHeapFromAddress" ||
              function_name == "ID3D12Device4::CreateHeap1") {
     if (event.object_refs.size() < 2 || event.object_refs[1] == 0) {
       last_error_ = record_prefix(event) + ": CreateHeap missing heap object id";
@@ -1085,6 +1086,10 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     heap.size_in_bytes = payload_u64(payload, "size_in_bytes");
     heap.alignment = payload_u64(payload, "alignment");
     heap.heap_type = payload_u32(payload, "heap_type");
+    heap.cpu_page_property = payload.contains("cpu_page_property") ? payload_u32(payload, "cpu_page_property") : 0;
+    heap.memory_pool_preference = payload.contains("memory_pool_preference") ? payload_u32(payload, "memory_pool_preference") : 0;
+    heap.creation_node_mask = payload.contains("creation_node_mask") ? payload_u32(payload, "creation_node_mask") : 1;
+    heap.visible_node_mask = payload.contains("visible_node_mask") ? payload_u32(payload, "visible_node_mask") : 1;
     heap.flags = payload_u32(payload, "flags");
     if (heap.size_in_bytes == 0) {
       last_error_ = record_prefix(event) + ": CreateHeap size_in_bytes must be non-zero";

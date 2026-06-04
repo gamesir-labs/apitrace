@@ -330,15 +330,26 @@ private:
     return true;
   }
 
-  static D3D12_HEAP_PROPERTIES heap_properties(std::uint32_t heap_type)
+  static D3D12_HEAP_PROPERTIES heap_properties(const D3D12ReplayBackend::HeapSemanticState &semantic_heap)
   {
     D3D12_HEAP_PROPERTIES heap{};
-    heap.Type = static_cast<D3D12_HEAP_TYPE>(heap_type);
-    heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
-    heap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
-    heap.CreationNodeMask = 1;
-    heap.VisibleNodeMask = 1;
+    heap.Type = static_cast<D3D12_HEAP_TYPE>(semantic_heap.heap_type);
+    heap.CPUPageProperty = static_cast<D3D12_CPU_PAGE_PROPERTY>(semantic_heap.cpu_page_property);
+    heap.MemoryPoolPreference = static_cast<D3D12_MEMORY_POOL>(semantic_heap.memory_pool_preference);
+    heap.CreationNodeMask = semantic_heap.creation_node_mask ? semantic_heap.creation_node_mask : 1;
+    heap.VisibleNodeMask = semantic_heap.visible_node_mask ? semantic_heap.visible_node_mask : 1;
     return heap;
+  }
+
+  static D3D12_HEAP_PROPERTIES heap_properties(std::uint32_t heap_type)
+  {
+    D3D12ReplayBackend::HeapSemanticState heap{};
+    heap.heap_type = heap_type;
+    heap.cpu_page_property = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    heap.memory_pool_preference = D3D12_MEMORY_POOL_UNKNOWN;
+    heap.creation_node_mask = 1;
+    heap.visible_node_mask = 1;
+    return heap_properties(heap);
   }
 
   bool create_heaps(std::string &error)
@@ -346,7 +357,7 @@ private:
     for (const auto &[object_id, heap] : backend_.heaps_) {
       D3D12_HEAP_DESC desc{};
       desc.SizeInBytes = heap.size_in_bytes;
-      desc.Properties = heap_properties(heap.heap_type);
+      desc.Properties = heap_properties(heap);
       desc.Alignment = heap.alignment;
       desc.Flags = static_cast<D3D12_HEAP_FLAGS>(heap.flags);
       NativeHeap native;

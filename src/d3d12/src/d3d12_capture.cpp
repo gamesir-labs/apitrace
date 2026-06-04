@@ -3637,7 +3637,7 @@ std::uint64_t record_create_committed_resource(
   return record_call("ID3D12Device::CreateCommittedResource", payload.str().c_str(), refs, 2, nullptr, 0, result_code);
 }
 
-std::uint64_t record_create_heap(ID3D12Device *device, const D3D12_HEAP_DESC *desc, const void *heap, std::int32_t result_code)
+std::uint64_t record_create_heap(ID3D12Device *device, const D3D12_HEAP_DESC *desc, const void *heap, std::int32_t result_code, const char *function_name)
 {
   if (heap && result_code >= 0) {
     record_object_create(heap, CaptureObjectKind::Heap, device, "ID3D12Heap");
@@ -3646,10 +3646,14 @@ std::uint64_t record_create_heap(ID3D12Device *device, const D3D12_HEAP_DESC *de
   payload << "{\"size_in_bytes\":" << (desc ? desc->SizeInBytes : 0)
           << ",\"alignment\":" << (desc ? desc->Alignment : 0)
           << ",\"heap_type\":" << (desc ? static_cast<unsigned int>(desc->Properties.Type) : 0)
+          << ",\"cpu_page_property\":" << (desc ? static_cast<unsigned int>(desc->Properties.CPUPageProperty) : 0)
+          << ",\"memory_pool_preference\":" << (desc ? static_cast<unsigned int>(desc->Properties.MemoryPoolPreference) : 0)
+          << ",\"creation_node_mask\":" << (desc ? desc->Properties.CreationNodeMask : 0)
+          << ",\"visible_node_mask\":" << (desc ? desc->Properties.VisibleNodeMask : 0)
           << ",\"flags\":" << (desc ? static_cast<unsigned int>(desc->Flags) : 0)
           << "}";
   const void *refs[] = {device, heap};
-  return record_call("ID3D12Device::CreateHeap", payload.str().c_str(), refs, 2, nullptr, 0, result_code);
+  return record_call(function_name ? function_name : "ID3D12Device::CreateHeap", payload.str().c_str(), refs, 2, nullptr, 0, result_code);
 }
 
 std::uint64_t record_create_placed_resource(

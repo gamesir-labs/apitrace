@@ -341,6 +341,10 @@ HRESULT STDMETHODCALLTYPE hook_device_create_heap(
     payload << "{\"size_in_bytes\":" << (desc ? desc->SizeInBytes : 0)
             << ",\"alignment\":" << (desc ? desc->Alignment : 0)
             << ",\"heap_type\":" << (desc ? static_cast<unsigned int>(desc->Properties.Type) : 0)
+            << ",\"cpu_page_property\":" << (desc ? static_cast<unsigned int>(desc->Properties.CPUPageProperty) : 0)
+            << ",\"memory_pool_preference\":" << (desc ? static_cast<unsigned int>(desc->Properties.MemoryPoolPreference) : 0)
+            << ",\"creation_node_mask\":" << (desc ? desc->Properties.CreationNodeMask : 0)
+            << ",\"visible_node_mask\":" << (desc ? desc->Properties.VisibleNodeMask : 0)
             << ",\"flags\":" << (desc ? static_cast<unsigned int>(desc->Flags) : 0)
             << "}";
     record_call_locked("ID3D12Device::CreateHeap", hr, {self, *heap}, {}, payload.str());
