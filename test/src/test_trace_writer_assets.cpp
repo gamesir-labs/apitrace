@@ -1009,6 +1009,37 @@ int main(int argc, char **argv)
     std::cerr << "known content_hash Metal duplicate should reuse the stored asset before hashing or writing\n";
     return 1;
   }
+  const auto expected_metal_pipeline_path =
+      std::filesystem::path("metal/pipelines") /
+      (metal_known_hash_digest + ".pipeline.json");
+  if (metal_known_hash_first.relative_path != expected_metal_pipeline_path) {
+    std::cerr << "known content_hash Metal pipeline should use canonical Metal pipeline storage\n";
+    return 1;
+  }
+
+  std::vector<std::uint8_t> metal_known_hash_library_bytes(48 * 1024, 0x7e);
+  const auto metal_known_hash_library_digest =
+      apitrace::trace::content_hash_bytes(
+          metal_known_hash_library_bytes.data(),
+          metal_known_hash_library_bytes.size());
+  apitrace::trace::AssetRecord metal_known_hash_library;
+  metal_known_hash_library.blob_id = 16;
+  metal_known_hash_library.kind = apitrace::trace::AssetKind::Unknown;
+  metal_known_hash_library.debug_name = "known-hash-metal-library";
+  metal_known_hash_library.relative_path = metal_known_hash_library_digest + ".bin";
+  metal_known_hash_library.content_hash = metal_known_hash_library_digest;
+  metal_known_hash_library.byte_size = metal_known_hash_library_bytes.size();
+  metal_known_hash_library.payload_bytes = metal_known_hash_library_bytes;
+  metal_known_hash_library = writer.register_metal_asset(
+      apitrace::trace::MetalAssetKind::Library,
+      std::move(metal_known_hash_library));
+  const auto expected_metal_library_path =
+      std::filesystem::path("metal/libraries") /
+      (metal_known_hash_library_digest + ".metallib");
+  if (metal_known_hash_library.relative_path != expected_metal_library_path) {
+    std::cerr << "known content_hash Metal library should not keep caller-provided generic storage\n";
+    return 1;
+  }
 
   apitrace::trace::EventRecord event;
   event.kind = apitrace::trace::EventKind::ResourceBlob;
@@ -1406,8 +1437,8 @@ int main(int argc, char **argv)
     std::cerr << "\n";
     return 1;
   }
-  if (reader.assets().size() != 18) {
-    std::cerr << "expected eighteen reader-visible blob aliases, got " << reader.assets().size() << "\n";
+  if (reader.assets().size() != 21) {
+    std::cerr << "expected twenty-one reader-visible blob aliases, got " << reader.assets().size() << "\n";
     return 1;
   }
   bool found_first = false;
@@ -1425,6 +1456,7 @@ int main(int argc, char **argv)
   bool found_small_second = false;
   bool found_known_hash_second = false;
   std::filesystem::path sparse_reader_path;
+  std::filesystem::path pipeline_reader_path;
   for (const auto &asset : reader.assets()) {
     found_first = found_first || asset.blob_id == first.blob_id;
     found_texture = found_texture || asset.blob_id == generic_texture.blob_id;
@@ -1439,44 +1471,54 @@ int main(int argc, char **argv)
     found_hash_only_large_second = found_hash_only_large_second || asset.blob_id == hash_only_large_second.blob_id;
     found_small_second = found_small_second || asset.blob_id == small_second.blob_id;
     found_known_hash_second = found_known_hash_second || asset.blob_id == known_hash_second.blob_id;
-    if (asset.blob_id == sparse_asset.blob_id) {
-      found_sparse = true;
-      sparse_reader_path = asset.relative_path;
-    }
-  }
-  if (!found_first || !found_texture || !found_collision || !found_cached || !found_hash_only_first ||
-      !found_second || !found_metal_buffer || !found_metal_texture || !found_hash_only_second ||
-      !found_hash_only_large_first || !found_hash_only_large_second ||
-      !found_small_second || !found_known_hash_second || !found_sparse) {
-    std::cerr << "reader-visible blob ids did not match registered assets\n";
-    return 1;
-  }
-  if (reader.metal_assets().size() != 2) {
+	    if (asset.blob_id == sparse_asset.blob_id) {
+	      found_sparse = true;
+	      sparse_reader_path = asset.relative_path;
+	    }
+	    if (asset.blob_id == pipeline_asset.blob_id) {
+	      pipeline_reader_path = asset.relative_path;
+	    }
+	  }
+	  if (!found_first || !found_texture || !found_collision || !found_cached || !found_hash_only_first ||
+	      !found_second || !found_metal_buffer || !found_metal_texture || !found_hash_only_second ||
+	      !found_hash_only_large_first || !found_hash_only_large_second ||
+	      !found_small_second || !found_known_hash_second || !found_sparse) {
+	    std::cerr << "reader-visible blob ids did not match registered assets\n";
+	    return 1;
+	  }
+	  if (pipeline_reader_path.empty()) {
+	    std::cerr << "reader-visible blob ids did not include pipeline asset\n";
+	    return 1;
+	  }
+  if (reader.metal_assets().size() != 3) {
     std::cerr << "Metal-specific known-hash aliases were not indexed as Metal assets\n";
     return 1;
   }
   bool found_metal_known_hash_second = false;
-  for (const auto &asset : reader.metal_assets())
+  bool found_metal_known_hash_library = false;
+  for (const auto &asset : reader.metal_assets()) {
     found_metal_known_hash_second = found_metal_known_hash_second || asset.blob_id == metal_known_hash_second.blob_id;
-  if (!found_metal_known_hash_second) {
-    std::cerr << "reader-visible Metal blob ids did not include known-hash alias\n";
+    found_metal_known_hash_library = found_metal_known_hash_library || asset.blob_id == metal_known_hash_library.blob_id;
+  }
+  if (!found_metal_known_hash_second || !found_metal_known_hash_library) {
+    std::cerr << "reader-visible Metal blob ids did not include known-hash assets\n";
     return 1;
   }
 
-  const auto callstream = read_text(bundle / "callstream.jsonl");
-  const auto metal_callstream = read_text(bundle / "metal-callstream.jsonl");
-  const auto pipeline_json = read_text(pipeline_json_path);
+	  const auto callstream = read_text(bundle / "callstream.jsonl");
+	  const auto metal_callstream = read_text(bundle / "metal-callstream.jsonl");
+	  const auto pipeline_json = read_text(bundle / pipeline_reader_path);
   const auto resource_json = read_text(resource_json_path);
   const auto checksums_json = read_text(bundle / "checksums.json");
   const auto assets_json = read_text(bundle / "assets.json");
   const auto writer_stats = read_text(bundle / "analysis" / "writer-stats.jsonl");
   if (assets_json.find("\"content_hash\"") == std::string::npos ||
       assets_json.find("\"fast_fingerprint\"") != std::string::npos ||
-      assets_json.find("\"byte_size\"") == std::string::npos ||
-      assets_json.find("\"debug_name\":\"large-buffer\"") == std::string::npos ||
-      assets_json.find("\"debug_name\":\"sparse-zero-buffer\"") == std::string::npos ||
-      assets_json.find("\"byte_size\":8388608") == std::string::npos ||
-      assets_json.find("asset-") != std::string::npos) {
+	      assets_json.find("\"byte_size\"") == std::string::npos ||
+	      assets_json.find("\"debug_name\":\"large-buffer\"") == std::string::npos ||
+	      assets_json.find("\"debug_name\":\"sparse-zero-buffer\"") == std::string::npos ||
+	      assets_json.find("\"byte_size\":8388608") == std::string::npos ||
+	      assets_json.find(expected_metal_library_path.generic_string()) == std::string::npos) {
     std::cerr << "assets.json did not preserve final replay metadata without capture-only fingerprints\n";
     return 1;
   }
@@ -1552,7 +1594,7 @@ int main(int argc, char **argv)
   }
   if (!checksum_matches_file(checksums_json, bundle, "callstream.jsonl") ||
       !checksum_matches_file(checksums_json, bundle, "metal-callstream.jsonl") ||
-      !checksum_matches_file(checksums_json, bundle, pipeline_asset.relative_path.generic_string()) ||
+	      !checksum_matches_file(checksums_json, bundle, pipeline_reader_path.generic_string()) ||
       !checksum_matches_file(checksums_json, bundle, "objects/objects.json") ||
       !checksum_matches_file(checksums_json, bundle, "analysis/resource-summary.jsonl") ||
       !checksum_matches_file(checksums_json, bundle, "analysis/translation-links.jsonl") ||
@@ -1576,13 +1618,12 @@ int main(int argc, char **argv)
   }
   if (writer_stats.find("\"record_type\":\"writer_stats\"") == std::string::npos ||
       json_u64_field(writer_stats, "async_enqueued") < 1 ||
-      json_u64_field(writer_stats, "async_queue_rejected") != 0 ||
-      json_u64_field(writer_stats, "known_hash_hits") < 2 ||
-      json_u64_field(writer_stats, "known_hash_bytes_avoided") < known_hash_bytes.size() + metal_known_hash_bytes.size() ||
-      json_u64_field(writer_stats, "async_hash_only_candidates") < 2 ||
-      json_u64_field(writer_stats, "async_hash_only_write_avoids") < 1 ||
-      json_u64_field(writer_stats, "async_hash_only_write_bytes_avoided") < hash_only_large_bytes.size() ||
-      json_u64_field(writer_stats, "async_path_aliases") < 6 ||
+	      json_u64_field(writer_stats, "async_queue_rejected") != 0 ||
+	      json_u64_field(writer_stats, "known_hash_hits") < 2 ||
+	      json_u64_field(writer_stats, "known_hash_bytes_avoided") < known_hash_bytes.size() + metal_known_hash_bytes.size() ||
+	      json_u64_field(writer_stats, "asset_writer_hash_and_write_count") < 1 ||
+	      json_u64_field(writer_stats, "asset_writer_write_without_hash_count") != 0 ||
+	      json_u64_field(writer_stats, "async_path_aliases") < 6 ||
       json_u64_field(writer_stats, "asset_rewrite_candidates_scanned") < 4 ||
       json_u64_field(writer_stats, "asset_rewrite_candidates_skipped_clean") < 1 ||
       json_u64_field(writer_stats, "asset_rewrite_replacements") < 4 ||
@@ -1594,11 +1635,10 @@ int main(int argc, char **argv)
       json_u64_field(writer_stats, "sparse_zero_bytes_skipped") < sparse_bytes.size() - 2 ||
       json_u64_field(writer_stats, "exact_dedup_skipped_large") < 1 ||
       json_u64_field(writer_stats, "payload_cache_skipped_large") < 1 ||
-      json_u64_field(writer_stats, "callstream_peak_pending_bytes") == 0 ||
-      json_u64_field(writer_stats, "metal_callstream_peak_pending_bytes") == 0 ||
-      json_u64_field(writer_stats, "analysis_peak_pending_bytes") == 0 ||
-      json_u64_field(writer_stats, "sync_hashes") < 1 ||
-      json_u64_field(writer_stats, "sync_hash_bytes") >= 2 * 1024 * 1024 ||
+	      json_u64_field(writer_stats, "callstream_peak_pending_bytes") == 0 ||
+	      json_u64_field(writer_stats, "metal_callstream_peak_pending_bytes") == 0 ||
+	      json_u64_field(writer_stats, "analysis_peak_pending_bytes") == 0 ||
+	      json_u64_field(writer_stats, "sync_hash_bytes") != 0 ||
       json_u64_field(writer_stats, "payload_move_registrations") < 15 ||
       json_u64_field(writer_stats, "payload_move_bytes") != json_u64_field(writer_stats, "payload_bytes_seen")) {
     std::cerr << "writer stats did not cover the expected async dedup and rewrite paths\n";
