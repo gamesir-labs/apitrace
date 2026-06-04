@@ -557,13 +557,19 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
   } else if (function_name == "ID3D12Device::CreateGraphicsPipelineState" ||
       function_name == "ID3D12Device::CreateComputePipelineState" ||
       function_name == "ID3D12Device2::CreatePipelineState") {
-    if (event.object_refs.size() < 2 || event.object_refs[1] == 0) {
+    const auto pipeline_state_object_id = event.object_refs.size() >= 2 ? event.object_refs.back() : trace::ObjectId{};
+    if (pipeline_state_object_id == 0) {
       last_error_ = record_prefix(event) + ": pipeline create missing pipeline state object id";
       return false;
     }
     const auto pipeline_path = payload_string(payload, "pipeline_path");
     if (pipeline_path.empty()) {
-      last_error_ = record_prefix(event) + ": pipeline create missing pipeline_path";
+      if (payload.value("pso_raw_version", 0) != 0) {
+        last_error_ = record_prefix(event) +
+            ": pipeline create has raw PSO evidence but no pipeline_path; run bundle-finalize or inspect incomplete D3D12 pipeline semantic rebuild";
+      } else {
+        last_error_ = record_prefix(event) + ": pipeline create missing pipeline_path";
+      }
       return false;
     }
     json pipeline_asset;
@@ -582,7 +588,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       return false;
     }
     PipelineSemanticState pipeline;
-    pipeline.pipeline_state_object_id = event.object_refs[1];
+    pipeline.pipeline_state_object_id = pipeline_state_object_id;
     pipeline.create_sequence = event.callsite.sequence;
     const auto pipeline_type = payload_string(pipeline_asset, "type");
     pipeline.graphics = function_name == "ID3D12Device::CreateGraphicsPipelineState" ||

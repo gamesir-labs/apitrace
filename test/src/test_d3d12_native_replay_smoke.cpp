@@ -5,6 +5,7 @@
 #include <fstream>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -203,6 +204,74 @@ bool select_shader_asset(
   return false;
 }
 
+std::optional<std::filesystem::path> find_first_asset_with_extension(
+    const std::filesystem::path &asset_dir,
+    const char *extension,
+    const std::filesystem::path &exclude = {})
+{
+  std::error_code error;
+  for (std::filesystem::directory_iterator it(asset_dir, error), end; it != end && !error; it.increment(error)) {
+    if (!it->is_regular_file(error) || error) {
+      continue;
+    }
+    if (it->path() == exclude) {
+      continue;
+    }
+    if (it->path().extension() == extension) {
+      return it->path();
+    }
+  }
+  return std::nullopt;
+}
+
+bool select_root_signature_asset(const std::filesystem::path &asset_dir, std::filesystem::path &out)
+{
+  const auto named = asset_dir / "fullscreen_triangle.rootsig";
+  if (std::filesystem::exists(named)) {
+    out = named;
+    return true;
+  }
+  if (const auto found = find_first_asset_with_extension(asset_dir, ".rootsig")) {
+    out = *found;
+    return true;
+  }
+  return false;
+}
+
+bool select_shader_pair(
+    const std::filesystem::path &asset_dir,
+    ShaderAssetSource &vs,
+    ShaderAssetSource &ps)
+{
+  if (select_shader_asset(asset_dir, "fullscreen_triangle.vs", vs) &&
+      select_shader_asset(asset_dir, "fullscreen_triangle.ps", ps)) {
+    return true;
+  }
+  if (const auto first_dxil = find_first_asset_with_extension(asset_dir, ".dxil")) {
+    vs.kind = AssetKind::ShaderDxil;
+    vs.path = *first_dxil;
+    if (const auto second_dxil = find_first_asset_with_extension(asset_dir, ".dxil", *first_dxil)) {
+      ps.kind = AssetKind::ShaderDxil;
+      ps.path = *second_dxil;
+    } else {
+      ps = vs;
+    }
+    return true;
+  }
+  if (const auto first_dxbc = find_first_asset_with_extension(asset_dir, ".dxbc")) {
+    vs.kind = AssetKind::ShaderDxbc;
+    vs.path = *first_dxbc;
+    if (const auto second_dxbc = find_first_asset_with_extension(asset_dir, ".dxbc", *first_dxbc)) {
+      ps.kind = AssetKind::ShaderDxbc;
+      ps.path = *second_dxbc;
+    } else {
+      ps = vs;
+    }
+    return true;
+  }
+  return false;
+}
+
 std::string shader_stage_json(
     const char *stage,
     const apitrace::trace::AssetRecord &asset,
@@ -248,14 +317,15 @@ std::string default_depth_stencil_state_json()
       "\"stencil_pass_op\":1,\"stencil_func\":1}}";
 }
 
-std::string graphics_pipeline_json(
+std::string raw_graphics_pipeline_payload(
     const apitrace::trace::AssetRecord &vs,
     std::uint64_t vs_size,
     const apitrace::trace::AssetRecord &ps,
     std::uint64_t ps_size)
 {
   std::ostringstream pipeline;
-  pipeline << "{\"type\":\"graphics\""
+  pipeline << "{\"pso_raw_version\":1"
+           << ",\"pso_kind\":\"graphics\""
            << ",\"root_signature_object_id\":7"
            << ",\"node_mask\":0"
            << ",\"flags\":0"
@@ -271,8 +341,8 @@ std::string graphics_pipeline_json(
            << ",\"dsv_format\":0"
            << ",\"sample_desc\":{\"count\":1,\"quality\":0}"
            << ",\"ib_strip_cut_value\":0"
-           << "," << shader_stage_json("vs", vs, vs_size)
-           << "," << shader_stage_json("ps", ps, ps_size)
+           << ",\"vs\":{\"bytecode_size\":" << vs_size << ",\"blob_id\":" << vs.blob_id << "}"
+           << ",\"ps\":{\"bytecode_size\":" << ps_size << ",\"blob_id\":" << ps.blob_id << "}"
            << "}";
   return pipeline.str();
 }
@@ -308,7 +378,7 @@ bool write_bundle(
   writer.write_metadata(metadata);
 
   apitrace::trace::AssetRecord present_frame;
-  present_frame.blob_id = 2000;
+  present_frame.blob_id = 1;
   present_frame.kind = AssetKind::Texture;
   present_frame.debug_name = "d3d12-native-smoke-present-frame";
   present_frame.payload_bytes.assign(4 * 4 * 4, poison_present_frame ? 0x00 : 0xff);
@@ -322,23 +392,24 @@ bool write_bundle(
   std::uint64_t ps_size = 0;
   ShaderAssetSource vs_source;
   ShaderAssetSource ps_source;
-  if (!select_shader_asset(asset_dir, "fullscreen_triangle.vs", vs_source) ||
-      !select_shader_asset(asset_dir, "fullscreen_triangle.ps", ps_source)) {
+  std::filesystem::path root_signature_source;
+  if (!select_root_signature_asset(asset_dir, root_signature_source) ||
+      !select_shader_pair(asset_dir, vs_source, ps_source)) {
     return false;
   }
 
   if (!register_file_asset(
           writer,
           AssetKind::RootSignature,
-          2001,
+          2,
           "d3d12-native-smoke-root-signature",
-          asset_dir / "fullscreen_triangle.rootsig",
+          root_signature_source,
           root_signature,
           root_signature_size) ||
       !register_file_asset(
           writer,
           vs_source.kind,
-          2002,
+          3,
           "d3d12-native-smoke-vs",
           vs_source.path,
           vs,
@@ -346,21 +417,13 @@ bool write_bundle(
       !register_file_asset(
           writer,
           ps_source.kind,
-          2003,
+          4,
           "d3d12-native-smoke-ps",
           ps_source.path,
           ps,
           ps_size)) {
     return false;
   }
-
-  apitrace::trace::AssetRecord pipeline;
-  pipeline.blob_id = 2004;
-  pipeline.kind = AssetKind::Pipeline;
-  pipeline.debug_name = "d3d12-native-smoke-graphics-pipeline";
-  const auto pipeline_text = graphics_pipeline_json(vs, vs_size, ps, ps_size);
-  pipeline.payload_bytes.assign(pipeline_text.begin(), pipeline_text.end());
-  pipeline = writer.register_asset(std::move(pipeline));
 
   std::vector<std::uint8_t> vertex_bytes(48);
   for (std::size_t index = 0; index < vertex_bytes.size(); ++index) {
@@ -379,10 +442,10 @@ bool write_bundle(
     texture_upload_bytes[index + 3] = 0xff;
   }
 
-  auto vertex_asset = register_buffer_asset(writer, 2005, "d3d12-native-smoke-vertex-buffer", vertex_bytes);
-  auto index_asset = register_buffer_asset(writer, 2006, "d3d12-native-smoke-index-buffer", index_bytes);
-  auto constant_asset = register_buffer_asset(writer, 2007, "d3d12-native-smoke-constant-buffer", constant_bytes);
-  auto texture_upload_asset = register_buffer_asset(writer, 2008, "d3d12-native-smoke-texture-upload", texture_upload_bytes);
+  auto vertex_asset = register_buffer_asset(writer, 5, "d3d12-native-smoke-vertex-buffer", vertex_bytes);
+  auto index_asset = register_buffer_asset(writer, 6, "d3d12-native-smoke-index-buffer", index_bytes);
+  auto constant_asset = register_buffer_asset(writer, 7, "d3d12-native-smoke-constant-buffer", constant_bytes);
+  auto texture_upload_asset = register_buffer_asset(writer, 8, "d3d12-native-smoke-texture-upload", texture_upload_bytes);
   if (vertex_asset.relative_path.empty() ||
       index_asset.relative_path.empty() ||
       constant_asset.relative_path.empty() ||
@@ -523,9 +586,9 @@ bool write_bundle(
   writer.append_call_event(call(
       sequence++,
       "ID3D12Device::CreateGraphicsPipelineState",
-      {1, 8},
-      "{\"pipeline_path\":\"" + pipeline.relative_path.generic_string() + "\"}",
-      {pipeline.blob_id, vs.blob_id, ps.blob_id}));
+      {1, 7, 8},
+      raw_graphics_pipeline_payload(vs, vs_size, ps, ps_size),
+      {vs.blob_id, ps.blob_id}));
 
   writer.append_call_event(object_create(sequence++, 4, ObjectKind::CommandQueue, 1, "ID3D12CommandQueue"));
   writer.append_call_event(call(
@@ -672,6 +735,39 @@ bool write_bundle(
   return true;
 }
 
+std::string shell_quote_path(const std::filesystem::path &path)
+{
+  std::string quoted = "'";
+  for (const char ch : path.string()) {
+    if (ch == '\'') {
+      quoted += "'\\''";
+    } else {
+      quoted += ch;
+    }
+  }
+  quoted += "'";
+  return quoted;
+}
+
+bool finalize_bundle(const char *argv0, const std::filesystem::path &bundle, std::string &error)
+{
+  std::filesystem::path finalize = "bundle-finalize";
+  const auto self = std::filesystem::path(argv0 ? argv0 : "");
+  if (self.has_parent_path()) {
+    const auto sibling = self.parent_path() / "bundle-finalize";
+    if (std::filesystem::exists(sibling)) {
+      finalize = sibling;
+    }
+  }
+  const auto command = shell_quote_path(finalize) + " --jobs 1 " + shell_quote_path(bundle);
+  const auto result = std::system(command.c_str());
+  if (result != 0) {
+    error = "bundle-finalize failed for " + bundle.string();
+    return false;
+  }
+  return true;
+}
+
 bool require_native_ready_bundle(const std::filesystem::path &bundle, std::string &error)
 {
   TraceBundleReader reader;
@@ -752,6 +848,10 @@ int main(int argc, char **argv)
   }
 
   std::string error;
+  if (!finalize_bundle(argv[0], bundle, error)) {
+    std::cerr << error << "\n";
+    return 1;
+  }
   if (!require_native_ready_bundle(bundle, error)) {
     std::cerr << error << "\n";
     return 1;

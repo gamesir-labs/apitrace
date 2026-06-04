@@ -120,9 +120,12 @@ callstream 闭包，不能证明 GPU 命令实际执行；`apitrace_test_metal_n
 - resource / root signature / PSO 创建记录及其资产引用
 - device 创建记录，包括 device object id 和 `minimum_feature_level`
 - root signature object id 到 serialized root signature asset、blob_refs 和 bytecode bytes 的映射
-- PSO object id 到 pipeline asset path、blob_refs 和可重建 graphics/compute PSO metadata 的映射；
-  graphics pipeline asset 必须包含 root signature、input layout、blend/rasterizer/depth-stencil、
-  sample、RTV/DSV 和 shader 资产引用
+- PSO object id 到 pipeline asset path、blob_refs 和可重建 graphics/compute/stream PSO metadata
+  的映射；graphics pipeline asset 必须包含 root signature、input layout、
+  blend/rasterizer/depth-stencil、sample、RTV/DSV 和 shader 资产引用。D3D12 retrace 只消费
+  `bundle-finalize` 生成的 `pipeline_path`，不会在 replay 进程内从 raw PSO evidence 重建 pipeline
+  JSON；遇到 raw-only `pso_raw_version` payload 时必须明确报错，提示先运行 `bundle-finalize` 或检查
+  incomplete D3D12 pipeline semantic rebuild
 - resource 创建参数，包括完整 resource desc、optimized clear value、Map 状态、Unmap 写入区间、buffer asset bytes 与 blob 引用的资源数据表
 - GPU virtual address 到 resource object id / offset 的重定位，用于 VB/IB/root CBV/root SRV/root UAV/indirect buffer 等绑定
 - descriptor heap 元数据、descriptor view 创建记录、结构化 view desc，以及 raw descriptor handle 到

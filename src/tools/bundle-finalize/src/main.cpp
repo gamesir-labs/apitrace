@@ -86,6 +86,8 @@ struct Stats {
   std::size_t hashed_unique_files = 0;
   std::size_t primary_blob_id_conflicts = 0;
   std::size_t restored_inline_query_assets = 0;
+  std::size_t rebuilt_d3d12_pipeline_assets = 0;
+  std::size_t incomplete_d3d12_pipeline_semantics = 0;
   std::size_t preserved_referenced_duplicate_assets = 0;
   std::size_t dropped_unreferenced_missing_assets = 0;
   std::uint64_t hashed_asset_bytes = 0;
@@ -536,6 +538,29 @@ void add_discovered_asset(
   ++stats.input_assets;
 }
 
+std::optional<std::string> raw_asset_path_for_blob_id(
+    const fs::path &bundle_root,
+    std::uint64_t blob_id,
+    std::initializer_list<const char *> extensions)
+{
+  std::ostringstream stem;
+  stem << "asset-" << std::hex << std::setw(16) << std::setfill('0') << blob_id;
+  for (const auto *extension : extensions) {
+    const auto relative = fs::path("shaders") / (stem.str() + extension);
+    if (fs::is_regular_file(bundle_root / relative)) {
+      return relative.generic_string();
+    }
+  }
+  return std::nullopt;
+}
+
+bool is_d3d12_pipeline_create_function(const std::string &function)
+{
+  return function == "ID3D12Device::CreateGraphicsPipelineState" ||
+         function == "ID3D12Device::CreateComputePipelineState" ||
+         function == "ID3D12Device2::CreatePipelineState";
+}
+
 void discover_raw_asset_references_from_jsonl(
     const fs::path &bundle_root,
     const fs::path &relative_path,
@@ -558,15 +583,23 @@ void discover_raw_asset_references_from_jsonl(
     std::vector<std::uint64_t> blob_refs;
     std::vector<std::string> paths;
     collect_asset_references_from_json(record, blob_refs, paths);
-    if (blob_refs.empty() || paths.empty()) {
-      continue;
-    }
 
     const auto function = record.value("function", std::string());
     const auto payload = record.value("payload", json::object());
-    if ((function == "ID3D12Device::CreateGraphicsPipelineState" ||
-         function == "ID3D12Device::CreateComputePipelineState" ||
-         function == "ID3D12Device2::CreatePipelineState") &&
+    if (is_d3d12_pipeline_create_function(function) &&
+        payload.is_object() &&
+        payload.value("pso_raw_version", 0) == 1) {
+      for (const auto blob_id : blob_refs) {
+        if (const auto path = raw_asset_path_for_blob_id(bundle_root, blob_id, {".dxil", ".dxbc"})) {
+          add_discovered_asset(bundle_root, assets, stats, blob_id, *path);
+        }
+      }
+      continue;
+    }
+    if (blob_refs.empty() || paths.empty()) {
+      continue;
+    }
+    if (is_d3d12_pipeline_create_function(function) &&
         payload.is_object() &&
         payload.contains("pipeline_path") &&
         payload["pipeline_path"].is_string()) {
@@ -1526,6 +1559,259 @@ void sanitize_jsonl_tail_file(
   }
 }
 
+std::uint64_t max_blob_id(const std::vector<AssetEntry> &assets)
+{
+  std::uint64_t max_id = 0;
+  for (const auto &asset : assets) {
+    max_id = std::max(max_id, asset.blob_id);
+  }
+  return max_id;
+}
+
+std::unordered_map<std::uint64_t, std::string> build_effective_path_by_blob_id(const std::vector<AssetEntry> &assets)
+{
+  std::unordered_map<std::uint64_t, std::string> by_blob_id;
+  for (const auto &asset : assets) {
+    if (asset.blob_id != 0) {
+      by_blob_id.emplace(asset.blob_id, effective_asset_path(asset));
+    }
+  }
+  return by_blob_id;
+}
+
+std::unordered_map<std::string, AssetEntry> build_asset_by_effective_path(const std::vector<AssetEntry> &assets)
+{
+  std::unordered_map<std::string, AssetEntry> by_path;
+  for (const auto &asset : assets) {
+    const auto path = effective_asset_path(asset);
+    if (!path.empty()) {
+      by_path.emplace(path, asset);
+    }
+  }
+  return by_path;
+}
+
+bool resolve_pipeline_shader_paths(
+    json &pipeline,
+    const std::unordered_map<std::uint64_t, std::string> &path_by_blob_id,
+    std::vector<std::uint64_t> &shader_blob_refs)
+{
+  bool complete = true;
+  for (const auto *stage : {"vs", "ps", "ds", "hs", "gs", "cs", "as", "ms"}) {
+    auto shader = pipeline.find(stage);
+    if (shader == pipeline.end() || shader->is_null()) {
+      continue;
+    }
+    if (!shader->is_object()) {
+      complete = false;
+      continue;
+    }
+    const auto blob_id = shader->value("blob_id", 0ull);
+    if (blob_id == 0) {
+      if (!shader->contains(std::string(stage) + "_path")) {
+        complete = false;
+      }
+      continue;
+    }
+    const auto path_it = path_by_blob_id.find(blob_id);
+    if (path_it == path_by_blob_id.end() || path_it->second.empty()) {
+      complete = false;
+      continue;
+    }
+    (*shader)[std::string(stage) + "_path"] = path_it->second;
+    shader->erase("blob_id");
+    shader_blob_refs.push_back(blob_id);
+  }
+  return complete;
+}
+
+std::optional<AssetEntry> ensure_pipeline_asset(
+    const fs::path &bundle_root,
+    const json &pipeline,
+    const Options &options,
+    std::uint64_t &next_blob_id,
+    std::unordered_map<std::string, AssetEntry> &assets_by_path,
+    std::vector<AssetEntry> &assets,
+    Stats &stats)
+{
+  const auto text = pipeline.dump();
+  const auto digest = apitrace::trace::content_hash_bytes(text.data(), text.size());
+  const auto relative_path = (fs::path("pipelines") / (digest + ".pipeline.json")).generic_string();
+  if (const auto existing = assets_by_path.find(relative_path); existing != assets_by_path.end()) {
+    return existing->second;
+  }
+
+  AssetEntry asset;
+  asset.blob_id = ++next_blob_id;
+  asset.path = relative_path;
+  asset.kind = "Pipeline";
+  asset.debug_name = "d3d12-rebuilt-pipeline";
+  asset.content_hash = digest;
+  asset.digest = digest;
+  asset.fast_fingerprint = apitrace::trace::fast_fingerprint_bytes(text.data(), text.size());
+  asset.byte_size = static_cast<std::uint64_t>(text.size());
+  asset.actual_size = asset.byte_size;
+  asset.binary_payload = false;
+  asset.source = AssetSource::Primary;
+  asset.file_exists = true;
+  asset.safe_path = true;
+  asset.canonical_path = relative_path;
+
+  if (!options.dry_run) {
+    const auto absolute_path = bundle_root / relative_path;
+    std::error_code error;
+    fs::create_directories(absolute_path.parent_path(), error);
+    if (error) {
+      std::cerr << "warning: failed to create pipeline asset directory: " << error.message() << "\n";
+      return std::nullopt;
+    }
+    std::ofstream output(absolute_path, std::ios::binary | std::ios::trunc);
+    output << text << '\n';
+    if (!output) {
+      std::cerr << "warning: failed to write rebuilt pipeline asset " << relative_path << "\n";
+      return std::nullopt;
+    }
+  }
+
+  assets.push_back(asset);
+  assets_by_path.emplace(relative_path, asset);
+  ++stats.rebuilt_d3d12_pipeline_assets;
+  return asset;
+}
+
+bool rebuild_pipeline_event(
+    const fs::path &bundle_root,
+    json &record,
+    const Options &options,
+    std::uint64_t &next_blob_id,
+    std::unordered_map<std::uint64_t, std::string> &path_by_blob_id,
+    std::unordered_map<std::string, AssetEntry> &assets_by_path,
+    std::vector<AssetEntry> &assets,
+    Stats &stats)
+{
+  const auto function = record.value("function", std::string());
+  if (!is_d3d12_pipeline_create_function(function)) {
+    return false;
+  }
+  auto payload_it = record.find("payload");
+  if (payload_it == record.end() || !payload_it->is_object()) {
+    return false;
+  }
+  auto &payload = *payload_it;
+  if (payload.contains("pipeline_path")) {
+    return false;
+  }
+  if (payload.value("pso_raw_version", 0) != 1) {
+    return false;
+  }
+
+  json pipeline = payload;
+  const auto raw_kind = pipeline.value("pso_kind", std::string());
+  pipeline.erase("pso_raw_version");
+  pipeline.erase("pso_kind");
+  if (raw_kind.empty()) {
+    ++stats.incomplete_d3d12_pipeline_semantics;
+    return false;
+  }
+  pipeline["type"] = raw_kind;
+
+  std::vector<std::uint64_t> shader_blob_refs;
+  if (!resolve_pipeline_shader_paths(pipeline, path_by_blob_id, shader_blob_refs)) {
+    ++stats.incomplete_d3d12_pipeline_semantics;
+    return false;
+  }
+
+  const auto pipeline_asset =
+      ensure_pipeline_asset(bundle_root, pipeline, options, next_blob_id, assets_by_path, assets, stats);
+  if (!pipeline_asset) {
+    ++stats.incomplete_d3d12_pipeline_semantics;
+    return false;
+  }
+
+  payload["pipeline_path"] = pipeline_asset->canonical_path.empty() ? pipeline_asset->path : pipeline_asset->canonical_path;
+  payload.erase("pso_raw_version");
+  payload.erase("pso_kind");
+  for (const auto *stage : {"vs", "ps", "ds", "hs", "gs", "cs", "as", "ms"}) {
+    payload.erase(stage);
+  }
+
+  json blob_refs = json::array();
+  blob_refs.push_back(pipeline_asset->blob_id);
+  for (const auto blob_id : shader_blob_refs) {
+    blob_refs.push_back(blob_id);
+  }
+  record["blob_refs"] = std::move(blob_refs);
+  path_by_blob_id.emplace(
+      pipeline_asset->blob_id,
+      pipeline_asset->canonical_path.empty() ? pipeline_asset->path : pipeline_asset->canonical_path);
+  return true;
+}
+
+std::unordered_set<std::string> rebuild_d3d12_pipeline_semantics(
+    const fs::path &bundle_root,
+    std::vector<AssetEntry> &assets,
+    const Options &options,
+    Stats &stats,
+    ProgressReporter *progress)
+{
+  std::unordered_set<std::string> rewritten_paths;
+  const auto callstream_path = bundle_root / apitrace::trace::kCallstreamFileName;
+  if (!fs::is_regular_file(callstream_path)) {
+    return rewritten_paths;
+  }
+
+  auto path_by_blob_id = build_effective_path_by_blob_id(assets);
+  auto assets_by_path = build_asset_by_effective_path(assets);
+  auto next_blob_id = max_blob_id(assets);
+  std::ifstream input(callstream_path, std::ios::binary);
+  if (!input.is_open()) {
+    return rewritten_paths;
+  }
+
+  std::vector<std::string> lines;
+  std::string line;
+  bool changed = false;
+  std::uint64_t line_index = 0;
+  while (std::getline(input, line)) {
+    ++line_index;
+    auto record = json::parse(line, nullptr, false);
+    if (record.is_discarded()) {
+      lines.push_back(std::move(line));
+      continue;
+    }
+    if (rebuild_pipeline_event(
+            bundle_root,
+            record,
+            options,
+            next_blob_id,
+            path_by_blob_id,
+            assets_by_path,
+            assets,
+            stats)) {
+      lines.push_back(record.dump());
+      changed = true;
+    } else {
+      lines.push_back(std::move(line));
+    }
+    if (progress) {
+      progress->update(line_index, 0, 0, 0);
+    }
+  }
+
+  if (!changed) {
+    return rewritten_paths;
+  }
+  ++stats.rewritten_text_files;
+  rewritten_paths.insert(apitrace::trace::kCallstreamFileName);
+  if (!options.dry_run) {
+    std::ofstream output(callstream_path, std::ios::binary | std::ios::trunc);
+    for (const auto &rewritten_line : lines) {
+      output << rewritten_line << '\n';
+    }
+  }
+  return rewritten_paths;
+}
+
 void write_asset_index(const fs::path &bundle_root, const std::vector<AssetEntry> &assets, const Options &options)
 {
   json list = json::array();
@@ -1878,7 +2164,7 @@ int main(int argc, char **argv)
   }
 
   const auto started = std::chrono::steady_clock::now();
-  constexpr std::size_t kStageCount = 16;
+  constexpr std::size_t kStageCount = 18;
   std::size_t stage_index = 0;
   ProgressReporter progress(options.progress);
   Stats stats;
@@ -1931,6 +2217,31 @@ int main(int argc, char **argv)
     sanitize_and_rewrite_jsonl_file(metal_callstream, blob_id_remap, options, stats, &progress, 5, 6);
     sanitize_and_rewrite_jsonl_file(translation_links, blob_id_remap, options, stats, &progress, 6, 6);
   });
+  run_stage(options, progress, stage_index, kStageCount, "rebuild_semantics", [&] {
+    const auto rebuilt_paths =
+        rebuild_d3d12_pipeline_semantics(options.bundle_root, assets, options, stats, &progress);
+    rewritten_paths.insert(rebuilt_paths.begin(), rebuilt_paths.end());
+    if (!rebuilt_paths.empty()) {
+      assets = merge_assets(std::move(assets));
+      stat_assets(options.bundle_root, assets);
+      hash_assets(options.bundle_root, assets, options.jobs, stats, &progress);
+      ensure_canonical_files(options.bundle_root, assets, options, stats);
+      const auto rebuilt_blob_id_remap = normalize_blob_ids(assets, stats);
+      if (!rebuilt_blob_id_remap.empty()) {
+        sanitize_and_rewrite_jsonl_file(
+            options.bundle_root / apitrace::trace::kCallstreamFileName,
+            rebuilt_blob_id_remap,
+            options,
+            stats,
+            &progress);
+      }
+    }
+  });
+  run_stage(options, progress, stage_index, kStageCount, "rewrite_rebuilt_references", [&] {
+    aliases = build_aliases(assets);
+    const auto rebuilt_rewrites = rewrite_text_references(options.bundle_root, aliases, options, stats, &progress);
+    rewritten_paths.insert(rebuilt_rewrites.begin(), rebuilt_rewrites.end());
+  });
   std::unordered_set<std::string> referenced_paths_after_rewrite;
   run_stage(options, progress, stage_index, kStageCount, "rebuild_reference_graph", [&] {
     referenced_paths_after_rewrite = collect_referenced_asset_paths(options.bundle_root, aliases);
@@ -1962,6 +2273,8 @@ int main(int argc, char **argv)
             << " duplicate_assets=" << stats.duplicate_assets
             << " duplicate_bytes=" << stats.duplicate_bytes
             << " restored_inline_query_assets=" << stats.restored_inline_query_assets
+            << " rebuilt_d3d12_pipeline_assets=" << stats.rebuilt_d3d12_pipeline_assets
+            << " incomplete_d3d12_pipeline_semantics=" << stats.incomplete_d3d12_pipeline_semantics
             << " preserved_referenced_duplicate_assets=" << stats.preserved_referenced_duplicate_assets
             << " dropped_unreferenced_missing_assets=" << stats.dropped_unreferenced_missing_assets
             << " remapped_blob_ids=" << stats.remapped_blob_ids

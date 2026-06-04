@@ -2083,7 +2083,7 @@ std::string shader_asset_json_locked(const char *field_name, const D3D12_SHADER_
   std::ostringstream payload;
   payload << "\"" << field_name << "\":{"
           << "\"bytecode_size\":" << static_cast<std::uint64_t>(bytecode.BytecodeLength) << ","
-          << "\"" << field_name << "_path\":\"" << asset.relative_path.generic_string() << "\""
+          << "\"blob_id\":" << asset.blob_id
           << "}";
   return payload.str();
 }
@@ -2380,7 +2380,8 @@ std::string graphics_pipeline_asset_json_locked(
   }
   std::ostringstream payload;
   payload << "{"
-          << "\"type\":\"graphics\","
+          << "\"pso_raw_version\":1,"
+          << "\"pso_kind\":\"graphics\","
           << "\"root_signature_object_id\":" << object_id_json(lookup_object_id_locked(desc->pRootSignature)) << ","
           << "\"node_mask\":" << desc->NodeMask << ","
           << "\"flags\":" << static_cast<unsigned int>(desc->Flags) << ","
@@ -2422,7 +2423,8 @@ std::string compute_pipeline_asset_json_locked(
   }
   std::ostringstream payload;
   payload << "{"
-          << "\"type\":\"compute\","
+          << "\"pso_raw_version\":1,"
+          << "\"pso_kind\":\"compute\","
           << "\"root_signature_object_id\":" << object_id_json(lookup_object_id_locked(desc->pRootSignature)) << ","
           << "\"node_mask\":" << desc->NodeMask << ","
           << "\"flags\":" << static_cast<unsigned int>(desc->Flags) << ","
@@ -2677,16 +2679,22 @@ StreamPipelineAsset stream_pipeline_asset_json_locked(
 
   std::ostringstream pipeline;
   if (result.compute) {
-    pipeline << "{\"type\":\"compute\""
+    pipeline << "{\"pso_raw_version\":1"
+             << ",\"pso_kind\":\"compute\""
              << ",\"source\":\"stream\""
+             << ",\"stream_size\":" << static_cast<std::uint64_t>(desc->SizeInBytes)
              << ",\"root_signature_object_id\":" << object_id_json(lookup_object_id_locked(compute.pRootSignature))
              << ",\"node_mask\":" << compute.NodeMask
              << ",\"flags\":" << static_cast<unsigned int>(compute.Flags)
              << "," << shader_json.cs
+             << ",\"requires_dxmt_backend\":false"
+             << ",\"stream_metadata\":" << result.metadata_json
              << "}";
   } else {
-    pipeline << "{\"type\":\"" << (has_ms ? "mesh" : "graphics") << "\""
+    pipeline << "{\"pso_raw_version\":1"
+             << ",\"pso_kind\":\"" << (has_ms ? "mesh" : "graphics") << "\""
              << ",\"source\":\"stream\""
+             << ",\"stream_size\":" << static_cast<std::uint64_t>(desc->SizeInBytes)
              << ",\"root_signature_object_id\":" << object_id_json(lookup_object_id_locked(graphics.pRootSignature))
              << ",\"node_mask\":" << graphics.NodeMask
              << ",\"flags\":" << static_cast<unsigned int>(graphics.Flags)
@@ -2721,6 +2729,8 @@ StreamPipelineAsset stream_pipeline_asset_json_locked(
     if (has_ms) {
       pipeline << "," << shader_json.ms;
     }
+    pipeline << ",\"requires_dxmt_backend\":" << (result.requires_dxmt_backend ? "true" : "false")
+             << ",\"stream_metadata\":" << result.metadata_json;
     pipeline << "}";
   }
   result.pipeline_json = pipeline.str();
@@ -3665,13 +3675,15 @@ HRESULT STDMETHODCALLTYPE hook_device_create_graphics_pipeline_state(
     const auto parent = lookup_object_id_locked(self);
     register_fresh_object_locked(*pipeline_state, apitrace::trace::ObjectKind::PipelineState, "ID3D12PipelineState", parent);
     std::vector<apitrace::trace::BlobId> shader_blob_refs;
-    const auto pipeline_json = graphics_pipeline_asset_json_locked(desc, shader_blob_refs);
-    const auto pipeline_asset = register_asset_text_locked(apitrace::trace::AssetKind::Pipeline, "d3d12-graphics-pipeline", pipeline_json);
-    std::vector<apitrace::trace::BlobId> blob_refs = {pipeline_asset.blob_id};
+    const auto payload = graphics_pipeline_asset_json_locked(desc, shader_blob_refs);
+    std::vector<apitrace::trace::BlobId> blob_refs;
     blob_refs.insert(blob_refs.end(), shader_blob_refs.begin(), shader_blob_refs.end());
-    std::ostringstream payload;
-    payload << "{\"pipeline_path\":\"" << pipeline_asset.relative_path.generic_string() << "\"}";
-    record_call_locked("ID3D12Device::CreateGraphicsPipelineState", hr, {self, *pipeline_state}, blob_refs, payload.str());
+    record_call_locked(
+        "ID3D12Device::CreateGraphicsPipelineState",
+        hr,
+        {self, desc ? desc->pRootSignature : nullptr, *pipeline_state},
+        blob_refs,
+        payload);
   }
   return hr;
 }
@@ -3694,13 +3706,15 @@ HRESULT STDMETHODCALLTYPE hook_device_create_compute_pipeline_state(
     const auto parent = lookup_object_id_locked(self);
     register_fresh_object_locked(*pipeline_state, apitrace::trace::ObjectKind::PipelineState, "ID3D12PipelineState", parent);
     std::vector<apitrace::trace::BlobId> shader_blob_refs;
-    const auto pipeline_json = compute_pipeline_asset_json_locked(desc, shader_blob_refs);
-    const auto pipeline_asset = register_asset_text_locked(apitrace::trace::AssetKind::Pipeline, "d3d12-compute-pipeline", pipeline_json);
-    std::vector<apitrace::trace::BlobId> blob_refs = {pipeline_asset.blob_id};
+    const auto payload = compute_pipeline_asset_json_locked(desc, shader_blob_refs);
+    std::vector<apitrace::trace::BlobId> blob_refs;
     blob_refs.insert(blob_refs.end(), shader_blob_refs.begin(), shader_blob_refs.end());
-    std::ostringstream payload;
-    payload << "{\"pipeline_path\":\"" << pipeline_asset.relative_path.generic_string() << "\"}";
-    record_call_locked("ID3D12Device::CreateComputePipelineState", hr, {self, *pipeline_state}, blob_refs, payload.str());
+    record_call_locked(
+        "ID3D12Device::CreateComputePipelineState",
+        hr,
+        {self, desc ? desc->pRootSignature : nullptr, *pipeline_state},
+        blob_refs,
+        payload);
   }
   return hr;
 }
@@ -3724,20 +3738,9 @@ HRESULT STDMETHODCALLTYPE hook_device_create_pipeline_state(
     register_fresh_object_locked(*pipeline_state, apitrace::trace::ObjectKind::PipelineState, "ID3D12PipelineState", parent);
     std::vector<apitrace::trace::BlobId> shader_blob_refs;
     const auto stream_asset = stream_pipeline_asset_json_locked(desc, shader_blob_refs);
-    const auto pipeline_asset = register_asset_text_locked(
-        apitrace::trace::AssetKind::Pipeline,
-        stream_asset.compute ? "d3d12-stream-compute-pipeline" : "d3d12-stream-graphics-pipeline",
-        stream_asset.pipeline_json);
-    std::vector<apitrace::trace::BlobId> blob_refs = {pipeline_asset.blob_id};
+    std::vector<apitrace::trace::BlobId> blob_refs;
     blob_refs.insert(blob_refs.end(), shader_blob_refs.begin(), shader_blob_refs.end());
-    std::ostringstream payload;
-    payload << "{\"pipeline_path\":\"" << pipeline_asset.relative_path.generic_string() << "\""
-            << ",\"stream_size\":" << static_cast<std::uint64_t>(desc ? desc->SizeInBytes : 0)
-            << ",\"source\":\"stream\""
-            << ",\"requires_dxmt_backend\":" << (stream_asset.requires_dxmt_backend ? "true" : "false")
-            << ",\"stream_metadata\":" << stream_asset.metadata_json
-            << "}";
-    record_call_locked("ID3D12Device2::CreatePipelineState", hr, {self, *pipeline_state}, blob_refs, payload.str());
+    record_call_locked("ID3D12Device2::CreatePipelineState", hr, {self, *pipeline_state}, blob_refs, stream_asset.pipeline_json);
   }
   return hr;
 }

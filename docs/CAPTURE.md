@@ -120,7 +120,7 @@ Windows 侧建议把入口分成四个模式，再统一进同一个 runtime。
 
 - `D3D12CreateDevice`
 - command queue / allocator / list
-- root signature / pipeline state
+- root signature / pipeline state raw evidence
 - descriptor heap / descriptor table
 - resource barrier
 - fence / submit / present
@@ -131,6 +131,13 @@ Windows 侧建议把入口分成四个模式，再统一进同一个 runtime。
 - command list 重放必须保留提交顺序
 - barrier 和资源状态必须精确
 - descriptor 数据通常要单独持久化
+- PSO 录制期只保存 raw evidence：`pso_raw_version: 1`、`pso_kind`、root signature object id、
+  node mask、flags、graphics / compute / stream desc 快照、shader stage `{blob_id, bytecode_size}`、
+  stream metadata 和 `requires_dxmt_backend`
+- shader/root signature bytecode 仍作为 raw asset 写入并进入 `blob_refs`；录制期不写
+  `pipelines/*.pipeline.json`，也不把 pipeline JSON 资产放进 PSO call 的 `blob_refs`
+- D3D12 PSO semantic rebuild 统一交给 `bundle-finalize`，由离线 CLI 生成 deterministic
+  `pipeline_path`、pipeline JSON 和完整 replay closure
 
 ## Metal trace 重点
 

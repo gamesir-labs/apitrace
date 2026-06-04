@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <sstream>
 #include <string_view>
 
 #include <d3d12.h>
@@ -83,6 +84,81 @@ std::string read_text(const std::filesystem::path &path)
 {
   std::ifstream input(path, std::ios::binary);
   return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+}
+
+std::string shell_quote_path(const std::filesystem::path &path)
+{
+  std::string quoted = "'";
+  for (const char ch : path.string()) {
+    if (ch == '\'') {
+      quoted += "'\\''";
+    } else {
+      quoted += ch;
+    }
+  }
+  quoted += "'";
+  return quoted;
+}
+
+bool finalize_bundle(const char *argv0, const std::filesystem::path &bundle)
+{
+  std::filesystem::path finalize = "bundle-finalize";
+  const auto self = std::filesystem::path(argv0 ? argv0 : "");
+  if (self.has_parent_path()) {
+    const auto sibling = self.parent_path() / "bundle-finalize";
+    if (std::filesystem::exists(sibling)) {
+      finalize = sibling;
+    }
+  }
+  const auto command = shell_quote_path(finalize) + " --jobs 1 " + shell_quote_path(bundle);
+  return std::system(command.c_str()) == 0;
+}
+
+bool verify_raw_pipeline_capture(const std::filesystem::path &bundle)
+{
+  std::ifstream input(bundle / apitrace::trace::kCallstreamFileName, std::ios::binary);
+  if (!input.is_open()) {
+    std::cerr << "raw callstream was not written\n";
+    return false;
+  }
+  std::string line;
+  std::size_t stream_pipeline_calls = 0;
+  bool found_compute_stream_pipeline = false;
+  bool found_mesh_stream_pipeline = false;
+  while (std::getline(input, line)) {
+    const auto record = nlohmann::json::parse(line, nullptr, false);
+    if (record.is_discarded() ||
+        record.value("function", std::string()) != "ID3D12Device2::CreatePipelineState") {
+      continue;
+    }
+    ++stream_pipeline_calls;
+    const auto payload = record.value("payload", nlohmann::json::object());
+    const auto blob_refs = record.value("blob_refs", nlohmann::json::array());
+    if (!payload.is_object() ||
+        payload.value("pso_raw_version", 0) != 1 ||
+        payload.value("source", "") != "stream" ||
+        payload.contains("pipeline_path") ||
+        !payload.contains("stream_metadata") ||
+        blob_refs.size() != 1) {
+      std::cerr << "raw CreatePipelineState stream payload is incomplete\n";
+      return false;
+    }
+    const auto blob_id = blob_refs.front().get<std::uint64_t>();
+    if (payload.value("requires_dxmt_backend", false)) {
+      found_mesh_stream_pipeline =
+          payload.contains("ms") && !payload["ms"].is_null() &&
+          payload["ms"].value("blob_id", 0ull) == blob_id;
+    } else {
+      found_compute_stream_pipeline =
+          payload.contains("cs") && !payload["cs"].is_null() &&
+          payload["cs"].value("blob_id", 0ull) == blob_id;
+    }
+  }
+  if (stream_pipeline_calls != 2 || !found_compute_stream_pipeline || !found_mesh_stream_pipeline) {
+    std::cerr << "raw CreatePipelineState calls did not preserve compute and mesh variants\n";
+    return false;
+  }
+  return true;
 }
 
 } // namespace
@@ -451,6 +527,14 @@ int main(int argc, char **argv)
   apitrace::runtime::shutdown_process_trace_session();
   clear_trace_bundle_env();
 
+  if (!verify_raw_pipeline_capture(bundle)) {
+    return 1;
+  }
+  if (!finalize_bundle(argv[0], bundle)) {
+    std::cerr << "bundle-finalize failed for capture api bundle\n";
+    return 1;
+  }
+
   apitrace::trace::TraceBundleReader reader;
   if (!reader.open(bundle)) {
     std::cerr << "failed to read bundle: " << reader.last_error() << "\n";
@@ -543,6 +627,16 @@ int main(int argc, char **argv)
   bool found_compute_stream_pipeline = false;
   bool found_mesh_stream_pipeline = false;
   std::size_t stream_shader_blob_refs = 0;
+  std::size_t pipeline_assets = 0;
+  for (const auto &asset : reader.assets()) {
+    if (asset.kind == apitrace::trace::AssetKind::Pipeline) {
+      ++pipeline_assets;
+    }
+  }
+  if (pipeline_assets != 2) {
+    std::cerr << "bundle-finalize should rebuild two D3D12 pipeline semantic assets\n";
+    return 1;
+  }
   for (const auto &event : reader.events()) {
     if (event.kind != apitrace::trace::EventKind::Call ||
         event.callsite.function_name != "ID3D12Device2::CreatePipelineState") {
@@ -568,7 +662,7 @@ int main(int argc, char **argv)
       return 1;
     }
     if (event.blob_refs.size() != 2) {
-      std::cerr << "CreatePipelineState stream should link one pipeline asset and one shader asset\n";
+      std::cerr << "CreatePipelineState stream should link one pipeline asset and one shader asset after bundle-finalize\n";
       return 1;
     }
     ++stream_shader_blob_refs;

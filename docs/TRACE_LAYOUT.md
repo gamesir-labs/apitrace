@@ -403,24 +403,36 @@ shader-visible heap 必须有 `gpu_start`，非 shader-visible heap 不应有 `g
 `SetDescriptorHeaps` 记录的 heap 数量必须和 object refs 一致，并且同一调用中不能绑定重复 heap
 类型；root descriptor table 只能引用当前 command list 已绑定的 shader-visible heap。
 
-### `pipelines/`
+### D3D12 PSO raw evidence 与 `pipelines/`
 
-pipeline 相关结构独立保存为便于 review 的中间格式，例如：
+D3D12 pipeline state 在录制期只进入 `callstream.jsonl` 的 raw evidence，不直接写
+`pipelines/*.pipeline.json`。`CreateGraphicsPipelineState`、`CreateComputePipelineState` 和
+`ID3D12Device2::CreatePipelineState` 的 payload 使用 `pso_raw_version: 1`，并记录：
 
-- `.pipeline.json`
+- `pso_kind`：`graphics`、`compute` 或 `mesh`
+- `root_signature_object_id`、`node_mask`、`flags`
+- graphics / compute / stream desc 的结构化快照
+- shader stage 对象，例如 `{ "bytecode_size": N, "blob_id": B }`
+- stream PSO 的 `source: "stream"`、`stream_size`、`stream_metadata`
+- mesh / amplification shader stream PSO 的 `requires_dxmt_backend`
 
-但要注意：
+shader 和 root signature bytecode 仍作为 raw asset 写入 `shaders/`，并通过事件 `blob_refs`
+引用。录制期 PSO 事件不能包含 `pipeline_path`，也不能把 pipeline JSON 放进 `blob_refs`。
 
-- 这是辅助资产
-- 不能替代 `callstream.jsonl` 中的调用语义
+`bundle-finalize` 是唯一的 D3D12 PSO semantic rebuild 入口。它在 raw JSONL 和 blob id
+完成 sanitize / canonical rewrite 后读取 raw PSO payload，把 shader `blob_id` 解析为 canonical
+asset path，生成 deterministic `pipelines/<digest>.pipeline.json`，为 pipeline asset 分配稳定
+blob id，并把对应 create 调用重写为 retrace 可消费的 `pipeline_path + blob_refs` 形式。重复运行
+finalize 不应生成重复 pipeline asset；旧 bundle 已经带合法 `pipeline_path` 时只做 canonical rewrite。
 
-retrace 读取 `CreateGraphicsPipelineState` / `CreateComputePipelineState` 时必须把 pipeline object id
-映射到对应 `pipeline_path`、`blob_refs` 和关键 metadata。graphics pipeline 至少保留
+finalize 后的 pipeline JSON 至少保留足以重建 D3D12 PSO 的字段。graphics pipeline 至少保留
 `root_signature_object_id`、`input_layout`、`blend_state`、`rasterizer_state`、`depth_stencil_state`、
 `sample_mask`、`sample_desc`、`primitive_topology_type`、`num_render_targets`、`rtv_formats[]`、
 `dsv_format`、`ib_strip_cut_value`、`node_mask`、`flags` 以及 VS/PS/DS/HS/GS shader asset 引用；
-compute pipeline 至少保留 `root_signature_object_id`、`node_mask`、`flags` 和 CS shader asset 引用。
-这些字段必须足以重建 D3D12 PSO；不能只保存摘要或反射结果。
+compute pipeline 至少保留 `root_signature_object_id`、`node_mask`、`flags` 和 CS shader asset 引用；
+mesh pipeline 还需要保留 AS/MS shader 引用和 DXMT-only replay guard。缺失 shader blob、尾部半行
+或不完整 stream subobject 时，finalize 不生成悬空 `pipeline_path`，并在 summary 中报告 incomplete
+D3D12 pipeline semantic 数量。
 
 ### `objects/`
 

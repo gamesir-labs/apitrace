@@ -1426,11 +1426,6 @@ trace::AssetRecord register_asset_bytes(
   return asset;
 }
 
-trace::AssetRecord register_asset_text(trace::AssetKind kind, const char *debug_name, const std::string &text)
-{
-  return register_asset_bytes(kind, debug_name, text.data(), text.size());
-}
-
 std::string hex_encode_bytes(const void *data, std::size_t size)
 {
   static constexpr char kHex[] = "0123456789abcdef";
@@ -1551,7 +1546,7 @@ std::size_t pipeline_stream_payload_alignment(PipelineStateSubobjectType type)
   }
 }
 
-std::string shader_asset_json(
+std::string raw_shader_asset_json(
     const char *field_name,
     const D3D12_SHADER_BYTECODE &bytecode,
     std::vector<trace::BlobId> &blob_refs)
@@ -1568,7 +1563,7 @@ std::string shader_asset_json(
   std::ostringstream payload;
   payload << "\"" << field_name << "\":{"
           << "\"bytecode_size\":" << static_cast<std::uint64_t>(bytecode.BytecodeLength)
-          << ",\"" << field_name << "_path\":\"" << asset.relative_path.generic_string() << "\""
+          << ",\"blob_id\":" << asset.blob_id
           << "}";
   return payload.str();
 }
@@ -3134,12 +3129,11 @@ std::uint64_t record_create_graphics_pipeline_state(
   }
   std::vector<trace::BlobId> shader_blob_refs;
   std::vector<trace::BlobId> blob_refs;
-  std::string pipeline_path;
   std::ostringstream payload;
   payload << "{";
   if (desc) {
-    std::ostringstream pipeline;
-    pipeline << "{\"type\":\"graphics\""
+    payload << "\"pso_raw_version\":1"
+             << ",\"pso_kind\":\"graphics\""
              << ",\"root_signature_object_id\":" << object_id(desc->pRootSignature)
              << ",\"node_mask\":" << desc->NodeMask
              << ",\"flags\":" << static_cast<unsigned int>(desc->Flags)
@@ -3154,35 +3148,29 @@ std::uint64_t record_create_graphics_pipeline_state(
              << ",\"rtv_formats\":[";
     for (UINT index = 0; index < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++index) {
       if (index) {
-        pipeline << ",";
+        payload << ",";
       }
-      pipeline << static_cast<unsigned int>(desc->RTVFormats[index]);
+      payload << static_cast<unsigned int>(desc->RTVFormats[index]);
     }
-    pipeline << "]"
+    payload << "]"
              << ",\"dsv_format\":" << static_cast<unsigned int>(desc->DSVFormat)
              << ",\"sample_desc\":{\"count\":" << desc->SampleDesc.Count
              << ",\"quality\":" << desc->SampleDesc.Quality << "}"
              << ",\"ib_strip_cut_value\":" << static_cast<unsigned int>(desc->IBStripCutValue)
-             << "," << shader_asset_json("vs", desc->VS, shader_blob_refs)
-             << "," << shader_asset_json("ps", desc->PS, shader_blob_refs)
-             << "," << shader_asset_json("ds", desc->DS, shader_blob_refs)
-             << "," << shader_asset_json("hs", desc->HS, shader_blob_refs)
-             << "," << shader_asset_json("gs", desc->GS, shader_blob_refs)
-             << "}";
-    const auto pipeline_asset = register_asset_text(
-        trace::AssetKind::Pipeline, "d3d12-graphics-pipeline", pipeline.str());
-    pipeline_path = pipeline_asset.relative_path.generic_string();
-    blob_refs.push_back(pipeline_asset.blob_id);
-    payload << "\"pipeline_path\":\"" << pipeline_path << "\"";
+             << "," << raw_shader_asset_json("vs", desc->VS, shader_blob_refs)
+             << "," << raw_shader_asset_json("ps", desc->PS, shader_blob_refs)
+             << "," << raw_shader_asset_json("ds", desc->DS, shader_blob_refs)
+             << "," << raw_shader_asset_json("hs", desc->HS, shader_blob_refs)
+             << "," << raw_shader_asset_json("gs", desc->GS, shader_blob_refs);
   }
   payload << "}";
   blob_refs.insert(blob_refs.end(), shader_blob_refs.begin(), shader_blob_refs.end());
-  const void *refs[] = {device, pipeline_state};
+  const void *refs[] = {device, desc ? desc->pRootSignature : nullptr, pipeline_state};
   return record_call(
       "ID3D12Device::CreateGraphicsPipelineState",
       payload.str().c_str(),
       refs,
-      2,
+      3,
       reinterpret_cast<const std::uint64_t *>(blob_refs.data()),
       blob_refs.size(),
       result_code);
@@ -3202,26 +3190,21 @@ std::uint64_t record_create_compute_pipeline_state(
   std::ostringstream payload;
   payload << "{";
   if (desc) {
-    std::ostringstream pipeline;
-    pipeline << "{\"type\":\"compute\""
+    payload << "\"pso_raw_version\":1"
+             << ",\"pso_kind\":\"compute\""
              << ",\"root_signature_object_id\":" << object_id(desc->pRootSignature)
              << ",\"node_mask\":" << desc->NodeMask
              << ",\"flags\":" << static_cast<unsigned int>(desc->Flags)
-             << "," << shader_asset_json("cs", desc->CS, shader_blob_refs)
-             << "}";
-    const auto pipeline_asset = register_asset_text(
-        trace::AssetKind::Pipeline, "d3d12-compute-pipeline", pipeline.str());
-    blob_refs.push_back(pipeline_asset.blob_id);
+             << "," << raw_shader_asset_json("cs", desc->CS, shader_blob_refs);
     blob_refs.insert(blob_refs.end(), shader_blob_refs.begin(), shader_blob_refs.end());
-    payload << "\"pipeline_path\":\"" << pipeline_asset.relative_path.generic_string() << "\"";
   }
   payload << "}";
-  const void *refs[] = {device, pipeline_state};
+  const void *refs[] = {device, desc ? desc->pRootSignature : nullptr, pipeline_state};
   return record_call(
       "ID3D12Device::CreateComputePipelineState",
       payload.str().c_str(),
       refs,
-      2,
+      3,
       reinterpret_cast<const std::uint64_t *>(blob_refs.data()),
       blob_refs.size(),
       result_code);
@@ -3471,18 +3454,22 @@ std::uint64_t record_create_pipeline_state(
     }
     stream << "]";
 
-    std::ostringstream pipeline;
     if (has_cs && !has_as && !has_ms) {
-      pipeline << "{\"type\":\"compute\""
+      payload << "\"pso_raw_version\":1"
+               << ",\"pso_kind\":\"compute\""
                << ",\"source\":\"stream\""
+               << ",\"stream_size\":" << static_cast<std::uint64_t>(stream_size)
                << ",\"root_signature_object_id\":" << object_id(compute.pRootSignature)
                << ",\"node_mask\":" << compute.NodeMask
                << ",\"flags\":" << static_cast<unsigned int>(compute.Flags)
-               << "," << shader_json.cs
-               << "}";
+               << "," << shader_metadata_json.cs
+               << ",\"requires_dxmt_backend\":false"
+               << ",\"stream_metadata\":" << stream.str() << "}";
     } else {
-      pipeline << "{\"type\":\"" << (has_ms ? "mesh" : "graphics") << "\""
+      payload << "\"pso_raw_version\":1"
+               << ",\"pso_kind\":\"" << (has_ms ? "mesh" : "graphics") << "\""
                << ",\"source\":\"stream\""
+               << ",\"stream_size\":" << static_cast<std::uint64_t>(stream_size)
                << ",\"root_signature_object_id\":" << object_id(graphics.pRootSignature)
                << ",\"node_mask\":" << graphics.NodeMask
                << ",\"flags\":" << static_cast<unsigned int>(graphics.Flags)
@@ -3497,40 +3484,30 @@ std::uint64_t record_create_pipeline_state(
                << ",\"rtv_formats\":[";
       for (UINT index = 0; index < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++index) {
         if (index) {
-          pipeline << ",";
+          payload << ",";
         }
-        pipeline << static_cast<unsigned int>(graphics.RTVFormats[index]);
+        payload << static_cast<unsigned int>(graphics.RTVFormats[index]);
       }
-      pipeline << "]"
+      payload << "]"
                << ",\"dsv_format\":" << static_cast<unsigned int>(graphics.DSVFormat)
                << ",\"sample_desc\":{\"count\":" << graphics.SampleDesc.Count
                << ",\"quality\":" << graphics.SampleDesc.Quality << "}"
                << ",\"ib_strip_cut_value\":" << static_cast<unsigned int>(graphics.IBStripCutValue)
-               << "," << shader_json.vs
-               << "," << shader_json.ps
-               << "," << shader_json.ds
-               << "," << shader_json.hs
-               << "," << shader_json.gs;
+               << "," << shader_metadata_json.vs
+               << "," << shader_metadata_json.ps
+               << "," << shader_metadata_json.ds
+               << "," << shader_metadata_json.hs
+               << "," << shader_metadata_json.gs;
       if (has_as) {
-        pipeline << "," << shader_json.as;
+        payload << "," << shader_metadata_json.as;
       }
       if (has_ms) {
-        pipeline << "," << shader_json.ms;
+        payload << "," << shader_metadata_json.ms;
       }
-      pipeline << "}";
+      payload << ",\"requires_dxmt_backend\":" << (has_ms || has_as ? "true" : "false")
+              << ",\"stream_metadata\":" << stream.str() << "}";
     }
-
-    const auto pipeline_asset = register_asset_text(
-        trace::AssetKind::Pipeline,
-        has_cs && !has_as && !has_ms ? "d3d12-stream-compute-pipeline" : "d3d12-stream-graphics-pipeline",
-        pipeline.str());
-    blob_refs.push_back(pipeline_asset.blob_id);
     blob_refs.insert(blob_refs.end(), shader_blob_refs.begin(), shader_blob_refs.end());
-    payload << "\"pipeline_path\":\"" << pipeline_asset.relative_path.generic_string() << "\""
-            << ",\"stream_size\":" << static_cast<std::uint64_t>(stream_size)
-            << ",\"source\":\"stream\""
-            << ",\"requires_dxmt_backend\":" << (has_ms || has_as ? "true" : "false")
-            << ",\"stream_metadata\":" << stream.str() << "}";
   }
   payload << "}";
   return record_call(

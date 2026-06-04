@@ -278,13 +278,15 @@ extern "C" void WINAPI apitrace_d3d12_record_graphics_pipeline(
   const auto parent = lookup_object_id_locked(device);
   register_object_locked(pipeline_state, apitrace::trace::ObjectKind::PipelineState, "ID3D12PipelineState", parent);
   std::vector<apitrace::trace::BlobId> shader_blob_refs;
-  const auto pipeline_json = graphics_pipeline_asset_json_locked(desc, shader_blob_refs);
-  const auto pipeline_asset = register_asset_text_locked(apitrace::trace::AssetKind::Pipeline, "d3d12-graphics-pipeline", pipeline_json);
-  std::vector<apitrace::trace::BlobId> blob_refs = {pipeline_asset.blob_id};
+  const auto payload = graphics_pipeline_asset_json_locked(desc, shader_blob_refs);
+  std::vector<apitrace::trace::BlobId> blob_refs;
   blob_refs.insert(blob_refs.end(), shader_blob_refs.begin(), shader_blob_refs.end());
-  std::ostringstream payload;
-  payload << "{\"pipeline_path\":\"" << pipeline_asset.relative_path.generic_string() << "\"}";
-  record_call_locked("ID3D12Device::CreateGraphicsPipelineState", S_OK, {device, pipeline_state}, blob_refs, payload.str());
+  record_call_locked(
+      "ID3D12Device::CreateGraphicsPipelineState",
+      S_OK,
+      {device, desc->pRootSignature, pipeline_state},
+      blob_refs,
+      payload);
 }
 
 extern "C" void WINAPI apitrace_d3d12_record_compute_pipeline(
@@ -302,13 +304,15 @@ extern "C" void WINAPI apitrace_d3d12_record_compute_pipeline(
   const auto parent = lookup_object_id_locked(device);
   register_object_locked(pipeline_state, apitrace::trace::ObjectKind::PipelineState, "ID3D12PipelineState", parent);
   std::vector<apitrace::trace::BlobId> shader_blob_refs;
-  const auto pipeline_json = compute_pipeline_asset_json_locked(desc, shader_blob_refs);
-  const auto pipeline_asset = register_asset_text_locked(apitrace::trace::AssetKind::Pipeline, "d3d12-compute-pipeline", pipeline_json);
-  std::vector<apitrace::trace::BlobId> blob_refs = {pipeline_asset.blob_id};
+  const auto payload = compute_pipeline_asset_json_locked(desc, shader_blob_refs);
+  std::vector<apitrace::trace::BlobId> blob_refs;
   blob_refs.insert(blob_refs.end(), shader_blob_refs.begin(), shader_blob_refs.end());
-  std::ostringstream payload;
-  payload << "{\"pipeline_path\":\"" << pipeline_asset.relative_path.generic_string() << "\"}";
-  record_call_locked("ID3D12Device::CreateComputePipelineState", S_OK, {device, pipeline_state}, blob_refs, payload.str());
+  record_call_locked(
+      "ID3D12Device::CreateComputePipelineState",
+      S_OK,
+      {device, desc->pRootSignature, pipeline_state},
+      blob_refs,
+      payload);
 }
 
 extern "C" HRESULT WINAPI D3D12SerializeRootSignature(
