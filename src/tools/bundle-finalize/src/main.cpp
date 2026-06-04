@@ -529,10 +529,11 @@ void add_discovered_asset(
     const fs::path &bundle_root,
     std::vector<AssetEntry> &assets,
     Stats &stats,
+    const std::unordered_set<std::uint64_t> &indexed_blob_ids,
     std::uint64_t blob_id,
     const std::string &path)
 {
-  if (blob_id == 0) {
+  if (blob_id == 0 || indexed_blob_ids.find(blob_id) != indexed_blob_ids.end()) {
     return;
   }
   const fs::path asset_path(path);
@@ -576,6 +577,7 @@ void discover_raw_asset_references_from_jsonl(
     const fs::path &bundle_root,
     const fs::path &relative_path,
     std::vector<AssetEntry> &assets,
+    const std::unordered_set<std::uint64_t> &indexed_blob_ids,
     Stats &stats)
 {
   const auto absolute_path = bundle_root / relative_path;
@@ -602,7 +604,7 @@ void discover_raw_asset_references_from_jsonl(
         payload.value("pso_raw_version", 0) == 1) {
       for (const auto blob_id : blob_refs) {
         if (const auto path = raw_asset_path_for_blob_id(bundle_root, blob_id, {".dxil", ".dxbc"})) {
-          add_discovered_asset(bundle_root, assets, stats, blob_id, *path);
+          add_discovered_asset(bundle_root, assets, stats, indexed_blob_ids, blob_id, *path);
         }
       }
       continue;
@@ -615,7 +617,7 @@ void discover_raw_asset_references_from_jsonl(
         payload.contains("pipeline_path") &&
         payload["pipeline_path"].is_string()) {
       const auto pipeline_path = payload["pipeline_path"].get<std::string>();
-      add_discovered_asset(bundle_root, assets, stats, blob_refs[0], pipeline_path);
+      add_discovered_asset(bundle_root, assets, stats, indexed_blob_ids, blob_refs[0], pipeline_path);
 
       const auto pipeline_json_path = bundle_root / fs::path(pipeline_path);
       std::ifstream pipeline_input(pipeline_json_path, std::ios::binary);
@@ -626,7 +628,7 @@ void discover_raw_asset_references_from_jsonl(
         for (std::size_t index = 0;
              index < dependency_paths.size() && index + 1 < blob_refs.size();
              ++index) {
-          add_discovered_asset(bundle_root, assets, stats, blob_refs[index + 1], dependency_paths[index]);
+          add_discovered_asset(bundle_root, assets, stats, indexed_blob_ids, blob_refs[index + 1], dependency_paths[index]);
         }
       }
       continue;
@@ -636,7 +638,7 @@ void discover_raw_asset_references_from_jsonl(
       if (index >= blob_refs.size()) {
         break;
       }
-      add_discovered_asset(bundle_root, assets, stats, blob_refs[index], paths[index]);
+      add_discovered_asset(bundle_root, assets, stats, indexed_blob_ids, blob_refs[index], paths[index]);
     }
   }
 }
@@ -646,20 +648,29 @@ void discover_raw_asset_references(
     std::vector<AssetEntry> &assets,
     Stats &stats)
 {
+  std::unordered_set<std::uint64_t> indexed_blob_ids;
+  for (const auto &asset : assets) {
+    if (asset.blob_id != 0) {
+      indexed_blob_ids.insert(asset.blob_id);
+    }
+  }
   discover_raw_asset_references_from_jsonl(
       bundle_root,
       fs::path(apitrace::trace::kCallstreamFileName),
       assets,
+      indexed_blob_ids,
       stats);
   discover_raw_asset_references_from_jsonl(
       bundle_root,
       fs::path(apitrace::trace::kMetalCallstreamFileName),
       assets,
+      indexed_blob_ids,
       stats);
   discover_raw_asset_references_from_jsonl(
       bundle_root,
       fs::path(apitrace::trace::kAnalysisDirectoryName) / apitrace::trace::kTranslationLinksFileName,
       assets,
+      indexed_blob_ids,
       stats);
 }
 
@@ -2398,6 +2409,17 @@ std::string bundle_hash_from_records(std::vector<std::pair<std::string, std::pai
   return "sha256:" + apitrace::trace::content_hash_bytes(source.data(), source.size());
 }
 
+bool is_host_metadata_file(const fs::path &relative)
+{
+  for (const auto &component : relative) {
+    const auto name = component.generic_string();
+    if (name == ".DS_Store" || name == "Thumbs.db" || name == "desktop.ini") {
+      return true;
+    }
+  }
+  return false;
+}
+
 void write_checksums(
     const fs::path &bundle_root,
     const std::vector<AssetEntry> &assets,
@@ -2434,7 +2456,7 @@ void write_checksums(
       continue;
     }
     const auto relative_text = relative.generic_string();
-    if (relative_text == apitrace::trace::kChecksumsFileName) {
+    if (relative_text == apitrace::trace::kChecksumsFileName || is_host_metadata_file(relative)) {
       continue;
     }
     const auto size = static_cast<std::uint64_t>(fs::file_size(it->path(), error));
