@@ -472,6 +472,11 @@ std::string canonical_asset_path(const AssetEntry &asset)
   return (fs::path(directory) / filename).generic_string();
 }
 
+bool is_path_reference_key(const std::string &key)
+{
+  return (key.size() >= 5 && key.compare(key.size() - 5, 5, "_path") == 0) || key == "path";
+}
+
 void collect_asset_references_from_json(
     const json &node,
     std::vector<std::uint64_t> &blob_refs,
@@ -487,9 +492,7 @@ void collect_asset_references_from_json(
         }
         continue;
       }
-      if (it.key().size() >= 5 &&
-          it.key().compare(it.key().size() - 5, 5, "_path") == 0 &&
-          it.value().is_string()) {
+      if (is_path_reference_key(it.key()) && it.value().is_string()) {
         paths.push_back(it.value().get<std::string>());
       }
       collect_asset_references_from_json(it.value(), blob_refs, paths);
@@ -1017,6 +1020,18 @@ std::unordered_map<std::string, std::string> build_aliases(const std::vector<Ass
   return aliases;
 }
 
+std::unordered_map<std::string, std::uint64_t> build_blob_id_by_effective_path(const std::vector<AssetEntry> &assets)
+{
+  std::unordered_map<std::string, std::uint64_t> blob_id_by_path;
+  for (const auto &asset : assets) {
+    const auto path = effective_asset_path(asset);
+    if (!path.empty() && asset.blob_id != 0) {
+      blob_id_by_path.emplace(path, asset.blob_id);
+    }
+  }
+  return blob_id_by_path;
+}
+
 std::unordered_map<std::uint64_t, std::uint64_t> normalize_blob_ids(std::vector<AssetEntry> &assets, Stats &stats)
 {
   constexpr std::size_t kConflictWarningLimit = 16;
@@ -1109,9 +1124,7 @@ void collect_path_references_from_json(
 {
   if (node.is_object()) {
     for (auto it = node.begin(); it != node.end(); ++it) {
-      if (it->is_string() &&
-          it.key().size() >= 5 &&
-          it.key().compare(it.key().size() - 5, 5, "_path") == 0) {
+      if (it->is_string() && is_path_reference_key(it.key())) {
         const auto path = it->get<std::string>();
         const auto alias = aliases.find(path);
         paths.insert(alias == aliases.end() ? path : alias->second);
@@ -1191,8 +1204,7 @@ bool rewrite_path_refs(json &node, const std::unordered_map<std::string, std::st
 
   if (node.is_object()) {
     for (auto it = node.begin(); it != node.end(); ++it) {
-      if (it->is_string() &&
-          (it.key().size() >= 5 && it.key().compare(it.key().size() - 5, 5, "_path") == 0)) {
+      if (it->is_string() && is_path_reference_key(it.key())) {
         const auto found = aliases.find(it->get<std::string>());
         if (found != aliases.end()) {
           *it = found->second;
@@ -1205,6 +1217,46 @@ bool rewrite_path_refs(json &node, const std::unordered_map<std::string, std::st
   } else if (node.is_array()) {
     for (auto &item : node) {
       changed = rewrite_path_refs(item, aliases) || changed;
+    }
+  }
+  return changed;
+}
+
+bool rewrite_blob_refs_for_effective_paths(
+    json &node,
+    const std::unordered_map<std::string, std::uint64_t> &blob_id_by_effective_path,
+    bool path_references_changed)
+{
+  if (!path_references_changed || blob_id_by_effective_path.empty() || !node.is_object()) {
+    return false;
+  }
+
+  auto refs = node.find("blob_refs");
+  if (refs == node.end() || !refs->is_array()) {
+    return false;
+  }
+
+  std::vector<std::uint64_t> blob_refs;
+  std::vector<std::string> paths;
+  collect_asset_references_from_json(node, blob_refs, paths);
+  if (paths.empty() || blob_refs.empty()) {
+    return false;
+  }
+
+  bool changed = false;
+  for (std::size_t index = 0; index < paths.size() && index < refs->size(); ++index) {
+    auto &ref = (*refs)[index];
+    if (!ref.is_number_unsigned()) {
+      continue;
+    }
+    const auto path = blob_id_by_effective_path.find(paths[index]);
+    if (path == blob_id_by_effective_path.end()) {
+      continue;
+    }
+    const auto blob_id = path->second;
+    if (blob_id != 0 && ref.get<std::uint64_t>() != blob_id) {
+      ref = blob_id;
+      changed = true;
     }
   }
   return changed;
@@ -1245,12 +1297,13 @@ std::vector<fs::path> text_reference_files(const fs::path &bundle_root)
 std::unordered_set<std::string> rewrite_text_references(
     const fs::path &bundle_root,
     const std::unordered_map<std::string, std::string> &aliases,
+    const std::unordered_map<std::string, std::uint64_t> &blob_id_by_effective_path,
     const Options &options,
     Stats &stats,
     ProgressReporter *progress)
 {
   std::unordered_set<std::string> rewritten_paths;
-  if (aliases.empty()) {
+  if (aliases.empty() && blob_id_by_effective_path.empty()) {
     return rewritten_paths;
   }
 
@@ -1284,7 +1337,10 @@ std::unordered_set<std::string> rewrite_text_references(
           lines.push_back(std::move(line));
           continue;
         }
-        if (rewrite_path_refs(record, aliases)) {
+        const bool paths_changed = rewrite_path_refs(record, aliases);
+        const bool blob_refs_changed =
+            rewrite_blob_refs_for_effective_paths(record, blob_id_by_effective_path, paths_changed);
+        if (paths_changed || blob_refs_changed) {
           lines.push_back(record.dump());
           changed = true;
         } else {
@@ -1316,7 +1372,11 @@ std::unordered_set<std::string> rewrite_text_references(
     }
 
     root = json::parse(input, nullptr, false);
-    if (root.is_discarded() || !rewrite_path_refs(root, aliases)) {
+    const bool paths_changed = !root.is_discarded() && rewrite_path_refs(root, aliases);
+    const bool blob_refs_changed =
+        !root.is_discarded() &&
+        rewrite_blob_refs_for_effective_paths(root, blob_id_by_effective_path, paths_changed);
+    if (root.is_discarded() || (!paths_changed && !blob_refs_changed)) {
       ++file_index;
       processed_bytes += size_error ? 0 : file_size;
       if (progress) {
@@ -2521,12 +2581,15 @@ int main(int argc, char **argv)
     blob_id_remap = normalize_blob_ids(assets, stats);
   });
   std::unordered_map<std::string, std::string> aliases;
+  std::unordered_map<std::string, std::uint64_t> blob_id_by_effective_path;
   run_stage(options, progress, stage_index, kStageCount, "build_aliases", [&] {
     aliases = build_aliases(assets);
+    blob_id_by_effective_path = build_blob_id_by_effective_path(assets);
   });
   std::unordered_set<std::string> rewritten_paths;
   run_stage(options, progress, stage_index, kStageCount, "rewrite_references", [&] {
-    rewritten_paths = rewrite_text_references(options.bundle_root, aliases, options, stats, &progress);
+    rewritten_paths =
+        rewrite_text_references(options.bundle_root, aliases, blob_id_by_effective_path, options, stats, &progress);
   });
   run_stage(options, progress, stage_index, kStageCount, "sanitize_tail", [&] {
     const auto callstream = options.bundle_root / apitrace::trace::kCallstreamFileName;
@@ -2562,7 +2625,9 @@ int main(int argc, char **argv)
   });
   run_stage(options, progress, stage_index, kStageCount, "rewrite_rebuilt_references", [&] {
     aliases = build_aliases(assets);
-    const auto rebuilt_rewrites = rewrite_text_references(options.bundle_root, aliases, options, stats, &progress);
+    blob_id_by_effective_path = build_blob_id_by_effective_path(assets);
+    const auto rebuilt_rewrites =
+        rewrite_text_references(options.bundle_root, aliases, blob_id_by_effective_path, options, stats, &progress);
     rewritten_paths.insert(rebuilt_rewrites.begin(), rebuilt_rewrites.end());
   });
   std::unordered_set<std::string> referenced_paths_after_rewrite;
