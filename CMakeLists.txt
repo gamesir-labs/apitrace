@@ -155,6 +155,11 @@ else()
         src/d3d12/src/d3d12_proxy.cpp
         src/d3d12/src/d3d12_proxy/d3d12.def
     )
+
+    add_library(apitrace_platform_windows_dxgi SHARED
+        src/dxgi/src/dxgi_proxy.cpp
+        src/dxgi/src/dxgi.def
+    )
 endif()
 
 add_library(apitrace_platform_apple_metal
@@ -194,6 +199,15 @@ target_include_directories(apitrace_platform_windows_d3d12
         ${APITRACE_PRIVATE_INCLUDE_DIRS}
 )
 
+if(TARGET apitrace_platform_windows_dxgi)
+    target_include_directories(apitrace_platform_windows_dxgi
+        PUBLIC
+            ${APITRACE_PUBLIC_INCLUDE_DIRS}
+        PRIVATE
+            ${APITRACE_PRIVATE_INCLUDE_DIRS}
+    )
+endif()
+
 target_include_directories(apitrace_platform_apple_metal
     PUBLIC
         ${APITRACE_PUBLIC_INCLUDE_DIRS}
@@ -203,21 +217,30 @@ target_include_directories(apitrace_platform_apple_metal
 
 target_link_libraries(apitrace_platform_windows_d3d11 PRIVATE apitrace_core)
 target_link_libraries(apitrace_platform_windows_d3d12 PRIVATE apitrace_core apitrace_d3d_headers)
+if(TARGET apitrace_platform_windows_dxgi)
+    target_link_libraries(apitrace_platform_windows_dxgi PRIVATE apitrace_core apitrace_d3d_headers)
+endif()
 target_link_libraries(apitrace_platform_apple_metal PRIVATE apitrace_core)
 
 target_compile_features(apitrace_platform_windows_d3d11 PUBLIC cxx_std_17)
 target_compile_features(apitrace_platform_windows_d3d12 PUBLIC cxx_std_17)
+if(TARGET apitrace_platform_windows_dxgi)
+    target_compile_features(apitrace_platform_windows_dxgi PUBLIC cxx_std_17)
+endif()
 target_compile_features(apitrace_platform_apple_metal PUBLIC cxx_std_17)
 
 if(WIN32 AND APITRACE_BUILD_WINDOWS_DLLS AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
     set_target_properties(apitrace_platform_windows_d3d11 PROPERTIES OUTPUT_NAME d3d11 PREFIX "")
     set_target_properties(apitrace_platform_windows_d3d12 PROPERTIES OUTPUT_NAME d3d12 PREFIX "")
+    set_target_properties(apitrace_platform_windows_dxgi PROPERTIES OUTPUT_NAME dxgi PREFIX "")
     if(MINGW)
         target_link_options(apitrace_platform_windows_d3d12 PRIVATE -Wl,--exclude-all-symbols)
+        target_link_options(apitrace_platform_windows_dxgi PRIVATE -Wl,--exclude-all-symbols)
     endif()
     if(MINGW AND CMAKE_SIZEOF_VOID_P EQUAL 4)
         target_link_options(apitrace_platform_windows_d3d11 PRIVATE -Wl,--add-stdcall-alias)
         target_link_options(apitrace_platform_windows_d3d12 PRIVATE -Wl,--add-stdcall-alias)
+        target_link_options(apitrace_platform_windows_dxgi PRIVATE -Wl,--add-stdcall-alias)
     endif()
 elseif(APITRACE_BUILD_PE_CAPTURE_STATIC)
     set_target_properties(apitrace_platform_windows_d3d11 PROPERTIES
@@ -229,6 +252,9 @@ elseif(APITRACE_BUILD_PE_CAPTURE_STATIC)
 else()
     set_target_properties(apitrace_platform_windows_d3d11 PROPERTIES EXCLUDE_FROM_ALL TRUE)
     set_target_properties(apitrace_platform_windows_d3d12 PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    if(TARGET apitrace_platform_windows_dxgi)
+        set_target_properties(apitrace_platform_windows_dxgi PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    endif()
 endif()
 
 if(NOT APPLE OR NOT APITRACE_BUILD_METAL_BACKEND)
