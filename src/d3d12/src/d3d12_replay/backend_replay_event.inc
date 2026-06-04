@@ -1061,7 +1061,8 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     }
     resources_[resource.resource_object_id] = std::move(resource);
     ++semantic_calls_seen_;
-  } else if (function_name == "ID3D12Device::CreateHeap") {
+  } else if (function_name == "ID3D12Device::CreateHeap" ||
+             function_name == "ID3D12Device4::CreateHeap1") {
     if (event.object_refs.size() < 2 || event.object_refs[1] == 0) {
       last_error_ = record_prefix(event) + ": CreateHeap missing heap object id";
       return false;

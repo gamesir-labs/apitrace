@@ -679,6 +679,7 @@ bool is_supported_d3d12_call(std::string_view function_name)
          function_name == "ID3D12Device::CreateCommittedResource" ||
          function_name == "ID3D12Device::CreateReservedResource" ||
          function_name == "ID3D12Device::CreateHeap" ||
+         function_name == "ID3D12Device4::CreateHeap1" ||
          function_name == "ID3D12Device::CreatePlacedResource" ||
          function_name == "ID3D12Device::CreateFence" ||
          function_name == "ID3D12Device::CreateConstantBufferView" ||

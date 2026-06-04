@@ -177,6 +177,12 @@ HRESULT STDMETHODCALLTYPE hook_device_create_command_list1(
     D3D12_COMMAND_LIST_FLAGS flags,
     REFIID riid,
     void **command_list);
+HRESULT STDMETHODCALLTYPE hook_device_create_heap1(
+    ID3D12Device4 *self,
+    const D3D12_HEAP_DESC *desc,
+    ID3D12ProtectedResourceSession *protected_session,
+    REFIID riid,
+    void **heap);
 HRESULT STDMETHODCALLTYPE hook_device_create_descriptor_heap(
     ID3D12Device *self,
     const D3D12_DESCRIPTOR_HEAP_DESC *desc,
@@ -578,6 +584,7 @@ struct Device2HookState {
 struct Device4HookState {
   ID3D12Device4Vtbl *vtable = nullptr;
   decltype(std::declval<ID3D12Device4Vtbl>().CreateCommandList1) create_command_list1 = nullptr;
+  decltype(std::declval<ID3D12Device4Vtbl>().CreateHeap1) create_heap1 = nullptr;
 };
 
 struct CommandQueueHookState {
@@ -2888,8 +2895,10 @@ void patch_device(ID3D12Device *device, std::size_t vtable_size)
     Device4HookState hook4;
     hook4.vtable = original_vtable4;
     hook4.create_command_list1 = original_vtable4->CreateCommandList1;
+    hook4.create_heap1 = original_vtable4->CreateHeap1;
     capture_state().device4_hooks.emplace(vtable4, hook4);
     patch_vtable_field(vtable4, &ID3D12Device4Vtbl::CreateCommandList1, hook_device_create_command_list1);
+    patch_vtable_field(vtable4, &ID3D12Device4Vtbl::CreateHeap1, hook_device_create_heap1);
   }
   device->lpVtbl = vtable;
 
@@ -2916,7 +2925,7 @@ void patch_device(ID3D12Device *device, std::size_t vtable_size)
   patch_vtable_field(vtable, &ID3D12DeviceVtbl::CreateFence, hook_device_create_fence);
   patch_vtable_field(vtable, &ID3D12DeviceVtbl::CreateCommandSignature, hook_device_create_command_signature);
   proxy_debug_logf(
-      "patch_device vtable=%p pso=%d queue=%d allocator=%d list=%d list1=%d fence=%d",
+      "patch_device vtable=%p pso=%d queue=%d allocator=%d list=%d list1=%d heap1=%d fence=%d",
       static_cast<void *>(vtable),
       vtable->CreateGraphicsPipelineState == hook_device_create_graphics_pipeline_state,
       vtable->CreateCommandQueue == hook_device_create_command_queue,
@@ -2927,6 +2936,9 @@ void patch_device(ID3D12Device *device, std::size_t vtable_size)
           : false,
       vtable_size >= sizeof(ID3D12Device4Vtbl)
           ? reinterpret_cast<ID3D12Device4Vtbl *>(vtable)->CreateCommandList1 == hook_device_create_command_list1
+          : false,
+      vtable_size >= sizeof(ID3D12Device4Vtbl)
+          ? reinterpret_cast<ID3D12Device4Vtbl *>(vtable)->CreateHeap1 == hook_device_create_heap1
           : false,
       vtable->CreateFence == hook_device_create_fence);
 }
@@ -3911,6 +3923,38 @@ HRESULT STDMETHODCALLTYPE hook_device_create_root_signature(
     }
     payload << "}";
     record_call_locked("ID3D12Device::CreateRootSignature", hr, {self, *root_signature}, blob_refs, payload.str());
+  }
+  return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_device_create_heap1(
+    ID3D12Device4 *self,
+    const D3D12_HEAP_DESC *desc,
+    ID3D12ProtectedResourceSession *protected_session,
+    REFIID riid,
+    void **heap)
+{
+  const auto hook = device4_hook_for(self);
+  if (!hook.create_heap1) {
+    return E_FAIL;
+  }
+  ScopedOriginalVTable<ID3D12Device4, ID3D12Device4Vtbl> original_vtable(self, hook.vtable);
+  const HRESULT hr = hook.create_heap1(self, desc, protected_session, riid, heap);
+  if (SUCCEEDED(hr) && heap && *heap) {
+    std::lock_guard<std::mutex> lock(capture_state().mutex);
+    const auto parent = lookup_object_id_locked(self);
+    const auto protected_session_object_id = lookup_object_id_locked(protected_session);
+    register_fresh_object_locked(*heap, apitrace::trace::ObjectKind::Heap, "ID3D12Heap", parent);
+    capture_state().heap_types[static_cast<ID3D12Heap *>(*heap)] =
+        desc ? static_cast<UINT>(desc->Properties.Type) : 0;
+    std::ostringstream payload;
+    payload << "{\"size_in_bytes\":" << (desc ? desc->SizeInBytes : 0)
+            << ",\"alignment\":" << (desc ? desc->Alignment : 0)
+            << ",\"heap_type\":" << (desc ? static_cast<unsigned int>(desc->Properties.Type) : 0)
+            << ",\"flags\":" << (desc ? static_cast<unsigned int>(desc->Flags) : 0)
+            << ",\"protected_session_object_id\":" << object_id_json(protected_session_object_id)
+            << "}";
+    record_call_locked("ID3D12Device4::CreateHeap1", hr, {self, protected_session, *heap}, {}, payload.str());
   }
   return hr;
 }

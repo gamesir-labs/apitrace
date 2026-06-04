@@ -68,6 +68,12 @@ struct AssetEntry {
   std::string canonical_path;
 };
 
+struct ShaderAssetRef {
+  std::uint64_t blob_id = 0;
+  std::uint64_t byte_size = 0;
+  std::string path;
+};
+
 struct Stats {
   std::size_t input_assets = 0;
   std::size_t indexed_assets = 0;
@@ -94,6 +100,8 @@ struct Stats {
   std::uint64_t refreshed_asset_bytes = 0;
   std::uint64_t checksum_hashed_bytes = 0;
   std::uint64_t duplicate_bytes = 0;
+  std::size_t repaired_d3d12_pipeline_events = 0;
+  std::size_t unresolved_d3d12_pipeline_asset_refs = 0;
 };
 
 bool stderr_is_tty()
@@ -789,6 +797,21 @@ std::string effective_asset_path(const AssetEntry &asset)
   return asset.canonical_path.empty() ? asset.path : asset.canonical_path;
 }
 
+bool is_shader_asset(const AssetEntry &asset)
+{
+  return asset.kind == "ShaderDxil" || asset.kind == "ShaderDxbc";
+}
+
+bool is_pipeline_asset(const AssetEntry &asset)
+{
+  return asset.kind == "Pipeline";
+}
+
+std::uint64_t asset_storage_size(const AssetEntry &asset)
+{
+  return asset.actual_size != 0 ? asset.actual_size : asset.byte_size;
+}
+
 void stat_assets(const fs::path &bundle_root, std::vector<AssetEntry> &assets)
 {
   for (auto &asset : assets) {
@@ -1333,6 +1356,12 @@ bool rewrite_blob_refs(json &node, const std::unordered_map<std::uint64_t, std::
           ref = found->second;
           changed = true;
         }
+      } else if (it.key() == "blob_id" && it.value().is_number_unsigned()) {
+        const auto found = blob_id_remap.find(it.value().get<std::uint64_t>());
+        if (found != blob_id_remap.end()) {
+          it.value() = found->second;
+          changed = true;
+        }
       } else {
         changed = rewrite_blob_refs(it.value(), blob_id_remap) || changed;
       }
@@ -1579,6 +1608,71 @@ std::unordered_map<std::uint64_t, std::string> build_effective_path_by_blob_id(c
   return by_blob_id;
 }
 
+std::unordered_map<std::uint64_t, AssetEntry> build_asset_by_blob_id(const std::vector<AssetEntry> &assets)
+{
+  std::unordered_map<std::uint64_t, AssetEntry> by_blob_id;
+  for (const auto &asset : assets) {
+    if (asset.blob_id != 0) {
+      by_blob_id.emplace(asset.blob_id, asset);
+    }
+  }
+  return by_blob_id;
+}
+
+std::unordered_map<std::uint64_t, ShaderAssetRef> build_shader_ref_by_blob_id(const std::vector<AssetEntry> &assets)
+{
+  std::unordered_map<std::uint64_t, ShaderAssetRef> by_blob_id;
+  for (const auto &asset : assets) {
+    const auto path = effective_asset_path(asset);
+    const auto size = asset_storage_size(asset);
+    if (!is_shader_asset(asset) || asset.blob_id == 0 || path.empty() || size == 0 || !asset.file_exists) {
+      continue;
+    }
+    by_blob_id.emplace(asset.blob_id, ShaderAssetRef{asset.blob_id, size, path});
+  }
+  return by_blob_id;
+}
+
+std::unordered_map<std::string, ShaderAssetRef> build_shader_ref_by_path(const std::vector<AssetEntry> &assets)
+{
+  std::unordered_map<std::string, ShaderAssetRef> by_path;
+  for (const auto &asset : assets) {
+    const auto path = effective_asset_path(asset);
+    const auto size = asset_storage_size(asset);
+    if (!is_shader_asset(asset) || asset.blob_id == 0 || path.empty() || size == 0 || !asset.file_exists) {
+      continue;
+    }
+    const auto [it, inserted] = by_path.emplace(path, ShaderAssetRef{asset.blob_id, size, path});
+    if (!inserted && asset.blob_id < it->second.blob_id) {
+      it->second.blob_id = asset.blob_id;
+    }
+  }
+  return by_path;
+}
+
+std::unordered_map<std::uint64_t, ShaderAssetRef> build_unique_shader_ref_by_size(const std::vector<AssetEntry> &assets)
+{
+  std::unordered_map<std::uint64_t, ShaderAssetRef> by_size;
+  std::unordered_set<std::uint64_t> ambiguous_sizes;
+  for (const auto &asset : assets) {
+    const auto path = effective_asset_path(asset);
+    const auto size = asset_storage_size(asset);
+    if (!is_shader_asset(asset) || asset.blob_id == 0 || path.empty() || size == 0 || !asset.file_exists) {
+      continue;
+    }
+    const auto [it, inserted] = by_size.emplace(size, ShaderAssetRef{asset.blob_id, size, path});
+    if (!inserted && it->second.path != path) {
+      ambiguous_sizes.insert(size);
+    } else if (!inserted && asset.blob_id < it->second.blob_id) {
+      it->second.blob_id = asset.blob_id;
+    }
+  }
+  for (const auto size : ambiguous_sizes) {
+    by_size.erase(size);
+  }
+  return by_size;
+}
+
 std::unordered_map<std::string, AssetEntry> build_asset_by_effective_path(const std::vector<AssetEntry> &assets)
 {
   std::unordered_map<std::string, AssetEntry> by_path;
@@ -1593,7 +1687,8 @@ std::unordered_map<std::string, AssetEntry> build_asset_by_effective_path(const 
 
 bool resolve_pipeline_shader_paths(
     json &pipeline,
-    const std::unordered_map<std::uint64_t, std::string> &path_by_blob_id,
+    const std::unordered_map<std::uint64_t, ShaderAssetRef> &shader_ref_by_blob_id,
+    const std::unordered_map<std::uint64_t, ShaderAssetRef> &unique_shader_ref_by_size,
     std::vector<std::uint64_t> &shader_blob_refs)
 {
   bool complete = true;
@@ -1606,6 +1701,7 @@ bool resolve_pipeline_shader_paths(
       complete = false;
       continue;
     }
+    const auto bytecode_size = shader->value("bytecode_size", 0ull);
     const auto blob_id = shader->value("blob_id", 0ull);
     if (blob_id == 0) {
       if (!shader->contains(std::string(stage) + "_path")) {
@@ -1613,16 +1709,31 @@ bool resolve_pipeline_shader_paths(
       }
       continue;
     }
-    const auto path_it = path_by_blob_id.find(blob_id);
-    if (path_it == path_by_blob_id.end() || path_it->second.empty()) {
+    const auto ref_it = shader_ref_by_blob_id.find(blob_id);
+    if (ref_it != shader_ref_by_blob_id.end() && ref_it->second.byte_size == bytecode_size) {
+      (*shader)[std::string(stage) + "_path"] = ref_it->second.path;
+      shader->erase("blob_id");
+      shader_blob_refs.push_back(ref_it->second.blob_id);
+      continue;
+    }
+
+    const auto size_it = unique_shader_ref_by_size.find(bytecode_size);
+    if (size_it == unique_shader_ref_by_size.end() || size_it->second.path.empty()) {
       complete = false;
       continue;
     }
-    (*shader)[std::string(stage) + "_path"] = path_it->second;
+    (*shader)[std::string(stage) + "_path"] = size_it->second.path;
     shader->erase("blob_id");
-    shader_blob_refs.push_back(blob_id);
+    shader_blob_refs.push_back(size_it->second.blob_id);
   }
   return complete;
+}
+
+void append_unique_blob_ref(json &refs, std::unordered_set<std::uint64_t> &seen, std::uint64_t blob_id)
+{
+  if (blob_id != 0 && seen.insert(blob_id).second) {
+    refs.push_back(blob_id);
+  }
 }
 
 std::optional<AssetEntry> ensure_pipeline_asset(
@@ -1685,6 +1796,8 @@ bool rebuild_pipeline_event(
     const Options &options,
     std::uint64_t &next_blob_id,
     std::unordered_map<std::uint64_t, std::string> &path_by_blob_id,
+    const std::unordered_map<std::uint64_t, ShaderAssetRef> &shader_ref_by_blob_id,
+    const std::unordered_map<std::uint64_t, ShaderAssetRef> &unique_shader_ref_by_size,
     std::unordered_map<std::string, AssetEntry> &assets_by_path,
     std::vector<AssetEntry> &assets,
     Stats &stats)
@@ -1716,7 +1829,7 @@ bool rebuild_pipeline_event(
   pipeline["type"] = raw_kind;
 
   std::vector<std::uint64_t> shader_blob_refs;
-  if (!resolve_pipeline_shader_paths(pipeline, path_by_blob_id, shader_blob_refs)) {
+  if (!resolve_pipeline_shader_paths(pipeline, shader_ref_by_blob_id, unique_shader_ref_by_size, shader_blob_refs)) {
     ++stats.incomplete_d3d12_pipeline_semantics;
     return false;
   }
@@ -1747,6 +1860,195 @@ bool rebuild_pipeline_event(
   return true;
 }
 
+std::string shader_stage_path_key(const char *stage)
+{
+  return std::string(stage) + "_path";
+}
+
+std::optional<ShaderAssetRef> shader_ref_for_pipeline_stage(
+    const json &shader,
+    const char *stage,
+    const std::vector<ShaderAssetRef> &call_shader_refs,
+    const std::unordered_map<std::string, ShaderAssetRef> &shader_ref_by_path,
+    const std::unordered_map<std::uint64_t, ShaderAssetRef> &unique_shader_ref_by_size)
+{
+  if (!shader.is_object()) {
+    return std::nullopt;
+  }
+  const auto bytecode_size = shader.value("bytecode_size", 0ull);
+  if (bytecode_size == 0) {
+    return std::nullopt;
+  }
+
+  const auto path = shader.value(shader_stage_path_key(stage), std::string());
+  if (!path.empty()) {
+    const auto path_it = shader_ref_by_path.find(path);
+    if (path_it != shader_ref_by_path.end() && path_it->second.byte_size == bytecode_size) {
+      return path_it->second;
+    }
+  }
+
+  std::optional<ShaderAssetRef> call_match;
+  for (const auto &ref : call_shader_refs) {
+    if (ref.byte_size != bytecode_size) {
+      continue;
+    }
+    if (call_match && call_match->path != ref.path) {
+      call_match.reset();
+      break;
+    }
+    call_match = ref;
+  }
+  if (call_match) {
+    return call_match;
+  }
+
+  const auto size_it = unique_shader_ref_by_size.find(bytecode_size);
+  if (size_it != unique_shader_ref_by_size.end()) {
+    return size_it->second;
+  }
+  return std::nullopt;
+}
+
+bool repair_pipeline_asset_stage_refs(
+    json &pipeline,
+    const std::vector<ShaderAssetRef> &call_shader_refs,
+    const std::unordered_map<std::string, ShaderAssetRef> &shader_ref_by_path,
+    const std::unordered_map<std::uint64_t, ShaderAssetRef> &unique_shader_ref_by_size,
+    std::vector<std::uint64_t> &shader_blob_refs,
+    Stats &stats)
+{
+  struct StageRepair {
+    std::string stage;
+    ShaderAssetRef ref;
+  };
+
+  std::vector<StageRepair> repairs;
+  bool changed = false;
+  for (const auto *stage : {"vs", "ps", "ds", "hs", "gs", "cs", "as", "ms"}) {
+    auto shader = pipeline.find(stage);
+    if (shader == pipeline.end() || shader->is_null()) {
+      continue;
+    }
+    if (!shader->is_object()) {
+      ++stats.unresolved_d3d12_pipeline_asset_refs;
+      continue;
+    }
+    const auto ref = shader_ref_for_pipeline_stage(
+        *shader,
+        stage,
+        call_shader_refs,
+        shader_ref_by_path,
+        unique_shader_ref_by_size);
+    if (!ref) {
+      ++stats.unresolved_d3d12_pipeline_asset_refs;
+      return false;
+    }
+    repairs.push_back({stage, *ref});
+  }
+
+  for (const auto &repair : repairs) {
+    auto shader = pipeline.find(repair.stage);
+    if (shader == pipeline.end() || !shader->is_object()) {
+      continue;
+    }
+    const auto &ref = repair.ref;
+    shader_blob_refs.push_back(ref.blob_id);
+    const auto key = shader_stage_path_key(repair.stage.c_str());
+    if (shader->value(key, std::string()) != ref.path) {
+      (*shader)[key] = ref.path;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+bool repair_pipeline_asset_event(
+    const fs::path &bundle_root,
+    json &record,
+    const Options &options,
+    std::uint64_t &next_blob_id,
+    std::unordered_map<std::uint64_t, std::string> &path_by_blob_id,
+    const std::unordered_map<std::uint64_t, AssetEntry> &asset_by_blob_id,
+    const std::unordered_map<std::uint64_t, ShaderAssetRef> &shader_ref_by_blob_id,
+    const std::unordered_map<std::string, ShaderAssetRef> &shader_ref_by_path,
+    const std::unordered_map<std::uint64_t, ShaderAssetRef> &unique_shader_ref_by_size,
+    std::unordered_map<std::string, AssetEntry> &assets_by_path,
+    std::vector<AssetEntry> &assets,
+    Stats &stats)
+{
+  auto payload_it = record.find("payload");
+  if (payload_it == record.end() || !payload_it->is_object()) {
+    return false;
+  }
+  auto &payload = *payload_it;
+  const auto pipeline_path = payload.value("pipeline_path", std::string());
+  if (pipeline_path.empty()) {
+    return false;
+  }
+
+  const auto pipeline_absolute = bundle_root / pipeline_path;
+  std::ifstream input(pipeline_absolute, std::ios::binary);
+  if (!input.is_open()) {
+    return false;
+  }
+  auto pipeline = json::parse(input, nullptr, false);
+  if (pipeline.is_discarded() || !pipeline.is_object()) {
+    return false;
+  }
+
+  std::vector<ShaderAssetRef> call_shader_refs;
+  std::vector<std::uint64_t> existing_non_shader_refs;
+  for (const auto &blob_ref : record.value("blob_refs", json::array())) {
+    if (!blob_ref.is_number_unsigned()) {
+      continue;
+    }
+    const auto blob_id = blob_ref.get<std::uint64_t>();
+    if (const auto shader_it = shader_ref_by_blob_id.find(blob_id); shader_it != shader_ref_by_blob_id.end()) {
+      call_shader_refs.push_back(shader_it->second);
+      continue;
+    }
+    existing_non_shader_refs.push_back(blob_id);
+  }
+
+  std::vector<std::uint64_t> shader_blob_refs;
+  if (!repair_pipeline_asset_stage_refs(
+          pipeline,
+          call_shader_refs,
+          shader_ref_by_path,
+          unique_shader_ref_by_size,
+          shader_blob_refs,
+          stats)) {
+    return false;
+  }
+
+  const auto pipeline_asset =
+      ensure_pipeline_asset(bundle_root, pipeline, options, next_blob_id, assets_by_path, assets, stats);
+  if (!pipeline_asset) {
+    return false;
+  }
+
+  payload["pipeline_path"] = pipeline_asset->canonical_path.empty() ? pipeline_asset->path : pipeline_asset->canonical_path;
+  json blob_refs = json::array();
+  std::unordered_set<std::uint64_t> seen_refs;
+  append_unique_blob_ref(blob_refs, seen_refs, pipeline_asset->blob_id);
+  for (const auto blob_id : existing_non_shader_refs) {
+    const auto asset_it = asset_by_blob_id.find(blob_id);
+    if (asset_it != asset_by_blob_id.end() && !is_pipeline_asset(asset_it->second)) {
+      append_unique_blob_ref(blob_refs, seen_refs, blob_id);
+    }
+  }
+  for (const auto blob_id : shader_blob_refs) {
+    append_unique_blob_ref(blob_refs, seen_refs, blob_id);
+  }
+  record["blob_refs"] = std::move(blob_refs);
+  path_by_blob_id.emplace(
+      pipeline_asset->blob_id,
+      pipeline_asset->canonical_path.empty() ? pipeline_asset->path : pipeline_asset->canonical_path);
+  ++stats.repaired_d3d12_pipeline_events;
+  return true;
+}
+
 std::unordered_set<std::string> rebuild_d3d12_pipeline_semantics(
     const fs::path &bundle_root,
     std::vector<AssetEntry> &assets,
@@ -1761,6 +2063,10 @@ std::unordered_set<std::string> rebuild_d3d12_pipeline_semantics(
   }
 
   auto path_by_blob_id = build_effective_path_by_blob_id(assets);
+  const auto asset_by_blob_id = build_asset_by_blob_id(assets);
+  const auto shader_ref_by_blob_id = build_shader_ref_by_blob_id(assets);
+  const auto shader_ref_by_path = build_shader_ref_by_path(assets);
+  const auto unique_shader_ref_by_size = build_unique_shader_ref_by_size(assets);
   auto assets_by_path = build_asset_by_effective_path(assets);
   auto next_blob_id = max_blob_id(assets);
   std::ifstream input(callstream_path, std::ios::binary);
@@ -1785,9 +2091,26 @@ std::unordered_set<std::string> rebuild_d3d12_pipeline_semantics(
             options,
             next_blob_id,
             path_by_blob_id,
+            shader_ref_by_blob_id,
+            unique_shader_ref_by_size,
             assets_by_path,
             assets,
             stats)) {
+      lines.push_back(record.dump());
+      changed = true;
+    } else if (repair_pipeline_asset_event(
+                   bundle_root,
+                   record,
+                   options,
+                   next_blob_id,
+                   path_by_blob_id,
+                   asset_by_blob_id,
+                   shader_ref_by_blob_id,
+                   shader_ref_by_path,
+                   unique_shader_ref_by_size,
+                   assets_by_path,
+                   assets,
+                   stats)) {
       lines.push_back(record.dump());
       changed = true;
     } else {
@@ -2274,7 +2597,9 @@ int main(int argc, char **argv)
             << " duplicate_bytes=" << stats.duplicate_bytes
             << " restored_inline_query_assets=" << stats.restored_inline_query_assets
             << " rebuilt_d3d12_pipeline_assets=" << stats.rebuilt_d3d12_pipeline_assets
+            << " repaired_d3d12_pipeline_events=" << stats.repaired_d3d12_pipeline_events
             << " incomplete_d3d12_pipeline_semantics=" << stats.incomplete_d3d12_pipeline_semantics
+            << " unresolved_d3d12_pipeline_asset_refs=" << stats.unresolved_d3d12_pipeline_asset_refs
             << " preserved_referenced_duplicate_assets=" << stats.preserved_referenced_duplicate_assets
             << " dropped_unreferenced_missing_assets=" << stats.dropped_unreferenced_missing_assets
             << " remapped_blob_ids=" << stats.remapped_blob_ids
