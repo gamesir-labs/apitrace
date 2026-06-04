@@ -666,6 +666,7 @@ bool is_supported_d3d12_call(std::string_view function_name)
          function_name == "ID3D12Device::QueryInterface" ||
          function_name == "IDXGIFactory::CreateSwapChain" ||
          function_name == "ID3D12Device::CreateCommandQueue" ||
+         function_name == "ID3D12Device9::CreateCommandQueue1" ||
          function_name == "ID3D12Device::CreateCommandAllocator" ||
          function_name == "ID3D12Device::CreateCommandList" ||
          function_name == "ID3D12Device::CreateCommandList1" ||
@@ -676,11 +677,18 @@ bool is_supported_d3d12_call(std::string_view function_name)
          function_name == "ID3D12Device::CreateGraphicsPipelineState" ||
          function_name == "ID3D12Device::CreateComputePipelineState" ||
          function_name == "ID3D12Device2::CreatePipelineState" ||
+         function_name == "ID3D12Device6::SetBackgroundProcessingMode" ||
+         function_name == "ID3D12Device7::AddToStateObject" ||
+         function_name == "ID3D12Device7::CreateProtectedResourceSession1" ||
          function_name == "ID3D12Device::CreateCommittedResource" ||
+         function_name == "ID3D12Device8::CreateCommittedResource2" ||
          function_name == "ID3D12Device::CreateReservedResource" ||
          function_name == "ID3D12Device::CreateHeap" ||
          function_name == "ID3D12Device4::CreateHeap1" ||
          function_name == "ID3D12Device::CreatePlacedResource" ||
+         function_name == "ID3D12Device8::CreatePlacedResource1" ||
+         function_name == "ID3D12Device9::CreateShaderCacheSession" ||
+         function_name == "ID3D12Device9::ShaderCacheControl" ||
          function_name == "ID3D12Device::CreateFence" ||
          function_name == "ID3D12Device::CreateConstantBufferView" ||
          function_name == "ID3D12Device::CreateShaderResourceView" ||

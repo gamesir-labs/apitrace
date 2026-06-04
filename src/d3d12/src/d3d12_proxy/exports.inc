@@ -19,9 +19,9 @@ extern "C" HRESULT WINAPI D3D12CreateDevice(
       payload << "{\"minimum_feature_level\":" << static_cast<unsigned int>(minimum_feature_level) << "}";
       record_call_locked("D3D12CreateDevice", hr, {*device}, {}, payload.str());
     }
-    if (is_device_iid(iid)) {
-      patch_device(static_cast<ID3D12Device *>(*device), device_vtable_size_for_iid(iid));
-    }
+    auto *d3d_device = static_cast<ID3D12Device *>(*device);
+    const auto minimum_vtable_size = is_device_iid(iid) ? device_vtable_size_for_iid(iid) : sizeof(ID3D12DeviceVtbl);
+    patch_device(d3d_device, supported_device_vtable_size(d3d_device, minimum_vtable_size));
   } else {
     std::lock_guard<std::mutex> lock(capture_state().mutex);
     std::ostringstream payload;

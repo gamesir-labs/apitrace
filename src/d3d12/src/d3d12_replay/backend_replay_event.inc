@@ -824,7 +824,8 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     }
     root_signatures_[root_signature.root_signature_object_id] = std::move(root_signature);
     ++semantic_calls_seen_;
-  } else if (function_name == "ID3D12Device::CreateCommandQueue") {
+  } else if (function_name == "ID3D12Device::CreateCommandQueue" ||
+             function_name == "ID3D12Device9::CreateCommandQueue1") {
     if (event.object_refs.size() < 2 || event.object_refs[1] == 0) {
       last_error_ = record_prefix(event) + ": CreateCommandQueue missing queue object id";
       return false;
@@ -882,7 +883,14 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     fence.flags = payload_u32(payload, "flags");
     fences_[fence.fence_object_id] = fence;
     ++semantic_calls_seen_;
-  } else if (function_name == "ID3D12Device::CreateCommittedResource") {
+  } else if (function_name == "ID3D12Device6::SetBackgroundProcessingMode" ||
+             function_name == "ID3D12Device7::AddToStateObject" ||
+             function_name == "ID3D12Device7::CreateProtectedResourceSession1" ||
+             function_name == "ID3D12Device9::CreateShaderCacheSession" ||
+             function_name == "ID3D12Device9::ShaderCacheControl") {
+    ++semantic_calls_seen_;
+  } else if (function_name == "ID3D12Device::CreateCommittedResource" ||
+             function_name == "ID3D12Device8::CreateCommittedResource2") {
     if (!require_payload_key(event, payload, "resource_desc", last_error_) ||
         !require_payload_key(event, payload, "initial_state", last_error_)) {
       return false;
@@ -1084,7 +1092,8 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     }
     heaps_[heap.heap_object_id] = heap;
     ++semantic_calls_seen_;
-  } else if (function_name == "ID3D12Device::CreatePlacedResource") {
+  } else if (function_name == "ID3D12Device::CreatePlacedResource" ||
+             function_name == "ID3D12Device8::CreatePlacedResource1") {
     if (!require_payload_key(event, payload, "resource_desc", last_error_) ||
         !require_payload_key(event, payload, "heap_object_id", last_error_) ||
         !require_payload_key(event, payload, "initial_state", last_error_)) {

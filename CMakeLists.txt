@@ -38,7 +38,7 @@ list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 add_library(apitrace_d3d_headers INTERFACE)
 target_include_directories(apitrace_d3d_headers
     INTERFACE
-        ${PROJECT_SOURCE_DIR}/third_party/d3d-headers/directx
+        $<$<NOT:$<PLATFORM_ID:Windows>>:${PROJECT_SOURCE_DIR}/third_party/d3d-headers/directx>
         $<$<NOT:$<PLATFORM_ID:Windows>>:${PROJECT_SOURCE_DIR}/third_party/d3d-headers/windows>
 )
 
@@ -201,7 +201,7 @@ target_include_directories(apitrace_platform_apple_metal
 )
 
 target_link_libraries(apitrace_platform_windows_d3d11 PRIVATE apitrace_core)
-target_link_libraries(apitrace_platform_windows_d3d12 PRIVATE apitrace_core)
+target_link_libraries(apitrace_platform_windows_d3d12 PRIVATE apitrace_core apitrace_d3d_headers)
 target_link_libraries(apitrace_platform_apple_metal PRIVATE apitrace_core)
 
 target_compile_features(apitrace_platform_windows_d3d11 PUBLIC cxx_std_17)
