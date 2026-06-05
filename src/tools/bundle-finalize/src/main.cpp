@@ -18,6 +18,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -114,6 +115,10 @@ struct Stats {
   std::uint64_t referenced_paths_collected = 0;
   std::uint64_t rewritten_digest_files = 0;
   std::uint64_t checksum_reused_rewritten_files = 0;
+  std::uint64_t checksum_reused_prior_files = 0;
+  std::uint64_t checksum_reused_prior_bytes = 0;
+  std::uint64_t asset_hash_reused_files = 0;
+  std::uint64_t asset_hash_reused_bytes = 0;
 };
 
 class FileDigestCache {
@@ -1080,6 +1085,16 @@ void hash_assets(
   for (std::size_t index = 0; index < assets.size(); ++index) {
     const auto &asset = assets[index];
     if (!asset.file_exists) {
+      continue;
+    }
+    if (!asset.content_hash.empty() &&
+        asset.byte_size != 0 &&
+        asset.actual_size == asset.byte_size) {
+      auto &mutable_asset = assets[index];
+      mutable_asset.digest = mutable_asset.content_hash;
+      ++stats.hashed_assets;
+      ++stats.asset_hash_reused_files;
+      stats.asset_hash_reused_bytes += mutable_asset.actual_size;
       continue;
     }
     const auto [it, inserted] = group_by_path.emplace(asset.path, groups.size());
@@ -3049,6 +3064,55 @@ bool is_host_metadata_file(const fs::path &relative)
   return false;
 }
 
+std::optional<std::pair<std::string, std::uint64_t>> parse_checksum_value(const std::string &value)
+{
+  constexpr std::string_view prefix = "sha256:";
+  if (value.rfind(prefix, 0) != 0) {
+    return std::nullopt;
+  }
+  const auto size_separator = value.rfind(':');
+  if (size_separator == std::string::npos || size_separator <= prefix.size()) {
+    return std::nullopt;
+  }
+  const auto digest = value.substr(prefix.size(), size_separator - prefix.size());
+  if (digest.empty()) {
+    return std::nullopt;
+  }
+  const auto size_text = value.substr(size_separator + 1);
+  char *end = nullptr;
+  errno = 0;
+  const auto size = std::strtoull(size_text.c_str(), &end, 10);
+  if (errno != 0 || end == size_text.c_str() || *end != '\0') {
+    return std::nullopt;
+  }
+  return std::make_pair(digest, static_cast<std::uint64_t>(size));
+}
+
+std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> load_prior_checksums(
+    const fs::path &bundle_root)
+{
+  std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> checksums;
+  const auto path = bundle_root / apitrace::trace::kChecksumsFileName;
+  std::ifstream input(path, std::ios::binary);
+  if (!input.is_open()) {
+    return checksums;
+  }
+  const auto root = json::parse(input, nullptr, false);
+  if (root.is_discarded() || !root.contains("files") || !root["files"].is_object()) {
+    return checksums;
+  }
+  for (auto it = root["files"].begin(); it != root["files"].end(); ++it) {
+    if (!it.value().is_string()) {
+      continue;
+    }
+    const auto parsed = parse_checksum_value(it.value().get<std::string>());
+    if (parsed) {
+      checksums[it.key()] = *parsed;
+    }
+  }
+  return checksums;
+}
+
 void write_checksums(
     const fs::path &bundle_root,
     const std::vector<AssetEntry> &assets,
@@ -3067,6 +3131,12 @@ void write_checksums(
     std::size_t record_index = 0;
     fs::path absolute_path;
   };
+
+  std::error_code checksum_time_error;
+  const auto prior_checksum_mtime =
+      fs::last_write_time(bundle_root / apitrace::trace::kChecksumsFileName, checksum_time_error);
+  const auto prior_checksums = checksum_time_error ? std::unordered_map<std::string, std::pair<std::string, std::uint64_t>>()
+                                                  : load_prior_checksums(bundle_root);
 
   std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> known;
   for (const auto &asset : assets) {
@@ -3106,10 +3176,23 @@ void write_checksums(
     }
     auto digest = known.find(relative_text);
     if (digest == known.end() || digest->second.second != size) {
-      ++stats.checksum_hashed_files;
-      stats.checksum_hashed_bytes += size;
-      records.push_back({relative_text, std::string(), size});
-      hash_tasks.push_back({records.size() - 1, it->path()});
+      const auto prior = prior_checksums.find(relative_text);
+      const auto mtime = fs::last_write_time(it->path(), error);
+      const bool can_reuse_prior =
+          prior != prior_checksums.end() &&
+          prior->second.second == size &&
+          !error &&
+          mtime <= prior_checksum_mtime;
+      if (can_reuse_prior) {
+        ++stats.checksum_reused_prior_files;
+        stats.checksum_reused_prior_bytes += size;
+        records.push_back({relative_text, prior->second.first, size});
+      } else {
+        ++stats.checksum_hashed_files;
+        stats.checksum_hashed_bytes += size;
+        records.push_back({relative_text, std::string(), size});
+        hash_tasks.push_back({records.size() - 1, it->path()});
+      }
     } else {
       if (rewritten_digests.find(relative_text) != rewritten_digests.end()) {
         ++stats.checksum_reused_rewritten_files;
@@ -3228,6 +3311,9 @@ int main(int argc, char **argv)
   const bool legacy_asset_discovery =
       !callstream_size_error &&
       callstream_size <= kLegacyDiscoveryCallstreamLimit;
+  const bool finalized_indexed_bundle =
+      !legacy_asset_discovery &&
+      fs::is_regular_file(options.bundle_root / apitrace::trace::kChecksumsFileName);
   run_stage(options, progress, stage_index, kStageCount, "restore_inline_query_assets", [&] {
     restore_inline_query_assets(options.bundle_root, options, stats);
   });
@@ -3237,7 +3323,9 @@ int main(int argc, char **argv)
     loaded_asset_count = assets.size();
   });
   run_stage(options, progress, stage_index, kStageCount, "scan_raw_events", [&] {
-    discover_raw_asset_references(options.bundle_root, assets, legacy_asset_discovery, stats);
+    if (!finalized_indexed_bundle || assets.empty()) {
+      discover_raw_asset_references(options.bundle_root, assets, legacy_asset_discovery, stats);
+    }
   });
   run_stage(options, progress, stage_index, kStageCount, "merge_assets", [&] {
     assets = merge_assets(std::move(assets));
@@ -3475,6 +3563,10 @@ int main(int argc, char **argv)
             << " referenced_paths_collected=" << stats.referenced_paths_collected
             << " rewritten_digest_files=" << stats.rewritten_digest_files
             << " checksum_reused_rewritten_files=" << stats.checksum_reused_rewritten_files
+            << " checksum_reused_prior_files=" << stats.checksum_reused_prior_files
+            << " checksum_reused_prior_bytes=" << stats.checksum_reused_prior_bytes
+            << " asset_hash_reused_files=" << stats.asset_hash_reused_files
+            << " asset_hash_reused_bytes=" << stats.asset_hash_reused_bytes
             << " removed_files=" << stats.removed_files
             << " dry_run=" << (options.dry_run ? "true" : "false")
             << " elapsed_s=" << elapsed << "\n";
