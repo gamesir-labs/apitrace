@@ -106,10 +106,14 @@ struct Stats {
   std::uint64_t input_bytes = 0;
   std::uint64_t output_bytes = 0;
   std::uint64_t rewritten_records = 0;
+  std::uint64_t jsonl_passes = 0;
   std::uint64_t digest_cache_hits = 0;
   std::uint64_t digest_cache_misses = 0;
   std::uint64_t pipeline_cache_hits = 0;
   std::uint64_t pipeline_cache_misses = 0;
+  std::uint64_t referenced_paths_collected = 0;
+  std::uint64_t rewritten_digest_files = 0;
+  std::uint64_t checksum_reused_rewritten_files = 0;
 };
 
 class FileDigestCache {
@@ -599,16 +603,45 @@ void collect_asset_references_from_json(
   }
 }
 
-bool line_may_contain_rewritable_asset_path(const std::string &line)
+bool is_canonical_jsonl_asset_path_value(const std::string &path)
 {
-  return line.find("asset-") != std::string::npos ||
-         line.find("_path\"") != std::string::npos ||
-         line.find("\"path\"") != std::string::npos ||
-         line.find("\"pipeline_path\"") != std::string::npos ||
-         line.find("\"shader_path\"") != std::string::npos ||
-         line.find("\"buffer_path\"") != std::string::npos ||
-         line.find("\"texture_path\"") != std::string::npos ||
-         line.find("\"source_asset_path\"") != std::string::npos;
+  return path.rfind("buffers/asset-", 0) == 0 ||
+         path.rfind("shaders/asset-", 0) == 0 ||
+         path.rfind("pipelines/asset-", 0) == 0 ||
+         path.rfind("metal/libraries/asset-", 0) == 0;
+}
+
+bool jsonl_line_may_contain_rewritable_asset_path(const std::string &line)
+{
+  std::size_t search = 0;
+  while ((search = line.find("path\"", search)) != std::string::npos) {
+    const auto colon = line.find(':', search + 5);
+    if (colon == std::string::npos) {
+      return false;
+    }
+    const auto value_begin = line.find('"', colon + 1);
+    if (value_begin == std::string::npos) {
+      search = colon + 1;
+      continue;
+    }
+    const auto value_end = line.find('"', value_begin + 1);
+    if (value_end == std::string::npos) {
+      return false;
+    }
+    const auto value = line.substr(value_begin + 1, value_end - value_begin - 1);
+    if (!value.empty() && !is_canonical_jsonl_asset_path_value(value)) {
+      return true;
+    }
+    search = value_end + 1;
+  }
+  return false;
+}
+
+bool text_may_contain_rewritable_asset_path(const std::string &text)
+{
+  return jsonl_line_may_contain_rewritable_asset_path(text) ||
+         text.find("_path\"") != std::string::npos ||
+         text.find("\"path\"") != std::string::npos;
 }
 
 void collect_pipeline_dependency_paths(const json &node, std::vector<std::string> &paths)
@@ -703,6 +736,7 @@ void discover_raw_asset_references_from_jsonl(
     const fs::path &relative_path,
     std::vector<AssetEntry> &assets,
     const std::unordered_set<std::uint64_t> &indexed_blob_ids,
+    bool legacy_asset_discovery,
     Stats &stats)
 {
   const auto absolute_path = bundle_root / relative_path;
@@ -711,8 +745,9 @@ void discover_raw_asset_references_from_jsonl(
   }
 
   std::ifstream input(absolute_path, std::ios::binary);
+  ++stats.jsonl_passes;
   std::string line;
-  const bool infer_object_blob_assets = indexed_blob_ids.empty();
+  const bool infer_object_blob_assets = indexed_blob_ids.empty() && legacy_asset_discovery;
   std::unordered_map<std::uint64_t, std::string> asset_path_by_object_id;
   while (std::getline(input, line)) {
     const bool has_path_field =
@@ -806,6 +841,7 @@ void discover_raw_asset_references_from_jsonl(
 void discover_raw_asset_references(
     const fs::path &bundle_root,
     std::vector<AssetEntry> &assets,
+    bool legacy_asset_discovery,
     Stats &stats)
 {
   std::unordered_set<std::uint64_t> indexed_blob_ids;
@@ -819,18 +855,21 @@ void discover_raw_asset_references(
       fs::path(apitrace::trace::kCallstreamFileName),
       assets,
       indexed_blob_ids,
+      legacy_asset_discovery,
       stats);
   discover_raw_asset_references_from_jsonl(
       bundle_root,
       fs::path(apitrace::trace::kMetalCallstreamFileName),
       assets,
       indexed_blob_ids,
+      legacy_asset_discovery,
       stats);
   discover_raw_asset_references_from_jsonl(
       bundle_root,
       fs::path(apitrace::trace::kAnalysisDirectoryName) / apitrace::trace::kTranslationLinksFileName,
       assets,
       indexed_blob_ids,
+      legacy_asset_discovery,
       stats);
 }
 
@@ -842,6 +881,7 @@ void restore_inline_query_assets(const fs::path &bundle_root, const Options &opt
   }
 
   std::ifstream input(callstream_path, std::ios::binary);
+  ++stats.jsonl_passes;
   std::string line;
   while (std::getline(input, line)) {
     if (line.find("ID3D12GraphicsCommandList::ResolveQueryDataResult") == std::string::npos) {
@@ -1337,24 +1377,27 @@ std::unordered_map<std::string, std::string> build_pipeline_file_aliases(
 void collect_path_references_from_json(
     const json &node,
     const std::unordered_map<std::string, std::string> &aliases,
-    std::unordered_set<std::string> &paths)
+    std::unordered_set<std::string> &paths,
+    bool include_alias_sources = true)
 {
   if (node.is_object()) {
     for (auto it = node.begin(); it != node.end(); ++it) {
       if (it->is_string() && is_path_reference_key(it.key())) {
         const auto path = it->get<std::string>();
         const auto alias = aliases.find(path);
-        paths.insert(path);
+        if (include_alias_sources || alias == aliases.end()) {
+          paths.insert(path);
+        }
         if (alias != aliases.end()) {
           paths.insert(alias->second);
         }
       } else {
-        collect_path_references_from_json(it.value(), aliases, paths);
+        collect_path_references_from_json(it.value(), aliases, paths, include_alias_sources);
       }
     }
   } else if (node.is_array()) {
     for (const auto &item : node) {
-      collect_path_references_from_json(item, aliases, paths);
+      collect_path_references_from_json(item, aliases, paths, include_alias_sources);
     }
   }
 }
@@ -1377,7 +1420,7 @@ std::unordered_set<std::string> collect_referenced_asset_paths(
     if (relative.extension() == ".jsonl") {
       std::string line;
       while (std::getline(input, line)) {
-        if (!line_may_contain_rewritable_asset_path(line)) {
+        if (!jsonl_line_may_contain_rewritable_asset_path(line)) {
           continue;
         }
         const auto record = json::parse(line, nullptr, false);
@@ -1391,7 +1434,7 @@ std::unordered_set<std::string> collect_referenced_asset_paths(
     std::ostringstream text_buffer;
     text_buffer << input.rdbuf();
     const auto text = text_buffer.str();
-    if (!line_may_contain_rewritable_asset_path(text)) {
+    if (!text_may_contain_rewritable_asset_path(text)) {
       continue;
     }
     const auto root = json::parse(text, nullptr, false);
@@ -1517,6 +1560,28 @@ void note_jsonl_output(Stats &stats, const std::string &line)
   stats.output_bytes += static_cast<std::uint64_t>(line.size()) + 1;
 }
 
+void remember_rewritten_digest(
+    const fs::path &bundle_root,
+    const fs::path &relative,
+    FileDigestCache &digest_cache,
+    std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> &rewritten_digests,
+    Stats &stats)
+{
+  const auto absolute = bundle_root / relative;
+  std::error_code error;
+  const auto size = static_cast<std::uint64_t>(fs::file_size(absolute, error));
+  if (error) {
+    return;
+  }
+  constexpr std::uint64_t kRewrittenDigestInlineLimit = 64ull * 1024ull * 1024ull;
+  if (size > kRewrittenDigestInlineLimit) {
+    return;
+  }
+  const auto digest = digest_cache.digest_file(absolute);
+  rewritten_digests[relative.generic_string()] = {digest, size};
+  ++stats.rewritten_digest_files;
+}
+
 std::vector<fs::path> text_reference_files(const fs::path &bundle_root)
 {
   std::vector<fs::path> files;
@@ -1555,7 +1620,10 @@ std::unordered_set<std::string> rewrite_text_references(
     const std::unordered_map<std::string, std::uint64_t> &blob_id_by_effective_path,
     const Options &options,
     Stats &stats,
-    ProgressReporter *progress)
+    ProgressReporter *progress,
+    std::unordered_set<std::string> *referenced_paths = nullptr,
+    FileDigestCache *digest_cache = nullptr,
+    std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> *rewritten_digests = nullptr)
 {
   std::unordered_set<std::string> rewritten_paths;
   if (aliases.empty()) {
@@ -1583,6 +1651,7 @@ std::unordered_set<std::string> rewrite_text_references(
 
     json root;
     if (relative.extension() == ".jsonl") {
+      ++stats.jsonl_passes;
       bool changed = false;
       const auto temporary = temporary_rewrite_path(absolute);
       std::ofstream output;
@@ -1598,7 +1667,7 @@ std::unordered_set<std::string> rewrite_text_references(
       while (std::getline(input, line)) {
         ++stats.jsonl_records;
         stats.input_bytes += static_cast<std::uint64_t>(line.size()) + 1;
-        if (!line_may_contain_rewritable_asset_path(line)) {
+        if (!jsonl_line_may_contain_rewritable_asset_path(line)) {
           if (!options.dry_run) {
             output << line << '\n';
           }
@@ -1617,6 +1686,9 @@ std::unordered_set<std::string> rewrite_text_references(
         const bool blob_refs_changed =
             rewrite_blob_refs_for_effective_paths(record, blob_id_by_effective_path, paths_changed);
         if (paths_changed || blob_refs_changed) {
+          if (referenced_paths) {
+            collect_path_references_from_json(record, aliases, *referenced_paths, false);
+          }
           const auto rewritten = record.dump();
           if (!options.dry_run) {
             output << rewritten << '\n';
@@ -1625,6 +1697,9 @@ std::unordered_set<std::string> rewrite_text_references(
           changed = true;
           ++stats.rewritten_records;
         } else {
+          if (referenced_paths) {
+            collect_path_references_from_json(record, aliases, *referenced_paths, false);
+          }
           if (!options.dry_run) {
             output << line << '\n';
           }
@@ -1650,6 +1725,8 @@ std::unordered_set<std::string> rewrite_text_references(
         output.close();
         if (!replace_with_temporary_file(absolute, temporary)) {
           rewritten_paths.erase(relative_text);
+        } else if (digest_cache && rewritten_digests) {
+          remember_rewritten_digest(bundle_root, relative, *digest_cache, *rewritten_digests, stats);
         }
       }
       ++file_index;
@@ -1663,7 +1740,7 @@ std::unordered_set<std::string> rewrite_text_references(
     std::ostringstream text_buffer;
     text_buffer << input.rdbuf();
     const auto text = text_buffer.str();
-    if (!line_may_contain_rewritable_asset_path(text)) {
+    if (!text_may_contain_rewritable_asset_path(text)) {
       ++file_index;
       processed_bytes += size_error ? 0 : file_size;
       if (progress) {
@@ -1677,6 +1754,9 @@ std::unordered_set<std::string> rewrite_text_references(
         !root.is_discarded() &&
         rewrite_blob_refs_for_effective_paths(root, blob_id_by_effective_path, paths_changed);
     if (root.is_discarded() || (!paths_changed && !blob_refs_changed)) {
+      if (referenced_paths && !root.is_discarded()) {
+        collect_path_references_from_json(root, aliases, *referenced_paths, false);
+      }
       ++file_index;
       processed_bytes += size_error ? 0 : file_size;
       if (progress) {
@@ -1686,9 +1766,16 @@ std::unordered_set<std::string> rewrite_text_references(
     }
     ++stats.rewritten_text_files;
     rewritten_paths.insert(relative_text);
+    if (referenced_paths) {
+      collect_path_references_from_json(root, aliases, *referenced_paths, false);
+    }
     if (!options.dry_run) {
       std::ofstream output(absolute, std::ios::binary | std::ios::trunc);
       output << root.dump() << '\n';
+      output.close();
+      if (digest_cache && rewritten_digests) {
+        remember_rewritten_digest(bundle_root, relative, *digest_cache, *rewritten_digests, stats);
+      }
     }
     ++file_index;
     processed_bytes += size_error ? 0 : file_size;
@@ -1799,7 +1886,9 @@ void sanitize_and_rewrite_jsonl_file(
     Stats &stats,
     ProgressReporter *progress = nullptr,
     std::uint64_t file_index = 0,
-    std::uint64_t file_count = 0)
+    std::uint64_t file_count = 0,
+    FileDigestCache *digest_cache = nullptr,
+    std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> *rewritten_digests = nullptr)
 {
   if (!fs::is_regular_file(path)) {
     if (progress && file_count != 0) {
@@ -1815,6 +1904,7 @@ void sanitize_and_rewrite_jsonl_file(
   }
 
   std::ifstream input(path, std::ios::binary);
+  ++stats.jsonl_passes;
   if (!input.is_open()) {
     if (progress && file_count != 0) {
       progress->update(file_index, file_count, 0, 0);
@@ -1883,7 +1973,10 @@ void sanitize_and_rewrite_jsonl_file(
   }
 
   output.close();
-  replace_with_temporary_file(path, temporary);
+  if (replace_with_temporary_file(path, temporary) && digest_cache && rewritten_digests) {
+    const auto relative = fs::relative(path, options.bundle_root);
+    remember_rewritten_digest(options.bundle_root, relative, *digest_cache, *rewritten_digests, stats);
+  }
   if (progress && file_count != 0) {
     progress->update(file_index, file_count, 0, 0);
   }
@@ -2606,7 +2699,9 @@ std::unordered_set<std::string> rebuild_d3d12_pipeline_semantics(
     const Options &options,
     bool legacy_asset_discovery,
     Stats &stats,
-    ProgressReporter *progress)
+    ProgressReporter *progress,
+    FileDigestCache *digest_cache = nullptr,
+    std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> *rewritten_digests = nullptr)
 {
   std::unordered_set<std::string> rewritten_paths;
   const auto callstream_path = bundle_root / apitrace::trace::kCallstreamFileName;
@@ -2623,6 +2718,7 @@ std::unordered_set<std::string> rebuild_d3d12_pipeline_semantics(
   std::unordered_map<std::string, json> pipeline_json_cache;
   auto next_blob_id = max_blob_id(assets);
   std::ifstream input(callstream_path, std::ios::binary);
+  ++stats.jsonl_passes;
   if (!input.is_open()) {
     return rewritten_paths;
   }
@@ -2679,7 +2775,7 @@ std::unordered_set<std::string> rebuild_d3d12_pipeline_semantics(
       note_jsonl_output(stats, rewritten);
       changed = true;
       ++stats.rewritten_records;
-    } else if (repair_pipeline_asset_event(
+    } else if (legacy_asset_discovery && repair_pipeline_asset_event(
                    bundle_root,
                    record,
                    options,
@@ -2726,6 +2822,13 @@ std::unordered_set<std::string> rebuild_d3d12_pipeline_semantics(
     output.close();
     if (!replace_with_temporary_file(callstream_path, temporary)) {
       rewritten_paths.clear();
+    } else if (digest_cache && rewritten_digests) {
+      remember_rewritten_digest(
+          bundle_root,
+          fs::path(apitrace::trace::kCallstreamFileName),
+          *digest_cache,
+          *rewritten_digests,
+          stats);
     }
   }
   return rewritten_paths;
@@ -2952,7 +3055,8 @@ void write_checksums(
     const Options &options,
     Stats &stats,
     FileDigestCache &digest_cache,
-    ProgressReporter *progress)
+    ProgressReporter *progress,
+    const std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> &rewritten_digests = {})
 {
   struct ChecksumRecord {
     std::string path;
@@ -2976,6 +3080,9 @@ void write_checksums(
     if (!asset.path.empty()) {
       known[asset.path] = {asset.content_hash, asset.byte_size};
     }
+  }
+  for (const auto &[path, digest_and_size] : rewritten_digests) {
+    known[path] = digest_and_size;
   }
 
   std::vector<ChecksumRecord> records;
@@ -3004,6 +3111,9 @@ void write_checksums(
       records.push_back({relative_text, std::string(), size});
       hash_tasks.push_back({records.size() - 1, it->path()});
     } else {
+      if (rewritten_digests.find(relative_text) != rewritten_digests.end()) {
+        ++stats.checksum_reused_rewritten_files;
+      }
       records.push_back({relative_text, digest->second.first, digest->second.second});
     }
   }
@@ -3111,6 +3221,13 @@ int main(int argc, char **argv)
   std::vector<AssetEntry> assets;
   std::unordered_map<std::string, std::string> canonical_aliases;
   std::size_t loaded_asset_count = 0;
+  std::error_code callstream_size_error;
+  const auto callstream_size =
+      fs::file_size(options.bundle_root / apitrace::trace::kCallstreamFileName, callstream_size_error);
+  constexpr std::uint64_t kLegacyDiscoveryCallstreamLimit = 64ull * 1024ull * 1024ull;
+  const bool legacy_asset_discovery =
+      !callstream_size_error &&
+      callstream_size <= kLegacyDiscoveryCallstreamLimit;
   run_stage(options, progress, stage_index, kStageCount, "restore_inline_query_assets", [&] {
     restore_inline_query_assets(options.bundle_root, options, stats);
   });
@@ -3120,7 +3237,7 @@ int main(int argc, char **argv)
     loaded_asset_count = assets.size();
   });
   run_stage(options, progress, stage_index, kStageCount, "scan_raw_events", [&] {
-    discover_raw_asset_references(options.bundle_root, assets, stats);
+    discover_raw_asset_references(options.bundle_root, assets, legacy_asset_discovery, stats);
   });
   run_stage(options, progress, stage_index, kStageCount, "merge_assets", [&] {
     assets = merge_assets(std::move(assets));
@@ -3145,12 +3262,14 @@ int main(int argc, char **argv)
   });
   std::unordered_map<std::string, std::string> aliases;
   std::unordered_map<std::string, std::uint64_t> blob_id_by_effective_path;
+  std::unordered_set<std::string> referenced_paths_after_rewrite;
+  std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> rewritten_digests;
   run_stage(options, progress, stage_index, kStageCount, "build_aliases", [&] {
     aliases = build_aliases(assets);
     for (const auto &[from, to] : canonical_aliases) {
       aliases[from] = to;
     }
-    if (loaded_asset_count == 0) {
+    if (loaded_asset_count == 0 && legacy_asset_discovery) {
       const auto initial_pipeline_file_aliases = build_pipeline_file_aliases(options.bundle_root, digest_cache);
       for (const auto &[from, to] : initial_pipeline_file_aliases) {
         aliases[from] = to;
@@ -3162,7 +3281,16 @@ int main(int argc, char **argv)
   bool rebuilt_assets_changed = false;
   run_stage(options, progress, stage_index, kStageCount, "rewrite_references", [&] {
     rewritten_paths =
-        rewrite_text_references(options.bundle_root, aliases, blob_id_by_effective_path, options, stats, &progress);
+        rewrite_text_references(
+            options.bundle_root,
+            aliases,
+            blob_id_by_effective_path,
+            options,
+            stats,
+            &progress,
+            legacy_asset_discovery ? &referenced_paths_after_rewrite : nullptr,
+            &digest_cache,
+            &rewritten_digests);
   });
   run_stage(options, progress, stage_index, kStageCount, "sanitize_tail", [&] {
     const auto callstream = options.bundle_root / apitrace::trace::kCallstreamFileName;
@@ -3172,9 +3300,12 @@ int main(int argc, char **argv)
     sanitize_jsonl_tail_file(callstream, options, stats, &progress, 1, 6);
     sanitize_jsonl_tail_file(metal_callstream, options, stats, &progress, 2, 6);
     sanitize_jsonl_tail_file(translation_links, options, stats, &progress, 3, 6);
-    sanitize_and_rewrite_jsonl_file(callstream, blob_id_remap, options, stats, &progress, 4, 6);
-    sanitize_and_rewrite_jsonl_file(metal_callstream, blob_id_remap, options, stats, &progress, 5, 6);
-    sanitize_and_rewrite_jsonl_file(translation_links, blob_id_remap, options, stats, &progress, 6, 6);
+    sanitize_and_rewrite_jsonl_file(
+        callstream, blob_id_remap, options, stats, &progress, 4, 6, &digest_cache, &rewritten_digests);
+    sanitize_and_rewrite_jsonl_file(
+        metal_callstream, blob_id_remap, options, stats, &progress, 5, 6, &digest_cache, &rewritten_digests);
+    sanitize_and_rewrite_jsonl_file(
+        translation_links, blob_id_remap, options, stats, &progress, 6, 6, &digest_cache, &rewritten_digests);
   });
   run_stage(options, progress, stage_index, kStageCount, "rebuild_semantics", [&] {
     const auto rebuilt_paths =
@@ -3182,9 +3313,11 @@ int main(int argc, char **argv)
             options.bundle_root,
             assets,
             options,
-            loaded_asset_count == 0,
+            loaded_asset_count == 0 && legacy_asset_discovery,
             stats,
-            &progress);
+            &progress,
+            &digest_cache,
+            &rewritten_digests);
     rewritten_paths.insert(rebuilt_paths.begin(), rebuilt_paths.end());
     if (!rebuilt_paths.empty()) {
       assets = merge_assets(std::move(assets));
@@ -3202,7 +3335,11 @@ int main(int argc, char **argv)
             rebuilt_blob_id_remap,
             options,
             stats,
-            &progress);
+            &progress,
+            0,
+            0,
+            &digest_cache,
+            &rewritten_digests);
       }
     }
   });
@@ -3219,7 +3356,16 @@ int main(int argc, char **argv)
       return;
     }
     const auto rebuilt_rewrites =
-        rewrite_text_references(options.bundle_root, aliases, blob_id_by_effective_path, options, stats, &progress);
+        rewrite_text_references(
+            options.bundle_root,
+            aliases,
+            blob_id_by_effective_path,
+            options,
+            stats,
+            &progress,
+            legacy_asset_discovery ? &referenced_paths_after_rewrite : nullptr,
+            &digest_cache,
+            &rewritten_digests);
     rewritten_paths.insert(rebuilt_rewrites.begin(), rebuilt_rewrites.end());
     if (!rebuilt_rewrites.empty()) {
       stat_assets(options.bundle_root, assets);
@@ -3234,7 +3380,7 @@ int main(int argc, char **argv)
     for (const auto &[from, to] : canonical_aliases) {
       aliases[from] = to;
     }
-    if (loaded_asset_count == 0) {
+    if (loaded_asset_count == 0 && legacy_asset_discovery) {
       const auto pipeline_file_aliases = build_pipeline_file_aliases(options.bundle_root, digest_cache);
       for (const auto &[from, to] : pipeline_file_aliases) {
         aliases[from] = to;
@@ -3243,15 +3389,24 @@ int main(int argc, char **argv)
     blob_id_by_effective_path = build_blob_id_by_effective_path(assets);
     if (!aliases.empty()) {
       const auto final_rewrites =
-          rewrite_text_references(options.bundle_root, aliases, blob_id_by_effective_path, options, stats, &progress);
+          rewrite_text_references(
+              options.bundle_root,
+              aliases,
+              blob_id_by_effective_path,
+              options,
+              stats,
+              &progress,
+              legacy_asset_discovery ? &referenced_paths_after_rewrite : nullptr,
+              &digest_cache,
+              &rewritten_digests);
       rewritten_paths.insert(final_rewrites.begin(), final_rewrites.end());
     }
   });
-  std::unordered_set<std::string> referenced_paths_after_rewrite;
   run_stage(options, progress, stage_index, kStageCount, "rebuild_reference_graph", [&] {
-    if (!options.dry_run && !aliases.empty()) {
+    if (!options.dry_run && !aliases.empty() && referenced_paths_after_rewrite.empty()) {
       referenced_paths_after_rewrite = collect_referenced_asset_paths(options.bundle_root, aliases);
     }
+    stats.referenced_paths_collected = referenced_paths_after_rewrite.size();
     drop_unreferenced_missing_assets(assets, referenced_paths_after_rewrite, stats);
   });
   run_stage(options, progress, stage_index, kStageCount, "remove_duplicate_files", [&] {
@@ -3274,7 +3429,7 @@ int main(int argc, char **argv)
     write_sideband_asset_index(options.bundle_root, assets, options);
   });
   run_stage(options, progress, stage_index, kStageCount, "write_checksums", [&] {
-    write_checksums(options.bundle_root, assets, options, stats, digest_cache, &progress);
+    write_checksums(options.bundle_root, assets, options, stats, digest_cache, &progress, rewritten_digests);
   });
   stats.digest_cache_hits = digest_cache.hits();
   stats.digest_cache_misses = digest_cache.misses();
@@ -3312,10 +3467,14 @@ int main(int argc, char **argv)
             << " input_bytes=" << stats.input_bytes
             << " output_bytes=" << stats.output_bytes
             << " rewritten_records=" << stats.rewritten_records
+            << " jsonl_passes=" << stats.jsonl_passes
             << " digest_cache_hits=" << stats.digest_cache_hits
             << " digest_cache_misses=" << stats.digest_cache_misses
             << " pipeline_cache_hits=" << stats.pipeline_cache_hits
             << " pipeline_cache_misses=" << stats.pipeline_cache_misses
+            << " referenced_paths_collected=" << stats.referenced_paths_collected
+            << " rewritten_digest_files=" << stats.rewritten_digest_files
+            << " checksum_reused_rewritten_files=" << stats.checksum_reused_rewritten_files
             << " removed_files=" << stats.removed_files
             << " dry_run=" << (options.dry_run ? "true" : "false")
             << " elapsed_s=" << elapsed << "\n";
