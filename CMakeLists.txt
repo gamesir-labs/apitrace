@@ -11,8 +11,8 @@ option(APITRACE_BUILD_WINDOWS_DLLS "Build Windows proxy DLLs when supported" ON)
 option(APITRACE_BUILD_METAL_BACKEND "Build Metal backend sources when supported" ON)
 # Produce the PE-side capture units (d3d11/d3d12 capture + core) as STATIC
 # archives suitable for embedding into a host PE module (e.g. DXMT's own
-# d3d11.dll / d3d12.dll). When OFF, the platform_windows_d3d11/d3d12 targets
-# remain SHARED proxy DLLs as before.
+# d3d11.dll / d3d12.dll). When OFF, the platform_windows_d3d11/d3d12/dxgi
+# targets remain SHARED proxy DLLs as before.
 option(APITRACE_BUILD_PE_CAPTURE_STATIC "Emit PE capture units as STATIC archives for embedding" OFF)
 
 # Native macOS D3D retrace via DXMT dylibs. Disabled by default; turn ON
@@ -439,6 +439,10 @@ if(WIN32 AND APITRACE_BUILD_WINDOWS_DLLS AND NOT APITRACE_BUILD_PE_CAPTURE_STATI
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     )
     install(TARGETS apitrace_platform_windows_d3d12
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    )
+    install(TARGETS apitrace_platform_windows_dxgi
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     )

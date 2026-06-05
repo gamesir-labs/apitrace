@@ -9,7 +9,7 @@
 当前产物分为三组：
 
 - `retrace` / `retrace.exe`：读取 trace bundle 并执行 replay。
-- `d3d11.dll` / `d3d12.dll`：Windows 或 Wine app-local override 用的 capture proxy。
+- `d3d11.dll` / `d3d12.dll` / `dxgi.dll`：Windows 或 Wine app-local override 用的 capture proxy。
 - `libapitrace_platform_apple_metal.a` 与 `metal_capi.h`：给转译层写入 Metal
   callstream 的 native facade。
 
@@ -62,7 +62,10 @@ binary 标志和 debug name。`content_hash` 用于稳定资源身份和跨 API 
 当前可直接使用的 Windows capture 入口是 app-local proxy DLL：
 
 - D3D11：把 `d3d11.dll` 放到目标程序同目录，并通过 Wine / Windows DLL 搜索顺序优先加载。
-- D3D12：把 `d3d12.dll` 放到目标程序同目录，并对 D3D12 路径设置 override。
+- D3D12：把 `d3d12.dll` 和 `dxgi.dll` 放到目标程序同目录，并对 D3D12/DXGI
+  路径设置 override。`d3d12.dll` 记录 device/command/resource 语义，
+  `dxgi.dll` 记录 swapchain creation 和 `IDXGISwapChain::Present/Present1`；
+  只加载 `d3d12.dll` proxy 时不会产生 DXGI Present callstream 记录。
 
 测试脚本通过 `APITRACE_TRACE_BUNDLE` 指定输出 bundle 目录。D3D12 调试画面读回需要显式开启：
 

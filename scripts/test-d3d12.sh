@@ -19,6 +19,7 @@ DEMO_EXE="$DEMO_BIN_DIR/apitrace_test_d3d12.exe"
 RETRACE_BIN_DIR="$TEST_PREFIX/retrace-bin"
 RETRACE_EXE="$RETRACE_BIN_DIR/retrace.exe"
 ROOT_D3D12_PROXY_DLL="$ROOT_BUILD_DIR/d3d12.dll"
+ROOT_DXGI_PROXY_DLL="$ROOT_BUILD_DIR/dxgi.dll"
 ROOT_RETRACE_EXE="$ROOT_BUILD_DIR/retrace.exe"
 HOST_BUNDLE_CHECK="$ROOT_DIR/build/cmake-arm64/bundle-check"
 HOST_RETRACE="$ROOT_DIR/build/cmake-arm64/retrace"
@@ -134,6 +135,7 @@ step_build() {
     cmake --install "$TEST_BUILD_DIR" --prefix "$TEST_PREFIX"
 
     require_file "$ROOT_D3D12_PROXY_DLL"
+    require_file "$ROOT_DXGI_PROXY_DLL"
     require_file "$ROOT_RETRACE_EXE"
     require_file "$DXMT_D3D12_DLL"
     require_file "$DXMT_D3D12CORE_DLL"
@@ -150,7 +152,7 @@ step_build() {
 
     cp "$ROOT_D3D12_PROXY_DLL" "$DEMO_BIN_DIR/d3d12.dll"
     cp "$DXMT_D3D12CORE_DLL" "$DEMO_BIN_DIR/d3d12core.dll"
-    cp "$DXMT_DXGI_DLL" "$DEMO_BIN_DIR/dxgi.dll"
+    cp "$ROOT_DXGI_PROXY_DLL" "$DEMO_BIN_DIR/dxgi.dll"
     cp "$DXMT_WINEMETAL_DLL" "$DEMO_BIN_DIR/winemetal.dll"
     cp "$D3D_COMPILER_DLL" "$DEMO_BIN_DIR/d3dcompiler_47.dll"
 
@@ -169,6 +171,7 @@ prepare_wine_env() {
     export WINEPREFIX="$WINE_PREFIX"
     export APITRACE_D3D12_BACKEND="dxmt"
     export APITRACE_DOWNSTREAM_D3D12="$DXMT_D3D12_DLL"
+    export APITRACE_DOWNSTREAM_DXGI="$DXMT_DXGI_DLL"
     export APITRACE_D3D12_BUILTIN_CAPTURE=0
     export DXMT_EXPERIMENT_DX12_SUPPORT="1"
     export WINEDLLPATH="$DXMT_RUNTIME_ROOT:$WINE_ENV_ROOT/lib/wine"
@@ -203,11 +206,13 @@ step_retrace() {
     export APITRACE_TRACE_BUNDLE="$RETRACE_BUNDLE"
     export APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES=1
     cp "$ROOT_D3D12_PROXY_DLL" "$RETRACE_BIN_DIR/d3d12.dll"
+    cp "$ROOT_DXGI_PROXY_DLL" "$RETRACE_BIN_DIR/dxgi.dll"
     (
         cd "$RETRACE_BIN_DIR"
         "$WINE_BIN" "$RETRACE_EXE" "$TRACE_BUNDLE"
     ) | tr -d '\r' | tee "$RETRACE_LOG"
     cp "$DXMT_D3D12_DLL" "$RETRACE_BIN_DIR/d3d12.dll"
+    cp "$DXMT_DXGI_DLL" "$RETRACE_BIN_DIR/dxgi.dll"
     unset APITRACE_TRACE_BUNDLE
     unset APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES
     require_file "$RETRACE_BUNDLE/callstream.jsonl"

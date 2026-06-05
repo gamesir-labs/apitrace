@@ -27,7 +27,7 @@ The repository currently covers two debugging paths:
 The Windows-side deliverables are:
 
 - `retrace.exe`: the replay entrypoint for trace bundles.
-- `d3d11.dll` / `d3d12.dll`: capture proxy DLLs intended for Wine or Windows override-based injection.
+- `d3d11.dll` / `d3d12.dll` / `dxgi.dll`: capture proxy DLLs intended for Wine or Windows override-based injection.
 
 The macOS Metal deliverables are:
 
@@ -50,6 +50,7 @@ retrace/
 override/
   d3d11.dll
   d3d12.dll
+  dxgi.dll
 ```
 
 By design, the package only contains the minimal binaries produced by this repository. It does not include headers, static libraries, or MinGW runtime DLLs.
@@ -66,7 +67,12 @@ A typical DX11 example is:
 WINEDLLOVERRIDES="d3d11=n,b;mscoree,mshtml=d" wine game.exe
 ```
 
-If you also want to cover the DX12 path, place `d3d12.dll` in the same directory and add the corresponding override.
+If you also want to cover the DX12 path, place both `d3d12.dll` and
+`dxgi.dll` in the same directory and add the corresponding overrides. The
+`d3d12.dll` proxy records device, command, and resource semantics; the
+`dxgi.dll` proxy records swapchain creation and `IDXGISwapChain::Present` /
+`Present1`. Loading only the `d3d12.dll` proxy leaves DXGI Present records out
+of the trace.
 
 The capture output bundle is selected by the capture runtime. The repository
 test scripts set `APITRACE_TRACE_BUNDLE` to the target bundle directory.

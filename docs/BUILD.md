@@ -81,6 +81,7 @@ retrace/
 override/
   d3d11.dll
   d3d12.dll
+  dxgi.dll
 ```
 
 macOS native Metal artifact 布局：

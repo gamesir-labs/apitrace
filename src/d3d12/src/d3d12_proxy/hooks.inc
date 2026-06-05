@@ -296,6 +296,13 @@ HRESULT STDMETHODCALLTYPE hook_device_create_committed_resource(
       const auto resource_object_id =
           register_fresh_object_locked(*resource, apitrace::trace::ObjectKind::Resource, "ID3D12Resource", parent);
       const auto gpu_virtual_address = resource_gpu_virtual_address(static_cast<ID3D12Resource *>(*resource));
+      const auto heap_type = heap_properties ? static_cast<UINT>(heap_properties->Type) : 0;
+      remember_resource_capture_info_locked(
+          static_cast<ID3D12Resource *>(*resource),
+          resource_object_id,
+          desc,
+          heap_type,
+          heap_type == static_cast<UINT>(D3D12_HEAP_TYPE_UPLOAD));
       capture_state().resource_gpu_virtual_addresses[static_cast<ID3D12Resource *>(*resource)] = {
           resource_object_id,
           gpu_virtual_address,
@@ -387,9 +394,15 @@ HRESULT STDMETHODCALLTYPE hook_device_create_placed_resource(
           capture_state().next_sequence,
       };
       const auto heap_type_it = capture_state().heap_types.find(heap);
+      const auto heap_type = heap_type_it != capture_state().heap_types.end() ? heap_type_it->second : 0;
       should_patch_resource =
-          heap_type_it != capture_state().heap_types.end() &&
-          heap_type_it->second == static_cast<UINT>(D3D12_HEAP_TYPE_UPLOAD);
+          heap_type == static_cast<UINT>(D3D12_HEAP_TYPE_UPLOAD);
+      remember_resource_capture_info_locked(
+          static_cast<ID3D12Resource *>(*resource),
+          resource_object_id,
+          desc,
+          heap_type,
+          should_patch_resource);
       std::ostringstream payload;
       payload << "{\"heap_object_id\":" << object_id_json(heap_object_id)
               << ",\"heap_offset\":" << heap_offset
@@ -635,7 +648,11 @@ HRESULT STDMETHODCALLTYPE hook_command_list_reset(
   if (SUCCEEDED(hr)) {
     capture_state().command_list_resources[self].clear();
   }
-  record_call_locked("ID3D12GraphicsCommandList::Reset", hr, {self, allocator, initial_state}, {}, "{}");
+  std::ostringstream payload;
+  payload << "{\"command_allocator_object_id\":" << object_id_json(lookup_object_id_locked(allocator))
+          << ",\"initial_pipeline_state_object_id\":" << object_id_json(lookup_object_id_locked(initial_state))
+          << "}";
+  record_call_locked("ID3D12GraphicsCommandList::Reset", hr, {self, allocator, initial_state}, {}, payload.str());
   return hr;
 }
 
@@ -664,7 +681,9 @@ void STDMETHODCALLTYPE hook_command_list_set_pipeline_state(
     hook.set_pipeline_state(self, pipeline_state);
   }
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  record_call_locked("ID3D12GraphicsCommandList::SetPipelineState", S_OK, {self, pipeline_state}, {}, "{}");
+  std::ostringstream payload;
+  payload << "{\"pipeline_state_object_id\":" << object_id_json(lookup_object_id_locked(pipeline_state)) << "}";
+  record_call_locked("ID3D12GraphicsCommandList::SetPipelineState", S_OK, {self, pipeline_state}, {}, payload.str());
 }
 
 void STDMETHODCALLTYPE hook_command_list_om_set_blend_factor(
@@ -714,7 +733,10 @@ void STDMETHODCALLTYPE hook_command_list_set_graphics_root_signature(
     hook.set_graphics_root_signature(self, root_signature);
   }
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  record_call_locked("ID3D12GraphicsCommandList::SetGraphicsRootSignature", S_OK, {self, root_signature}, {}, "{}");
+  std::ostringstream payload;
+  payload << "{\"compute\":false,\"root_signature_object_id\":"
+          << object_id_json(lookup_object_id_locked(root_signature)) << "}";
+  record_call_locked("ID3D12GraphicsCommandList::SetGraphicsRootSignature", S_OK, {self, root_signature}, {}, payload.str());
 }
 
 void STDMETHODCALLTYPE hook_command_list_set_compute_root_signature(
@@ -727,7 +749,10 @@ void STDMETHODCALLTYPE hook_command_list_set_compute_root_signature(
     hook.set_compute_root_signature(self, root_signature);
   }
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  record_call_locked("ID3D12GraphicsCommandList::SetComputeRootSignature", S_OK, {self, root_signature}, {}, "{}");
+  std::ostringstream payload;
+  payload << "{\"compute\":true,\"root_signature_object_id\":"
+          << object_id_json(lookup_object_id_locked(root_signature)) << "}";
+  record_call_locked("ID3D12GraphicsCommandList::SetComputeRootSignature", S_OK, {self, root_signature}, {}, payload.str());
 }
 
 void STDMETHODCALLTYPE hook_command_list_set_graphics_root_descriptor_table(
@@ -743,6 +768,7 @@ void STDMETHODCALLTYPE hook_command_list_set_graphics_root_descriptor_table(
   std::lock_guard<std::mutex> lock(capture_state().mutex);
   std::ostringstream payload;
   payload << "{\"root_parameter_index\":" << root_parameter_index
+          << ",\"compute\":false"
           << ",\"base_descriptor\":" << gpu_descriptor_handle_json(base_descriptor) << "}";
   record_call_locked("ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable", S_OK, {self}, {}, payload.str());
 }
@@ -760,6 +786,7 @@ void STDMETHODCALLTYPE hook_command_list_set_compute_root_descriptor_table(
   std::lock_guard<std::mutex> lock(capture_state().mutex);
   std::ostringstream payload;
   payload << "{\"root_parameter_index\":" << root_parameter_index
+          << ",\"compute\":true"
           << ",\"base_descriptor\":" << gpu_descriptor_handle_json(base_descriptor) << "}";
   record_call_locked("ID3D12GraphicsCommandList::SetComputeRootDescriptorTable", S_OK, {self}, {}, payload.str());
 }
@@ -1079,7 +1106,16 @@ void STDMETHODCALLTYPE hook_command_list_om_set_render_targets(
           << ",\"single_handle_to_descriptor_range\":" << (single_handle_to_descriptor_range ? "true" : "false");
   if (render_target_count > 0 && render_target_descriptors) {
     payload << ",\"first_rtv\":" << descriptor_handle_json(render_target_descriptors[0]);
+    payload << ",\"single_descriptor_handle\":" << descriptor_handle_json(render_target_descriptors[0]);
     payload << ",\"render_targets\":[";
+    for (UINT index = 0; index < render_target_count; ++index) {
+      if (index != 0) {
+        payload << ",";
+      }
+      payload << descriptor_handle_json(render_target_descriptors[index]);
+    }
+    payload << "]";
+    payload << ",\"render_target_descriptors\":[";
     for (UINT index = 0; index < render_target_count; ++index) {
       if (index != 0) {
         payload << ",";
@@ -1090,8 +1126,10 @@ void STDMETHODCALLTYPE hook_command_list_om_set_render_targets(
   }
   if (depth_stencil_descriptor) {
     payload << ",\"dsv\":" << descriptor_handle_json(*depth_stencil_descriptor);
+    payload << ",\"depth_stencil_descriptor\":" << descriptor_handle_json(*depth_stencil_descriptor);
   } else {
     payload << ",\"dsv\":0";
+    payload << ",\"depth_stencil_descriptor\":0";
   }
   payload << "}";
   record_call_locked("ID3D12GraphicsCommandList::OMSetRenderTargets", S_OK, {self}, {}, payload.str());
@@ -1112,6 +1150,7 @@ void STDMETHODCALLTYPE hook_command_list_clear_render_target_view(
   std::lock_guard<std::mutex> lock(capture_state().mutex);
   std::ostringstream payload;
   payload << "{\"descriptor\":" << descriptor_handle_json(render_target_view)
+          << ",\"rtv\":" << descriptor_handle_json(render_target_view)
           << ",\"rect_count\":" << rect_count;
   if (color_rgba) {
     payload << ",\"color\":[" << color_rgba[0] << "," << color_rgba[1] << "," << color_rgba[2] << "," << color_rgba[3] << "]";
@@ -1154,6 +1193,7 @@ void STDMETHODCALLTYPE hook_command_list_clear_depth_stencil_view(
   std::lock_guard<std::mutex> lock(capture_state().mutex);
   std::ostringstream payload;
   payload << "{\"descriptor\":" << descriptor_handle_json(depth_stencil_view)
+          << ",\"dsv\":" << descriptor_handle_json(depth_stencil_view)
           << ",\"clear_flags\":" << static_cast<unsigned int>(clear_flags)
           << ",\"depth\":" << depth
           << ",\"stencil\":" << static_cast<unsigned int>(stencil)
@@ -1428,7 +1468,14 @@ void STDMETHODCALLTYPE hook_command_list_set_descriptor_heaps(
   }
   std::lock_guard<std::mutex> lock(capture_state().mutex);
   std::ostringstream payload;
-  payload << "{\"heap_count\":" << heap_count << "}";
+  payload << "{\"heap_count\":" << heap_count << ",\"heaps\":[";
+  for (UINT index = 0; index < heap_count; ++index) {
+    if (index != 0) {
+      payload << ",";
+    }
+    payload << object_id_json(lookup_object_id_locked(heaps ? heaps[index] : nullptr));
+  }
+  payload << "]}";
   record_call_locked("ID3D12GraphicsCommandList::SetDescriptorHeaps", S_OK, refs, {}, payload.str());
 }
 
@@ -1843,15 +1890,63 @@ void STDMETHODCALLTYPE hook_resource_unmap(
 
   std::vector<apitrace::trace::BlobId> blob_refs;
   std::string buffer_path;
-  const bool has_written_range = written_range && written_range->End > written_range->Begin;
-  if (mapped_data && has_written_range) {
-    const auto begin = static_cast<std::size_t>(written_range->Begin);
-    const auto size = static_cast<std::size_t>(written_range->End - written_range->Begin);
+  std::uint64_t captured_begin = 0;
+  std::uint64_t captured_end = 0;
+  std::uint64_t captured_size = 0;
+  apitrace::trace::ObjectId resource_object_id = 0;
+  const char *capture_skipped_reason = nullptr;
+  {
     std::lock_guard<std::mutex> lock(capture_state().mutex);
-    const auto *bytes = static_cast<const std::uint8_t *>(mapped_data) + begin;
-    const auto asset = register_asset_bytes_locked(apitrace::trace::AssetKind::Buffer, "d3d12-mapped-resource", bytes, size);
-    blob_refs.push_back(asset.blob_id);
-    buffer_path = asset.relative_path.generic_string();
+    const auto info_it = capture_state().resource_capture_infos.find(self);
+    if (info_it != capture_state().resource_capture_infos.end()) {
+      resource_object_id = info_it->second.object_id;
+    } else {
+      resource_object_id = lookup_object_id_locked(self);
+    }
+
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    const bool has_written_range = written_range && written_range->End > written_range->Begin;
+    if (has_written_range) {
+      begin = static_cast<std::uint64_t>(written_range->Begin);
+      end = static_cast<std::uint64_t>(written_range->End);
+    } else if (!written_range) {
+      if (info_it == capture_state().resource_capture_infos.end()) {
+        capture_skipped_reason = "missing_resource_info";
+      } else if (!info_it->second.cpu_writable) {
+        capture_skipped_reason = "resource_not_cpu_writable";
+      } else if (!info_it->second.has_desc) {
+        capture_skipped_reason = "missing_resource_desc";
+      } else if (info_it->second.desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        capture_skipped_reason = "non_buffer_resource";
+      } else if (info_it->second.desc.Width == 0) {
+        capture_skipped_reason = "empty_buffer";
+      } else {
+        begin = 0;
+        end = info_it->second.desc.Width;
+      }
+    } else {
+      capture_skipped_reason = "empty_written_range";
+    }
+
+    if (mapped_data && end > begin) {
+      const auto size64 = end - begin;
+      if (size64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        capture_skipped_reason = "written_range_too_large";
+      } else {
+        const auto size = static_cast<std::size_t>(size64);
+        const auto *bytes = static_cast<const std::uint8_t *>(mapped_data) + static_cast<std::size_t>(begin);
+        const auto asset = register_asset_bytes_locked(apitrace::trace::AssetKind::Buffer, "d3d12-mapped-resource", bytes, size);
+        blob_refs.push_back(asset.blob_id);
+        buffer_path = asset.relative_path.generic_string();
+        captured_begin = begin;
+        captured_end = end;
+        captured_size = size64;
+        capture_skipped_reason = nullptr;
+      }
+    } else if (!mapped_data && !capture_skipped_reason) {
+      capture_skipped_reason = "missing_mapped_data";
+    }
   }
 
   if (hook.unmap) {
@@ -1862,15 +1957,22 @@ void STDMETHODCALLTYPE hook_resource_unmap(
   std::lock_guard<std::mutex> lock(capture_state().mutex);
   capture_state().mapped_resources.erase(self);
   std::ostringstream payload;
-  payload << "{\"subresource\":" << subresource;
-  if (written_range) {
-    payload << ",\"written_begin\":" << static_cast<std::uint64_t>(written_range->Begin)
-            << ",\"written_end\":" << static_cast<std::uint64_t>(written_range->End);
-  } else {
+  payload << "{\"resource_object_id\":" << object_id_json(resource_object_id)
+          << ",\"subresource\":" << subresource;
+  if (!written_range) {
     payload << ",\"written_range\":null";
   }
   if (!buffer_path.empty()) {
-    payload << ",\"buffer_path\":\"" << buffer_path << "\"";
+    payload << ",\"written_begin\":" << captured_begin
+            << ",\"written_end\":" << captured_end
+            << ",\"written_size\":" << captured_size
+            << ",\"buffer_path\":\"" << buffer_path << "\"";
+  } else if (written_range) {
+    payload << ",\"written_begin\":" << static_cast<std::uint64_t>(written_range->Begin)
+            << ",\"written_end\":" << static_cast<std::uint64_t>(written_range->End);
+  }
+  if (capture_skipped_reason) {
+    payload << ",\"capture_skipped_reason\":\"" << capture_skipped_reason << "\"";
   }
   payload << "}";
   record_call_locked("ID3D12Resource::Unmap", S_OK, {self}, blob_refs, payload.str());

@@ -28,6 +28,7 @@ DXMT_UNIX_DIR=""
 DEMO_BIN_DIR="$TEST_PREFIX/bin"
 DEMO_EXE="$DEMO_BIN_DIR/apitrace_test_d3d12.exe"
 ROOT_D3D12_PROXY_DLL="$WINDOWS_BUILD_DIR/d3d12.dll"
+ROOT_DXGI_PROXY_DLL="$WINDOWS_BUILD_DIR/dxgi.dll"
 NATIVE_RETRACE="$HOST_BUILD_DIR/retrace"
 HOST_BUNDLE_CHECK="$HOST_BUILD_DIR/bundle-check"
 
@@ -64,6 +65,7 @@ stage_dxmt_runtime() {
 
 prepare_demo_runtime() {
     require_file "$ROOT_D3D12_PROXY_DLL"
+    require_file "$ROOT_DXGI_PROXY_DLL"
     require_file "$DEMO_EXE"
     require_file "$DXMT_RUNTIME_ROOT/x86_64-windows/d3d12.dll"
     require_file "$DXMT_RUNTIME_ROOT/x86_64-windows/d3d12core.dll"
@@ -72,7 +74,7 @@ prepare_demo_runtime() {
 
     cp "$ROOT_D3D12_PROXY_DLL" "$DEMO_BIN_DIR/d3d12.dll"
     cp "$DXMT_RUNTIME_ROOT/x86_64-windows/d3d12core.dll" "$DEMO_BIN_DIR/d3d12core.dll"
-    cp "$DXMT_RUNTIME_ROOT/x86_64-windows/dxgi.dll" "$DEMO_BIN_DIR/dxgi.dll"
+    cp "$ROOT_DXGI_PROXY_DLL" "$DEMO_BIN_DIR/dxgi.dll"
     cp "$DXMT_RUNTIME_ROOT/x86_64-windows/winemetal.dll" "$DEMO_BIN_DIR/winemetal.dll"
 }
 
@@ -83,6 +85,7 @@ prepare_wine_env() {
     export WINEPREFIX="${APITRACE_WINEPREFIX:-$LINK_DIR/wineprefix-d3d12-link}"
     export APITRACE_D3D12_BACKEND="dxmt"
     export APITRACE_DOWNSTREAM_D3D12="$DXMT_RUNTIME_ROOT/x86_64-windows/d3d12.dll"
+    export APITRACE_DOWNSTREAM_DXGI="$DXMT_RUNTIME_ROOT/x86_64-windows/dxgi.dll"
     export DXMT_EXPERIMENT_DX12_SUPPORT=1
     export APITRACE_D3D12_BUILTIN_CAPTURE=0
     export WINEDLLPATH="$DXMT_RUNTIME_ROOT:$WINE_ENV_ROOT/lib/wine"

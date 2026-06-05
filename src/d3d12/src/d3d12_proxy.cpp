@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -787,6 +788,14 @@ struct ResourceGpuVirtualAddressState {
   std::uint64_t create_sequence = 0;
 };
 
+struct ResourceCaptureInfo {
+  apitrace::trace::ObjectId object_id = 0;
+  D3D12_RESOURCE_DESC desc = {};
+  bool has_desc = false;
+  UINT heap_type = 0;
+  bool cpu_writable = false;
+};
+
 struct GpuVirtualAddressResolve {
   bool resolved = false;
   apitrace::trace::ObjectId object_id = 0;
@@ -826,6 +835,7 @@ struct CaptureState {
   std::unordered_map<ID3D12ResourceVtbl *, ResourceHookState> resource_hooks;
   std::unordered_map<ID3D12Resource *, MappedResourceState> mapped_resources;
   std::unordered_map<ID3D12Resource *, ResourceGpuVirtualAddressState> resource_gpu_virtual_addresses;
+  std::unordered_map<ID3D12Resource *, ResourceCaptureInfo> resource_capture_infos;
   std::unordered_map<ID3D12Heap *, UINT> heap_types;
   std::unordered_map<ID3D12GraphicsCommandList *, std::vector<ID3D12Resource *>> command_list_resources;
   std::vector<const void *> bridge_command_objects;
@@ -1708,6 +1718,25 @@ void patch_vtable_field_cast(VTable *vtable, Field VTable::*field, Replacement r
   patch_vtable_field(vtable, field, reinterpret_cast<Field>(replacement));
 }
 
+void record_object_create_locked(const apitrace::trace::ObjectRecord &record, std::string payload_json = "{}")
+{
+  if (capture_recording_suppressed()) {
+    return;
+  }
+  if (auto *session = apitrace::runtime::ensure_process_trace_session(apitrace::trace::ApiKind::D3D12)) {
+    apitrace::trace::EventRecord event;
+    event.kind = apitrace::trace::EventKind::ObjectCreate;
+    event.callsite.sequence = capture_state().next_sequence++;
+    event.callsite.function_name = "D3DObjectCreate";
+    event.object_id = record.object_id;
+    event.object_kind = record.kind;
+    event.parent_object_id = record.parent_object_id;
+    event.object_debug_name = record.debug_name;
+    event.payload = std::move(payload_json);
+    session->append_call_event(std::move(event));
+  }
+}
+
 apitrace::trace::ObjectId register_object_locked(
     const void *object,
     apitrace::trace::ObjectKind kind,
@@ -1732,6 +1761,7 @@ apitrace::trace::ObjectId register_object_locked(
     record.parent_object_id = parent_object_id;
     record.debug_name = std::move(debug_name);
     session->record_object(record);
+    record_object_create_locked(record);
 
     state.objects.emplace(
         object,
@@ -1756,6 +1786,54 @@ apitrace::trace::ObjectId register_fresh_object_locked(
   }
   capture_state().objects.erase(object);
   return register_object_locked(object, kind, std::move(debug_name), parent_object_id);
+}
+
+void remember_resource_capture_info_locked(
+    ID3D12Resource *resource,
+    apitrace::trace::ObjectId object_id,
+    const D3D12_RESOURCE_DESC *desc,
+    UINT heap_type,
+    bool cpu_writable)
+{
+  if (!resource) {
+    return;
+  }
+
+  ResourceCaptureInfo info;
+  info.object_id = object_id;
+  if (desc) {
+    info.desc = *desc;
+    info.has_desc = true;
+  }
+  info.heap_type = heap_type;
+  info.cpu_writable = cpu_writable;
+  capture_state().resource_capture_infos[resource] = info;
+}
+
+void remember_resource_capture_info_locked(
+    ID3D12Resource *resource,
+    apitrace::trace::ObjectId object_id,
+    const D3D12_RESOURCE_DESC1 *desc,
+    UINT heap_type,
+    bool cpu_writable)
+{
+  if (!desc) {
+    remember_resource_capture_info_locked(resource, object_id, static_cast<const D3D12_RESOURCE_DESC *>(nullptr), heap_type, cpu_writable);
+    return;
+  }
+
+  D3D12_RESOURCE_DESC legacy_desc = {};
+  legacy_desc.Dimension = desc->Dimension;
+  legacy_desc.Alignment = desc->Alignment;
+  legacy_desc.Width = desc->Width;
+  legacy_desc.Height = desc->Height;
+  legacy_desc.DepthOrArraySize = desc->DepthOrArraySize;
+  legacy_desc.MipLevels = desc->MipLevels;
+  legacy_desc.Format = desc->Format;
+  legacy_desc.SampleDesc = desc->SampleDesc;
+  legacy_desc.Layout = desc->Layout;
+  legacy_desc.Flags = desc->Flags;
+  remember_resource_capture_info_locked(resource, object_id, &legacy_desc, heap_type, cpu_writable);
 }
 
 void remember_bridge_command_object_locked(const void *object)
@@ -4462,7 +4540,22 @@ HRESULT STDMETHODCALLTYPE hook_device_create_committed_resource2(
     std::lock_guard<std::mutex> lock(capture_state().mutex);
     const auto parent = lookup_object_id_locked(self);
     const auto protected_session_object_id = lookup_object_id_locked(protected_session);
-    register_fresh_object_locked(*resource, apitrace::trace::ObjectKind::Resource, "ID3D12Resource", parent);
+    const auto resource_object_id =
+        register_fresh_object_locked(*resource, apitrace::trace::ObjectKind::Resource, "ID3D12Resource", parent);
+    const auto heap_type = heap_properties ? static_cast<UINT>(heap_properties->Type) : 0;
+    const auto gpu_virtual_address = resource_gpu_virtual_address(static_cast<ID3D12Resource *>(*resource));
+    capture_state().resource_gpu_virtual_addresses[static_cast<ID3D12Resource *>(*resource)] = {
+        resource_object_id,
+        gpu_virtual_address,
+        desc ? desc->Width : 0,
+        capture_state().next_sequence,
+    };
+    remember_resource_capture_info_locked(
+        static_cast<ID3D12Resource *>(*resource),
+        resource_object_id,
+        desc,
+        heap_type,
+        heap_type == static_cast<UINT>(D3D12_HEAP_TYPE_UPLOAD));
     std::ostringstream payload;
     payload << "{"
             << "\"heap_type\":" << (heap_properties ? static_cast<unsigned int>(heap_properties->Type) : 0) << ","
@@ -4471,7 +4564,7 @@ HRESULT STDMETHODCALLTYPE hook_device_create_committed_resource2(
             << "\"resource_desc\":" << resource_desc1_json(desc) << ","
             << "\"optimized_clear_value\":" << clear_value_json(optimized_clear_value) << ","
             << "\"protected_session_object_id\":" << object_id_json(protected_session_object_id) << ","
-            << "\"gpu_virtual_address\":" << resource_gpu_virtual_address(static_cast<ID3D12Resource *>(*resource))
+            << "\"gpu_virtual_address\":" << gpu_virtual_address
             << "}";
     record_call_locked("ID3D12Device8::CreateCommittedResource2", hr, {self, *resource, protected_session}, {}, payload.str());
   }
@@ -4501,7 +4594,23 @@ HRESULT STDMETHODCALLTYPE hook_device_create_placed_resource1(
     std::lock_guard<std::mutex> lock(capture_state().mutex);
     const auto parent = lookup_object_id_locked(self);
     const auto heap_object_id = lookup_object_id_locked(heap);
-    register_fresh_object_locked(*resource, apitrace::trace::ObjectKind::Resource, "ID3D12Resource", parent);
+    const auto resource_object_id =
+        register_fresh_object_locked(*resource, apitrace::trace::ObjectKind::Resource, "ID3D12Resource", parent);
+    const auto heap_type_it = capture_state().heap_types.find(heap);
+    const auto heap_type = heap_type_it != capture_state().heap_types.end() ? heap_type_it->second : 0;
+    const auto gpu_virtual_address = resource_gpu_virtual_address(static_cast<ID3D12Resource *>(*resource));
+    capture_state().resource_gpu_virtual_addresses[static_cast<ID3D12Resource *>(*resource)] = {
+        resource_object_id,
+        gpu_virtual_address,
+        desc ? desc->Width : 0,
+        capture_state().next_sequence,
+    };
+    remember_resource_capture_info_locked(
+        static_cast<ID3D12Resource *>(*resource),
+        resource_object_id,
+        desc,
+        heap_type,
+        heap_type == static_cast<UINT>(D3D12_HEAP_TYPE_UPLOAD));
     std::ostringstream payload;
     payload << "{"
             << "\"heap_object_id\":" << object_id_json(heap_object_id) << ","
@@ -4509,7 +4618,7 @@ HRESULT STDMETHODCALLTYPE hook_device_create_placed_resource1(
             << "\"initial_state\":" << static_cast<unsigned int>(initial_state) << ","
             << "\"resource_desc\":" << resource_desc1_json(desc) << ","
             << "\"optimized_clear_value\":" << clear_value_json(optimized_clear_value) << ","
-            << "\"gpu_virtual_address\":" << resource_gpu_virtual_address(static_cast<ID3D12Resource *>(*resource))
+            << "\"gpu_virtual_address\":" << gpu_virtual_address
             << "}";
     record_call_locked("ID3D12Device8::CreatePlacedResource1", hr, {self, heap, *resource}, {}, payload.str());
   }
