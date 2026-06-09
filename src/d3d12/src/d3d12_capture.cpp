@@ -565,6 +565,15 @@ bool object_kind_known_locked(const void *object, trace::ObjectKind kind)
   return found != g_object_kinds.end() && found->second == kind;
 }
 
+trace::ObjectId existing_object_id_locked(const void *object)
+{
+  if (!object) {
+    return 0;
+  }
+  const auto found = g_object_ids.find(object);
+  return found == g_object_ids.end() ? 0 : found->second;
+}
+
 GpuVirtualAddressResolve resolve_gpu_virtual_address_locked(std::uint64_t address)
 {
   GpuVirtualAddressResolve resolve;
@@ -2778,8 +2787,13 @@ std::uint64_t record_dxgi_create_swapchain(
     return 0;
   }
   record_object_create(swapchain, CaptureObjectKind::SwapChain, factory, "IDXGISwapChain");
-  const void *refs[] = {device, swapchain};
-  return record_call("IDXGIFactory::CreateSwapChain", "{}", refs, 2);
+  std::vector<trace::ObjectId> refs;
+  {
+    std::lock_guard lock(g_object_mutex);
+    append_object_ref_id(refs, existing_object_id_locked(device));
+    append_object_ref_id(refs, lookup_object_id_locked(swapchain));
+  }
+  return record_call_with_object_ids("IDXGIFactory::CreateSwapChain", "{}", std::move(refs));
 }
 
 std::uint64_t record_execute_command_lists(const void *queue, const void *command_list)

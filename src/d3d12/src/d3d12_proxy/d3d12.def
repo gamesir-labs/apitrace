@@ -3,24 +3,30 @@ EXPORTS
     GetBehaviorValue @100
     D3D12CreateDevice @101
     D3D12GetDebugInterface @102
-    D3D12CoreCreateLayeredDevice
-    D3D12CoreGetLayeredDeviceSize
-    D3D12CoreRegisterLayers
-    D3D12CreateRootSignatureDeserializer
-    D3D12CreateVersionedRootSignatureDeserializer
-    D3D12EnableExperimentalFeatures
-    D3D12SerializeRootSignature
-    D3D12SerializeVersionedRootSignature
-    apitrace_bootstrap_d3d12
-    apitrace_d3d12_begin_capture_suppression
-    apitrace_d3d12_emit_scene_marker
-    apitrace_d3d12_end_capture_suppression
-    apitrace_d3d12_record_compute_pipeline
-    apitrace_d3d12_record_descriptor_heap
-    apitrace_d3d12_record_execute_command_lists
-    apitrace_d3d12_record_graphics_pipeline
-    apitrace_d3d12_record_present_frame
-    apitrace_d3d12_record_present_semantics
-    apitrace_d3d12_record_resource_barrier
-    apitrace_d3d12_record_runtime_objects
-    apitrace_d3d12_record_swapchain_back_buffer
+    D3D12CoreCreateLayeredDevice @103
+    D3D12CoreGetLayeredDeviceSize @104
+    D3D12CoreRegisterLayers @105
+    D3D12CreateRootSignatureDeserializer @106
+    D3D12CreateVersionedRootSignatureDeserializer @107
+    D3D12EnableExperimentalFeatures @108
+    D3D12SerializeRootSignature @109
+    D3D12SerializeVersionedRootSignature @110
+    apitrace_bootstrap_d3d12 @200
+    apitrace_d3d12_begin_capture_suppression @201
+    apitrace_d3d12_emit_scene_marker @202
+    apitrace_d3d12_end_capture_suppression @203
+    apitrace_d3d12_record_compute_pipeline @204
+    apitrace_d3d12_record_descriptor_heap @205
+    apitrace_d3d12_record_execute_command_lists @206
+    apitrace_d3d12_record_graphics_pipeline @207
+    apitrace_d3d12_record_present_frame @208
+    apitrace_d3d12_record_present_semantics @209
+    apitrace_d3d12_record_resource_barrier @210
+    apitrace_d3d12_record_runtime_objects @211
+    apitrace_d3d12_record_swapchain_back_buffer @212
+    apitrace_d3d12_restore_queue_vtable @213
+    apitrace_d3d12_repatch_queue_vtable @214
+    apitrace_d3d12_suspend_all_queue_vtables @215
+    apitrace_d3d12_resume_all_queue_vtables @216
+    apitrace_d3d12_suspend_all_vtables @217
+    apitrace_d3d12_resume_all_vtables @218

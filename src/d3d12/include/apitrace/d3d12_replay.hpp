@@ -498,6 +498,7 @@ public:
     bool graphics = false;
     std::filesystem::path relative_path;
     std::vector<trace::BlobId> blob_refs;
+    bool uses_embedded_root_signature = false;
     std::uint32_t node_mask = 0;
     std::uint32_t flags = 0;
     std::uint32_t sample_mask = 0;

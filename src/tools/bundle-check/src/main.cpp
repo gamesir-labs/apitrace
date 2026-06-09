@@ -1784,6 +1784,7 @@ bool verify_d3d_pipeline_payload(
     const json &payload,
     const std::vector<apitrace::trace::BlobId> &blob_refs,
     const std::unordered_map<std::uint64_t, std::string> &blob_paths,
+    const std::unordered_set<std::uint64_t> &root_signature_objects,
     const std::unordered_map<std::uint64_t, std::string> &root_signature_paths_by_object,
     AssetJsonCache &asset_json_cache,
     std::unordered_set<std::string> &d3d_pipeline_paths,
@@ -1827,19 +1828,28 @@ bool verify_d3d_pipeline_payload(
   const bool graphics_pipeline = !compute_pipeline;
 
   const auto root_signature_object_id = object_id_from_pipeline_json(pipeline, "root_signature_object_id");
-  if (root_signature_object_id == 0) {
+  const bool uses_embedded_root_signature =
+      root_signature_object_id == 0 &&
+      string_from_json(pipeline.value("root_signature_source", json(nullptr))) == "embedded";
+  if (root_signature_object_id == 0 && !uses_embedded_root_signature) {
     error = label + ": pipeline asset missing root_signature_object_id";
     return false;
   }
-  const auto root_signature_path_it = root_signature_paths_by_object.find(root_signature_object_id);
-  if (root_signature_path_it == root_signature_paths_by_object.end()) {
-    error = label + ": pipeline asset references an unknown root signature object id";
-    return false;
-  }
-  const std::filesystem::path root_signature_relative_path(root_signature_path_it->second);
-  if (!is_d3d_root_signature_asset_path(root_signature_relative_path)) {
-    error = label + ": pipeline root signature object does not reference a D3D root signature asset";
-    return false;
+  auto root_signature_path_it = root_signature_paths_by_object.end();
+  if (root_signature_object_id != 0) {
+    root_signature_path_it = root_signature_paths_by_object.find(root_signature_object_id);
+    if (root_signature_path_it == root_signature_paths_by_object.end() &&
+        root_signature_objects.find(root_signature_object_id) == root_signature_objects.end()) {
+      error = label + ": pipeline asset references an unknown root signature object id";
+      return false;
+    }
+    if (root_signature_path_it != root_signature_paths_by_object.end()) {
+      const std::filesystem::path root_signature_relative_path(root_signature_path_it->second);
+      if (!is_d3d_root_signature_asset_path(root_signature_relative_path)) {
+        error = label + ": pipeline root signature object does not reference a D3D root signature asset";
+        return false;
+      }
+    }
   }
 
   std::unordered_set<std::string> nested_shader_paths;
@@ -1914,7 +1924,9 @@ bool verify_d3d_pipeline_payload(
   if (root_signature_refs != payload.end() && root_signature_refs->is_string()) {
     d3d_root_signature_paths.insert(root_signature_refs->get<std::string>());
   }
-  d3d_root_signature_paths.insert(root_signature_path_it->second);
+  if (root_signature_path_it != root_signature_paths_by_object.end()) {
+    d3d_root_signature_paths.insert(root_signature_path_it->second);
+  }
 
   return true;
 }
@@ -3099,6 +3111,7 @@ bool verify_strict_options(
   std::unordered_set<std::string> d3d_pipeline_paths;
   std::unordered_set<std::string> d3d_shader_paths;
   std::unordered_set<std::string> d3d_root_signature_paths;
+  std::unordered_set<std::uint64_t> root_signature_objects;
   std::unordered_map<std::uint64_t, std::string> root_signature_paths_by_object;
   std::unordered_set<std::string> metal_resource_paths;
   std::unordered_set<std::string> metal_buffer_paths;
@@ -3137,6 +3150,11 @@ bool verify_strict_options(
       error = "sequence " + std::to_string(event.callsite.sequence) + ": " + error;
       return false;
     }
+    if (event.kind == apitrace::trace::EventKind::ObjectCreate &&
+        event.object_kind == apitrace::trace::ObjectKind::RootSignature &&
+        event.object_id != 0) {
+      root_signature_objects.insert(event.object_id);
+    }
     if (event.kind == apitrace::trace::EventKind::Call &&
         event.callsite.function_name == "ID3D12Device::CreateRootSignature") {
       const auto root_signature_path = string_from_json(payload.value("root_signature_path", json(nullptr)));
@@ -3160,6 +3178,7 @@ bool verify_strict_options(
                   ": root_signature_path is not covered by blob_refs";
           return false;
         }
+        root_signature_objects.insert(event.object_refs[1]);
         root_signature_paths_by_object[event.object_refs[1]] = root_signature_path;
         d3d_root_signature_paths.insert(root_signature_path);
       }
@@ -3174,6 +3193,7 @@ bool verify_strict_options(
             payload,
             event.blob_refs,
             blob_paths,
+            root_signature_objects,
             root_signature_paths_by_object,
             asset_json_cache,
             d3d_pipeline_paths,

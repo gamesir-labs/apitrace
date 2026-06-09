@@ -5,7 +5,7 @@
 #endif
 
 #include <windows.h>
-#include <dxgi1_2.h>
+#include <dxgi1_6.h>
 
 #include <cstdarg>
 #include <cstdint>
@@ -21,12 +21,19 @@ namespace {
 using CreateDXGIFactoryFn = HRESULT(WINAPI *)(REFIID, void **);
 using CreateDXGIFactory1Fn = HRESULT(WINAPI *)(REFIID, void **);
 using CreateDXGIFactory2Fn = HRESULT(WINAPI *)(UINT, REFIID, void **);
+using DXGID3D10CreateDeviceFn =
+    HRESULT(WINAPI *)(HMODULE, IDXGIFactory *, IDXGIAdapter *, UINT, const void *, UINT, void **);
+using DXGID3D10RegisterLayersFn = HRESULT(WINAPI *)(const void *, UINT);
 using DXGIGetDebugInterface1Fn = HRESULT(WINAPI *)(UINT, REFIID, void **);
 using DXGIDeclareAdapterRemovalSupportFn = HRESULT(WINAPI *)();
 using DXGIReportAdapterConfigurationFn = HRESULT(WINAPI *)(DWORD);
 using PIXBeginCaptureFn = HRESULT(WINAPI *)(DWORD, void *);
 using PIXEndCaptureFn = HRESULT(WINAPI *)();
 using PIXGetCaptureStateFn = HRESULT(WINAPI *)();
+using RestoreD3D12QueueVTableFn = void *(WINAPI *)(void *);
+using RepatchD3D12QueueVTableFn = void(WINAPI *)(void *, void *);
+using SuspendAllD3D12VTablesFn = void *(WINAPI *)();
+using ResumeAllD3D12VTablesFn = void(WINAPI *)(void *);
 
 using FactoryCreateSwapChainFn =
     HRESULT(STDMETHODCALLTYPE *)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **);
@@ -48,6 +55,8 @@ struct DownstreamModule {
   CreateDXGIFactoryFn create_factory = nullptr;
   CreateDXGIFactory1Fn create_factory1 = nullptr;
   CreateDXGIFactory2Fn create_factory2 = nullptr;
+  DXGID3D10CreateDeviceFn d3d10_create_device = nullptr;
+  DXGID3D10RegisterLayersFn d3d10_register_layers = nullptr;
   DXGIGetDebugInterface1Fn get_debug_interface1 = nullptr;
   DXGIDeclareAdapterRemovalSupportFn declare_adapter_removal_support = nullptr;
   DXGIReportAdapterConfigurationFn report_adapter_configuration = nullptr;
@@ -95,6 +104,40 @@ State &state()
   static State value;
   return value;
 }
+
+bool proxy_hooks_disabled()
+{
+  if (const char *value = std::getenv("APITRACE_DXGI_PROXY_DISABLE_HOOKS")) {
+    return *value && std::strcmp(value, "0") != 0 &&
+           std::strcmp(value, "false") != 0 &&
+           std::strcmp(value, "FALSE") != 0;
+  }
+  return false;
+}
+
+bool env_flag_enabled(const char *name)
+{
+  if (const char *value = std::getenv(name)) {
+    return *value && std::strcmp(value, "0") != 0 &&
+           std::strcmp(value, "false") != 0 &&
+           std::strcmp(value, "FALSE") != 0;
+  }
+  return false;
+}
+
+bool dxgi_factory_scope_restore_disabled()
+{
+  return false;
+}
+
+constexpr GUID kIID_IDXGIFactory3 = {0x25483823, 0xcd46, 0x4c7d, {0x86, 0xca, 0x47, 0xaa, 0x95, 0xb8, 0x37, 0xbd}};
+constexpr GUID kIID_IDXGIFactory4 = {0x1bc6ea02, 0xef36, 0x464f, {0xbf, 0x0c, 0x21, 0xca, 0x39, 0xe5, 0x16, 0x8a}};
+constexpr GUID kIID_IDXGIFactory5 = {0x7632e1f5, 0xee65, 0x4dca, {0x87, 0xfd, 0x84, 0xcd, 0x75, 0xf8, 0x83, 0x8d}};
+constexpr GUID kIID_IDXGIFactory6 = {0xc1b6694f, 0xff09, 0x44a9, {0xb0, 0x3c, 0x77, 0x90, 0x0a, 0x0a, 0x1d, 0x17}};
+constexpr GUID kIID_IDXGIFactory7 = {0xa4966eed, 0x76db, 0x44da, {0x84, 0xc1, 0xee, 0x9a, 0x7a, 0xfb, 0x20, 0xa8}};
+constexpr GUID kIID_IDXGISwapChain2 = {0xa8be2ac4, 0x199f, 0x4946, {0xb3, 0x31, 0x79, 0x59, 0x9f, 0xb9, 0x8d, 0xe7}};
+constexpr GUID kIID_IDXGISwapChain3 = {0x94d99bdb, 0xf1f8, 0x4ab0, {0xb2, 0x36, 0x7d, 0xa0, 0x17, 0x0e, 0xda, 0xb1}};
+constexpr GUID kIID_IDXGISwapChain4 = {0x3d585d5a, 0xbd4a, 0x489e, {0xb1, 0xf4, 0x3d, 0xbc, 0xb6, 0x45, 0x2f, 0xfb}};
 
 std::string downstream_path()
 {
@@ -158,6 +201,10 @@ DownstreamModule &downstream_module()
         reinterpret_cast<CreateDXGIFactory1Fn>(GetProcAddress(current.downstream.module, "CreateDXGIFactory1"));
     current.downstream.create_factory2 =
         reinterpret_cast<CreateDXGIFactory2Fn>(GetProcAddress(current.downstream.module, "CreateDXGIFactory2"));
+    current.downstream.d3d10_create_device =
+        reinterpret_cast<DXGID3D10CreateDeviceFn>(GetProcAddress(current.downstream.module, "DXGID3D10CreateDevice"));
+    current.downstream.d3d10_register_layers =
+        reinterpret_cast<DXGID3D10RegisterLayersFn>(GetProcAddress(current.downstream.module, "DXGID3D10RegisterLayers"));
     current.downstream.get_debug_interface1 =
         reinterpret_cast<DXGIGetDebugInterface1Fn>(GetProcAddress(current.downstream.module, "DXGIGetDebugInterface1"));
     current.downstream.declare_adapter_removal_support =
@@ -200,18 +247,23 @@ void patch_vtable_field(VTable *vtable, Field VTable::*field, Field replacement)
   WriteProcessMemory(GetCurrentProcess(), slot, &replacement, sizeof(replacement), &written);
 }
 
-template <typename VTable>
-VTable *clone_vtable(const VTable *source)
+void *clone_vtable_bytes(const void *source, std::size_t size)
 {
   if (!source) {
     return nullptr;
   }
-  auto *memory = std::malloc(sizeof(VTable));
+  auto *memory = std::malloc(size);
   if (!memory) {
     return nullptr;
   }
-  std::memcpy(memory, source, sizeof(VTable));
-  return static_cast<VTable *>(memory);
+  std::memcpy(memory, source, size);
+  return memory;
+}
+
+template <typename VTable>
+VTable *clone_vtable(const VTable *source, std::size_t size = sizeof(VTable))
+{
+  return static_cast<VTable *>(clone_vtable_bytes(source, size));
 }
 
 template <typename Interface, typename VTable>
@@ -220,6 +272,11 @@ public:
   ScopedOriginalVTable(Interface *object, VTable *original_vtable)
       : object_(object), patched_vtable_(object ? object->lpVtbl : nullptr)
   {
+    if (dxgi_factory_scope_restore_disabled()) {
+      object_ = nullptr;
+      patched_vtable_ = nullptr;
+      return;
+    }
     if (object_ && original_vtable) {
       object_->lpVtbl = original_vtable;
     }
@@ -237,11 +294,191 @@ private:
   VTable *patched_vtable_ = nullptr;
 };
 
+class ScopedD3D12QueueOriginalVTable {
+public:
+  explicit ScopedD3D12QueueOriginalVTable(void *queue)
+      : queue_(queue)
+  {
+    HMODULE d3d12 = GetModuleHandleA("d3d12.dll");
+    proxy_debug_logf("ScopedD3D12QueueOriginalVTable queue=%p d3d12=%p", queue_, d3d12);
+    if (!d3d12) {
+      return;
+    }
+    restore_ = reinterpret_cast<RestoreD3D12QueueVTableFn>(
+        GetProcAddress(d3d12, "apitrace_d3d12_restore_queue_vtable"));
+    repatch_ = reinterpret_cast<RepatchD3D12QueueVTableFn>(
+        GetProcAddress(d3d12, "apitrace_d3d12_repatch_queue_vtable"));
+    proxy_debug_logf(
+        "ScopedD3D12QueueOriginalVTable exports restore=%p repatch=%p",
+        reinterpret_cast<void *>(restore_),
+        reinterpret_cast<void *>(repatch_));
+    if (restore_) {
+      patched_vtable_ = restore_(queue_);
+      proxy_debug_logf(
+          "ScopedD3D12QueueOriginalVTable restored queue=%p patched_vtable=%p",
+          queue_,
+          patched_vtable_);
+      if (patched_vtable_) {
+        return;
+      }
+    }
+
+    suspend_all_ = reinterpret_cast<SuspendAllD3D12VTablesFn>(
+        GetProcAddress(d3d12, "apitrace_d3d12_suspend_all_queue_vtables"));
+    resume_all_ = reinterpret_cast<ResumeAllD3D12VTablesFn>(
+        GetProcAddress(d3d12, "apitrace_d3d12_resume_all_queue_vtables"));
+    proxy_debug_logf(
+        "ScopedD3D12QueueOriginalVTable queue-only fallback exports suspend=%p resume=%p",
+        reinterpret_cast<void *>(suspend_all_),
+        reinterpret_cast<void *>(resume_all_));
+    if (suspend_all_) {
+      suspend_token_ = suspend_all_();
+      proxy_debug_logf("ScopedD3D12QueueOriginalVTable suspend_all_queues token=%p", suspend_token_);
+    }
+  }
+
+  ~ScopedD3D12QueueOriginalVTable()
+  {
+    if (resume_all_ && suspend_token_) {
+      resume_all_(suspend_token_);
+      proxy_debug_logf("ScopedD3D12QueueOriginalVTable resumed_all_queues token=%p", suspend_token_);
+      return;
+    }
+    if (repatch_ && patched_vtable_) {
+      repatch_(queue_, patched_vtable_);
+      proxy_debug_logf(
+          "ScopedD3D12QueueOriginalVTable repatched queue=%p patched_vtable=%p",
+          queue_,
+          patched_vtable_);
+    }
+  }
+
+  ScopedD3D12QueueOriginalVTable(const ScopedD3D12QueueOriginalVTable &) = delete;
+  ScopedD3D12QueueOriginalVTable &operator=(const ScopedD3D12QueueOriginalVTable &) = delete;
+
+private:
+  void *queue_ = nullptr;
+  void *patched_vtable_ = nullptr;
+  void *suspend_token_ = nullptr;
+  RestoreD3D12QueueVTableFn restore_ = nullptr;
+  RepatchD3D12QueueVTableFn repatch_ = nullptr;
+  SuspendAllD3D12VTablesFn suspend_all_ = nullptr;
+  ResumeAllD3D12VTablesFn resume_all_ = nullptr;
+};
+
 void patch_factory(IDXGIFactory *factory);
-void patch_factory2(IDXGIFactory2 *factory);
+void patch_factory2(IDXGIFactory2 *factory, std::size_t vtable_size);
 void patch_swapchain(IDXGISwapChain *swapchain);
-void patch_swapchain1(IDXGISwapChain1 *swapchain);
+void patch_swapchain1(IDXGISwapChain1 *swapchain, std::size_t vtable_size);
 void patch_swapchain_interfaces(IDXGISwapChain *swapchain);
+
+template <typename Interface>
+void release_interface(Interface *object)
+{
+  if (object && object->lpVtbl && object->lpVtbl->Release) {
+    object->lpVtbl->Release(object);
+  }
+}
+
+std::size_t supported_factory_vtable_size(IDXGIFactory *factory, std::size_t minimum_size)
+{
+  if (!factory || !factory->lpVtbl) {
+    return minimum_size;
+  }
+
+  IDXGIFactory7 *factory7 = nullptr;
+  if (SUCCEEDED(factory->lpVtbl->QueryInterface(factory, kIID_IDXGIFactory7, reinterpret_cast<void **>(&factory7))) &&
+      factory7) {
+    release_interface(factory7);
+    return sizeof(IDXGIFactory7Vtbl);
+  }
+
+  IDXGIFactory6 *factory6 = nullptr;
+  if (SUCCEEDED(factory->lpVtbl->QueryInterface(factory, kIID_IDXGIFactory6, reinterpret_cast<void **>(&factory6))) &&
+      factory6) {
+    release_interface(factory6);
+    return sizeof(IDXGIFactory6Vtbl);
+  }
+
+  IDXGIFactory5 *factory5 = nullptr;
+  if (SUCCEEDED(factory->lpVtbl->QueryInterface(factory, kIID_IDXGIFactory5, reinterpret_cast<void **>(&factory5))) &&
+      factory5) {
+    release_interface(factory5);
+    return sizeof(IDXGIFactory5Vtbl);
+  }
+
+  IDXGIFactory4 *factory4 = nullptr;
+  if (SUCCEEDED(factory->lpVtbl->QueryInterface(factory, kIID_IDXGIFactory4, reinterpret_cast<void **>(&factory4))) &&
+      factory4) {
+    release_interface(factory4);
+    return sizeof(IDXGIFactory4Vtbl);
+  }
+
+  IDXGIFactory3 *factory3 = nullptr;
+  if (SUCCEEDED(factory->lpVtbl->QueryInterface(factory, kIID_IDXGIFactory3, reinterpret_cast<void **>(&factory3))) &&
+      factory3) {
+    release_interface(factory3);
+    return sizeof(IDXGIFactory3Vtbl);
+  }
+
+  IDXGIFactory2 *factory2 = nullptr;
+  if (SUCCEEDED(factory->lpVtbl->QueryInterface(factory, IID_IDXGIFactory2, reinterpret_cast<void **>(&factory2))) &&
+      factory2) {
+    release_interface(factory2);
+    return sizeof(IDXGIFactory2Vtbl);
+  }
+
+  return minimum_size;
+}
+
+std::size_t supported_swapchain_vtable_size(IDXGISwapChain *swapchain, std::size_t minimum_size)
+{
+  if (!swapchain || !swapchain->lpVtbl) {
+    return minimum_size;
+  }
+
+  IDXGISwapChain4 *swapchain4 = nullptr;
+  if (SUCCEEDED(swapchain->lpVtbl->QueryInterface(
+          swapchain,
+          kIID_IDXGISwapChain4,
+          reinterpret_cast<void **>(&swapchain4))) &&
+      swapchain4) {
+    release_interface(swapchain4);
+    return sizeof(IDXGISwapChain4Vtbl);
+  }
+
+  IDXGISwapChain3 *swapchain3 = nullptr;
+  if (SUCCEEDED(swapchain->lpVtbl->QueryInterface(
+          swapchain,
+          kIID_IDXGISwapChain3,
+          reinterpret_cast<void **>(&swapchain3))) &&
+      swapchain3) {
+    release_interface(swapchain3);
+    return sizeof(IDXGISwapChain3Vtbl);
+  }
+
+  IDXGISwapChain2 *swapchain2 = nullptr;
+  if (SUCCEEDED(swapchain->lpVtbl->QueryInterface(
+          swapchain,
+          kIID_IDXGISwapChain2,
+          reinterpret_cast<void **>(&swapchain2))) &&
+      swapchain2) {
+    release_interface(swapchain2);
+    return sizeof(IDXGISwapChain2Vtbl);
+  }
+
+  IDXGISwapChain1 *swapchain1 = nullptr;
+  if (SUCCEEDED(swapchain->lpVtbl->QueryInterface(
+          swapchain,
+          IID_IDXGISwapChain1,
+          reinterpret_cast<void **>(&swapchain1))) &&
+      swapchain1) {
+    release_interface(swapchain1);
+    return sizeof(IDXGISwapChain1Vtbl);
+  }
+
+  return minimum_size;
+}
 
 FactoryHookState factory_hook_for(IDXGIFactory *factory)
 {
@@ -282,9 +519,15 @@ HRESULT STDMETHODCALLTYPE hook_factory_create_swap_chain(
     return E_FAIL;
   }
   ScopedOriginalVTable<IDXGIFactory, IDXGIFactoryVtbl> original(factory, hook.vtable);
+  ScopedD3D12QueueOriginalVTable original_queue(device);
   const HRESULT hr = hook.create_swap_chain(factory, device, desc, swapchain);
+  proxy_debug_logf(
+      "hook_factory_create_swap_chain factory=%p hr=0x%08lx swapchain=%p",
+      factory,
+      hr,
+      swapchain ? *swapchain : nullptr);
   if (SUCCEEDED(hr) && swapchain && *swapchain) {
-    patch_swapchain(*swapchain);
+    patch_swapchain_interfaces(*swapchain);
     apitrace::d3d12::record_dxgi_create_swapchain(factory, device, *swapchain);
   }
   return hr;
@@ -301,7 +544,13 @@ HRESULT STDMETHODCALLTYPE hook_factory2_create_swap_chain(
     return E_FAIL;
   }
   ScopedOriginalVTable<IDXGIFactory2, IDXGIFactory2Vtbl> original(factory, hook.vtable);
+  ScopedD3D12QueueOriginalVTable original_queue(device);
   const HRESULT hr = hook.create_swap_chain(reinterpret_cast<IDXGIFactory *>(factory), device, desc, swapchain);
+  proxy_debug_logf(
+      "hook_factory2_create_swap_chain factory=%p hr=0x%08lx swapchain=%p",
+      factory,
+      hr,
+      swapchain ? *swapchain : nullptr);
   if (SUCCEEDED(hr) && swapchain && *swapchain) {
     patch_swapchain_interfaces(*swapchain);
     apitrace::d3d12::record_dxgi_create_swapchain(factory, device, *swapchain);
@@ -322,11 +571,36 @@ HRESULT STDMETHODCALLTYPE hook_factory2_create_swap_chain_for_hwnd(
   if (!hook.create_swap_chain_for_hwnd) {
     return E_FAIL;
   }
+  proxy_debug_logf(
+      "hook_factory2_create_swap_chain_for_hwnd enter factory=%p device=%p hwnd=%p desc=%p fullscreen_desc=%p output=%p slot=%p current_vtable=%p original_vtable=%p width=%u height=%u format=%u buffer_count=%u swap_effect=%u flags=0x%08x",
+      factory,
+      device,
+      hwnd,
+      desc,
+      fullscreen_desc,
+      restrict_to_output,
+      swapchain,
+      factory ? factory->lpVtbl : nullptr,
+      hook.vtable,
+      desc ? desc->Width : 0,
+      desc ? desc->Height : 0,
+      desc ? static_cast<unsigned int>(desc->Format) : 0,
+      desc ? desc->BufferCount : 0,
+      desc ? static_cast<unsigned int>(desc->SwapEffect) : 0,
+      desc ? desc->Flags : 0);
   ScopedOriginalVTable<IDXGIFactory2, IDXGIFactory2Vtbl> original(factory, hook.vtable);
+  ScopedD3D12QueueOriginalVTable original_queue(device);
   const HRESULT hr = hook.create_swap_chain_for_hwnd(
       factory, device, hwnd, desc, fullscreen_desc, restrict_to_output, swapchain);
+  proxy_debug_logf(
+      "hook_factory2_create_swap_chain_for_hwnd factory=%p hr=0x%08lx swapchain=%p",
+      factory,
+      hr,
+      swapchain ? *swapchain : nullptr);
   if (SUCCEEDED(hr) && swapchain && *swapchain) {
-    patch_swapchain1(*swapchain);
+    patch_swapchain1(
+        *swapchain,
+        supported_swapchain_vtable_size(reinterpret_cast<IDXGISwapChain *>(*swapchain), sizeof(IDXGISwapChain1Vtbl)));
     apitrace::d3d12::record_dxgi_create_swapchain(factory, device, *swapchain);
   }
   return hr;
@@ -345,10 +619,18 @@ HRESULT STDMETHODCALLTYPE hook_factory2_create_swap_chain_for_core_window(
     return E_FAIL;
   }
   ScopedOriginalVTable<IDXGIFactory2, IDXGIFactory2Vtbl> original(factory, hook.vtable);
+  ScopedD3D12QueueOriginalVTable original_queue(device);
   const HRESULT hr = hook.create_swap_chain_for_core_window(
       factory, device, window, desc, restrict_to_output, swapchain);
+  proxy_debug_logf(
+      "hook_factory2_create_swap_chain_for_core_window factory=%p hr=0x%08lx swapchain=%p",
+      factory,
+      hr,
+      swapchain ? *swapchain : nullptr);
   if (SUCCEEDED(hr) && swapchain && *swapchain) {
-    patch_swapchain1(*swapchain);
+    patch_swapchain1(
+        *swapchain,
+        supported_swapchain_vtable_size(reinterpret_cast<IDXGISwapChain *>(*swapchain), sizeof(IDXGISwapChain1Vtbl)));
     apitrace::d3d12::record_dxgi_create_swapchain(factory, device, *swapchain);
   }
   return hr;
@@ -366,10 +648,18 @@ HRESULT STDMETHODCALLTYPE hook_factory2_create_swap_chain_for_composition(
     return E_FAIL;
   }
   ScopedOriginalVTable<IDXGIFactory2, IDXGIFactory2Vtbl> original(factory, hook.vtable);
+  ScopedD3D12QueueOriginalVTable original_queue(device);
   const HRESULT hr = hook.create_swap_chain_for_composition(
       factory, device, desc, restrict_to_output, swapchain);
+  proxy_debug_logf(
+      "hook_factory2_create_swap_chain_for_composition factory=%p hr=0x%08lx swapchain=%p",
+      factory,
+      hr,
+      swapchain ? *swapchain : nullptr);
   if (SUCCEEDED(hr) && swapchain && *swapchain) {
-    patch_swapchain1(*swapchain);
+    patch_swapchain1(
+        *swapchain,
+        supported_swapchain_vtable_size(reinterpret_cast<IDXGISwapChain *>(*swapchain), sizeof(IDXGISwapChain1Vtbl)));
     apitrace::d3d12::record_dxgi_create_swapchain(factory, device, *swapchain);
   }
   return hr;
@@ -435,9 +725,10 @@ void patch_factory(IDXGIFactory *factory)
   state().factory_hooks.emplace(vtable, hook);
   factory->lpVtbl = vtable;
   patch_vtable_field(vtable, &IDXGIFactoryVtbl::CreateSwapChain, hook_factory_create_swap_chain);
+  proxy_debug_logf("patch_factory factory=%p original_vtable=%p patched_vtable=%p", factory, original_vtable, vtable);
 }
 
-void patch_factory2(IDXGIFactory2 *factory)
+void patch_factory2(IDXGIFactory2 *factory, std::size_t vtable_size)
 {
   if (!factory || !factory->lpVtbl) {
     return;
@@ -447,7 +738,7 @@ void patch_factory2(IDXGIFactory2 *factory)
     return;
   }
   auto *original_vtable = factory->lpVtbl;
-  auto *vtable = clone_vtable(original_vtable);
+  auto *vtable = clone_vtable(original_vtable, vtable_size);
   if (!vtable) {
     return;
   }
@@ -472,6 +763,12 @@ void patch_factory2(IDXGIFactory2 *factory)
       vtable,
       &IDXGIFactory2Vtbl::CreateSwapChainForComposition,
       hook_factory2_create_swap_chain_for_composition);
+  proxy_debug_logf(
+      "patch_factory2 factory=%p original_vtable=%p patched_vtable=%p vtable_size=%zu",
+      factory,
+      original_vtable,
+      vtable,
+      vtable_size);
 }
 
 void patch_factory_interfaces(void *factory)
@@ -481,13 +778,17 @@ void patch_factory_interfaces(void *factory)
   }
   auto *factory0 = static_cast<IDXGIFactory *>(factory);
   auto *factory0_vtable = factory0->lpVtbl;
+  proxy_debug_logf("patch_factory_interfaces factory=%p vtable=%p", factory0, factory0_vtable);
 
   IDXGIFactory2 *factory2 = nullptr;
-  if (SUCCEEDED(factory0->lpVtbl->QueryInterface(factory0, IID_IDXGIFactory2, reinterpret_cast<void **>(&factory2))) &&
-      factory2) {
+  const HRESULT hr = factory0->lpVtbl->QueryInterface(factory0, IID_IDXGIFactory2, reinterpret_cast<void **>(&factory2));
+  proxy_debug_logf("patch_factory_interfaces QueryInterface(IDXGIFactory2) hr=0x%08lx factory2=%p", hr, factory2);
+  if (SUCCEEDED(hr) && factory2) {
     const bool shared_vtable = factory0_vtable == reinterpret_cast<IDXGIFactoryVtbl *>(factory2->lpVtbl);
-    patch_factory2(factory2);
-    factory2->lpVtbl->Release(factory2);
+    const std::size_t vtable_size = supported_factory_vtable_size(factory0, sizeof(IDXGIFactory2Vtbl));
+    proxy_debug_logf("patch_factory_interfaces supported_factory_vtable_size=%zu", vtable_size);
+    patch_factory2(factory2, vtable_size);
+    release_interface(factory2);
     if (shared_vtable) {
       return;
     }
@@ -515,9 +816,10 @@ void patch_swapchain(IDXGISwapChain *swapchain)
   state().swapchain_hooks.emplace(vtable, hook);
   swapchain->lpVtbl = vtable;
   patch_vtable_field(vtable, &IDXGISwapChainVtbl::Present, hook_swapchain_present);
+  proxy_debug_logf("patch_swapchain swapchain=%p original_vtable=%p patched_vtable=%p", swapchain, original_vtable, vtable);
 }
 
-void patch_swapchain1(IDXGISwapChain1 *swapchain)
+void patch_swapchain1(IDXGISwapChain1 *swapchain, std::size_t vtable_size)
 {
   if (!swapchain || !swapchain->lpVtbl) {
     return;
@@ -527,7 +829,7 @@ void patch_swapchain1(IDXGISwapChain1 *swapchain)
     return;
   }
   auto *original_vtable = swapchain->lpVtbl;
-  auto *vtable = clone_vtable(original_vtable);
+  auto *vtable = clone_vtable(original_vtable, vtable_size);
   if (!vtable) {
     return;
   }
@@ -542,6 +844,12 @@ void patch_swapchain1(IDXGISwapChain1 *swapchain)
       &IDXGISwapChain1Vtbl::Present,
       reinterpret_cast<decltype(vtable->Present)>(hook_swapchain1_present));
   patch_vtable_field(vtable, &IDXGISwapChain1Vtbl::Present1, hook_swapchain1_present1);
+  proxy_debug_logf(
+      "patch_swapchain1 swapchain=%p original_vtable=%p patched_vtable=%p vtable_size=%zu",
+      swapchain,
+      original_vtable,
+      vtable,
+      vtable_size);
 }
 
 void patch_swapchain_interfaces(IDXGISwapChain *swapchain)
@@ -558,8 +866,10 @@ void patch_swapchain_interfaces(IDXGISwapChain *swapchain)
           reinterpret_cast<void **>(&swapchain1))) &&
       swapchain1) {
     const bool shared_vtable = swapchain_vtable == reinterpret_cast<IDXGISwapChainVtbl *>(swapchain1->lpVtbl);
-    patch_swapchain1(swapchain1);
-    swapchain1->lpVtbl->Release(swapchain1);
+    const std::size_t vtable_size = supported_swapchain_vtable_size(swapchain, sizeof(IDXGISwapChain1Vtbl));
+    proxy_debug_logf("patch_swapchain_interfaces supported_swapchain_vtable_size=%zu", vtable_size);
+    patch_swapchain1(swapchain1, vtable_size);
+    release_interface(swapchain1);
     if (shared_vtable) {
       return;
     }
@@ -567,9 +877,17 @@ void patch_swapchain_interfaces(IDXGISwapChain *swapchain)
   patch_swapchain(swapchain);
 }
 
-HRESULT create_factory_common(HRESULT hr, void **factory)
+HRESULT create_factory_common(const char *name, HRESULT hr, void **factory)
 {
-  if (SUCCEEDED(hr) && factory && *factory) {
+  const bool hooks_disabled = proxy_hooks_disabled();
+  proxy_debug_logf(
+      "%s hr=0x%08lx factory_slot=%p factory=%p hooks_disabled=%d",
+      name ? name : "CreateDXGIFactory",
+      hr,
+      factory,
+      factory ? *factory : nullptr,
+      hooks_disabled ? 1 : 0);
+  if (SUCCEEDED(hr) && factory && *factory && !hooks_disabled) {
     patch_factory_interfaces(*factory);
   }
   return hr;
@@ -581,27 +899,57 @@ extern "C" HRESULT WINAPI CreateDXGIFactory(REFIID riid, void **factory)
 {
   auto &downstream = downstream_module();
   if (!downstream.create_factory) {
+    proxy_debug_log("CreateDXGIFactory missing downstream export");
     return E_FAIL;
   }
-  return create_factory_common(downstream.create_factory(riid, factory), factory);
+  return create_factory_common("CreateDXGIFactory", downstream.create_factory(riid, factory), factory);
 }
 
 extern "C" HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void **factory)
 {
   auto &downstream = downstream_module();
   if (!downstream.create_factory1) {
+    proxy_debug_log("CreateDXGIFactory1 missing downstream export");
     return E_FAIL;
   }
-  return create_factory_common(downstream.create_factory1(riid, factory), factory);
+  return create_factory_common("CreateDXGIFactory1", downstream.create_factory1(riid, factory), factory);
 }
 
 extern "C" HRESULT WINAPI CreateDXGIFactory2(UINT flags, REFIID riid, void **factory)
 {
   auto &downstream = downstream_module();
   if (!downstream.create_factory2) {
+    proxy_debug_log("CreateDXGIFactory2 missing downstream export");
     return E_FAIL;
   }
-  return create_factory_common(downstream.create_factory2(flags, riid, factory), factory);
+  return create_factory_common("CreateDXGIFactory2", downstream.create_factory2(flags, riid, factory), factory);
+}
+
+extern "C" HRESULT WINAPI DXGID3D10CreateDevice(
+    HMODULE d3d10core,
+    IDXGIFactory *factory,
+    IDXGIAdapter *adapter,
+    UINT flags,
+    const void *unknown,
+    UINT sdk_version,
+    void **device)
+{
+  auto &downstream = downstream_module();
+  if (!downstream.d3d10_create_device) {
+    proxy_debug_log("DXGID3D10CreateDevice missing downstream export");
+    return E_NOTIMPL;
+  }
+  return downstream.d3d10_create_device(d3d10core, factory, adapter, flags, unknown, sdk_version, device);
+}
+
+extern "C" HRESULT WINAPI DXGID3D10RegisterLayers(const void *layers, UINT layer_count)
+{
+  auto &downstream = downstream_module();
+  if (!downstream.d3d10_register_layers) {
+    proxy_debug_log("DXGID3D10RegisterLayers missing downstream export");
+    return E_NOTIMPL;
+  }
+  return downstream.d3d10_register_layers(layers, layer_count);
 }
 
 extern "C" HRESULT WINAPI DXGIGetDebugInterface1(UINT flags, REFIID riid, void **debug)

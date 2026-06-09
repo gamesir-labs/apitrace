@@ -2,6 +2,7 @@
 
 #include "apitrace/asset_index.hpp"
 #include "apitrace/capture_runtime.hpp"
+#include "apitrace/d3d12_capture.hpp"
 #include "apitrace/trace_session.hpp"
 
 #ifndef CINTERFACE
@@ -66,8 +67,15 @@ constexpr GUID kIidD3D12Device6 = {0xc70b221b, 0x40e4, 0x4a17, {0x89, 0xaf, 0x02
 constexpr GUID kIidD3D12Device7 = {0x5c014b53, 0x68a1, 0x4b9b, {0x8b, 0xd1, 0xdd, 0x60, 0x46, 0xb9, 0x35, 0x8b}};
 constexpr GUID kIidD3D12Device8 = {0x9218e6bb, 0xf944, 0x4f7e, {0xa7, 0x5c, 0xb1, 0xb2, 0xc7, 0xb7, 0x01, 0xf3}};
 constexpr GUID kIidD3D12Device9 = {0x4c80e962, 0xf032, 0x4f60, {0xbc, 0x9e, 0xeb, 0xc2, 0xcf, 0xa1, 0xd8, 0x3c}};
+constexpr GUID kIidD3D12Fence = {0x0a753dcf, 0xc4d8, 0x4b91, {0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76}};
+constexpr GUID kIidD3D12Fence1 = {0x433685fe, 0xe22b, 0x4ca0, {0xa8, 0xdb, 0xb5, 0xb4, 0xf4, 0xdd, 0x0e, 0x4a}};
+constexpr GUID kIidD3D12RootSignature = {0xc54a6b66, 0x72df, 0x4ee8, {0x8b, 0xe5, 0xa9, 0x46, 0xa1, 0x42, 0x92, 0x14}};
 constexpr GUID kIidD3D12RootSignatureDeserializer = {0x34ab647b, 0x3cc8, 0x46ac, {0x84, 0x1b, 0xc0, 0x96, 0x56, 0x45, 0xc0, 0x46}};
 constexpr GUID kIidD3D12VersionedRootSignatureDeserializer = {0x7f91ce67, 0x090c, 0x4bb7, {0xb7, 0x8e, 0xed, 0x8f, 0xf2, 0xe3, 0x1d, 0xa0}};
+constexpr GUID kIidIUnknown = {0x00000000, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+constexpr GUID kIidD3D12CommandAllocator = {0x6102dee4, 0xaf59, 0x4b09, {0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24}};
+constexpr GUID kIidD3D12CommandList = {0x7116d91c, 0xe7e4, 0x47ce, {0xb8, 0xc6, 0xec, 0x81, 0x68, 0xf4, 0x37, 0xe5}};
+constexpr GUID kIidD3D12GraphicsCommandList = {0x5b160d0f, 0xac1b, 0x4185, {0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55}};
 constexpr GUID kIidD3D12GraphicsCommandList1 = {0x553103fb, 0x1fe7, 0x4557, {0xbb, 0x38, 0x94, 0x6d, 0x7d, 0x0e, 0x7c, 0xa7}};
 constexpr GUID kIidD3D12GraphicsCommandList2 = {0x38c3e585, 0xff17, 0x412c, {0x91, 0x50, 0x4f, 0xc6, 0xf9, 0xd7, 0x2a, 0x28}};
 constexpr GUID kIidD3D12GraphicsCommandList4 = {0x8754318e, 0xd3a9, 0x4541, {0x98, 0xcf, 0x64, 0x5b, 0x50, 0xdc, 0x48, 0x74}};
@@ -349,6 +357,7 @@ void STDMETHODCALLTYPE hook_queue_execute_command_lists(
     ID3D12CommandList *const *command_lists);
 HRESULT STDMETHODCALLTYPE hook_queue_signal(ID3D12CommandQueue *self, ID3D12Fence *fence, UINT64 value);
 HRESULT STDMETHODCALLTYPE hook_queue_wait(ID3D12CommandQueue *self, ID3D12Fence *fence, UINT64 value);
+HRESULT STDMETHODCALLTYPE hook_fence_query_interface(ID3D12Fence *self, REFIID riid, void **object);
 HRESULT STDMETHODCALLTYPE hook_command_list_query_interface(ID3D12GraphicsCommandList *self, REFIID riid, void **object);
 HRESULT STDMETHODCALLTYPE hook_command_list_close(ID3D12GraphicsCommandList *self);
 HRESULT STDMETHODCALLTYPE hook_command_list_reset(
@@ -608,6 +617,7 @@ void STDMETHODCALLTYPE hook_command_list_dispatch_mesh(
     UINT thread_group_count_x,
     UINT thread_group_count_y,
     UINT thread_group_count_z);
+HRESULT STDMETHODCALLTYPE hook_fence_query_interface(ID3D12Fence *self, REFIID riid, void **object);
 HRESULT STDMETHODCALLTYPE hook_fence_set_event_on_completion(ID3D12Fence *self, UINT64 value, HANDLE event);
 HRESULT STDMETHODCALLTYPE hook_fence_signal(ID3D12Fence *self, UINT64 value);
 UINT64 STDMETHODCALLTYPE hook_fence_get_completed_value(ID3D12Fence *self);
@@ -683,6 +693,25 @@ struct CommandQueueHookState {
   decltype(std::declval<ID3D12CommandQueueVtbl>().ExecuteCommandLists) execute_command_lists = nullptr;
   decltype(std::declval<ID3D12CommandQueueVtbl>().Signal) signal = nullptr;
   decltype(std::declval<ID3D12CommandQueueVtbl>().Wait) wait = nullptr;
+};
+
+struct PatchedCommandQueueState {
+  ID3D12CommandQueue *queue = nullptr;
+  ID3D12CommandQueueVtbl *patched_vtable = nullptr;
+  ID3D12CommandQueueVtbl *original_vtable = nullptr;
+  bool suspended = false;
+};
+
+struct PatchedObjectVTableState {
+  void *object = nullptr;
+  void **patched_vtable = nullptr;
+  void **original_vtable = nullptr;
+  bool suspended = false;
+};
+
+struct SuspendedObjectVTable {
+  void *object = nullptr;
+  void **patched_vtable = nullptr;
 };
 
 struct CommandAllocatorHookState {
@@ -765,6 +794,7 @@ struct CommandList6HookState {
 
 struct FenceHookState {
   ID3D12FenceVtbl *vtable = nullptr;
+  decltype(std::declval<ID3D12FenceVtbl>().QueryInterface) query_interface = nullptr;
   decltype(std::declval<ID3D12FenceVtbl>().SetEventOnCompletion) set_event_on_completion = nullptr;
   decltype(std::declval<ID3D12FenceVtbl>().Signal) signal = nullptr;
   decltype(std::declval<ID3D12FenceVtbl>().GetCompletedValue) get_completed_value = nullptr;
@@ -804,6 +834,11 @@ struct GpuVirtualAddressResolve {
   const char *status = "missing";
 };
 
+struct OptionalResourceDesc {
+  bool has_desc = false;
+  D3D12_RESOURCE_DESC desc = {};
+};
+
 struct CaptureState {
   std::once_flag downstream_once;
   DownstreamModule downstream;
@@ -825,6 +860,8 @@ struct CaptureState {
   std::unordered_map<ID3D12Device8Vtbl *, Device8HookState> device8_hooks;
   std::unordered_map<ID3D12Device9Vtbl *, Device9HookState> device9_hooks;
   std::unordered_map<ID3D12CommandQueueVtbl *, CommandQueueHookState> queue_hooks;
+  std::unordered_map<ID3D12CommandQueue *, PatchedCommandQueueState> patched_queues;
+  std::unordered_map<void *, PatchedObjectVTableState> patched_object_vtables;
   std::unordered_map<ID3D12CommandAllocatorVtbl *, CommandAllocatorHookState> allocator_hooks;
   std::unordered_map<ID3D12GraphicsCommandListVtbl *, CommandListHookState> command_list_hooks;
   std::unordered_map<ID3D12GraphicsCommandList1Vtbl *, CommandList1HookState> command_list1_hooks;
@@ -843,6 +880,13 @@ struct CaptureState {
 
 thread_local unsigned int g_capture_suppression_depth = 0;
 
+struct CaptureSuppressionScope {
+  CaptureSuppressionScope() { ++g_capture_suppression_depth; }
+  ~CaptureSuppressionScope() { --g_capture_suppression_depth; }
+  CaptureSuppressionScope(const CaptureSuppressionScope &) = delete;
+  CaptureSuppressionScope &operator=(const CaptureSuppressionScope &) = delete;
+};
+
 CaptureState &capture_state()
 {
   static CaptureState state;
@@ -852,6 +896,36 @@ CaptureState &capture_state()
 bool capture_recording_suppressed()
 {
   return g_capture_suppression_depth != 0;
+}
+
+bool env_flag_enabled(const char *name)
+{
+  if (const char *value = std::getenv(name)) {
+    return *value && std::strcmp(value, "0") != 0 &&
+           std::strcmp(value, "false") != 0 &&
+           std::strcmp(value, "FALSE") != 0;
+  }
+  return false;
+}
+
+bool alias_probes_disabled()
+{
+  return env_flag_enabled("APITRACE_D3D12_DISABLE_ALIAS_PROBES");
+}
+
+bool queue_hooks_disabled()
+{
+  return env_flag_enabled("APITRACE_D3D12_DISABLE_QUEUE_HOOKS");
+}
+
+bool submission_object_restore_disabled()
+{
+  return false;
+}
+
+bool queue_self_vtable_restore_enabled()
+{
+  return true;
 }
 
 std::string downstream_path()
@@ -908,6 +982,7 @@ DownstreamModule &downstream_module()
   std::call_once(state.downstream_once, [&state]() {
     const auto path = downstream_path();
     state.downstream.module = LoadLibraryA(path.c_str());
+    proxy_debug_logf("LoadLibraryA(%s)=%p", path.c_str(), state.downstream.module);
     if (!state.downstream.module) {
       return;
     }
@@ -929,6 +1004,12 @@ DownstreamModule &downstream_module()
             GetProcAddress(state.downstream.module, "D3D12CreateVersionedRootSignatureDeserializer"));
     state.downstream.enable_experimental_features = reinterpret_cast<D3D12EnableExperimentalFeaturesFn>(
         GetProcAddress(state.downstream.module, "D3D12EnableExperimentalFeatures"));
+    proxy_debug_logf(
+        "exports create_device=%p get_debug_interface=%p serialize_root_signature=%p serialize_versioned_root_signature=%p",
+        state.downstream.create_device,
+        state.downstream.get_debug_interface,
+        state.downstream.serialize_root_signature,
+        state.downstream.serialize_versioned_root_signature);
   });
   return state.downstream;
 }
@@ -1030,6 +1111,20 @@ CommandListHookState command_list_hook_for(ID3D12GraphicsCommandList *command_li
 ResourceHookState resource_hook_for(ID3D12Resource *resource);
 
 template <typename Interface, typename VTable>
+void remember_patched_object_vtable_locked(Interface *object, VTable *patched_vtable, VTable *original_vtable)
+{
+  if (!object || !patched_vtable || !original_vtable) {
+    return;
+  }
+  capture_state().patched_object_vtables[static_cast<void *>(object)] =
+      PatchedObjectVTableState{
+          static_cast<void *>(object),
+          reinterpret_cast<void **>(patched_vtable),
+          reinterpret_cast<void **>(original_vtable),
+          false};
+}
+
+template <typename Interface, typename VTable>
 class ScopedOriginalVTable {
 public:
   ScopedOriginalVTable(Interface *object, VTable *original_vtable)
@@ -1056,6 +1151,9 @@ class ScopedCommandListArrayOriginalVTables {
 public:
   ScopedCommandListArrayOriginalVTables(UINT count, ID3D12CommandList *const *command_lists)
   {
+    if (submission_object_restore_disabled()) {
+      return;
+    }
     if (!command_lists) {
       return;
     }
@@ -1118,6 +1216,9 @@ class ScopedResourceArrayOriginalVTables {
 public:
   explicit ScopedResourceArrayOriginalVTables(std::vector<ID3D12Resource *> resources)
   {
+    if (submission_object_restore_disabled()) {
+      return;
+    }
     entries_.reserve(resources.size());
     for (auto *resource : resources) {
       if (!resource || !resource->lpVtbl) {
@@ -1712,6 +1813,234 @@ void remember_object_alias_locked(const void *alias, const void *source)
   }
 }
 
+void release_iunknown_suppressed(void *object)
+{
+  if (!object) {
+    return;
+  }
+  auto *unknown = static_cast<IUnknown *>(object);
+  if (unknown->lpVtbl && unknown->lpVtbl->Release) {
+    CaptureSuppressionScope suppress;
+    unknown->lpVtbl->Release(unknown);
+  }
+}
+
+void remember_alias_from_known_identity_locked(const void *alias, const void *source)
+{
+  if (!alias || !source) {
+    return;
+  }
+  auto &state = capture_state();
+  if (state.objects.find(alias) != state.objects.end()) {
+    return;
+  }
+  if (state.objects.find(source) != state.objects.end()) {
+    remember_object_alias_locked(alias, source);
+    return;
+  }
+  if (state.objects.find(alias) != state.objects.end()) {
+    remember_object_alias_locked(source, alias);
+  }
+}
+
+void remember_command_list_interface_aliases(ID3D12GraphicsCommandList *command_list)
+{
+  if (alias_probes_disabled()) {
+    return;
+  }
+  if (!command_list || !command_list->lpVtbl || !command_list->lpVtbl->QueryInterface) {
+    return;
+  }
+
+  constexpr const GUID *kAliases[] = {
+      &kIidIUnknown,
+      &kIidD3D12CommandList,
+      &kIidD3D12GraphicsCommandList,
+      &kIidD3D12GraphicsCommandList1,
+      &kIidD3D12GraphicsCommandList2,
+      &kIidD3D12GraphicsCommandList4,
+      &kIidD3D12GraphicsCommandList6,
+  };
+  for (const GUID *iid : kAliases) {
+    void *alias = nullptr;
+    HRESULT hr = E_NOINTERFACE;
+    {
+      CaptureSuppressionScope suppress;
+      hr = command_list->lpVtbl->QueryInterface(command_list, *iid, &alias);
+    }
+    if (SUCCEEDED(hr) && alias) {
+      apitrace::trace::ObjectId alias_id = 0;
+      apitrace::trace::ObjectId source_id = 0;
+      {
+        std::lock_guard<std::mutex> lock(capture_state().mutex);
+        remember_alias_from_known_identity_locked(alias, command_list);
+        alias_id = lookup_object_id_locked(alias);
+        source_id = lookup_object_id_locked(command_list);
+      }
+      proxy_debug_logf(
+          "remember_command_list_interface_alias source=%p alias=%p alias_id=%llu source_id=%llu",
+          command_list,
+          alias,
+          static_cast<unsigned long long>(alias_id),
+          static_cast<unsigned long long>(source_id));
+      release_iunknown_suppressed(alias);
+    }
+  }
+}
+
+void remember_fence_interface_aliases(ID3D12Fence *fence)
+{
+  if (alias_probes_disabled()) {
+    return;
+  }
+  if (!fence || !fence->lpVtbl || !fence->lpVtbl->QueryInterface) {
+    return;
+  }
+
+  constexpr const GUID *kAliases[] = {
+      &kIidIUnknown,
+      &kIidD3D12Fence,
+      &kIidD3D12Fence1,
+  };
+  for (const GUID *iid : kAliases) {
+    void *alias = nullptr;
+    HRESULT hr = E_NOINTERFACE;
+    {
+      CaptureSuppressionScope suppress;
+      hr = fence->lpVtbl->QueryInterface(fence, *iid, &alias);
+    }
+    if (SUCCEEDED(hr) && alias) {
+      apitrace::trace::ObjectId alias_id = 0;
+      apitrace::trace::ObjectId source_id = 0;
+      {
+        std::lock_guard<std::mutex> lock(capture_state().mutex);
+        remember_alias_from_known_identity_locked(alias, fence);
+        alias_id = lookup_object_id_locked(alias);
+        source_id = lookup_object_id_locked(fence);
+      }
+      proxy_debug_logf(
+          "remember_fence_interface_alias source=%p alias=%p alias_id=%llu source_id=%llu",
+          fence,
+          alias,
+          static_cast<unsigned long long>(alias_id),
+          static_cast<unsigned long long>(source_id));
+      release_iunknown_suppressed(alias);
+    }
+  }
+}
+
+void remember_submitted_fence_alias(ID3D12Fence *fence)
+{
+  if (alias_probes_disabled()) {
+    return;
+  }
+  if (!fence || !fence->lpVtbl || !fence->lpVtbl->QueryInterface) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(capture_state().mutex);
+    if (lookup_object_id_locked(fence) != 0) {
+      return;
+    }
+  }
+
+  constexpr const GUID *kIdentities[] = {
+      &kIidIUnknown,
+      &kIidD3D12Fence,
+      &kIidD3D12Fence1,
+  };
+  for (const GUID *iid : kIdentities) {
+    void *identity = nullptr;
+    HRESULT hr = E_NOINTERFACE;
+    {
+      CaptureSuppressionScope suppress;
+      hr = fence->lpVtbl->QueryInterface(fence, *iid, &identity);
+    }
+    if (!SUCCEEDED(hr) || !identity) {
+      continue;
+    }
+
+    apitrace::trace::ObjectId submitted_id = 0;
+    apitrace::trace::ObjectId identity_id = 0;
+    {
+      std::lock_guard<std::mutex> lock(capture_state().mutex);
+      identity_id = lookup_object_id_locked(identity);
+      if (identity_id != 0) {
+        remember_object_alias_locked(fence, identity);
+      }
+      submitted_id = lookup_object_id_locked(fence);
+    }
+    proxy_debug_logf(
+        "remember_submitted_fence_alias submitted=%p identity=%p submitted_id=%llu identity_id=%llu",
+        fence,
+        identity,
+        static_cast<unsigned long long>(submitted_id),
+        static_cast<unsigned long long>(identity_id));
+    release_iunknown_suppressed(identity);
+    if (submitted_id != 0) {
+      return;
+    }
+  }
+}
+
+void remember_submitted_command_list_alias(ID3D12CommandList *command_list)
+{
+  if (alias_probes_disabled()) {
+    return;
+  }
+  if (!command_list || !command_list->lpVtbl || !command_list->lpVtbl->QueryInterface) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(capture_state().mutex);
+    if (lookup_object_id_locked(command_list) != 0) {
+      return;
+    }
+  }
+
+  constexpr const GUID *kIdentities[] = {
+      &kIidIUnknown,
+      &kIidD3D12GraphicsCommandList,
+      &kIidD3D12CommandList,
+      &kIidD3D12GraphicsCommandList1,
+      &kIidD3D12GraphicsCommandList2,
+      &kIidD3D12GraphicsCommandList4,
+      &kIidD3D12GraphicsCommandList6,
+  };
+  for (const GUID *iid : kIdentities) {
+    void *identity = nullptr;
+    HRESULT hr = E_NOINTERFACE;
+    {
+      CaptureSuppressionScope suppress;
+      hr = command_list->lpVtbl->QueryInterface(command_list, *iid, &identity);
+    }
+    if (!SUCCEEDED(hr) || !identity) {
+      continue;
+    }
+
+    apitrace::trace::ObjectId submitted_id = 0;
+    apitrace::trace::ObjectId identity_id = 0;
+    {
+      std::lock_guard<std::mutex> lock(capture_state().mutex);
+      identity_id = lookup_object_id_locked(identity);
+      if (identity_id != 0) {
+        remember_object_alias_locked(command_list, identity);
+      }
+      submitted_id = lookup_object_id_locked(command_list);
+    }
+    proxy_debug_logf(
+        "remember_submitted_command_list_alias submitted=%p identity=%p submitted_id=%llu identity_id=%llu",
+        command_list,
+        identity,
+        static_cast<unsigned long long>(submitted_id),
+        static_cast<unsigned long long>(identity_id));
+    release_iunknown_suppressed(identity);
+    if (submitted_id != 0) {
+      return;
+    }
+  }
+}
+
 template <typename VTable, typename Field, typename Replacement>
 void patch_vtable_field_cast(VTable *vtable, Field VTable::*field, Replacement replacement)
 {
@@ -1741,7 +2070,8 @@ apitrace::trace::ObjectId register_object_locked(
     const void *object,
     apitrace::trace::ObjectKind kind,
     std::string debug_name,
-    apitrace::trace::ObjectId parent_object_id = 0)
+    apitrace::trace::ObjectId parent_object_id = 0,
+    std::string payload_json = "{}")
 {
   if (!object) {
     return 0;
@@ -1761,7 +2091,7 @@ apitrace::trace::ObjectId register_object_locked(
     record.parent_object_id = parent_object_id;
     record.debug_name = std::move(debug_name);
     session->record_object(record);
-    record_object_create_locked(record);
+    record_object_create_locked(record, std::move(payload_json));
 
     state.objects.emplace(
         object,
@@ -1779,13 +2109,14 @@ apitrace::trace::ObjectId register_fresh_object_locked(
     const void *object,
     apitrace::trace::ObjectKind kind,
     std::string debug_name,
-    apitrace::trace::ObjectId parent_object_id = 0)
+    apitrace::trace::ObjectId parent_object_id = 0,
+    std::string payload_json = "{}")
 {
   if (!object) {
     return 0;
   }
   capture_state().objects.erase(object);
-  return register_object_locked(object, kind, std::move(debug_name), parent_object_id);
+  return register_object_locked(object, kind, std::move(debug_name), parent_object_id, std::move(payload_json));
 }
 
 void remember_resource_capture_info_locked(
@@ -1834,6 +2165,172 @@ void remember_resource_capture_info_locked(
   legacy_desc.Layout = desc->Layout;
   legacy_desc.Flags = desc->Flags;
   remember_resource_capture_info_locked(resource, object_id, &legacy_desc, heap_type, cpu_writable);
+}
+
+std::string resource_desc_json(const D3D12_RESOURCE_DESC *desc);
+
+apitrace::trace::ObjectId primary_device_object_id_locked()
+{
+  for (const auto &[object, info] : capture_state().objects) {
+    (void)object;
+    if (info.kind == apitrace::trace::ObjectKind::Device) {
+      return info.object_id;
+    }
+  }
+  return 0;
+}
+
+apitrace::trace::ObjectId ensure_external_resource_object_locked(
+    ID3D12Resource *resource,
+    const OptionalResourceDesc &desc,
+    const char *reason)
+{
+  if (!resource) {
+    return 0;
+  }
+
+  const auto existing = lookup_object_id_locked(resource);
+  if (existing != 0) {
+    return existing;
+  }
+
+  std::ostringstream payload;
+  payload << "{\"external_resource\":true";
+  if (reason && *reason) {
+    payload << ",\"reason\":\"" << json_escape(reason) << "\"";
+  }
+  if (desc.has_desc) {
+    payload << ",\"resource_desc\":" << resource_desc_json(&desc.desc);
+  }
+  payload << "}";
+
+  const auto object_id = register_object_locked(
+      resource,
+      apitrace::trace::ObjectKind::Resource,
+      "ExternalD3D12Resource",
+      primary_device_object_id_locked(),
+      payload.str());
+  remember_resource_capture_info_locked(
+      resource,
+      object_id,
+      desc.has_desc ? &desc.desc : nullptr,
+      D3D12_HEAP_TYPE_DEFAULT,
+      false);
+  proxy_debug_logf(
+      "ensure_external_resource_object reason=%s resource=%p object_id=%llu has_desc=%d",
+      reason ? reason : "",
+      resource,
+      static_cast<unsigned long long>(object_id),
+      desc.has_desc ? 1 : 0);
+  return object_id;
+}
+
+apitrace::trace::ObjectId ensure_external_root_signature_object_locked(
+    ID3D12RootSignature *root_signature,
+    const char *reason)
+{
+  if (!root_signature) {
+    return 0;
+  }
+
+  const auto existing = lookup_object_id_locked(root_signature);
+  if (existing != 0) {
+    return existing;
+  }
+
+  std::ostringstream payload;
+  payload << "{\"external_root_signature\":true";
+  if (reason && *reason) {
+    payload << ",\"reason\":\"" << json_escape(reason) << "\"";
+  }
+  payload << "}";
+
+  const auto object_id = register_object_locked(
+      root_signature,
+      apitrace::trace::ObjectKind::RootSignature,
+      "ExternalD3D12RootSignature",
+      primary_device_object_id_locked(),
+      payload.str());
+  proxy_debug_logf(
+      "ensure_external_root_signature_object reason=%s root_signature=%p object_id=%llu",
+      reason ? reason : "",
+      root_signature,
+      static_cast<unsigned long long>(object_id));
+  return object_id;
+}
+
+apitrace::trace::ObjectId ensure_external_fence_object_locked(
+    ID3D12Fence *fence,
+    UINT64 current_value,
+    const char *reason)
+{
+  if (!fence) {
+    return 0;
+  }
+
+  const auto existing = lookup_object_id_locked(fence);
+  if (existing != 0) {
+    return existing;
+  }
+
+  std::ostringstream payload;
+  payload << "{\"external_fence\":true"
+          << ",\"initial_value\":" << current_value
+          << ",\"flags\":0";
+  if (reason && *reason) {
+    payload << ",\"reason\":\"" << json_escape(reason) << "\"";
+  }
+  payload << "}";
+
+  const auto object_id = register_object_locked(
+      fence,
+      apitrace::trace::ObjectKind::Fence,
+      "ExternalD3D12Fence",
+      primary_device_object_id_locked(),
+      payload.str());
+  proxy_debug_logf(
+      "ensure_external_fence_object reason=%s fence=%p object_id=%llu initial_value=%llu",
+      reason ? reason : "",
+      fence,
+      static_cast<unsigned long long>(object_id),
+      static_cast<unsigned long long>(current_value));
+  return object_id;
+}
+
+apitrace::trace::ObjectId ensure_external_command_allocator_object_locked(
+    ID3D12CommandAllocator *allocator,
+    D3D12_COMMAND_LIST_TYPE type,
+    const char *reason)
+{
+  if (!allocator) {
+    return 0;
+  }
+
+  const auto existing = lookup_object_id_locked(allocator);
+  if (existing != 0) {
+    return existing;
+  }
+
+  std::ostringstream payload;
+  payload << "{\"type\":" << static_cast<unsigned int>(type)
+          << ",\"external_command_allocator\":true";
+  if (reason && *reason) {
+    payload << ",\"reason\":\"" << json_escape(reason) << "\"";
+  }
+  payload << "}";
+
+  const auto object_id = register_object_locked(
+      allocator,
+      apitrace::trace::ObjectKind::CommandAllocator,
+      "ExternalD3D12CommandAllocator",
+      primary_device_object_id_locked(),
+      payload.str());
+  proxy_debug_logf(
+      "ensure_external_command_allocator_object reason=%s allocator=%p object_id=%llu",
+      reason ? reason : "",
+      allocator,
+      static_cast<unsigned long long>(object_id));
+  return object_id;
 }
 
 void remember_bridge_command_object_locked(const void *object)
@@ -2123,6 +2620,21 @@ std::string resource_desc_json(const D3D12_RESOURCE_DESC *desc)
           << "\"flags\":" << static_cast<unsigned int>(desc->Flags)
           << "}";
   return payload.str();
+}
+
+OptionalResourceDesc describe_resource(ID3D12Resource *resource)
+{
+  OptionalResourceDesc result;
+  if (!resource || !resource->lpVtbl || !resource->lpVtbl->GetDesc) {
+    return result;
+  }
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+  resource->lpVtbl->GetDesc(resource, &result.desc);
+#else
+  result.desc = resource->lpVtbl->GetDesc(resource);
+#endif
+  result.has_desc = true;
+  return result;
 }
 
 std::string mip_region_json(const D3D12_MIP_REGION &region)
@@ -2631,7 +3143,8 @@ std::string graphics_pipeline_asset_json_locked(
   payload << "{"
           << "\"pso_raw_version\":1,"
           << "\"pso_kind\":\"graphics\","
-          << "\"root_signature_object_id\":" << object_id_json(lookup_object_id_locked(desc->pRootSignature)) << ","
+          << "\"root_signature_object_id\":"
+          << object_id_json(ensure_external_root_signature_object_locked(desc->pRootSignature, "CreateGraphicsPipelineState")) << ","
           << "\"node_mask\":" << desc->NodeMask << ","
           << "\"flags\":" << static_cast<unsigned int>(desc->Flags) << ","
           << "\"input_layout\":" << input_layout_json(desc->InputLayout) << ","
@@ -2674,7 +3187,8 @@ std::string compute_pipeline_asset_json_locked(
   payload << "{"
           << "\"pso_raw_version\":1,"
           << "\"pso_kind\":\"compute\","
-          << "\"root_signature_object_id\":" << object_id_json(lookup_object_id_locked(desc->pRootSignature)) << ","
+          << "\"root_signature_object_id\":"
+          << object_id_json(ensure_external_root_signature_object_locked(desc->pRootSignature, "CreateComputePipelineState")) << ","
           << "\"node_mask\":" << desc->NodeMask << ","
           << "\"flags\":" << static_cast<unsigned int>(desc->Flags) << ","
           << shader_asset_json_locked("cs", desc->CS, blob_refs)
@@ -2747,7 +3261,8 @@ StreamPipelineAsset stream_pipeline_asset_json_locked(
       const auto root_signature = *reinterpret_cast<ID3D12RootSignature *const *>(subobject);
       graphics.pRootSignature = root_signature;
       compute.pRootSignature = root_signature;
-      stream << ",\"root_signature_object_id\":" << object_id_json(lookup_object_id_locked(root_signature));
+      stream << ",\"root_signature_object_id\":"
+             << object_id_json(ensure_external_root_signature_object_locked(root_signature, "CreatePipelineStateStream"));
       break;
     }
     case PipelineStateSubobjectType::VS:
@@ -2932,7 +3447,8 @@ StreamPipelineAsset stream_pipeline_asset_json_locked(
              << ",\"pso_kind\":\"compute\""
              << ",\"source\":\"stream\""
              << ",\"stream_size\":" << static_cast<std::uint64_t>(desc->SizeInBytes)
-             << ",\"root_signature_object_id\":" << object_id_json(lookup_object_id_locked(compute.pRootSignature))
+             << ",\"root_signature_object_id\":"
+             << object_id_json(ensure_external_root_signature_object_locked(compute.pRootSignature, "CreatePipelineStateStreamCompute"))
              << ",\"node_mask\":" << compute.NodeMask
              << ",\"flags\":" << static_cast<unsigned int>(compute.Flags)
              << "," << shader_json.cs
@@ -2944,7 +3460,8 @@ StreamPipelineAsset stream_pipeline_asset_json_locked(
              << ",\"pso_kind\":\"" << (has_ms ? "mesh" : "graphics") << "\""
              << ",\"source\":\"stream\""
              << ",\"stream_size\":" << static_cast<std::uint64_t>(desc->SizeInBytes)
-             << ",\"root_signature_object_id\":" << object_id_json(lookup_object_id_locked(graphics.pRootSignature))
+             << ",\"root_signature_object_id\":"
+             << object_id_json(ensure_external_root_signature_object_locked(graphics.pRootSignature, "CreatePipelineStateStreamGraphics"))
              << ",\"node_mask\":" << graphics.NodeMask
              << ",\"flags\":" << static_cast<unsigned int>(graphics.Flags)
              << ",\"input_layout\":" << input_layout_json(graphics.InputLayout)
@@ -2998,123 +3515,287 @@ void patch_command_list6(ID3D12GraphicsCommandList6 *command_list);
 void patch_fence(ID3D12Fence *fence);
 void patch_resource(ID3D12Resource *resource);
 
+template <typename Interface, typename HookMap>
+auto hook_for_object_locked(Interface *object, const HookMap &hooks) -> typename HookMap::mapped_type
+{
+  if (!object) {
+    return {};
+  }
+  const auto direct = hooks.find(object->lpVtbl);
+  if (direct != hooks.end()) {
+    return direct->second;
+  }
+  const auto tracked = capture_state().patched_object_vtables.find(static_cast<void *>(object));
+  if (tracked == capture_state().patched_object_vtables.end() || !tracked->second.patched_vtable) {
+    return {};
+  }
+  const auto patched = hooks.find(reinterpret_cast<typename HookMap::key_type>(tracked->second.patched_vtable));
+  return patched == hooks.end() ? typename HookMap::mapped_type{} : patched->second;
+}
+
 DeviceHookState device_hook_for(ID3D12Device *device)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().device_hooks.find(device ? device->lpVtbl : nullptr);
-  return it == capture_state().device_hooks.end() ? DeviceHookState{} : it->second;
+  return hook_for_object_locked(device, capture_state().device_hooks);
 }
 
 Device2HookState device2_hook_for(ID3D12Device2 *device)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().device2_hooks.find(device ? device->lpVtbl : nullptr);
-  return it == capture_state().device2_hooks.end() ? Device2HookState{} : it->second;
+  return hook_for_object_locked(device, capture_state().device2_hooks);
 }
 
 Device3HookState device3_hook_for(ID3D12Device3 *device)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().device3_hooks.find(device ? device->lpVtbl : nullptr);
-  return it == capture_state().device3_hooks.end() ? Device3HookState{} : it->second;
+  return hook_for_object_locked(device, capture_state().device3_hooks);
 }
 
 Device4HookState device4_hook_for(ID3D12Device4 *device)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().device4_hooks.find(device ? device->lpVtbl : nullptr);
-  return it == capture_state().device4_hooks.end() ? Device4HookState{} : it->second;
+  return hook_for_object_locked(device, capture_state().device4_hooks);
 }
 
 Device6HookState device6_hook_for(ID3D12Device6 *device)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().device6_hooks.find(device ? device->lpVtbl : nullptr);
-  return it == capture_state().device6_hooks.end() ? Device6HookState{} : it->second;
+  return hook_for_object_locked(device, capture_state().device6_hooks);
 }
 
 Device7HookState device7_hook_for(ID3D12Device7 *device)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().device7_hooks.find(device ? device->lpVtbl : nullptr);
-  return it == capture_state().device7_hooks.end() ? Device7HookState{} : it->second;
+  return hook_for_object_locked(device, capture_state().device7_hooks);
 }
 
 Device8HookState device8_hook_for(ID3D12Device8 *device)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().device8_hooks.find(device ? device->lpVtbl : nullptr);
-  return it == capture_state().device8_hooks.end() ? Device8HookState{} : it->second;
+  return hook_for_object_locked(device, capture_state().device8_hooks);
 }
 
 Device9HookState device9_hook_for(ID3D12Device9 *device)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().device9_hooks.find(device ? device->lpVtbl : nullptr);
-  return it == capture_state().device9_hooks.end() ? Device9HookState{} : it->second;
+  return hook_for_object_locked(device, capture_state().device9_hooks);
 }
 
 CommandQueueHookState queue_hook_for(ID3D12CommandQueue *queue)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().queue_hooks.find(queue ? queue->lpVtbl : nullptr);
-  return it == capture_state().queue_hooks.end() ? CommandQueueHookState{} : it->second;
+  return hook_for_object_locked(queue, capture_state().queue_hooks);
+}
+
+class ScopedQueueOriginalVTable {
+public:
+  ScopedQueueOriginalVTable(ID3D12CommandQueue *queue, ID3D12CommandQueueVtbl *original_vtable)
+      : queue_(queue), patched_vtable_(queue ? queue->lpVtbl : nullptr)
+  {
+    if (!queue_self_vtable_restore_enabled()) {
+      queue_ = nullptr;
+      patched_vtable_ = nullptr;
+      return;
+    }
+    if (queue_ && original_vtable) {
+      queue_->lpVtbl = original_vtable;
+    }
+  }
+
+  ~ScopedQueueOriginalVTable()
+  {
+    if (queue_ && patched_vtable_) {
+      queue_->lpVtbl = patched_vtable_;
+    }
+  }
+
+  ScopedQueueOriginalVTable(const ScopedQueueOriginalVTable &) = delete;
+  ScopedQueueOriginalVTable &operator=(const ScopedQueueOriginalVTable &) = delete;
+
+private:
+  ID3D12CommandQueue *queue_ = nullptr;
+  ID3D12CommandQueueVtbl *patched_vtable_ = nullptr;
+};
+
+extern "C" void *WINAPI apitrace_d3d12_restore_queue_vtable(void *queue)
+{
+  auto *typed_queue = static_cast<ID3D12CommandQueue *>(queue);
+  if (!typed_queue || !typed_queue->lpVtbl) {
+    proxy_debug_logf("apitrace_d3d12_restore_queue_vtable queue=%p missing_vtable", queue);
+    return nullptr;
+  }
+
+  std::lock_guard<std::mutex> lock(capture_state().mutex);
+  const auto it = capture_state().queue_hooks.find(typed_queue->lpVtbl);
+  if (it == capture_state().queue_hooks.end() || !it->second.vtable) {
+    proxy_debug_logf(
+        "apitrace_d3d12_restore_queue_vtable queue=%p current_vtable=%p hook_found=0",
+        queue,
+        typed_queue->lpVtbl);
+    return nullptr;
+  }
+  void *patched_vtable = typed_queue->lpVtbl;
+  typed_queue->lpVtbl = it->second.vtable;
+  proxy_debug_logf(
+      "apitrace_d3d12_restore_queue_vtable queue=%p patched_vtable=%p original_vtable=%p",
+      queue,
+      patched_vtable,
+      it->second.vtable);
+  return patched_vtable;
+}
+
+extern "C" void WINAPI apitrace_d3d12_repatch_queue_vtable(void *queue, void *patched_vtable)
+{
+  auto *typed_queue = static_cast<ID3D12CommandQueue *>(queue);
+  if (typed_queue && patched_vtable) {
+    typed_queue->lpVtbl = static_cast<ID3D12CommandQueueVtbl *>(patched_vtable);
+    proxy_debug_logf(
+        "apitrace_d3d12_repatch_queue_vtable queue=%p patched_vtable=%p",
+        queue,
+        patched_vtable);
+  }
+}
+
+extern "C" void *WINAPI apitrace_d3d12_suspend_all_queue_vtables()
+{
+  std::lock_guard<std::mutex> lock(capture_state().mutex);
+  std::size_t restored_count = 0;
+  for (auto &[queue, state] : capture_state().patched_queues) {
+    if (!queue || !state.patched_vtable || !state.original_vtable || state.suspended) {
+      continue;
+    }
+    if (queue->lpVtbl != state.patched_vtable) {
+      continue;
+    }
+    queue->lpVtbl = state.original_vtable;
+    state.suspended = true;
+    ++restored_count;
+  }
+  proxy_debug_logf("apitrace_d3d12_suspend_all_queue_vtables restored_count=%zu", restored_count);
+  return reinterpret_cast<void *>(1);
+}
+
+extern "C" void WINAPI apitrace_d3d12_resume_all_queue_vtables(void *token)
+{
+  if (!token) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(capture_state().mutex);
+  std::size_t repatched_count = 0;
+  for (auto &[queue, state] : capture_state().patched_queues) {
+    if (!queue || !state.patched_vtable || !state.suspended) {
+      continue;
+    }
+    queue->lpVtbl = state.patched_vtable;
+    state.suspended = false;
+    ++repatched_count;
+  }
+  proxy_debug_logf("apitrace_d3d12_resume_all_queue_vtables repatched_count=%zu", repatched_count);
+}
+
+extern "C" void *WINAPI apitrace_d3d12_suspend_all_vtables()
+{
+  std::lock_guard<std::mutex> lock(capture_state().mutex);
+  auto *suspended = new (std::nothrow) std::vector<SuspendedObjectVTable>();
+  if (!suspended) {
+    return nullptr;
+  }
+  std::size_t restored_count = 0;
+  for (auto &[object, state] : capture_state().patched_object_vtables) {
+    if (!object || !state.patched_vtable || !state.original_vtable || state.suspended) {
+      continue;
+    }
+    auto **vtable_slot = reinterpret_cast<void ***>(object);
+    if (!vtable_slot || *vtable_slot != state.patched_vtable) {
+      continue;
+    }
+    *vtable_slot = state.original_vtable;
+    state.suspended = true;
+    suspended->push_back({object, state.patched_vtable});
+    ++restored_count;
+  }
+  proxy_debug_logf("apitrace_d3d12_suspend_all_vtables restored_count=%zu", restored_count);
+  if (suspended->empty()) {
+    delete suspended;
+    return nullptr;
+  }
+  return suspended;
+}
+
+extern "C" void WINAPI apitrace_d3d12_resume_all_vtables(void *token)
+{
+  if (!token) {
+    return;
+  }
+  auto *suspended = static_cast<std::vector<SuspendedObjectVTable> *>(token);
+  std::lock_guard<std::mutex> lock(capture_state().mutex);
+  std::size_t repatched_count = 0;
+  for (auto it = suspended->rbegin(); it != suspended->rend(); ++it) {
+    if (!it->object || !it->patched_vtable) {
+      continue;
+    }
+    const auto state_it = capture_state().patched_object_vtables.find(it->object);
+    if (state_it == capture_state().patched_object_vtables.end() || !state_it->second.suspended) {
+      continue;
+    }
+    auto **vtable_slot = reinterpret_cast<void ***>(it->object);
+    if (!vtable_slot) {
+      continue;
+    }
+    *vtable_slot = it->patched_vtable;
+    state_it->second.suspended = false;
+    ++repatched_count;
+  }
+  proxy_debug_logf("apitrace_d3d12_resume_all_vtables repatched_count=%zu", repatched_count);
+  delete suspended;
 }
 
 CommandAllocatorHookState allocator_hook_for(ID3D12CommandAllocator *allocator)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().allocator_hooks.find(allocator ? allocator->lpVtbl : nullptr);
-  return it == capture_state().allocator_hooks.end() ? CommandAllocatorHookState{} : it->second;
+  return hook_for_object_locked(allocator, capture_state().allocator_hooks);
 }
 
 CommandListHookState command_list_hook_for(ID3D12GraphicsCommandList *command_list)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().command_list_hooks.find(command_list ? command_list->lpVtbl : nullptr);
-  return it == capture_state().command_list_hooks.end() ? CommandListHookState{} : it->second;
+  return hook_for_object_locked(command_list, capture_state().command_list_hooks);
 }
 
 CommandList4HookState command_list4_hook_for(ID3D12GraphicsCommandList4 *command_list)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().command_list4_hooks.find(command_list ? command_list->lpVtbl : nullptr);
-  return it == capture_state().command_list4_hooks.end() ? CommandList4HookState{} : it->second;
+  return hook_for_object_locked(command_list, capture_state().command_list4_hooks);
 }
 
 CommandList1HookState command_list1_hook_for(ID3D12GraphicsCommandList1 *command_list)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().command_list1_hooks.find(command_list ? command_list->lpVtbl : nullptr);
-  return it == capture_state().command_list1_hooks.end() ? CommandList1HookState{} : it->second;
+  return hook_for_object_locked(command_list, capture_state().command_list1_hooks);
 }
 
 CommandList2HookState command_list2_hook_for(ID3D12GraphicsCommandList2 *command_list)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().command_list2_hooks.find(command_list ? command_list->lpVtbl : nullptr);
-  return it == capture_state().command_list2_hooks.end() ? CommandList2HookState{} : it->second;
+  return hook_for_object_locked(command_list, capture_state().command_list2_hooks);
 }
 
 CommandList6HookState command_list6_hook_for(ID3D12GraphicsCommandList6 *command_list)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().command_list6_hooks.find(command_list ? command_list->lpVtbl : nullptr);
-  return it == capture_state().command_list6_hooks.end() ? CommandList6HookState{} : it->second;
+  return hook_for_object_locked(command_list, capture_state().command_list6_hooks);
 }
 
 FenceHookState fence_hook_for(ID3D12Fence *fence)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().fence_hooks.find(fence ? fence->lpVtbl : nullptr);
-  return it == capture_state().fence_hooks.end() ? FenceHookState{} : it->second;
+  return hook_for_object_locked(fence, capture_state().fence_hooks);
 }
 
 ResourceHookState resource_hook_for(ID3D12Resource *resource)
 {
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto it = capture_state().resource_hooks.find(resource ? resource->lpVtbl : nullptr);
-  return it == capture_state().resource_hooks.end() ? ResourceHookState{} : it->second;
+  return hook_for_object_locked(resource, capture_state().resource_hooks);
 }
 
 void patch_device(ID3D12Device *device, std::size_t vtable_size)
@@ -3232,6 +3913,7 @@ void patch_device(ID3D12Device *device, std::size_t vtable_size)
     patch_vtable_field(vtable9, &ID3D12Device9Vtbl::CreateCommandQueue1, hook_device_create_command_queue1);
   }
   device->lpVtbl = vtable;
+  remember_patched_object_vtable_locked(device, vtable, original_vtable);
 
   patch_vtable_field(vtable, &ID3D12DeviceVtbl::QueryInterface, hook_device_query_interface);
   patch_vtable_field(vtable, &ID3D12DeviceVtbl::CreateCommandQueue, hook_device_create_command_queue);
@@ -3279,6 +3961,10 @@ void patch_command_queue(ID3D12CommandQueue *queue)
   if (!queue || !queue->lpVtbl) {
     return;
   }
+  if (queue_hooks_disabled()) {
+    proxy_debug_logf("patch_queue disabled queue=%p", queue);
+    return;
+  }
   std::lock_guard<std::mutex> lock(capture_state().mutex);
   auto *original_vtable = queue->lpVtbl;
   if (capture_state().queue_hooks.find(original_vtable) != capture_state().queue_hooks.end()) {
@@ -3295,7 +3981,10 @@ void patch_command_queue(ID3D12CommandQueue *queue)
   hook.signal = original_vtable->Signal;
   hook.wait = original_vtable->Wait;
   capture_state().queue_hooks.emplace(vtable, hook);
+  capture_state().patched_queues[queue] =
+      PatchedCommandQueueState{queue, vtable, original_vtable, false};
   queue->lpVtbl = vtable;
+  remember_patched_object_vtable_locked(queue, vtable, original_vtable);
   patch_vtable_field(vtable, &ID3D12CommandQueueVtbl::ExecuteCommandLists, hook_queue_execute_command_lists);
   patch_vtable_field(vtable, &ID3D12CommandQueueVtbl::Signal, hook_queue_signal);
   patch_vtable_field(vtable, &ID3D12CommandQueueVtbl::Wait, hook_queue_wait);
@@ -3327,6 +4016,7 @@ void patch_command_allocator(ID3D12CommandAllocator *allocator)
   hook.reset = original_vtable->Reset;
   capture_state().allocator_hooks.emplace(vtable, hook);
   allocator->lpVtbl = vtable;
+  remember_patched_object_vtable_locked(allocator, vtable, original_vtable);
   patch_vtable_field(vtable, &ID3D12CommandAllocatorVtbl::Reset, hook_allocator_reset);
   proxy_debug_logf("patch_allocator vtable=%p reset=%d", static_cast<void *>(vtable), vtable->Reset == hook_allocator_reset);
 }
@@ -3397,6 +4087,7 @@ void patch_command_list(ID3D12GraphicsCommandList *command_list)
   hook.set_predication = original_vtable->SetPredication;
   capture_state().command_list_hooks.emplace(vtable, hook);
   command_list->lpVtbl = vtable;
+  remember_patched_object_vtable_locked(command_list, vtable, original_vtable);
   patch_vtable_field(vtable, &ID3D12GraphicsCommandListVtbl::QueryInterface, hook_command_list_query_interface);
   patch_vtable_field(vtable, &ID3D12GraphicsCommandListVtbl::Close, hook_command_list_close);
   patch_vtable_field(vtable, &ID3D12GraphicsCommandListVtbl::Reset, hook_command_list_reset);
@@ -3633,6 +4324,7 @@ void patch_command_list1(ID3D12GraphicsCommandList1 *command_list)
       reinterpret_cast<ID3D12GraphicsCommandListVtbl *>(vtable),
       make_command_list_base_hook_state(original_vtable));
   command_list->lpVtbl = vtable;
+  remember_patched_object_vtable_locked(command_list, vtable, original_vtable);
   patch_command_list_base_methods(vtable);
   patch_command_list1_methods(vtable);
   proxy_debug_logf(
@@ -3665,6 +4357,7 @@ void patch_command_list2(ID3D12GraphicsCommandList2 *command_list)
       reinterpret_cast<ID3D12GraphicsCommandListVtbl *>(vtable),
       make_command_list_base_hook_state(original_vtable));
   command_list->lpVtbl = vtable;
+  remember_patched_object_vtable_locked(command_list, vtable, original_vtable);
   patch_command_list_base_methods(vtable);
   patch_command_list1_methods(vtable);
   patch_command_list2_methods(vtable);
@@ -3707,6 +4400,7 @@ void patch_command_list4(ID3D12GraphicsCommandList4 *command_list)
       reinterpret_cast<ID3D12GraphicsCommandListVtbl *>(vtable),
       make_command_list_base_hook_state(original_vtable));
   command_list->lpVtbl = vtable;
+  remember_patched_object_vtable_locked(command_list, vtable, original_vtable);
   patch_command_list_base_methods(vtable);
   patch_command_list1_methods(vtable);
   patch_command_list2_methods(vtable);
@@ -3753,6 +4447,7 @@ void patch_command_list6(ID3D12GraphicsCommandList6 *command_list)
       reinterpret_cast<ID3D12GraphicsCommandListVtbl *>(vtable),
       make_command_list_base_hook_state(original_vtable));
   command_list->lpVtbl = vtable;
+  remember_patched_object_vtable_locked(command_list, vtable, original_vtable);
   patch_command_list_base_methods(vtable);
   patch_command_list1_methods(vtable);
   patch_command_list2_methods(vtable);
@@ -3783,17 +4478,21 @@ void patch_fence(ID3D12Fence *fence)
   }
   FenceHookState hook;
   hook.vtable = original_vtable;
+  hook.query_interface = original_vtable->QueryInterface;
   hook.set_event_on_completion = original_vtable->SetEventOnCompletion;
   hook.signal = original_vtable->Signal;
   hook.get_completed_value = original_vtable->GetCompletedValue;
   capture_state().fence_hooks.emplace(vtable, hook);
   fence->lpVtbl = vtable;
+  remember_patched_object_vtable_locked(fence, vtable, original_vtable);
+  patch_vtable_field(vtable, &ID3D12FenceVtbl::QueryInterface, hook_fence_query_interface);
   patch_vtable_field(vtable, &ID3D12FenceVtbl::SetEventOnCompletion, hook_fence_set_event_on_completion);
   patch_vtable_field(vtable, &ID3D12FenceVtbl::Signal, hook_fence_signal);
   patch_vtable_field(vtable, &ID3D12FenceVtbl::GetCompletedValue, hook_fence_get_completed_value);
   proxy_debug_logf(
-      "patch_fence vtable=%p set_event=%d signal=%d completed=%d",
+      "patch_fence vtable=%p qi=%d set_event=%d signal=%d completed=%d",
       static_cast<void *>(vtable),
+      vtable->QueryInterface == hook_fence_query_interface,
       vtable->SetEventOnCompletion == hook_fence_set_event_on_completion,
       vtable->Signal == hook_fence_signal,
       vtable->GetCompletedValue == hook_fence_get_completed_value);
@@ -3820,6 +4519,7 @@ void patch_resource(ID3D12Resource *resource)
   hook.unmap = original_vtable->Unmap;
   capture_state().resource_hooks.emplace(vtable, hook);
   resource->lpVtbl = vtable;
+  remember_patched_object_vtable_locked(resource, vtable, original_vtable);
   patch_vtable_field(vtable, &ID3D12ResourceVtbl::Map, hook_resource_map);
   patch_vtable_field(vtable, &ID3D12ResourceVtbl::Unmap, hook_resource_unmap);
   proxy_debug_logf(
@@ -3902,6 +4602,18 @@ bool is_device_iid(REFIID riid)
          IsEqualGUID(riid, kIidD3D12Device7) ||
          IsEqualGUID(riid, kIidD3D12Device8) ||
          IsEqualGUID(riid, kIidD3D12Device9);
+}
+
+bool is_unknown_iid(REFIID riid)
+{
+  return IsEqualGUID(riid, IID_IUnknown);
+}
+
+bool is_fence_iid(REFIID riid)
+{
+  return is_unknown_iid(riid) ||
+         IsEqualGUID(riid, kIidD3D12Fence) ||
+         IsEqualGUID(riid, kIidD3D12Fence1);
 }
 
 std::size_t device_vtable_size_for_iid(REFIID riid)
@@ -4206,12 +4918,35 @@ HRESULT STDMETHODCALLTYPE hook_device_create_command_list(
     {
       std::lock_guard<std::mutex> lock(capture_state().mutex);
       const auto parent = lookup_object_id_locked(self);
+      const bool allocator_was_known = lookup_object_id_locked(command_allocator) != 0;
+      const auto allocator_object_id = ensure_external_command_allocator_object_locked(
+          command_allocator,
+          type,
+          "ID3D12Device::CreateCommandList");
+      if (!allocator_was_known && allocator_object_id != 0) {
+        std::ostringstream allocator_payload;
+        allocator_payload << "{\"type\":" << static_cast<unsigned int>(type)
+                          << ",\"external_command_allocator\":true"
+                          << ",\"reason\":\"ID3D12Device::CreateCommandList\"}";
+        record_call_locked(
+            "ID3D12Device::CreateCommandAllocator",
+            S_OK,
+            {},
+            {},
+            allocator_payload.str(),
+            {parent, allocator_object_id});
+      }
+      const auto initial_pipeline_state_object_id = lookup_object_id_locked(initial_pipeline_state);
       register_fresh_object_locked(*command_list, apitrace::trace::ObjectKind::CommandList, "ID3D12GraphicsCommandList", parent);
       std::ostringstream payload;
-      payload << "{\"node_mask\":" << node_mask << ",\"type\":" << static_cast<unsigned int>(type) << "}";
+      payload << "{\"node_mask\":" << node_mask
+              << ",\"type\":" << static_cast<unsigned int>(type)
+              << ",\"command_allocator_object_id\":" << object_id_json(allocator_object_id)
+              << ",\"initial_pipeline_state_object_id\":" << object_id_json(initial_pipeline_state_object_id) << "}";
       record_call_locked("ID3D12Device::CreateCommandList", hr, {self, command_allocator, initial_pipeline_state, *command_list}, {}, payload.str());
     }
     patch_command_list(static_cast<ID3D12GraphicsCommandList *>(*command_list));
+    remember_command_list_interface_aliases(static_cast<ID3D12GraphicsCommandList *>(*command_list));
   }
   return hr;
 }
@@ -4243,6 +4978,7 @@ HRESULT STDMETHODCALLTYPE hook_device_create_command_list1(
       record_call_locked("ID3D12Device::CreateCommandList1", hr, {self, *command_list}, {}, payload.str());
     }
     patch_command_list(static_cast<ID3D12GraphicsCommandList *>(*command_list));
+    remember_command_list_interface_aliases(static_cast<ID3D12GraphicsCommandList *>(*command_list));
   }
   return hr;
 }
@@ -4324,10 +5060,14 @@ HRESULT STDMETHODCALLTYPE hook_device_create_root_signature(
   }
   ScopedOriginalVTable<ID3D12Device, ID3D12DeviceVtbl> original_vtable(self, hook.vtable);
   const HRESULT hr = hook.create_root_signature(self, node_mask, bytecode, bytecode_length, riid, root_signature);
-  if (SUCCEEDED(hr) && root_signature && *root_signature) {
+  if ((SUCCEEDED(hr) && root_signature && *root_signature) || FAILED(hr)) {
     std::lock_guard<std::mutex> lock(capture_state().mutex);
     const auto parent = lookup_object_id_locked(self);
-    register_fresh_object_locked(*root_signature, apitrace::trace::ObjectKind::RootSignature, "ID3D12RootSignature", parent);
+    apitrace::trace::ObjectId root_signature_object_id = 0;
+    if (SUCCEEDED(hr)) {
+      root_signature_object_id =
+          register_fresh_object_locked(*root_signature, apitrace::trace::ObjectKind::RootSignature, "ID3D12RootSignature", parent);
+    }
     std::vector<apitrace::trace::BlobId> blob_refs;
     std::string root_sig_path;
     if (bytecode && bytecode_length != 0) {
@@ -4347,7 +5087,17 @@ HRESULT STDMETHODCALLTYPE hook_device_create_root_signature(
       payload << ",\"root_parameters\":" << root_parameters_json;
     }
     payload << "}";
-    record_call_locked("ID3D12Device::CreateRootSignature", hr, {self, *root_signature}, blob_refs, payload.str());
+    std::vector<const void *> object_refs = {self};
+    if (SUCCEEDED(hr)) {
+      object_refs.push_back(*root_signature);
+    }
+    record_call_locked(
+        "ID3D12Device::CreateRootSignature",
+        hr,
+        object_refs,
+        blob_refs,
+        payload.str(),
+        {root_signature_object_id});
   }
   return hr;
 }

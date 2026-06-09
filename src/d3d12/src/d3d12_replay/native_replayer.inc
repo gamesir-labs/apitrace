@@ -686,9 +686,13 @@ private:
   bool create_pipelines(std::string &error)
   {
     for (const auto &[object_id, pipeline] : backend_.pipelines_) {
-      const auto root_it = root_signatures_.find(pipeline.root_signature_object_id);
-      if (root_it == root_signatures_.end()) {
-        return fail(error, "pipeline references an unknown root signature");
+      ID3D12RootSignature *root_signature = nullptr;
+      if (!pipeline.uses_embedded_root_signature) {
+        const auto root_it = root_signatures_.find(pipeline.root_signature_object_id);
+        if (root_it == root_signatures_.end()) {
+          return fail(error, "pipeline references an unknown root signature");
+        }
+        root_signature = root_it->second.get();
       }
       json pipeline_asset;
       if (!read_pipeline_asset_json(backend_.bundle_root_, pipeline.relative_path, &pipeline_asset, error)) {
@@ -703,7 +707,7 @@ private:
           return false;
         }
         D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
-        desc.pRootSignature = root_it->second.get();
+        desc.pRootSignature = root_signature;
         desc.CS = D3D12_SHADER_BYTECODE{cs.data(), cs.size()};
         desc.NodeMask = pipeline.node_mask;
         desc.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(pipeline.flags);
@@ -736,7 +740,7 @@ private:
       std::vector<std::string> semantic_names;
       std::vector<D3D12_INPUT_ELEMENT_DESC> input_elements;
       D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
-      desc.pRootSignature = root_it->second.get();
+      desc.pRootSignature = root_signature;
       desc.VS = D3D12_SHADER_BYTECODE{vs.data(), vs.size()};
       desc.PS = D3D12_SHADER_BYTECODE{ps.data(), ps.size()};
       desc.DS = D3D12_SHADER_BYTECODE{ds.data(), ds.size()};

@@ -75,18 +75,68 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     objects_.track(tracked);
 	    if (event.object_kind == trace::ObjectKind::CommandList) {
 	      command_lists_.emplace(event.object_id, CommandListSemanticState{});
+	    } else if (event.object_kind == trace::ObjectKind::RootSignature && payload.value("external_root_signature", false)) {
+	      RootSignatureSemanticState root_signature;
+	      root_signature.root_signature_object_id = event.object_id;
+	      root_signature.create_sequence = event.callsite.sequence;
+	      root_signatures_[root_signature.root_signature_object_id] = std::move(root_signature);
+	    } else if (event.object_kind == trace::ObjectKind::Fence && payload.value("external_fence", false)) {
+	      FenceSemanticState fence;
+	      fence.fence_object_id = event.object_id;
+	      fence.create_sequence = event.callsite.sequence;
+	      fence.initial_value = payload_u64(payload, "initial_value");
+	      fence.current_value = fence.initial_value;
+	      fence.completed_value = fence.initial_value;
+	      fence.flags = payload_u32(payload, "flags");
+	      fences_[fence.fence_object_id] = fence;
 	    } else if (event.object_kind == trace::ObjectKind::Resource && payload.value("external_resource", false)) {
+	      if (!require_payload_key(event, payload, "resource_desc", last_error_)) {
+	        return false;
+	      }
+	      const auto &resource_desc = payload["resource_desc"];
+	      if (!resource_desc.is_object()) {
+	        last_error_ = record_prefix(event) + ": resource_desc must be an object";
+	        return false;
+	      }
+	      static constexpr const char *required_resource_desc_keys[] = {
+	          "dimension",
+	          "alignment",
+	          "width",
+	          "height",
+	          "depth_or_array_size",
+	          "mip_levels",
+	          "format",
+	          "sample_count",
+	          "sample_quality",
+	          "layout",
+	          "flags",
+	      };
+	      for (const char *key : required_resource_desc_keys) {
+	        if (!require_payload_key(event, resource_desc, key, last_error_)) {
+	          return false;
+	        }
+	      }
 	      ResourceSemanticState resource;
 	      resource.resource_object_id = event.object_id;
 	      resource.create_sequence = event.callsite.sequence;
 	      resource.initial_state = 0;
 	      resource.current_state = 0;
-	      resource.dimension = 3;
-	      resource.width = 1;
-	      resource.height = 1;
-	      resource.depth_or_array_size = 1;
-	      resource.mip_levels = 1;
-	      resource.sample_count = 1;
+	      resource.width = payload_u64(resource_desc, "width");
+	      resource.alignment = payload_u64(resource_desc, "alignment");
+	      resource.dimension = payload_u32(resource_desc, "dimension");
+	      resource.height = payload_u32(resource_desc, "height");
+	      resource.depth_or_array_size = payload_u32(resource_desc, "depth_or_array_size");
+	      resource.mip_levels = payload_u32(resource_desc, "mip_levels");
+	      resource.format = payload_u32(resource_desc, "format");
+	      resource.sample_count = payload_u32(resource_desc, "sample_count");
+	      resource.sample_quality = payload_u32(resource_desc, "sample_quality");
+	      resource.layout = payload_u32(resource_desc, "layout");
+	      resource.flags = payload_u32(resource_desc, "flags");
+	      if (resource.width == 0 || resource.height == 0 || resource.depth_or_array_size == 0 ||
+	          resource.mip_levels == 0 || resource.sample_count == 0) {
+	        last_error_ = record_prefix(event) + ": resource_desc has invalid dimensions or sample count";
+	        return false;
+	      }
 	      resources_[resource.resource_object_id] = std::move(resource);
 	    }
     ++commands_replayed_;
@@ -602,6 +652,9 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     pipeline.relative_path = pipeline_path;
     pipeline.blob_refs = event.blob_refs;
     pipeline.root_signature_object_id = json_object_id(pipeline_asset.value("root_signature_object_id", json(nullptr)));
+    pipeline.uses_embedded_root_signature =
+        pipeline.root_signature_object_id == 0 &&
+        payload_string(pipeline_asset, "root_signature_source") == "embedded";
     if (pipeline.root_signature_object_id != 0 && root_signatures_.find(pipeline.root_signature_object_id) == root_signatures_.end()) {
       last_error_ = record_prefix(event) + ": pipeline asset references an unknown root signature";
       return false;
@@ -696,7 +749,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       last_error_ = record_prefix(event) + ": graphics pipeline asset missing vertex shader entry";
       return false;
     }
-    if (pipeline.graphics && pipeline.root_signature_object_id == 0) {
+    if (pipeline.graphics && pipeline.root_signature_object_id == 0 && !pipeline.uses_embedded_root_signature) {
       last_error_ = record_prefix(event) + ": graphics pipeline asset missing root signature object id";
       return false;
     }
@@ -704,13 +757,17 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       last_error_ = record_prefix(event) + ": compute pipeline asset missing compute shader entry";
       return false;
     }
-    if (!pipeline.graphics && pipeline.root_signature_object_id == 0) {
+    if (!pipeline.graphics && pipeline.root_signature_object_id == 0 && !pipeline.uses_embedded_root_signature) {
       last_error_ = record_prefix(event) + ": compute pipeline asset missing root signature object id";
       return false;
     }
     pipelines_[pipeline.pipeline_state_object_id] = std::move(pipeline);
     ++semantic_calls_seen_;
   } else if (function_name == "ID3D12Device::CreateRootSignature") {
+    if (event.callsite.result_code < 0) {
+      ++semantic_calls_seen_;
+      return true;
+    }
     if (event.object_refs.size() < 2 || event.object_refs[1] == 0) {
       last_error_ = record_prefix(event) + ": CreateRootSignature missing root signature object id";
       return false;
@@ -1529,20 +1586,25 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     command_signatures_[signature.command_signature_object_id] = std::move(signature);
     ++semantic_calls_seen_;
   } else if (function_name == "ID3D12Device::CreateCommandList") {
-    if (event.object_refs.size() < 3 || event.object_refs.back() == 0) {
+    if (event.object_refs.empty() || event.object_refs.back() == 0) {
       last_error_ = record_prefix(event) + ": CreateCommandList missing command list object id";
       return false;
     }
     if (!require_payload_key(event, payload, "type", last_error_)) {
       return false;
     }
-    const auto allocator_object_id = event.object_refs[1];
+    const auto allocator_object_id = payload_u64(
+        payload,
+        "command_allocator_object_id",
+        event.object_refs.size() >= 3 ? event.object_refs[1] : trace::ObjectId{});
     if (allocator_object_id == 0 || command_allocators_.find(allocator_object_id) == command_allocators_.end()) {
       last_error_ = record_prefix(event) + ": CreateCommandList references an unknown command allocator";
       return false;
     }
-    const auto initial_pipeline_state_object_id =
-        event.object_refs.size() >= 4 ? event.object_refs[2] : trace::ObjectId{};
+    const auto initial_pipeline_state_object_id = payload_u64(
+        payload,
+        "initial_pipeline_state_object_id",
+        event.object_refs.size() >= 4 ? event.object_refs[2] : trace::ObjectId{});
     if (initial_pipeline_state_object_id != 0 &&
         pipelines_.find(initial_pipeline_state_object_id) == pipelines_.end()) {
       last_error_ = record_prefix(event) + ": CreateCommandList references an unknown initial pipeline state";
@@ -3266,6 +3328,13 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       if (command_list_count != event.object_refs.size() - 1) {
         last_error_ = record_prefix(event) + ": ExecuteCommandLists object refs do not match command_list_count";
         return false;
+      }
+      const auto bridge_command_list_count = payload_u64(payload, "bridge_command_list_count", 0);
+      if (command_list_count == 0 && bridge_command_list_count != 0) {
+        ++queue_it->second.execute_count;
+        queue_it->second.last_execute_sequence = event.callsite.sequence;
+        ++semantic_calls_seen_;
+        return true;
       }
       submissions_.begin_batch(queue_object_id, 0, event.callsite.sequence);
       for (std::size_t index = 1; index < event.object_refs.size(); ++index) {
