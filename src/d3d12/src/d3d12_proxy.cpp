@@ -811,6 +811,12 @@ struct MappedResourceState {
   UINT subresource = 0;
 };
 
+struct CaptureArena {
+  std::uint8_t *base = nullptr;
+  std::size_t size = 0;
+  std::size_t offset = 0;
+};
+
 struct ResourceGpuVirtualAddressState {
   apitrace::trace::ObjectId object_id = 0;
   std::uint64_t base = 0;
@@ -876,6 +882,7 @@ struct CaptureState {
   std::unordered_map<ID3D12Heap *, UINT> heap_types;
   std::unordered_map<ID3D12GraphicsCommandList *, std::vector<ID3D12Resource *>> command_list_resources;
   std::vector<const void *> bridge_command_objects;
+  CaptureArena capture_arena;
 };
 
 thread_local unsigned int g_capture_suppression_depth = 0;
@@ -916,6 +923,16 @@ bool alias_probes_disabled()
 bool queue_hooks_disabled()
 {
   return env_flag_enabled("APITRACE_D3D12_DISABLE_QUEUE_HOOKS");
+}
+
+bool resource_hooks_disabled()
+{
+  return env_flag_enabled("APITRACE_D3D12_DISABLE_RESOURCE_HOOKS");
+}
+
+bool resource_snapshot_disabled()
+{
+  return env_flag_enabled("APITRACE_D3D12_DISABLE_RESOURCE_SNAPSHOTS");
 }
 
 bool submission_object_restore_disabled()
@@ -3798,6 +3815,130 @@ ResourceHookState resource_hook_for(ID3D12Resource *resource)
   return hook_for_object_locked(resource, capture_state().resource_hooks);
 }
 
+std::uint8_t *capture_arena_alloc_locked(std::size_t size)
+{
+  constexpr std::size_t kCaptureArenaSize = 2ull * 1024ull * 1024ull * 1024ull;
+  auto &arena = capture_state().capture_arena;
+  if (size == 0 || size > kCaptureArenaSize) {
+    return nullptr;
+  }
+  if (!arena.base) {
+    arena.base = static_cast<std::uint8_t *>(
+        VirtualAlloc(nullptr, kCaptureArenaSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!arena.base) {
+      proxy_debug_log("capture_arena_alloc: failed to allocate 2GB arena");
+      return nullptr;
+    }
+    arena.size = kCaptureArenaSize;
+    arena.offset = 0;
+    proxy_debug_logf("capture_arena_alloc base=%p size=%zu", arena.base, arena.size);
+  }
+  constexpr std::size_t kAlignment = 256;
+  const auto aligned_offset = (arena.offset + kAlignment - 1) & ~(kAlignment - 1);
+  if (aligned_offset > arena.size || size > arena.size - aligned_offset) {
+    arena.offset = 0;
+  } else {
+    arena.offset = aligned_offset;
+  }
+  auto *result = arena.base + arena.offset;
+  arena.offset += size;
+  return result;
+}
+
+void snapshot_upload_resource(ID3D12Resource *resource, const char *reason)
+{
+  if (!resource || !resource->lpVtbl || resource_snapshot_disabled()) {
+    return;
+  }
+  ResourceCaptureInfo info;
+  {
+    std::lock_guard<std::mutex> lock(capture_state().mutex);
+    const auto info_it = capture_state().resource_capture_infos.find(resource);
+    if (info_it == capture_state().resource_capture_infos.end()) {
+      return;
+    }
+    info = info_it->second;
+  }
+  if (!info.cpu_writable || !info.has_desc ||
+      info.desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+      info.desc.Width == 0) {
+    return;
+  }
+  const auto size64 = info.desc.Width;
+  if (size64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    return;
+  }
+  const auto size = static_cast<std::size_t>(size64);
+
+  auto *original_vtable = resource->lpVtbl;
+  if (!original_vtable->Map || !original_vtable->Unmap) {
+    return;
+  }
+  void *mapped = nullptr;
+  D3D12_RANGE read_range{0, size};
+  HRESULT hr = E_FAIL;
+  {
+    CaptureSuppressionScope suppress;
+    hr = original_vtable->Map(resource, 0, &read_range, &mapped);
+  }
+  if (FAILED(hr) || !mapped) {
+    proxy_debug_logf(
+        "snapshot_upload_resource map_failed resource=%p hr=0x%08lx reason=%s",
+        resource,
+        static_cast<unsigned long>(hr),
+        reason ? reason : "");
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(capture_state().mutex);
+    auto *copy = capture_arena_alloc_locked(size);
+    if (copy) {
+      std::memcpy(copy, mapped, size);
+      const auto asset = register_asset_bytes_locked(apitrace::trace::AssetKind::Buffer, "d3d12-upload-snapshot", copy, size);
+      const auto buffer_path = asset.relative_path.generic_string();
+
+      std::ostringstream map_payload;
+      map_payload << "{\"resource_object_id\":" << object_id_json(info.object_id)
+                  << ",\"subresource\":0"
+                  << ",\"read_begin\":0"
+                  << ",\"read_end\":" << size64
+                  << ",\"mapped\":true"
+                  << ",\"snapshot\":true";
+      if (reason) {
+        map_payload << ",\"reason\":\"" << reason << "\"";
+      }
+      map_payload << "}";
+      record_call_locked("ID3D12Resource::Map", S_OK, {resource}, {}, map_payload.str());
+
+      std::ostringstream unmap_payload;
+      unmap_payload << "{\"resource_object_id\":" << object_id_json(info.object_id)
+                    << ",\"subresource\":0"
+                    << ",\"written_begin\":0"
+                    << ",\"written_end\":" << size64
+                    << ",\"written_size\":" << size64
+                    << ",\"buffer_path\":\"" << buffer_path << "\""
+                    << ",\"snapshot\":true";
+      if (reason) {
+        unmap_payload << ",\"reason\":\"" << reason << "\"";
+      }
+      unmap_payload << "}";
+      record_call_locked("ID3D12Resource::Unmap", S_OK, {resource}, {asset.blob_id}, unmap_payload.str());
+    }
+  }
+  {
+    CaptureSuppressionScope suppress;
+    D3D12_RANGE written_range{0, 0};
+    original_vtable->Unmap(resource, 0, &written_range);
+  }
+}
+
+void snapshot_upload_resources(const std::vector<ID3D12Resource *> &resources, const char *reason)
+{
+  for (auto *resource : resources) {
+    snapshot_upload_resource(resource, reason);
+  }
+}
+
 void patch_device(ID3D12Device *device, std::size_t vtable_size)
 {
   if (!device || !device->lpVtbl) {
@@ -4503,30 +4644,25 @@ void patch_resource(ID3D12Resource *resource)
   if (!resource || !resource->lpVtbl) {
     return;
   }
+  if (resource_hooks_disabled()) {
+    proxy_debug_logf("patch_resource disabled resource=%p", resource);
+    return;
+  }
   std::lock_guard<std::mutex> lock(capture_state().mutex);
   auto *original_vtable = resource->lpVtbl;
   if (capture_state().resource_hooks.find(original_vtable) != capture_state().resource_hooks.end()) {
-    return;
-  }
-  auto *vtable = clone_vtable(original_vtable);
-  if (!vtable) {
-    proxy_debug_log("patch_resource: failed to clone vtable");
     return;
   }
   ResourceHookState hook;
   hook.vtable = original_vtable;
   hook.map = original_vtable->Map;
   hook.unmap = original_vtable->Unmap;
-  capture_state().resource_hooks.emplace(vtable, hook);
-  resource->lpVtbl = vtable;
-  remember_patched_object_vtable_locked(resource, vtable, original_vtable);
-  patch_vtable_field(vtable, &ID3D12ResourceVtbl::Map, hook_resource_map);
-  patch_vtable_field(vtable, &ID3D12ResourceVtbl::Unmap, hook_resource_unmap);
+  capture_state().resource_hooks.emplace(original_vtable, hook);
   proxy_debug_logf(
-      "patch_resource vtable=%p map=%d unmap=%d",
-      static_cast<void *>(vtable),
-      vtable->Map == hook_resource_map,
-      vtable->Unmap == hook_resource_unmap);
+      "patch_resource vtable=%p snapshot=1 map=%d unmap=%d",
+      static_cast<void *>(original_vtable),
+      hook.map != nullptr,
+      hook.unmap != nullptr);
 }
 
 void patch_known_command_queues()

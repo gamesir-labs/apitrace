@@ -536,6 +536,7 @@ void STDMETHODCALLTYPE hook_queue_execute_command_lists(
     proxy_debug_logf("hook_queue_execute_command_lists enter self=%p count=%u", self, command_list_count);
     ScopedQueueOriginalVTable original_queue_vtable(self, hook.vtable);
     const auto referenced_resources = command_list_array_resources_snapshot(command_list_count, command_lists);
+    snapshot_upload_resources(referenced_resources, "ExecuteCommandLists");
     ScopedCommandListArrayOriginalVTables original_command_list_vtables(command_list_count, command_lists);
     ScopedResourceArrayOriginalVTables original_resource_vtables(referenced_resources);
     hook.execute_command_lists(self, command_list_count, command_lists);
