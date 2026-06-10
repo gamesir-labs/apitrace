@@ -1226,6 +1226,9 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
     impl_->last_error = file_label(impl_->layout.callstream_path) + ": missing bundle_header";
     return false;
   }
+  if (!impl_->metal_events.empty()) {
+    impl_->metadata.has_metal_callstream = true;
+  }
 
   std::unordered_set<std::string> validated_checksum_paths;
   std::unordered_map<std::string, std::uint64_t> validated_asset_file_sizes;

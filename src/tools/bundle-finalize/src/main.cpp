@@ -121,6 +121,8 @@ struct Stats {
   std::uint64_t asset_hash_reused_bytes = 0;
 };
 
+std::unordered_map<std::uint64_t, std::string> build_effective_path_by_blob_id(const std::vector<AssetEntry> &assets);
+
 class FileDigestCache {
 public:
   std::string digest_file(const fs::path &path)
@@ -608,44 +610,18 @@ void collect_asset_references_from_json(
   }
 }
 
-bool is_lower_hex_digest(std::string_view value)
+bool is_canonical_jsonl_asset_path_value(const std::string &path)
 {
-  if (value.size() != 64) {
-    return false;
-  }
-  for (const auto ch : value) {
-    if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool is_content_addressed_jsonl_asset_path_value(const std::string &path)
-{
-  if (path.rfind("metal/libraries/", 0) == 0) {
-    const auto filename = std::string_view(path).substr(std::string_view("metal/libraries/").size());
-    const auto extension = filename.find('.');
-    return extension != std::string_view::npos && is_lower_hex_digest(filename.substr(0, extension));
-  }
-
-  for (const auto prefix : {"buffers/", "shaders/", "pipelines/"}) {
-    if (path.rfind(prefix, 0) != 0) {
-      continue;
-    }
-    const auto filename = std::string_view(path).substr(std::string_view(prefix).size());
-    const auto extension = filename.find('.');
-    return extension != std::string_view::npos && is_lower_hex_digest(filename.substr(0, extension));
-  }
-  return false;
+  return path.rfind("buffers/asset-", 0) == 0 ||
+         path.rfind("shaders/asset-", 0) == 0 ||
+         path.rfind("pipelines/asset-", 0) == 0 ||
+         path.rfind("metal/libraries/asset-", 0) == 0;
 }
 
 bool jsonl_line_may_contain_rewritable_asset_path(const std::string &line)
 {
-  bool has_path = false;
   std::size_t search = 0;
   while ((search = line.find("path\"", search)) != std::string::npos) {
-    has_path = true;
     const auto colon = line.find(':', search + 5);
     if (colon == std::string::npos) {
       return false;
@@ -660,12 +636,12 @@ bool jsonl_line_may_contain_rewritable_asset_path(const std::string &line)
       return false;
     }
     const auto value = line.substr(value_begin + 1, value_end - value_begin - 1);
-    if (!value.empty() && !is_content_addressed_jsonl_asset_path_value(value)) {
+    if (!value.empty() && !is_canonical_jsonl_asset_path_value(value)) {
       return true;
     }
     search = value_end + 1;
   }
-  return has_path && line.find("\"blob_refs\"") != std::string::npos;
+  return false;
 }
 
 bool text_may_contain_rewritable_asset_path(const std::string &text)
@@ -739,21 +715,14 @@ void add_discovered_asset(
 std::optional<std::string> raw_asset_path_for_blob_id(
     const fs::path &bundle_root,
     std::uint64_t blob_id,
-    std::uint64_t asset_sequence_base,
     std::initializer_list<const char *> extensions)
 {
-  std::vector<std::uint64_t> candidates{blob_id};
-  if (asset_sequence_base != 0 && blob_id >= asset_sequence_base) {
-    candidates.push_back(blob_id - asset_sequence_base + 1);
-  }
-  for (const auto candidate : candidates) {
-    std::ostringstream stem;
-    stem << "asset-" << std::hex << std::setw(16) << std::setfill('0') << candidate;
-    for (const auto *extension : extensions) {
-      const auto relative = fs::path("shaders") / (stem.str() + extension);
-      if (fs::is_regular_file(bundle_root / relative)) {
-        return relative.generic_string();
-      }
+  std::ostringstream stem;
+  stem << "asset-" << std::hex << std::setw(16) << std::setfill('0') << blob_id;
+  for (const auto *extension : extensions) {
+    const auto relative = fs::path("shaders") / (stem.str() + extension);
+    if (fs::is_regular_file(bundle_root / relative)) {
+      return relative.generic_string();
     }
   }
   return std::nullopt;
@@ -786,7 +755,6 @@ void discover_raw_asset_references_from_jsonl(
   ++stats.jsonl_passes;
   std::string line;
   const bool infer_object_blob_assets = indexed_blob_ids.empty() && legacy_asset_discovery;
-  std::uint64_t asset_sequence_base = 0;
   std::unordered_map<std::uint64_t, std::string> asset_path_by_object_id;
   while (std::getline(input, line)) {
     const bool has_path_field =
@@ -808,14 +776,6 @@ void discover_raw_asset_references_from_jsonl(
     std::vector<std::uint64_t> blob_refs;
     std::vector<std::string> paths;
     collect_asset_references_from_json(record, blob_refs, paths);
-    if (asset_sequence_base == 0) {
-      for (const auto blob_id : blob_refs) {
-        if (blob_id != 0) {
-          asset_sequence_base = blob_id;
-          break;
-        }
-      }
-    }
 
     if (record.value("record_kind", std::string()) == "object_create" &&
         paths.size() == 1 &&
@@ -829,8 +789,13 @@ void discover_raw_asset_references_from_jsonl(
     if (is_d3d12_pipeline_create_function(function) &&
         payload.is_object() &&
         payload.value("pso_raw_version", 0) == 1) {
-      for (const auto blob_id : blob_refs) {
-        if (const auto path = raw_asset_path_for_blob_id(bundle_root, blob_id, asset_sequence_base, {".dxil", ".dxbc"})) {
+      std::size_t indexed_paths = 0;
+      for (; indexed_paths < paths.size() && indexed_paths < blob_refs.size(); ++indexed_paths) {
+        add_discovered_asset(bundle_root, assets, stats, indexed_blob_ids, blob_refs[indexed_paths], paths[indexed_paths]);
+      }
+      for (std::size_t index = indexed_paths; index < blob_refs.size(); ++index) {
+        const auto blob_id = blob_refs[index];
+        if (const auto path = raw_asset_path_for_blob_id(bundle_root, blob_id, {".dxil", ".dxbc"})) {
           add_discovered_asset(bundle_root, assets, stats, indexed_blob_ids, blob_id, *path);
         }
       }
@@ -1305,16 +1270,20 @@ std::unordered_map<std::string, std::string> build_aliases(const std::vector<Ass
 std::unordered_map<std::string, std::uint64_t> build_blob_id_by_effective_path(const std::vector<AssetEntry> &assets)
 {
   std::unordered_map<std::string, std::uint64_t> blob_id_by_path;
+  std::unordered_set<std::string> ambiguous_paths;
   for (const auto &asset : assets) {
     const auto path = effective_asset_path(asset);
-    if (!path.empty() && asset.blob_id != 0) {
-      blob_id_by_path.emplace(path, asset.blob_id);
+    if (path.empty() || asset.blob_id == 0 || ambiguous_paths.find(path) != ambiguous_paths.end()) {
+      continue;
+    }
+    const auto [it, inserted] = blob_id_by_path.emplace(path, asset.blob_id);
+    if (!inserted && it->second != asset.blob_id) {
+      blob_id_by_path.erase(it);
+      ambiguous_paths.insert(path);
     }
   }
   return blob_id_by_path;
 }
-
-std::unordered_map<std::uint64_t, std::string> build_effective_path_by_blob_id(const std::vector<AssetEntry> &assets);
 
 std::unordered_map<std::uint64_t, std::uint64_t> normalize_blob_ids(std::vector<AssetEntry> &assets, Stats &stats)
 {
@@ -1596,37 +1565,60 @@ bool rewrite_blob_refs_for_effective_paths(
   return changed;
 }
 
-bool rewrite_path_refs_for_blob_refs(
+bool asset_alias_matches_effective_path(const std::string &alias, const std::string &effective_path)
+{
+  if (alias.empty() || effective_path.empty() || alias == effective_path) {
+    return false;
+  }
+  if (alias.find("asset-") == std::string::npos) {
+    return false;
+  }
+  const fs::path alias_path(alias);
+  const fs::path final_path(effective_path);
+  return safe_relative_path(final_path) &&
+         (alias_path.extension() == final_path.extension() ||
+          alias_path.parent_path().generic_string().rfind("metal/", 0) == 0);
+}
+
+bool rewrite_asset_alias_strings_for_effective_path(json &node, const std::string &effective_path)
+{
+  bool changed = false;
+  if (node.is_object()) {
+    for (auto it = node.begin(); it != node.end(); ++it) {
+      if (it->is_string() && is_path_reference_key(it.key())) {
+        const auto current = it->get<std::string>();
+        if (asset_alias_matches_effective_path(current, effective_path)) {
+          *it = effective_path;
+          changed = true;
+          continue;
+        }
+      }
+      changed = rewrite_asset_alias_strings_for_effective_path(it.value(), effective_path) || changed;
+    }
+  } else if (node.is_array()) {
+    for (auto &item : node) {
+      changed = rewrite_asset_alias_strings_for_effective_path(item, effective_path) || changed;
+    }
+  }
+  return changed;
+}
+
+bool rewrite_single_blob_asset_alias_refs(
     json &node,
     const std::unordered_map<std::uint64_t, std::string> &effective_path_by_blob_id)
 {
   if (effective_path_by_blob_id.empty() || !node.is_object()) {
     return false;
   }
-
   auto refs = node.find("blob_refs");
-  if (refs == node.end() || !refs->is_array()) {
+  if (refs == node.end() || !refs->is_array() || refs->size() != 1 || !(*refs)[0].is_number_unsigned()) {
     return false;
   }
-
-  std::vector<std::uint64_t> blob_refs;
-  std::vector<std::string> paths;
-  collect_asset_references_from_json(node, blob_refs, paths);
-  if (paths.empty() || blob_refs.empty()) {
+  const auto path = effective_path_by_blob_id.find((*refs)[0].get<std::uint64_t>());
+  if (path == effective_path_by_blob_id.end()) {
     return false;
   }
-
-  std::unordered_map<std::string, std::string> local_aliases;
-  for (std::size_t index = 0; index < paths.size() && index < blob_refs.size(); ++index) {
-    if (paths[index].empty()) {
-      continue;
-    }
-    const auto found = effective_path_by_blob_id.find(blob_refs[index]);
-    if (found != effective_path_by_blob_id.end() && found->second != paths[index]) {
-      local_aliases.emplace(paths[index], found->second);
-    }
-  }
-  return rewrite_path_refs(node, local_aliases);
+  return rewrite_asset_alias_strings_for_effective_path(node, path->second);
 }
 
 fs::path temporary_rewrite_path(const fs::path &path)
@@ -1820,7 +1812,8 @@ std::unordered_set<std::string> rewrite_text_references(
       while (std::getline(input, line)) {
         ++stats.jsonl_records;
         stats.input_bytes += static_cast<std::uint64_t>(line.size()) + 1;
-        if (!jsonl_line_may_contain_rewritable_asset_path(line)) {
+        if (!jsonl_line_may_contain_rewritable_asset_path(line) &&
+            (effective_path_by_blob_id.empty() || line.find("asset-") == std::string::npos)) {
           if (!options.dry_run) {
             output.write_line(line);
           }
@@ -1835,12 +1828,15 @@ std::unordered_set<std::string> rewrite_text_references(
           note_jsonl_output(stats, line);
           continue;
         }
-        const bool paths_changed =
-            rewrite_path_refs(record, aliases) ||
-            rewrite_path_refs_for_blob_refs(record, effective_path_by_blob_id);
+        const bool paths_changed = rewrite_path_refs(record, aliases);
+        const bool single_blob_asset_alias_changed =
+            rewrite_single_blob_asset_alias_refs(record, effective_path_by_blob_id);
         const bool blob_refs_changed =
-            rewrite_blob_refs_for_effective_paths(record, blob_id_by_effective_path, paths_changed);
-        if (paths_changed || blob_refs_changed) {
+            rewrite_blob_refs_for_effective_paths(
+                record,
+                blob_id_by_effective_path,
+                paths_changed || single_blob_asset_alias_changed);
+        if (paths_changed || single_blob_asset_alias_changed || blob_refs_changed) {
           if (referenced_paths) {
             collect_path_references_from_json(record, aliases, *referenced_paths, false);
           }
@@ -1911,13 +1907,16 @@ std::unordered_set<std::string> rewrite_text_references(
       continue;
     }
     root = json::parse(text, nullptr, false);
-    const bool paths_changed =
-        !root.is_discarded() &&
-        (rewrite_path_refs(root, aliases) || rewrite_path_refs_for_blob_refs(root, effective_path_by_blob_id));
+    const bool paths_changed = !root.is_discarded() && rewrite_path_refs(root, aliases);
+    const bool single_blob_asset_alias_changed =
+        !root.is_discarded() && rewrite_single_blob_asset_alias_refs(root, effective_path_by_blob_id);
     const bool blob_refs_changed =
         !root.is_discarded() &&
-        rewrite_blob_refs_for_effective_paths(root, blob_id_by_effective_path, paths_changed);
-    if (root.is_discarded() || (!paths_changed && !blob_refs_changed)) {
+        rewrite_blob_refs_for_effective_paths(
+            root,
+            blob_id_by_effective_path,
+            paths_changed || single_blob_asset_alias_changed);
+    if (root.is_discarded() || (!paths_changed && !single_blob_asset_alias_changed && !blob_refs_changed)) {
       if (referenced_paths && !root.is_discarded()) {
         collect_path_references_from_json(root, aliases, *referenced_paths, false);
       }
@@ -2430,83 +2429,6 @@ bool blob_ref_sets_equal(const json &lhs, const json &rhs)
   return lhs_refs == rhs_refs;
 }
 
-std::uint64_t json_object_id(const json &value)
-{
-  if (value.is_number_unsigned()) {
-    return value.get<std::uint64_t>();
-  }
-  if (value.is_number_integer()) {
-    const auto signed_value = value.get<std::int64_t>();
-    return signed_value > 0 ? static_cast<std::uint64_t>(signed_value) : 0;
-  }
-  return 0;
-}
-
-bool mark_embedded_root_signature_if_needed(json &pipeline, const json &record)
-{
-  if (!pipeline.is_object() || json_object_id(pipeline.value("root_signature_object_id", json(nullptr))) != 0) {
-    return false;
-  }
-  if (record.value("result_code", -1) < 0) {
-    return false;
-  }
-  const auto object_refs_it = record.find("object_refs");
-  if (object_refs_it == record.end() || !object_refs_it->is_array() || object_refs_it->size() < 2) {
-    return false;
-  }
-  const auto pipeline_object_id = json_object_id(object_refs_it->back());
-  if (pipeline_object_id == 0) {
-    return false;
-  }
-  if (pipeline.value("root_signature_source", std::string()) == "embedded") {
-    return false;
-  }
-  pipeline["root_signature_source"] = "embedded";
-  return true;
-}
-
-std::uint64_t pipeline_root_signature_object_id(const json &pipeline)
-{
-  return json_object_id(pipeline.value("root_signature_object_id", json(nullptr)));
-}
-
-bool update_pipeline_create_object_refs(json &record, std::uint64_t root_signature_object_id)
-{
-  auto object_refs_it = record.find("object_refs");
-  if (object_refs_it == record.end() || !object_refs_it->is_array() || object_refs_it->size() < 2) {
-    return false;
-  }
-
-  const auto device_object_id = json_object_id(object_refs_it->front());
-  const auto pipeline_object_id = json_object_id(object_refs_it->back());
-  if (device_object_id == 0 || pipeline_object_id == 0) {
-    return false;
-  }
-
-  json object_refs = json::array();
-  object_refs.push_back(device_object_id);
-  if (root_signature_object_id != 0) {
-    object_refs.push_back(root_signature_object_id);
-  }
-  object_refs.push_back(pipeline_object_id);
-  if (*object_refs_it == object_refs) {
-    return false;
-  }
-  *object_refs_it = std::move(object_refs);
-  return true;
-}
-
-bool repair_pipeline_create_object_refs(json &record)
-{
-  auto payload_it = record.find("payload");
-  if (payload_it == record.end() || !payload_it->is_object()) {
-    return false;
-  }
-  return update_pipeline_create_object_refs(
-      record,
-      json_object_id(payload_it->value("root_signature_object_id", json(nullptr))));
-}
-
 void append_pipeline_dependency_blob_refs(
     const fs::path &bundle_root,
     const json &pipeline,
@@ -2528,7 +2450,7 @@ std::optional<AssetEntry> ensure_pipeline_asset(
     std::vector<AssetEntry> &assets,
     Stats &stats)
 {
-  const auto text = pipeline.dump() + "\n";
+  const auto text = pipeline.dump();
   const auto digest = apitrace::trace::content_hash_bytes(text.data(), text.size());
   const auto relative_path = (fs::path("pipelines") / (digest + ".pipeline.json")).generic_string();
   if (const auto existing = assets_by_path.find(relative_path); existing != assets_by_path.end()) {
@@ -2560,7 +2482,7 @@ std::optional<AssetEntry> ensure_pipeline_asset(
       return std::nullopt;
     }
     std::ofstream output(absolute_path, std::ios::binary | std::ios::trunc);
-    output << text;
+    output << text << '\n';
     if (!output) {
       std::cerr << "warning: failed to write rebuilt pipeline asset " << relative_path << "\n";
       return std::nullopt;
@@ -2610,7 +2532,6 @@ bool rebuild_pipeline_event(
     return false;
   }
   pipeline["type"] = raw_kind;
-  mark_embedded_root_signature_if_needed(pipeline, record);
 
   std::vector<std::uint64_t> shader_blob_refs;
   if (!resolve_pipeline_shader_paths(pipeline, shader_ref_by_blob_id, unique_shader_ref_by_size, shader_blob_refs)) {
@@ -2632,7 +2553,6 @@ bool rebuild_pipeline_event(
   for (const auto *stage : {"vs", "ps", "ds", "hs", "gs", "cs", "as", "ms"}) {
     payload.erase(stage);
   }
-  update_pipeline_create_object_refs(record, pipeline_root_signature_object_id(pipeline));
 
   json blob_refs = json::array();
   std::unordered_set<std::uint64_t> seen_refs;
@@ -2944,7 +2864,6 @@ bool repair_pipeline_asset_event(
     return false;
   }
   payload["pipeline_path"] = new_pipeline_path;
-  update_pipeline_create_object_refs(record, pipeline_root_signature_object_id(pipeline));
   record["blob_refs"] = std::move(blob_refs);
   path_by_blob_id.emplace(
       pipeline_asset->blob_id,
@@ -3050,14 +2969,6 @@ std::unordered_set<std::string> rebuild_d3d12_pipeline_semantics(
                    assets_by_path,
                    assets,
                    stats)) {
-      const auto rewritten = record.dump();
-      if (!options.dry_run) {
-        output.write_line(rewritten);
-      }
-      note_jsonl_output(stats, rewritten);
-      changed = true;
-      ++stats.rewritten_records;
-    } else if (repair_pipeline_create_object_refs(record)) {
       const auto rewritten = record.dump();
       if (!options.dry_run) {
         output.write_line(rewritten);
@@ -3603,7 +3514,7 @@ int main(int argc, char **argv)
     loaded_asset_count = assets.size();
   });
   run_stage(options, progress, stage_index, kStageCount, "scan_raw_events", [&] {
-    if (legacy_asset_discovery || !finalized_indexed_bundle || assets.empty()) {
+    if (!finalized_indexed_bundle || assets.empty()) {
       discover_raw_asset_references(options.bundle_root, assets, legacy_asset_discovery, stats);
     }
   });
@@ -3728,7 +3639,7 @@ int main(int argc, char **argv)
     }
     blob_id_by_effective_path = build_blob_id_by_effective_path(assets);
     effective_path_by_blob_id = build_effective_path_by_blob_id(assets);
-    if (aliases.empty() && effective_path_by_blob_id.empty()) {
+    if (aliases.empty()) {
       return;
     }
     const auto rebuilt_rewrites =
@@ -3765,7 +3676,7 @@ int main(int argc, char **argv)
     }
     blob_id_by_effective_path = build_blob_id_by_effective_path(assets);
     effective_path_by_blob_id = build_effective_path_by_blob_id(assets);
-    if (!aliases.empty() || !effective_path_by_blob_id.empty()) {
+    if (!aliases.empty()) {
       const auto final_rewrites =
           rewrite_text_references(
               options.bundle_root,

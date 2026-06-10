@@ -211,6 +211,18 @@ WriterLockStatsSnapshot snapshot_writer_lock_stats(const WriterLockStats &stats)
   };
 }
 
+std::mutex &metal_sequence_allocator_mutex()
+{
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<std::string, std::uint64_t> &metal_sequence_allocator_by_bundle()
+{
+  static std::unordered_map<std::string, std::uint64_t> allocators;
+  return allocators;
+}
+
 void record_writer_lock_wait(WriterLockStats *stats, std::uint64_t wait_ns)
 {
   if (!stats)
@@ -1365,11 +1377,89 @@ void add_asset_index_paths(
   }
 }
 
+std::uint64_t max_metal_sequence_in_callstream(const std::filesystem::path &path)
+{
+  if (!std::filesystem::is_regular_file(path))
+    return 0;
+
+  std::ifstream input(path, std::ios::binary);
+  if (!input.is_open())
+    return 0;
+
+  std::uint64_t max_sequence = 0;
+  std::string line;
+  while (std::getline(input, line)) {
+    auto record = json::parse(line, nullptr, false);
+    if (record.is_discarded() || !record.is_object())
+      continue;
+    const auto sequence = record.value("metal_sequence", 0ull);
+    max_sequence = std::max(max_sequence, static_cast<std::uint64_t>(sequence));
+  }
+  return max_sequence;
+}
+
+std::unordered_map<std::uint64_t, std::string> asset_paths_by_blob_id(
+    const std::vector<AssetRecord> &assets,
+    const std::vector<AssetRecord> &metal_assets)
+{
+  std::unordered_map<std::uint64_t, std::string> paths;
+  const auto append = [&paths](const std::vector<AssetRecord> &records) {
+    for (const auto &asset : records) {
+      if (asset.blob_id == 0 || asset.relative_path.empty())
+        continue;
+      paths[static_cast<std::uint64_t>(asset.blob_id)] = asset.relative_path.generic_string();
+    }
+  };
+  append(assets);
+  append(metal_assets);
+  return paths;
+}
+
+bool asset_alias_matches_final_path(std::string_view alias, std::string_view final_path)
+{
+  if (alias.empty() || final_path.empty() || alias == final_path)
+    return false;
+  if (alias.find("asset-") == std::string_view::npos)
+    return false;
+
+  const std::filesystem::path alias_path{std::string(alias)};
+  const std::filesystem::path final_asset_path{std::string(final_path)};
+  return is_bundle_relative_path(final_asset_path) &&
+         (alias_path.extension() == final_asset_path.extension() ||
+          alias_path.parent_path().generic_string().rfind("metal/", 0) == 0);
+}
+
+bool rewrite_json_asset_alias(json &value, std::string_view final_path)
+{
+  bool changed = false;
+  if (value.is_string()) {
+    const auto text = value.get<std::string>();
+    if (asset_alias_matches_final_path(text, final_path)) {
+      value = std::string(final_path);
+      return true;
+    }
+    return false;
+  }
+  if (value.is_array()) {
+    for (auto &child : value)
+      changed = rewrite_json_asset_alias(child, final_path) || changed;
+    return changed;
+  }
+  if (value.is_object()) {
+    for (auto &child : value.items())
+      changed = rewrite_json_asset_alias(child.value(), final_path) || changed;
+  }
+  return changed;
+}
+
 std::optional<std::pair<std::string, std::uint64_t>> rewrite_metal_callstream_blob_refs(
     const BundleLayout &layout,
-    const std::unordered_map<std::uint64_t, std::uint64_t> &blob_remap)
+    const std::unordered_map<std::uint64_t, std::uint64_t> &blob_remap,
+    const std::vector<AssetRecord> &assets,
+    const std::vector<AssetRecord> &metal_assets)
 {
-  if (blob_remap.empty())
+  const auto asset_paths = asset_paths_by_blob_id(assets, metal_assets);
+  if (blob_remap.empty() && asset_paths.empty())
     return std::nullopt;
 
   const auto path = layout.root_path / kMetalCallstreamFileName;
@@ -1390,6 +1480,7 @@ std::optional<std::pair<std::string, std::uint64_t>> rewrite_metal_callstream_bl
       output << line << "\n";
       continue;
     }
+    std::vector<std::uint64_t> rewritten_refs;
     auto refs = record.find("blob_refs");
     if (refs != record.end() && refs->is_array()) {
       for (auto &ref : *refs) {
@@ -1398,11 +1489,20 @@ std::optional<std::pair<std::string, std::uint64_t>> rewrite_metal_callstream_bl
         const auto value = ref.get<std::int64_t>();
         if (value <= 0)
           continue;
+        auto rewritten_value = static_cast<std::uint64_t>(value);
         const auto found = blob_remap.find(static_cast<std::uint64_t>(value));
-        if (found == blob_remap.end())
-          continue;
-        ref = found->second;
-        changed = true;
+        if (found != blob_remap.end()) {
+          rewritten_value = found->second;
+          ref = rewritten_value;
+          changed = true;
+        }
+        rewritten_refs.push_back(rewritten_value);
+      }
+    }
+    if (rewritten_refs.size() == 1) {
+      if (const auto asset_path = asset_paths.find(rewritten_refs.front());
+          asset_path != asset_paths.end()) {
+        changed = rewrite_json_asset_alias(record, asset_path->second) || changed;
       }
     }
     output << record.dump() << "\n";
@@ -3735,6 +3835,9 @@ struct TraceBundleWriter::Impl {
   bool append_existing_primary_callstream = false;
   TraceBundleOpenMode open_mode = TraceBundleOpenMode::Primary;
   bool metal_callstream_should_append = false;
+  std::uint64_t metal_sequence_offset = 0;
+  std::unordered_map<std::uint64_t, std::uint64_t> metal_sequence_remap;
+  bool metal_sequence_allocator_refreshed = false;
   std::atomic_bool metal_callstream_open_attempted{false};
   bool cache_events = false;
   bool inline_finalize = false;
@@ -4014,10 +4117,49 @@ struct TraceBundleWriter::Impl {
       return false;
     }
 
+    if (metal_callstream_should_append) {
+      std::lock_guard<std::mutex> sequence_lock(metal_sequence_allocator_mutex());
+      auto &allocator = metal_sequence_allocator_by_bundle()[layout.root_path.lexically_normal().generic_string()];
+      allocator = std::max(allocator, max_metal_sequence_in_callstream(layout.metal_callstream_path));
+      metal_sequence_offset = allocator;
+      metal_sequence_allocator_refreshed = true;
+    }
+
     const auto mode = metal_callstream_should_append ? std::ios::app : std::ios::trunc;
     const auto opened = metal_callstream_stream.open(layout.metal_callstream_path, mode);
     metal_callstream_open_attempted.store(true, std::memory_order_release);
     return opened;
+  }
+
+  std::uint64_t remap_metal_sequence(std::uint64_t local_sequence)
+  {
+    if (local_sequence == 0)
+      return 0;
+
+    if (const auto found = metal_sequence_remap.find(local_sequence); found != metal_sequence_remap.end())
+      return found->second;
+
+    std::lock_guard<std::mutex> lock(metal_sequence_allocator_mutex());
+    auto &allocator = metal_sequence_allocator_by_bundle()[layout.root_path.lexically_normal().generic_string()];
+    if (metal_callstream_should_append && !metal_sequence_allocator_refreshed) {
+      allocator = std::max(allocator, max_metal_sequence_in_callstream(layout.metal_callstream_path));
+      metal_sequence_offset = allocator;
+      metal_sequence_allocator_refreshed = true;
+    } else if (allocator == 0) {
+      allocator = std::max(allocator, metal_sequence_offset);
+    }
+    const auto global_sequence = ++allocator;
+    metal_sequence_remap.emplace(local_sequence, global_sequence);
+    return global_sequence;
+  }
+
+  std::uint64_t lookup_metal_sequence(std::uint64_t local_sequence) const
+  {
+    if (local_sequence == 0)
+      return 0;
+    if (const auto found = metal_sequence_remap.find(local_sequence); found != metal_sequence_remap.end())
+      return found->second;
+    return local_sequence;
   }
 
   std::vector<std::filesystem::path> rewrite_candidates() const
@@ -4506,7 +4648,11 @@ struct TraceBundleWriter::Impl {
             layout.analysis_directory_path / kSidebandAssetShardFileName,
             asset_snapshot,
             metal_asset_snapshot);
-        if (const auto rewritten = rewrite_metal_callstream_blob_refs(layout, blob_remap)) {
+        if (const auto rewritten = rewrite_metal_callstream_blob_refs(
+                layout,
+                blob_remap,
+                asset_snapshot,
+                metal_asset_snapshot)) {
           known_file_digests_snapshot[kMetalCallstreamFileName] = rewritten->first;
           known_file_sizes_snapshot[kMetalCallstreamFileName] = rewritten->second;
         }
@@ -4731,6 +4877,15 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
   impl_->metal_callstream_should_append =
       mode != TraceBundleOpenMode::Primary &&
       std::filesystem::is_regular_file(impl_->layout.metal_callstream_path);
+  {
+    std::lock_guard<std::mutex> lock(metal_sequence_allocator_mutex());
+    auto &allocator = metal_sequence_allocator_by_bundle()[impl_->layout.root_path.lexically_normal().generic_string()];
+    if (impl_->metal_callstream_should_append)
+      allocator = std::max(allocator, max_metal_sequence_in_callstream(impl_->layout.metal_callstream_path));
+    else
+      allocator = 0;
+    impl_->metal_sequence_offset = allocator;
+  }
   if (mode == TraceBundleOpenMode::Primary) {
     const auto callstream_mode =
         existing_primary_callstream ? std::ios::app : std::ios::trunc;
@@ -4815,9 +4970,11 @@ void TraceBundleWriter::append_call_event(EventRecord &&event)
 void TraceBundleWriter::append_metal_event(const MetalEventRecord &event)
 {
   TimedWriterPhase total_phase(impl_->writer_stats ? &impl_->metal_event_phase_total : nullptr);
+  MetalEventRecord adjusted_event = event;
+  adjusted_event.metal_sequence = impl_->remap_metal_sequence(adjusted_event.metal_sequence);
   if (impl_->cache_events) {
     TimedWriterLock lock(impl_->event_mutex, impl_->writer_stats ? &impl_->event_lock_stats : nullptr);
-    impl_->metal_events.push_back(event);
+    impl_->metal_events.push_back(adjusted_event);
   }
   {
     TimedWriterPhase phase(impl_->writer_stats ? &impl_->metal_event_phase_open : nullptr);
@@ -4827,13 +4984,13 @@ void TraceBundleWriter::append_metal_event(const MetalEventRecord &event)
   }
   {
     TimedWriterPhase phase(impl_->writer_stats ? &impl_->metal_event_phase_asset_ref_scan : nullptr);
-    if (event.payload.find("asset-") != std::string::npos ||
-        event.function_name.find("asset-") != std::string::npos)
+    if (adjusted_event.payload.find("asset-") != std::string::npos ||
+        adjusted_event.function_name.find("asset-") != std::string::npos)
       impl_->metal_callstream_may_reference_asset_alias.store(true, std::memory_order_relaxed);
   }
   {
     TimedWriterPhase phase(impl_->writer_stats ? &impl_->metal_event_phase_enqueue : nullptr);
-    impl_->metal_callstream_stream.write_event(event);
+    impl_->metal_callstream_stream.write_event(std::move(adjusted_event));
   }
   impl_->signal_checkpoint_work(1, 0);
 }
@@ -5532,7 +5689,21 @@ void TraceBundleWriter::append_analysis_line(std::string_view stream_name, std::
       stream.open(stream_path, std::ios::app);
     }
   }
-  const auto line = std::string(json_line);
+  auto line = std::string(json_line);
+  if (stream_key == "translation-links") {
+    auto record = json::parse(line, nullptr, false);
+    if (!record.is_discarded() && record.is_object()) {
+      auto adjust_sequence = [impl = impl_.get()](json &value) {
+        if (value.is_number_unsigned() && value.get<std::uint64_t>() != 0)
+          value = impl->lookup_metal_sequence(value.get<std::uint64_t>());
+      };
+      if (auto begin = record.find("metal_sequence_begin"); begin != record.end())
+        adjust_sequence(*begin);
+      if (auto end = record.find("metal_sequence_end"); end != record.end())
+        adjust_sequence(*end);
+      line = record.dump();
+    }
+  }
   if (line.find("asset-") != std::string::npos)
     impl_->analysis_streams_may_reference_asset_alias.insert(stream_key);
   stream.write_line(line);
@@ -5729,7 +5900,11 @@ void TraceBundleWriter::close()
           impl_->layout.analysis_directory_path / kSidebandAssetShardFileName,
           assets,
           metal_assets);
-      if (const auto rewritten = rewrite_metal_callstream_blob_refs(impl_->layout, blob_remap)) {
+      if (const auto rewritten = rewrite_metal_callstream_blob_refs(
+              impl_->layout,
+              blob_remap,
+              assets,
+              metal_assets)) {
         known_file_digests[kMetalCallstreamFileName] = rewritten->first;
         known_file_sizes[kMetalCallstreamFileName] = rewritten->second;
         TimedWriterLock lock(impl_->asset_mutex, impl_->writer_stats ? &impl_->asset_lock_stats : nullptr);
