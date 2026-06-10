@@ -30,3 +30,4 @@ EXPORTS
     apitrace_d3d12_resume_all_queue_vtables @216
     apitrace_d3d12_suspend_all_vtables @217
     apitrace_d3d12_resume_all_vtables @218
+    apitrace_d3d12_record_dxgi_create_swapchain @219

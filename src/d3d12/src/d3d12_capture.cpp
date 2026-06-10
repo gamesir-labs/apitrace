@@ -2877,6 +2877,7 @@ std::uint64_t record_present(
       frame_end_sequence,
       trace::BoundaryKind::Frame,
       frame_end_payload.str().c_str());
+  maybe_seal_checkpoint_after_present_frame(frame_index);
   return frame_index;
 }
 
@@ -2913,7 +2914,6 @@ void record_present_frame(
           << "}";
   const auto blob_id = static_cast<std::uint64_t>(asset.blob_id);
   record_resource_blob("D3D12PresentFrame", &blob_id, 1, payload.str().c_str());
-  maybe_seal_checkpoint_after_present_frame(frame_index);
 }
 
 void record_resource_unmap(
