@@ -4,13 +4,23 @@ extern "C" HRESULT WINAPI D3D12CreateDevice(
     REFIID iid,
     void **device)
 {
+  proxy_debug_logf(
+      "D3D12CreateDevice enter adapter=%p feature=0x%08x iid=%s",
+      adapter,
+      static_cast<unsigned int>(minimum_feature_level),
+      guid_string(iid).c_str());
   auto &downstream = downstream_module();
   if (!downstream.create_device) {
+    proxy_debug_log("D3D12CreateDevice missing downstream export");
     return E_FAIL;
   }
 
   const HRESULT hr = downstream.create_device(adapter, minimum_feature_level, iid, device);
   proxy_debug_logf("D3D12CreateDevice hr=0x%08lx device=%p", static_cast<unsigned long>(hr), device ? *device : nullptr);
+  if (proxy_hooks_disabled()) {
+    proxy_debug_log("D3D12CreateDevice hook disabled");
+    return hr;
+  }
   if (SUCCEEDED(hr) && device && *device) {
     {
       std::lock_guard<std::mutex> lock(capture_state().mutex);
@@ -33,11 +43,15 @@ extern "C" HRESULT WINAPI D3D12CreateDevice(
 
 extern "C" HRESULT WINAPI D3D12GetDebugInterface(REFIID iid, void **debug)
 {
+  proxy_debug_logf("D3D12GetDebugInterface enter iid=%s", guid_string(iid).c_str());
   auto &downstream = downstream_module();
   if (!downstream.get_debug_interface) {
+    proxy_debug_log("D3D12GetDebugInterface missing downstream export");
     return E_FAIL;
   }
-  return downstream.get_debug_interface(iid, debug);
+  const HRESULT hr = downstream.get_debug_interface(iid, debug);
+  proxy_debug_logf("D3D12GetDebugInterface hr=0x%08lx debug=%p", static_cast<unsigned long>(hr), debug ? *debug : nullptr);
+  return hr;
 }
 
 extern "C" void WINAPI apitrace_d3d12_record_runtime_objects(
@@ -321,11 +335,15 @@ extern "C" HRESULT WINAPI D3D12SerializeRootSignature(
     ID3DBlob **blob,
     ID3DBlob **error_blob)
 {
+  proxy_debug_logf("D3D12SerializeRootSignature enter version=%u", static_cast<unsigned int>(version));
   auto &downstream = downstream_module();
   if (!downstream.serialize_root_signature) {
+    proxy_debug_log("D3D12SerializeRootSignature missing downstream export");
     return E_FAIL;
   }
-  return downstream.serialize_root_signature(root_signature_desc, version, blob, error_blob);
+  const HRESULT hr = downstream.serialize_root_signature(root_signature_desc, version, blob, error_blob);
+  proxy_debug_logf("D3D12SerializeRootSignature hr=0x%08lx blob=%p", static_cast<unsigned long>(hr), blob ? *blob : nullptr);
+  return hr;
 }
 
 extern "C" HRESULT WINAPI D3D12SerializeVersionedRootSignature(
@@ -333,11 +351,18 @@ extern "C" HRESULT WINAPI D3D12SerializeVersionedRootSignature(
     ID3DBlob **blob,
     ID3DBlob **error_blob)
 {
+  proxy_debug_log("D3D12SerializeVersionedRootSignature enter");
   auto &downstream = downstream_module();
   if (!downstream.serialize_versioned_root_signature) {
+    proxy_debug_log("D3D12SerializeVersionedRootSignature missing downstream export");
     return E_FAIL;
   }
-  return downstream.serialize_versioned_root_signature(root_signature_desc, blob, error_blob);
+  const HRESULT hr = downstream.serialize_versioned_root_signature(root_signature_desc, blob, error_blob);
+  proxy_debug_logf(
+      "D3D12SerializeVersionedRootSignature hr=0x%08lx blob=%p",
+      static_cast<unsigned long>(hr),
+      blob ? *blob : nullptr);
+  return hr;
 }
 
 extern "C" HRESULT WINAPI D3D12CreateRootSignatureDeserializer(
@@ -346,11 +371,18 @@ extern "C" HRESULT WINAPI D3D12CreateRootSignatureDeserializer(
     REFIID iid,
     void **deserializer)
 {
+  proxy_debug_logf("D3D12CreateRootSignatureDeserializer enter size=%zu iid=%s", static_cast<std::size_t>(data_size), guid_string(iid).c_str());
   auto &downstream = downstream_module();
   if (!downstream.create_root_signature_deserializer) {
+    proxy_debug_log("D3D12CreateRootSignatureDeserializer missing downstream export");
     return E_FAIL;
   }
-  return downstream.create_root_signature_deserializer(data, data_size, iid, deserializer);
+  const HRESULT hr = downstream.create_root_signature_deserializer(data, data_size, iid, deserializer);
+  proxy_debug_logf(
+      "D3D12CreateRootSignatureDeserializer hr=0x%08lx deserializer=%p",
+      static_cast<unsigned long>(hr),
+      deserializer ? *deserializer : nullptr);
+  return hr;
 }
 
 extern "C" HRESULT WINAPI D3D12CreateVersionedRootSignatureDeserializer(
@@ -359,11 +391,18 @@ extern "C" HRESULT WINAPI D3D12CreateVersionedRootSignatureDeserializer(
     REFIID iid,
     void **deserializer)
 {
+  proxy_debug_logf("D3D12CreateVersionedRootSignatureDeserializer enter size=%zu iid=%s", static_cast<std::size_t>(data_size), guid_string(iid).c_str());
   auto &downstream = downstream_module();
   if (!downstream.create_versioned_root_signature_deserializer) {
+    proxy_debug_log("D3D12CreateVersionedRootSignatureDeserializer missing downstream export");
     return E_FAIL;
   }
-  return downstream.create_versioned_root_signature_deserializer(data, data_size, iid, deserializer);
+  const HRESULT hr = downstream.create_versioned_root_signature_deserializer(data, data_size, iid, deserializer);
+  proxy_debug_logf(
+      "D3D12CreateVersionedRootSignatureDeserializer hr=0x%08lx deserializer=%p",
+      static_cast<unsigned long>(hr),
+      deserializer ? *deserializer : nullptr);
+  return hr;
 }
 
 extern "C" HRESULT WINAPI D3D12EnableExperimentalFeatures(
@@ -372,11 +411,15 @@ extern "C" HRESULT WINAPI D3D12EnableExperimentalFeatures(
     void *configurations,
     UINT *configurations_sizes)
 {
+  proxy_debug_logf("D3D12EnableExperimentalFeatures enter count=%u", feature_count);
   auto &downstream = downstream_module();
   if (!downstream.enable_experimental_features) {
+    proxy_debug_log("D3D12EnableExperimentalFeatures missing downstream export");
     return E_FAIL;
   }
-  return downstream.enable_experimental_features(feature_count, iids, configurations, configurations_sizes);
+  const HRESULT hr = downstream.enable_experimental_features(feature_count, iids, configurations, configurations_sizes);
+  proxy_debug_logf("D3D12EnableExperimentalFeatures hr=0x%08lx", static_cast<unsigned long>(hr));
+  return hr;
 }
 
 extern "C" DWORD WINAPI GetBehaviorValue()
@@ -401,6 +444,7 @@ extern "C" HRESULT WINAPI D3D12CoreRegisterLayers()
 
 extern "C" void WINAPI apitrace_bootstrap_d3d12()
 {
+  proxy_debug_log("apitrace_bootstrap_d3d12");
   process_attach();
 }
 
@@ -417,8 +461,10 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved
   (void)instance;
   (void)reserved;
   if (reason == DLL_PROCESS_ATTACH) {
+    proxy_debug_log("D3D12 proxy process attach");
     process_attach();
   } else if (reason == DLL_PROCESS_DETACH) {
+    proxy_debug_log("D3D12 proxy process detach");
     process_detach();
   }
   return TRUE;

@@ -1572,6 +1572,7 @@ std::string raw_shader_asset_json(
   std::ostringstream payload;
   payload << "\"" << field_name << "\":{"
           << "\"bytecode_size\":" << static_cast<std::uint64_t>(bytecode.BytecodeLength)
+          << ",\"" << field_name << "_path\":\"" << asset.relative_path.generic_string() << "\""
           << ",\"blob_id\":" << asset.blob_id
           << "}";
   return payload.str();

@@ -434,16 +434,18 @@ HRESULT STDMETHODCALLTYPE hook_device_create_fence(
   ScopedOriginalVTable<ID3D12Device, ID3D12DeviceVtbl> original_vtable(self, hook.vtable);
   const HRESULT hr = hook.create_fence(self, initial_value, flags, riid, fence);
   if (SUCCEEDED(hr) && fence && *fence) {
+    void *identity = query_iunknown_identity(*fence);
     {
       std::lock_guard<std::mutex> lock(capture_state().mutex);
       const auto parent = lookup_object_id_locked(self);
       register_fresh_object_locked(*fence, apitrace::trace::ObjectKind::Fence, "ID3D12Fence", parent);
+      remember_object_alias_locked(identity, *fence);
       std::ostringstream payload;
       payload << "{\"initial_value\":" << initial_value << ",\"flags\":" << static_cast<unsigned int>(flags) << "}";
       record_call_locked("ID3D12Device::CreateFence", hr, {self, *fence}, {}, payload.str());
     }
+    release_iunknown(identity);
     patch_fence(static_cast<ID3D12Fence *>(*fence));
-    remember_fence_interface_aliases(static_cast<ID3D12Fence *>(*fence));
   }
   return hr;
 }
@@ -526,53 +528,48 @@ void STDMETHODCALLTYPE hook_queue_execute_command_lists(
     UINT command_list_count,
     ID3D12CommandList *const *command_lists)
 {
-  const auto hook = queue_hook_for(self);
-  std::vector<ID3D12CommandList *> submitted_lists;
-  submitted_lists.reserve(command_list_count);
+  std::vector<void *> queried_command_list_identities;
+  queried_command_list_identities.reserve(command_list_count);
+  std::vector<const void *> refs = {self};
+  refs.reserve(static_cast<std::size_t>(command_list_count) + 1);
   for (UINT index = 0; index < command_list_count; ++index) {
-    submitted_lists.push_back(command_lists ? command_lists[index] : nullptr);
+    ID3D12CommandList *command_list = command_lists ? command_lists[index] : nullptr;
+    const void *ref = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(capture_state().mutex);
+      ref = registered_command_list_key_locked(command_list);
+    }
+    if (!ref) {
+      if (auto *queried = query_iunknown_identity(command_list)) {
+        {
+          std::lock_guard<std::mutex> lock(capture_state().mutex);
+          ref = remember_registered_identity_alias_locked(command_list, queried);
+        }
+        queried_command_list_identities.push_back(queried);
+      }
+    }
+    refs.push_back(ref);
   }
+
+  const auto hook = queue_hook_for(self);
   if (hook.execute_command_lists) {
-    proxy_debug_logf("hook_queue_execute_command_lists enter self=%p count=%u", self, command_list_count);
-    ScopedQueueOriginalVTable original_queue_vtable(self, hook.vtable);
     const auto referenced_resources = command_list_array_resources_snapshot(command_list_count, command_lists);
-    snapshot_upload_resources(referenced_resources, "ExecuteCommandLists");
+    ScopedOriginalVTable<ID3D12CommandQueue, ID3D12CommandQueueVtbl> original_vtable(self, hook.vtable);
     ScopedCommandListArrayOriginalVTables original_command_list_vtables(command_list_count, command_lists);
     ScopedResourceArrayOriginalVTables original_resource_vtables(referenced_resources);
     hook.execute_command_lists(self, command_list_count, command_lists);
-    proxy_debug_logf("hook_queue_execute_command_lists return self=%p count=%u", self, command_list_count);
   }
   proxy_debug_logf("hook_queue_execute_command_lists self=%p count=%u", self, command_list_count);
-  std::vector<const void *> refs = {self};
-  UINT replayable_command_list_count = 0;
-  UINT bridge_command_list_count = 0;
-  for (UINT index = 0; index < command_list_count; ++index) {
-    auto *command_list = submitted_lists[index];
-    remember_submitted_command_list_alias(command_list);
-    apitrace::trace::ObjectId command_list_object_id = 0;
-    {
-      std::lock_guard<std::mutex> lock(capture_state().mutex);
-      command_list_object_id = lookup_object_id_locked(command_list);
-      proxy_debug_logf(
-          "hook_queue_execute_command_lists list[%u]=%p object_id=%llu",
-          index,
-          command_list,
-          static_cast<unsigned long long>(command_list_object_id));
-    }
-    if (command_list_object_id != 0) {
-      refs.push_back(command_list);
-      ++replayable_command_list_count;
-    } else if (command_list) {
-      ++bridge_command_list_count;
-    }
+  {
+    std::lock_guard<std::mutex> lock(capture_state().mutex);
+    std::ostringstream payload;
+    payload << "{\"command_list_count\":" << command_list_count << "}";
+    record_call_locked("ID3D12CommandQueue::ExecuteCommandLists", S_OK, refs, {}, payload.str());
+    record_boundary_locked(apitrace::trace::BoundaryKind::Submit, payload.str());
   }
-  std::lock_guard<std::mutex> lock(capture_state().mutex);
-  std::ostringstream payload;
-  payload << "{\"command_list_count\":" << replayable_command_list_count
-          << ",\"actual_command_list_count\":" << command_list_count
-          << ",\"bridge_command_list_count\":" << bridge_command_list_count << "}";
-  record_call_locked("ID3D12CommandQueue::ExecuteCommandLists", S_OK, refs, {}, payload.str());
-  record_boundary_locked(apitrace::trace::BoundaryKind::Submit, payload.str());
+  for (auto *queried : queried_command_list_identities) {
+    release_iunknown(queried);
+  }
 }
 
 HRESULT STDMETHODCALLTYPE hook_queue_signal(ID3D12CommandQueue *self, ID3D12Fence *fence, UINT64 value)
@@ -581,21 +578,34 @@ HRESULT STDMETHODCALLTYPE hook_queue_signal(ID3D12CommandQueue *self, ID3D12Fenc
   if (!hook.signal) {
     return E_FAIL;
   }
-  proxy_debug_logf("hook_queue_signal enter self=%p fence=%p value=%llu", self, fence, static_cast<unsigned long long>(value));
   const auto fence_hook = fence_hook_for(fence);
-  ScopedQueueOriginalVTable original_queue_vtable(self, hook.vtable);
+  ScopedOriginalVTable<ID3D12CommandQueue, ID3D12CommandQueueVtbl> original_vtable(self, hook.vtable);
   ScopedOriginalVTable<ID3D12Fence, ID3D12FenceVtbl> original_fence_vtable(fence, fence_hook.vtable);
   const HRESULT hr = hook.signal(self, fence, value);
-  proxy_debug_logf("hook_queue_signal return self=%p fence=%p value=%llu hr=0x%08lx", self, fence, static_cast<unsigned long long>(value), static_cast<unsigned long>(hr));
   proxy_debug_logf("hook_queue_signal self=%p fence=%p value=%llu", self, fence, static_cast<unsigned long long>(value));
-  remember_submitted_fence_alias(fence);
-  std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto fence_object_id = ensure_external_fence_object_locked(fence, value, "ID3D12CommandQueue::Signal");
-  std::ostringstream payload;
-  payload << "{\"fence_value\":" << value
-          << ",\"fence_object_id\":" << object_id_json(fence_object_id) << "}";
-  record_call_locked("ID3D12CommandQueue::Signal", hr, {self, fence}, {}, payload.str(), {fence_object_id});
-  record_boundary_locked(apitrace::trace::BoundaryKind::Fence, payload.str());
+  ID3D12Fence *queried_fence = nullptr;
+  const void *fence_ref = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(capture_state().mutex);
+    fence_ref = registered_object_key_locked(fence);
+  }
+  if (!fence_ref) {
+    queried_fence = static_cast<ID3D12Fence *>(query_iunknown_identity(fence));
+    if (queried_fence) {
+      std::lock_guard<std::mutex> lock(capture_state().mutex);
+      fence_ref = remember_registered_identity_alias_locked(fence, queried_fence);
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(capture_state().mutex);
+    std::ostringstream payload;
+    payload << "{\"fence_value\":" << value << "}";
+    record_call_locked("ID3D12CommandQueue::Signal", hr, {self, fence_ref}, {}, payload.str());
+    record_boundary_locked(apitrace::trace::BoundaryKind::Fence, payload.str());
+  }
+  if (queried_fence) {
+    release_iunknown(queried_fence);
+  }
   return hr;
 }
 
@@ -605,38 +615,32 @@ HRESULT STDMETHODCALLTYPE hook_queue_wait(ID3D12CommandQueue *self, ID3D12Fence 
   if (!hook.wait) {
     return E_FAIL;
   }
-  proxy_debug_logf("hook_queue_wait enter self=%p fence=%p value=%llu", self, fence, static_cast<unsigned long long>(value));
   const auto fence_hook = fence_hook_for(fence);
-  ScopedQueueOriginalVTable original_queue_vtable(self, hook.vtable);
+  ScopedOriginalVTable<ID3D12CommandQueue, ID3D12CommandQueueVtbl> original_vtable(self, hook.vtable);
   ScopedOriginalVTable<ID3D12Fence, ID3D12FenceVtbl> original_fence_vtable(fence, fence_hook.vtable);
   const HRESULT hr = hook.wait(self, fence, value);
-  proxy_debug_logf("hook_queue_wait return self=%p fence=%p value=%llu hr=0x%08lx", self, fence, static_cast<unsigned long long>(value), static_cast<unsigned long>(hr));
   proxy_debug_logf("hook_queue_wait self=%p fence=%p value=%llu", self, fence, static_cast<unsigned long long>(value));
-  remember_submitted_fence_alias(fence);
-  std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto fence_object_id = ensure_external_fence_object_locked(fence, value, "ID3D12CommandQueue::Wait");
-  std::ostringstream payload;
-  payload << "{\"fence_value\":" << value
-          << ",\"fence_object_id\":" << object_id_json(fence_object_id) << "}";
-  record_call_locked("ID3D12CommandQueue::Wait", hr, {self, fence}, {}, payload.str(), {fence_object_id});
-  return hr;
-}
-
-HRESULT STDMETHODCALLTYPE hook_fence_query_interface(ID3D12Fence *self, REFIID riid, void **object)
-{
-  const auto hook = fence_hook_for(self);
-  if (!hook.query_interface) {
-    return E_NOINTERFACE;
-  }
-  ScopedOriginalVTable<ID3D12Fence, ID3D12FenceVtbl> original_vtable(self, hook.vtable);
-  const HRESULT hr = hook.query_interface(self, riid, object);
-  if (SUCCEEDED(hr) && object && *object && is_fence_iid(riid)) {
+  ID3D12Fence *queried_fence = nullptr;
+  const void *fence_ref = nullptr;
+  {
     std::lock_guard<std::mutex> lock(capture_state().mutex);
-    remember_object_alias_locked(*object, self);
-    record_call_locked("ID3D12Fence::QueryInterface", hr, {self, *object}, {}, "{}");
+    fence_ref = registered_object_key_locked(fence);
   }
-  if (SUCCEEDED(hr) && object && *object && is_fence_iid(riid)) {
-    remember_fence_interface_aliases(static_cast<ID3D12Fence *>(*object));
+  if (!fence_ref) {
+    queried_fence = static_cast<ID3D12Fence *>(query_iunknown_identity(fence));
+    if (queried_fence) {
+      std::lock_guard<std::mutex> lock(capture_state().mutex);
+      fence_ref = remember_registered_identity_alias_locked(fence, queried_fence);
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(capture_state().mutex);
+    std::ostringstream payload;
+    payload << "{\"fence_value\":" << value << "}";
+    record_call_locked("ID3D12CommandQueue::Wait", hr, {self, fence_ref}, {}, payload.str());
+  }
+  if (queried_fence) {
+    release_iunknown(queried_fence);
   }
   return hr;
 }
@@ -707,35 +711,11 @@ HRESULT STDMETHODCALLTYPE hook_command_list_reset(
   if (SUCCEEDED(hr)) {
     capture_state().command_list_resources[self].clear();
   }
-  const bool allocator_was_known = lookup_object_id_locked(allocator) != 0;
-  const auto allocator_object_id =
-      ensure_external_command_allocator_object_locked(
-          allocator,
-          D3D12_COMMAND_LIST_TYPE_DIRECT,
-          "ID3D12GraphicsCommandList::Reset");
-  if (!allocator_was_known && allocator_object_id != 0) {
-    std::ostringstream create_payload;
-    create_payload << "{\"type\":" << static_cast<unsigned int>(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                   << ",\"external_command_allocator\":true"
-                   << ",\"reason\":\"ID3D12GraphicsCommandList::Reset\"}";
-    record_call_locked(
-        "ID3D12Device::CreateCommandAllocator",
-        S_OK,
-        {},
-        {},
-        create_payload.str(),
-        {primary_device_object_id_locked(), allocator_object_id});
-  }
   std::ostringstream payload;
-  payload << "{\"command_allocator_object_id\":" << object_id_json(allocator_object_id)
+  payload << "{\"command_allocator_object_id\":" << object_id_json(lookup_object_id_locked(allocator))
           << ",\"initial_pipeline_state_object_id\":" << object_id_json(lookup_object_id_locked(initial_state))
           << "}";
-  record_call_locked(
-      "ID3D12GraphicsCommandList::Reset",
-      hr,
-      {self, allocator, initial_state},
-      {},
-      payload.str());
+  record_call_locked("ID3D12GraphicsCommandList::Reset", hr, {self, allocator, initial_state}, {}, payload.str());
   return hr;
 }
 
@@ -816,11 +796,9 @@ void STDMETHODCALLTYPE hook_command_list_set_graphics_root_signature(
     hook.set_graphics_root_signature(self, root_signature);
   }
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto root_signature_object_id =
-      ensure_external_root_signature_object_locked(root_signature, "SetGraphicsRootSignature");
   std::ostringstream payload;
   payload << "{\"compute\":false,\"root_signature_object_id\":"
-          << object_id_json(root_signature_object_id) << "}";
+          << object_id_json(lookup_object_id_locked(root_signature)) << "}";
   record_call_locked("ID3D12GraphicsCommandList::SetGraphicsRootSignature", S_OK, {self, root_signature}, {}, payload.str());
 }
 
@@ -834,11 +812,9 @@ void STDMETHODCALLTYPE hook_command_list_set_compute_root_signature(
     hook.set_compute_root_signature(self, root_signature);
   }
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto root_signature_object_id =
-      ensure_external_root_signature_object_locked(root_signature, "SetComputeRootSignature");
   std::ostringstream payload;
   payload << "{\"compute\":true,\"root_signature_object_id\":"
-          << object_id_json(root_signature_object_id) << "}";
+          << object_id_json(lookup_object_id_locked(root_signature)) << "}";
   record_call_locked("ID3D12GraphicsCommandList::SetComputeRootSignature", S_OK, {self, root_signature}, {}, payload.str());
 }
 
@@ -1501,16 +1477,8 @@ void STDMETHODCALLTYPE hook_command_list_resource_barrier(
     ScopedResourceArrayOriginalVTables original_resource_vtables(barrier_resources);
     hook.resource_barrier(self, barrier_count, barriers);
   }
-  std::vector<OptionalResourceDesc> barrier_resource_descs;
-  barrier_resource_descs.reserve(barrier_resources.size());
-  for (auto *resource : barrier_resources) {
-    barrier_resource_descs.push_back(describe_resource(resource));
-  }
   proxy_debug_logf("hook_command_list_resource_barrier self=%p count=%u", self, barrier_count);
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  for (std::size_t index = 0; index < barrier_resources.size(); ++index) {
-    ensure_external_resource_object_locked(barrier_resources[index], barrier_resource_descs[index], "ResourceBarrier");
-  }
   remember_command_list_resources_locked(self, barrier_resources);
   std::vector<const void *> refs = {self};
   std::ostringstream payload;
@@ -1690,11 +1658,7 @@ void STDMETHODCALLTYPE hook_command_list_copy_buffer_region(
     ScopedResourceArrayOriginalVTables original_resource_vtables(referenced_resources);
     hook.copy_buffer_region(self, dst, dst_offset, src, src_offset, byte_count);
   }
-  const auto dst_desc = describe_resource(dst);
-  const auto src_desc = describe_resource(src);
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  ensure_external_resource_object_locked(dst, dst_desc, "CopyBufferRegionDst");
-  ensure_external_resource_object_locked(src, src_desc, "CopyBufferRegionSrc");
   remember_command_list_resources_locked(self, referenced_resources);
   std::ostringstream payload;
   payload << "{\"dst_offset\":" << dst_offset
@@ -1724,11 +1688,7 @@ void STDMETHODCALLTYPE hook_command_list_copy_texture_region(
     ScopedResourceArrayOriginalVTables original_resource_vtables(referenced_resources);
     hook.copy_texture_region(self, dst, dst_x, dst_y, dst_z, src, src_box);
   }
-  const auto dst_desc = describe_resource(dst ? dst->pResource : nullptr);
-  const auto src_desc = describe_resource(src ? src->pResource : nullptr);
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  ensure_external_resource_object_locked(dst ? dst->pResource : nullptr, dst_desc, "CopyTextureRegionDst");
-  ensure_external_resource_object_locked(src ? src->pResource : nullptr, src_desc, "CopyTextureRegionSrc");
   remember_command_list_resources_locked(self, referenced_resources);
   std::ostringstream payload;
   payload << "{\"dst_x\":" << dst_x
@@ -1768,11 +1728,7 @@ void STDMETHODCALLTYPE hook_command_list_copy_resource(
     ScopedResourceArrayOriginalVTables original_resource_vtables(referenced_resources);
     hook.copy_resource(self, dst, src);
   }
-  const auto dst_desc = describe_resource(dst);
-  const auto src_desc = describe_resource(src);
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  ensure_external_resource_object_locked(dst, dst_desc, "CopyResourceDst");
-  ensure_external_resource_object_locked(src, src_desc, "CopyResourceSrc");
   remember_command_list_resources_locked(self, referenced_resources);
   std::ostringstream payload;
   payload << "{\"dst_resource_object_id\":" << object_id_json(lookup_object_id_locked(dst))
@@ -1795,11 +1751,7 @@ void STDMETHODCALLTYPE hook_command_list_resolve_subresource(
     ScopedResourceArrayOriginalVTables original_resource_vtables(referenced_resources);
     hook.resolve_subresource(self, dst, dst_subresource, src, src_subresource, format);
   }
-  const auto dst_desc = describe_resource(dst);
-  const auto src_desc = describe_resource(src);
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  ensure_external_resource_object_locked(dst, dst_desc, "ResolveSubresourceDst");
-  ensure_external_resource_object_locked(src, src_desc, "ResolveSubresourceSrc");
   remember_command_list_resources_locked(self, referenced_resources);
   std::ostringstream payload;
   payload << "{\"dst_subresource\":" << dst_subresource
@@ -1925,11 +1877,7 @@ void STDMETHODCALLTYPE hook_command_list_resolve_subresource_region(
         format,
         mode);
   }
-  const auto dst_desc = describe_resource(dst);
-  const auto src_desc = describe_resource(src);
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  ensure_external_resource_object_locked(dst, dst_desc, "ResolveSubresourceRegionDst");
-  ensure_external_resource_object_locked(src, src_desc, "ResolveSubresourceRegionSrc");
   remember_command_list_resources_locked(reinterpret_cast<ID3D12GraphicsCommandList *>(self), referenced_resources);
   std::ostringstream payload;
   payload << "{\"dst_resource_object_id\":" << object_id_json(lookup_object_id_locked(dst))
@@ -2261,13 +2209,10 @@ HRESULT STDMETHODCALLTYPE hook_fence_set_event_on_completion(ID3D12Fence *self, 
   }
   ScopedOriginalVTable<ID3D12Fence, ID3D12FenceVtbl> original_vtable(self, hook.vtable);
   const HRESULT hr = hook.set_event_on_completion(self, value, event);
-  remember_submitted_fence_alias(self);
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto fence_object_id = lookup_object_id_locked(self);
   std::ostringstream payload;
-  payload << "{\"fence_value\":" << value
-          << ",\"fence_object_id\":" << object_id_json(fence_object_id) << "}";
-  record_call_locked("ID3D12Fence::SetEventOnCompletion", hr, {self}, {}, payload.str(), {fence_object_id});
+  payload << "{\"fence_value\":" << value << "}";
+  record_call_locked("ID3D12Fence::SetEventOnCompletion", hr, {self}, {}, payload.str());
   return hr;
 }
 
@@ -2279,13 +2224,10 @@ HRESULT STDMETHODCALLTYPE hook_fence_signal(ID3D12Fence *self, UINT64 value)
   }
   ScopedOriginalVTable<ID3D12Fence, ID3D12FenceVtbl> original_vtable(self, hook.vtable);
   const HRESULT hr = hook.signal(self, value);
-  remember_submitted_fence_alias(self);
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto fence_object_id = lookup_object_id_locked(self);
   std::ostringstream payload;
-  payload << "{\"fence_value\":" << value
-          << ",\"fence_object_id\":" << object_id_json(fence_object_id) << "}";
-  record_call_locked("ID3D12Fence::Signal", hr, {self}, {}, payload.str(), {fence_object_id});
+  payload << "{\"fence_value\":" << value << "}";
+  record_call_locked("ID3D12Fence::Signal", hr, {self}, {}, payload.str());
   return hr;
 }
 
@@ -2297,13 +2239,10 @@ UINT64 STDMETHODCALLTYPE hook_fence_get_completed_value(ID3D12Fence *self)
   }
   ScopedOriginalVTable<ID3D12Fence, ID3D12FenceVtbl> original_vtable(self, hook.vtable);
   const UINT64 completed_value = hook.get_completed_value(self);
-  remember_submitted_fence_alias(self);
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  const auto fence_object_id = lookup_object_id_locked(self);
   std::ostringstream payload;
-  payload << "{\"completed_value\":" << completed_value
-          << ",\"fence_object_id\":" << object_id_json(fence_object_id) << "}";
-  record_call_locked("ID3D12Fence::GetCompletedValue", S_OK, {self}, {}, payload.str(), {fence_object_id});
+  payload << "{\"completed_value\":" << completed_value << "}";
+  record_call_locked("ID3D12Fence::GetCompletedValue", S_OK, {self}, {}, payload.str());
   return completed_value;
 }
 
