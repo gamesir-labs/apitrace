@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <dxgi1_6.h>
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -34,6 +35,8 @@ using RestoreD3D12QueueVTableFn = void *(WINAPI *)(void *);
 using RepatchD3D12QueueVTableFn = void(WINAPI *)(void *, void *);
 using SuspendAllD3D12VTablesFn = void *(WINAPI *)();
 using ResumeAllD3D12VTablesFn = void(WINAPI *)(void *);
+using RecordD3D12DxgiCreateSwapChainFn = void(WINAPI *)(IDXGIFactory *, IUnknown *, IDXGISwapChain *);
+using RecordD3D12PresentSemanticsFn = void(WINAPI *)(UINT, UINT, HRESULT);
 
 using FactoryCreateSwapChainFn =
     HRESULT(STDMETHODCALLTYPE *)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **);
@@ -128,6 +131,53 @@ bool env_flag_enabled(const char *name)
 bool dxgi_factory_scope_restore_disabled()
 {
   return false;
+}
+
+HMODULE loaded_d3d12_proxy()
+{
+  return GetModuleHandleA("d3d12.dll");
+}
+
+RecordD3D12DxgiCreateSwapChainFn d3d12_dxgi_create_swapchain_recorder()
+{
+  static RecordD3D12DxgiCreateSwapChainFn recorder = []() {
+    HMODULE d3d12 = loaded_d3d12_proxy();
+    return d3d12
+        ? reinterpret_cast<RecordD3D12DxgiCreateSwapChainFn>(
+              GetProcAddress(d3d12, "apitrace_d3d12_record_dxgi_create_swapchain"))
+        : nullptr;
+  }();
+  return recorder;
+}
+
+RecordD3D12PresentSemanticsFn d3d12_present_semantics_recorder()
+{
+  static RecordD3D12PresentSemanticsFn recorder = []() {
+    HMODULE d3d12 = loaded_d3d12_proxy();
+    return d3d12
+        ? reinterpret_cast<RecordD3D12PresentSemanticsFn>(
+              GetProcAddress(d3d12, "apitrace_d3d12_record_present_semantics"))
+        : nullptr;
+  }();
+  return recorder;
+}
+
+void record_dxgi_create_swapchain(IDXGIFactory *factory, IUnknown *device, IDXGISwapChain *swapchain)
+{
+  if (auto *recorder = d3d12_dxgi_create_swapchain_recorder()) {
+    recorder(factory, device, swapchain);
+    return;
+  }
+  apitrace::d3d12::record_dxgi_create_swapchain(factory, device, swapchain);
+}
+
+void record_dxgi_present(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags, HRESULT result)
+{
+  if (auto *recorder = d3d12_present_semantics_recorder()) {
+    recorder(sync_interval, flags, result);
+    return;
+  }
+  apitrace::d3d12::record_present(swapchain, sync_interval, flags, static_cast<std::int32_t>(result), SUCCEEDED(result));
 }
 
 constexpr GUID kIID_IDXGIFactory3 = {0x25483823, 0xcd46, 0x4c7d, {0x86, 0xca, 0x47, 0xaa, 0x95, 0xb8, 0x37, 0xbd}};
@@ -260,10 +310,39 @@ void *clone_vtable_bytes(const void *source, std::size_t size)
   return memory;
 }
 
-template <typename VTable>
-VTable *clone_vtable(const VTable *source, std::size_t size = sizeof(VTable))
+std::size_t readable_vtable_clone_size(const void *source, std::size_t minimum_size)
 {
-  return static_cast<VTable *>(clone_vtable_bytes(source, size));
+  constexpr std::size_t kExtraVTableSlots = 64;
+  constexpr std::size_t kExtraVTableBytes = kExtraVTableSlots * sizeof(void *);
+  if (!source) {
+    return minimum_size;
+  }
+  MEMORY_BASIC_INFORMATION info = {};
+  if (!VirtualQuery(source, &info, sizeof(info))) {
+    return minimum_size;
+  }
+  if (info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+    return minimum_size;
+  }
+  const auto *region_begin = static_cast<const unsigned char *>(info.BaseAddress);
+  const auto *region_end = region_begin + info.RegionSize;
+  const auto *vtable_begin = static_cast<const unsigned char *>(source);
+  if (vtable_begin < region_begin || vtable_begin >= region_end) {
+    return minimum_size;
+  }
+  const auto readable_bytes = static_cast<std::size_t>(region_end - vtable_begin);
+  const auto desired_size = minimum_size + kExtraVTableBytes;
+  return std::min(readable_bytes, desired_size);
+}
+
+template <typename VTable>
+VTable *clone_vtable(const VTable *source, std::size_t minimum_size = sizeof(VTable), std::size_t *actual_size = nullptr)
+{
+  const auto clone_size = readable_vtable_clone_size(source, minimum_size);
+  if (actual_size) {
+    *actual_size = clone_size;
+  }
+  return static_cast<VTable *>(clone_vtable_bytes(source, clone_size));
 }
 
 template <typename Interface, typename VTable>
@@ -528,7 +607,7 @@ HRESULT STDMETHODCALLTYPE hook_factory_create_swap_chain(
       swapchain ? *swapchain : nullptr);
   if (SUCCEEDED(hr) && swapchain && *swapchain) {
     patch_swapchain_interfaces(*swapchain);
-    apitrace::d3d12::record_dxgi_create_swapchain(factory, device, *swapchain);
+    record_dxgi_create_swapchain(factory, device, *swapchain);
   }
   return hr;
 }
@@ -553,7 +632,7 @@ HRESULT STDMETHODCALLTYPE hook_factory2_create_swap_chain(
       swapchain ? *swapchain : nullptr);
   if (SUCCEEDED(hr) && swapchain && *swapchain) {
     patch_swapchain_interfaces(*swapchain);
-    apitrace::d3d12::record_dxgi_create_swapchain(factory, device, *swapchain);
+    record_dxgi_create_swapchain(reinterpret_cast<IDXGIFactory *>(factory), device, *swapchain);
   }
   return hr;
 }
@@ -601,7 +680,7 @@ HRESULT STDMETHODCALLTYPE hook_factory2_create_swap_chain_for_hwnd(
     patch_swapchain1(
         *swapchain,
         supported_swapchain_vtable_size(reinterpret_cast<IDXGISwapChain *>(*swapchain), sizeof(IDXGISwapChain1Vtbl)));
-    apitrace::d3d12::record_dxgi_create_swapchain(factory, device, *swapchain);
+    record_dxgi_create_swapchain(reinterpret_cast<IDXGIFactory *>(factory), device, reinterpret_cast<IDXGISwapChain *>(*swapchain));
   }
   return hr;
 }
@@ -631,7 +710,7 @@ HRESULT STDMETHODCALLTYPE hook_factory2_create_swap_chain_for_core_window(
     patch_swapchain1(
         *swapchain,
         supported_swapchain_vtable_size(reinterpret_cast<IDXGISwapChain *>(*swapchain), sizeof(IDXGISwapChain1Vtbl)));
-    apitrace::d3d12::record_dxgi_create_swapchain(factory, device, *swapchain);
+    record_dxgi_create_swapchain(reinterpret_cast<IDXGIFactory *>(factory), device, reinterpret_cast<IDXGISwapChain *>(*swapchain));
   }
   return hr;
 }
@@ -660,7 +739,7 @@ HRESULT STDMETHODCALLTYPE hook_factory2_create_swap_chain_for_composition(
     patch_swapchain1(
         *swapchain,
         supported_swapchain_vtable_size(reinterpret_cast<IDXGISwapChain *>(*swapchain), sizeof(IDXGISwapChain1Vtbl)));
-    apitrace::d3d12::record_dxgi_create_swapchain(factory, device, *swapchain);
+    record_dxgi_create_swapchain(reinterpret_cast<IDXGIFactory *>(factory), device, reinterpret_cast<IDXGISwapChain *>(*swapchain));
   }
   return hr;
 }
@@ -673,7 +752,7 @@ HRESULT STDMETHODCALLTYPE hook_swapchain_present(IDXGISwapChain *swapchain, UINT
   }
   ScopedOriginalVTable<IDXGISwapChain, IDXGISwapChainVtbl> original(swapchain, hook.vtable);
   const HRESULT hr = hook.present(swapchain, sync_interval, flags);
-  apitrace::d3d12::record_present(swapchain, sync_interval, flags, static_cast<std::int32_t>(hr), SUCCEEDED(hr));
+  record_dxgi_present(swapchain, sync_interval, flags, hr);
   return hr;
 }
 
@@ -685,7 +764,7 @@ HRESULT STDMETHODCALLTYPE hook_swapchain1_present(IDXGISwapChain1 *swapchain, UI
   }
   ScopedOriginalVTable<IDXGISwapChain1, IDXGISwapChain1Vtbl> original(swapchain, hook.vtable);
   const HRESULT hr = hook.present(reinterpret_cast<IDXGISwapChain *>(swapchain), sync_interval, flags);
-  apitrace::d3d12::record_present(swapchain, sync_interval, flags, static_cast<std::int32_t>(hr), SUCCEEDED(hr));
+  record_dxgi_present(reinterpret_cast<IDXGISwapChain *>(swapchain), sync_interval, flags, hr);
   return hr;
 }
 
@@ -701,7 +780,7 @@ HRESULT STDMETHODCALLTYPE hook_swapchain1_present1(
   }
   ScopedOriginalVTable<IDXGISwapChain1, IDXGISwapChain1Vtbl> original(swapchain, hook.vtable);
   const HRESULT hr = hook.present1(swapchain, sync_interval, flags, present_parameters);
-  apitrace::d3d12::record_present(swapchain, sync_interval, flags, static_cast<std::int32_t>(hr), SUCCEEDED(hr));
+  record_dxgi_present(reinterpret_cast<IDXGISwapChain *>(swapchain), sync_interval, flags, hr);
   return hr;
 }
 
@@ -738,7 +817,8 @@ void patch_factory2(IDXGIFactory2 *factory, std::size_t vtable_size)
     return;
   }
   auto *original_vtable = factory->lpVtbl;
-  auto *vtable = clone_vtable(original_vtable, vtable_size);
+  std::size_t cloned_vtable_size = 0;
+  auto *vtable = clone_vtable(original_vtable, vtable_size, &cloned_vtable_size);
   if (!vtable) {
     return;
   }
@@ -764,11 +844,12 @@ void patch_factory2(IDXGIFactory2 *factory, std::size_t vtable_size)
       &IDXGIFactory2Vtbl::CreateSwapChainForComposition,
       hook_factory2_create_swap_chain_for_composition);
   proxy_debug_logf(
-      "patch_factory2 factory=%p original_vtable=%p patched_vtable=%p vtable_size=%zu",
+      "patch_factory2 factory=%p original_vtable=%p patched_vtable=%p vtable_size=%zu cloned_vtable_size=%zu",
       factory,
       original_vtable,
       vtable,
-      vtable_size);
+      vtable_size,
+      cloned_vtable_size);
 }
 
 void patch_factory_interfaces(void *factory)
@@ -829,7 +910,8 @@ void patch_swapchain1(IDXGISwapChain1 *swapchain, std::size_t vtable_size)
     return;
   }
   auto *original_vtable = swapchain->lpVtbl;
-  auto *vtable = clone_vtable(original_vtable, vtable_size);
+  std::size_t cloned_vtable_size = 0;
+  auto *vtable = clone_vtable(original_vtable, vtable_size, &cloned_vtable_size);
   if (!vtable) {
     return;
   }
@@ -845,11 +927,12 @@ void patch_swapchain1(IDXGISwapChain1 *swapchain, std::size_t vtable_size)
       reinterpret_cast<decltype(vtable->Present)>(hook_swapchain1_present));
   patch_vtable_field(vtable, &IDXGISwapChain1Vtbl::Present1, hook_swapchain1_present1);
   proxy_debug_logf(
-      "patch_swapchain1 swapchain=%p original_vtable=%p patched_vtable=%p vtable_size=%zu",
+      "patch_swapchain1 swapchain=%p original_vtable=%p patched_vtable=%p vtable_size=%zu cloned_vtable_size=%zu",
       swapchain,
       original_vtable,
       vtable,
-      vtable_size);
+      vtable_size,
+      cloned_vtable_size);
 }
 
 void patch_swapchain_interfaces(IDXGISwapChain *swapchain)

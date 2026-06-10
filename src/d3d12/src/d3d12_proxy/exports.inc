@@ -127,6 +127,21 @@ extern "C" void WINAPI apitrace_d3d12_record_descriptor_heap(
   record_call_locked("ID3D12Device::CreateDescriptorHeap", S_OK, {device, descriptor_heap}, {}, payload.str());
 }
 
+extern "C" void WINAPI apitrace_d3d12_record_dxgi_create_swapchain(
+    IDXGIFactory *factory,
+    IUnknown *device,
+    IDXGISwapChain *swap_chain)
+{
+  if (!swap_chain) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(capture_state().mutex);
+  const auto parent = lookup_object_id_locked(device);
+  register_object_locked(swap_chain, apitrace::trace::ObjectKind::SwapChain, "IDXGISwapChain", parent);
+  record_call_locked("IDXGIFactory::CreateSwapChain", S_OK, {factory, device, swap_chain}, {}, "{}");
+}
+
 extern "C" void WINAPI apitrace_d3d12_record_swapchain_back_buffer(
     ID3D12Device *device,
     IDXGISwapChain *swap_chain,
