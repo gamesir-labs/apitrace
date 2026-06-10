@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -18,6 +19,34 @@ using apitrace::trace::EventRecord;
 using apitrace::trace::ObjectId;
 using apitrace::trace::TraceBundleReader;
 using apitrace::trace::TraceBundleWriter;
+
+std::string read_text(const std::filesystem::path &path)
+{
+  std::ifstream input(path, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+}
+
+bool bundle_has_timing_stamps(const std::filesystem::path &bundle)
+{
+  const auto callstream = read_text(bundle / apitrace::trace::kCallstreamFileName);
+  if (callstream.find("\"time_origin_ns\":") == std::string::npos ||
+      callstream.find("\"monotonic_origin_ns\":") == std::string::npos ||
+      callstream.find("\"time_ns\":") == std::string::npos ||
+      callstream.find("\"elapsed_ns\":") == std::string::npos) {
+    return false;
+  }
+
+  TraceBundleReader reader;
+  if (!reader.open(bundle)) {
+    return false;
+  }
+  for (const auto &event : reader.events()) {
+    if (event.time_ns != 0 && event.elapsed_ns != 0) {
+      return true;
+    }
+  }
+  return false;
+}
 
 EventRecord call(
     std::uint64_t sequence,
@@ -253,6 +282,10 @@ int main(int argc, char **argv)
   const auto valid_bundle = work_dir / "valid-shader.apitrace";
   if (!write_shader_blob_ref_bundle(valid_bundle, false)) {
     std::cerr << "failed to write valid D3D11 bundle\n";
+    return 1;
+  }
+  if (!bundle_has_timing_stamps(valid_bundle)) {
+    std::cerr << "D3D11 writer/reader did not preserve timing stamps\n";
     return 1;
   }
   std::string error;

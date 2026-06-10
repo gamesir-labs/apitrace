@@ -51,6 +51,29 @@ std::uint64_t monotonic_nanoseconds()
           .count());
 }
 
+std::uint64_t wall_clock_nanoseconds()
+{
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+
+template <typename Event>
+void stamp_event_timing(Event &event, std::uint64_t monotonic_origin_ns)
+{
+  const auto now_monotonic_ns = monotonic_nanoseconds();
+  const auto now_wall_ns = wall_clock_nanoseconds();
+  if (event.time_ns == 0) {
+    event.time_ns = now_wall_ns;
+  }
+  if (event.elapsed_ns == 0) {
+    event.elapsed_ns = monotonic_origin_ns != 0 && now_monotonic_ns >= monotonic_origin_ns
+                           ? now_monotonic_ns - monotonic_origin_ns
+                           : 0;
+  }
+}
+
 void update_atomic_max(std::atomic_uint64_t &target, std::uint64_t value)
 {
   auto current = target.load(std::memory_order_relaxed);
@@ -998,6 +1021,8 @@ std::string event_record_json(const EventRecord &event)
   if (event.kind == EventKind::Boundary) {
     output << "{\"record_kind\":\"boundary\""
            << ",\"sequence\":" << event.callsite.sequence
+           << ",\"time_ns\":" << event.time_ns
+           << ",\"elapsed_ns\":" << event.elapsed_ns
            << ",\"boundary\":\"" << boundary_name(event.boundary) << "\""
            << ",\"payload\":" << normalize_payload(event.payload)
            << "}";
@@ -1010,6 +1035,8 @@ std::string event_record_json(const EventRecord &event)
                event.kind == EventKind::ObjectDestroy ? "object_destroy" : "resource_blob")
            << "\""
            << ",\"sequence\":" << event.callsite.sequence
+           << ",\"time_ns\":" << event.time_ns
+           << ",\"elapsed_ns\":" << event.elapsed_ns
            << ",\"object_id\":" << event.object_id
            << ",\"object_kind\":\"" << object_kind_name(event.object_kind) << "\""
            << ",\"parent_object_id\":" << event.parent_object_id
@@ -1027,6 +1054,8 @@ std::string event_record_json(const EventRecord &event)
 
   output << "{\"record_kind\":\"call\""
          << ",\"sequence\":" << event.callsite.sequence
+         << ",\"time_ns\":" << event.time_ns
+         << ",\"elapsed_ns\":" << event.elapsed_ns
          << ",\"function\":\"" << json_escape(event.callsite.function_name) << "\""
          << ",\"result_code\":" << event.callsite.result_code;
   if (!event.object_refs.empty()) {
@@ -3703,6 +3732,8 @@ std::string fast_fingerprint_bytes(const void *data, std::size_t size)
 struct TraceBundleWriter::Impl {
   BundleLayout layout;
   TraceMetadata metadata;
+  std::uint64_t time_origin_ns = 0;
+  std::uint64_t monotonic_origin_ns = 0;
   std::vector<EventRecord> events;
   std::vector<MetalEventRecord> metal_events;
   std::vector<AssetRecord> assets;
@@ -4811,6 +4842,8 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
 {
   impl_ = std::make_unique<Impl>();
   impl_->open_mode = mode;
+  impl_->time_origin_ns = wall_clock_nanoseconds();
+  impl_->monotonic_origin_ns = monotonic_nanoseconds();
   impl_->cache_events = env_flag_enabled("APITRACE_CACHE_EVENTS");
   impl_->inline_finalize = env_flag_enabled("APITRACE_INLINE_FINALIZE");
   impl_->async_callstream_serialize =
@@ -4930,6 +4963,8 @@ void TraceBundleWriter::write_metadata(const TraceMetadata &metadata)
        << ",\"api\":\"" << api_name(metadata.api) << "\""
        << ",\"producer\":\"" << json_escape(metadata.producer) << "\""
        << ",\"has_metal_callstream\":" << (metadata.has_metal_callstream ? "true" : "false")
+       << ",\"time_origin_ns\":" << impl_->time_origin_ns
+       << ",\"monotonic_origin_ns\":" << impl_->monotonic_origin_ns
        << ",\"entry_file\":\"" << kCallstreamFileName << "\""
        << "}";
   impl_->callstream_stream.write_line(line.str());
@@ -4944,6 +4979,7 @@ void TraceBundleWriter::append_call_event(const EventRecord &event)
 
 void TraceBundleWriter::append_call_event(EventRecord &&event)
 {
+  stamp_event_timing(event, impl_->monotonic_origin_ns);
   if (impl_->cache_events) {
     TimedWriterLock lock(impl_->event_mutex, impl_->writer_stats ? &impl_->event_lock_stats : nullptr);
     impl_->events.push_back(event);
@@ -4972,6 +5008,7 @@ void TraceBundleWriter::append_metal_event(const MetalEventRecord &event)
   TimedWriterPhase total_phase(impl_->writer_stats ? &impl_->metal_event_phase_total : nullptr);
   MetalEventRecord adjusted_event = event;
   adjusted_event.metal_sequence = impl_->remap_metal_sequence(adjusted_event.metal_sequence);
+  stamp_event_timing(adjusted_event, impl_->monotonic_origin_ns);
   if (impl_->cache_events) {
     TimedWriterLock lock(impl_->event_mutex, impl_->writer_stats ? &impl_->event_lock_stats : nullptr);
     impl_->metal_events.push_back(adjusted_event);

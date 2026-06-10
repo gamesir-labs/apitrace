@@ -232,6 +232,8 @@ std::string metal_event_record_json(const MetalEventRecord &event)
   std::ostringstream record;
   record << "{\"call_kind\":\"" << metal_call_kind_name(event.call_kind)
          << "\",\"metal_sequence\":" << event.metal_sequence
+         << ",\"time_ns\":" << event.time_ns
+         << ",\"elapsed_ns\":" << event.elapsed_ns
          << ",\"d3d_sequence\":" << event.d3d_sequence
          << ",\"frame_id\":" << event.frame_id
          << ",\"object_id\":" << event.object_id
@@ -310,6 +312,8 @@ bool parse_metal_callstream(
     }
 
     event.metal_sequence = record.value("metal_sequence", 0ull);
+    event.time_ns = record.value("time_ns", 0ull);
+    event.elapsed_ns = record.value("elapsed_ns", 0ull);
     event.d3d_sequence = record.value("d3d_sequence", 0ull);
     event.frame_id = record.value("frame_id", 0ull);
     event.object_id = record.value("object_id", 0ull);

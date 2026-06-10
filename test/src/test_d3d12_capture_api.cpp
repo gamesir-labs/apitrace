@@ -127,8 +127,10 @@ bool verify_raw_pipeline_capture(const std::filesystem::path &bundle)
   bool found_mesh_stream_pipeline = false;
   while (std::getline(input, line)) {
     const auto record = nlohmann::json::parse(line, nullptr, false);
-    if (record.is_discarded() ||
-        record.value("function", std::string()) != "ID3D12Device2::CreatePipelineState") {
+    if (record.is_discarded()) {
+      continue;
+    }
+    if (record.value("function", std::string()) != "ID3D12Device2::CreatePipelineState") {
       continue;
     }
     ++stream_pipeline_calls;

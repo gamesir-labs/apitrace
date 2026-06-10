@@ -37,6 +37,8 @@ struct Callsite {
 struct EventRecord {
   EventKind kind = EventKind::Call;
   Callsite callsite;
+  std::uint64_t time_ns = 0;
+  std::uint64_t elapsed_ns = 0;
   BoundaryKind boundary = BoundaryKind::Frame;
   std::vector<ObjectId> object_refs;
   std::vector<BlobId> blob_refs;

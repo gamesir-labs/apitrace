@@ -100,6 +100,8 @@ enum class MetalAssetKind {
 struct MetalEventRecord {
   MetalCallKind call_kind = MetalCallKind::Unknown;
   std::uint64_t metal_sequence = 0;
+  std::uint64_t time_ns = 0;
+  std::uint64_t elapsed_ns = 0;
   std::uint64_t d3d_sequence = 0;
   std::uint64_t frame_id = 0;
   std::uint64_t object_id = 0;

@@ -687,6 +687,8 @@ bool parse_event_record(
   if (record_kind == "call") {
     event.kind = EventKind::Call;
     event.callsite.sequence = record.value("sequence", 0ull);
+    event.time_ns = record.value("time_ns", 0ull);
+    event.elapsed_ns = record.value("elapsed_ns", 0ull);
     event.callsite.function_name = record.value("function", std::string());
     event.callsite.result_code = record.value("result_code", 0);
     if (event.callsite.sequence == 0 || event.callsite.function_name.empty()) {
@@ -731,6 +733,8 @@ bool parse_event_record(
                  record_kind == "object_destroy" ? EventKind::ObjectDestroy :
                                                    EventKind::ResourceBlob;
     event.callsite.sequence = record.value("sequence", 0ull);
+    event.time_ns = record.value("time_ns", 0ull);
+    event.elapsed_ns = record.value("elapsed_ns", 0ull);
     if (event.callsite.sequence == 0) {
       std::ostringstream message;
       message << file_label(callstream_path) << ": " << record_kind << " record missing sequence";
@@ -788,6 +792,8 @@ bool parse_event_record(
   if (record_kind == "boundary") {
     event.kind = EventKind::Boundary;
     event.callsite.sequence = record.value("sequence", 0ull);
+    event.time_ns = record.value("time_ns", 0ull);
+    event.elapsed_ns = record.value("elapsed_ns", 0ull);
     const auto boundary_name = record.value("boundary", std::string());
     const auto boundary_kind = boundary_kind_from_name(boundary_name);
     if (!boundary_kind.has_value()) {

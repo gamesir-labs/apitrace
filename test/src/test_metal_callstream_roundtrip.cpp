@@ -72,6 +72,8 @@ int main(int argc, char **argv)
     MetalEventRecord event;
     event.call_kind = kind;
     event.metal_sequence = sequence++;
+    event.time_ns = 1700000000000000000ull + event.metal_sequence;
+    event.elapsed_ns = 1000000ull * event.metal_sequence;
     event.d3d_sequence = 1000 + event.metal_sequence;
     event.frame_id = 7;
     event.object_id = 42;
@@ -101,6 +103,8 @@ int main(int argc, char **argv)
   for (std::size_t index = 0; index < kinds.size(); ++index) {
     if (!expect(parsed[index].call_kind == kinds[index], "call kind mismatch") ||
         !expect(parsed[index].metal_sequence == index + 1, "metal sequence mismatch") ||
+        !expect(parsed[index].time_ns == 1700000000000000001ull + index, "time ns mismatch") ||
+        !expect(parsed[index].elapsed_ns == 1000000ull * (index + 1), "elapsed ns mismatch") ||
         !expect(parsed[index].d3d_sequence == 1001 + index, "d3d sequence mismatch") ||
         !expect(parsed[index].object_id == 42, "object id mismatch") ||
         !expect(parsed[index].object_refs.size() == 2, "object refs mismatch") ||
