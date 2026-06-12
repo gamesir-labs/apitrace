@@ -5,6 +5,7 @@ ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 DXMT_REPO_ROOT="${APITRACE_DXMT_REPO_ROOT:-$(CDPATH= cd -- "$ROOT_DIR/../.." && pwd)}"
 ROOT_BUILD_DIR="${APITRACE_ROOT_BUILD_DIR:-$ROOT_DIR/build/cmake-native-d3d-abi}"
 DXMT_NATIVE_BUILD_DIR="${APITRACE_DXMT_NATIVE_BUILD_DIR:-$DXMT_REPO_ROOT/build-gs-native}"
+OSX_ARCHITECTURES="${APITRACE_NATIVE_D3D_OSX_ARCHITECTURES:-x86_64}"
 SMOKE_BIN="$ROOT_BUILD_DIR/test/abi-check/apitrace_native_d3d12_smoke"
 SMOKE_LOG="$ROOT_DIR/test/artifacts/d3d-native-abi/smoke.log"
 REQUIRE_NATIVE_ABI="${APITRACE_REQUIRE_D3D_NATIVE_ABI:-0}"
@@ -28,6 +29,7 @@ ensure_ninja_build_dir() {
 
 [ -d "$DXMT_NATIVE_BUILD_DIR" ] || fail "missing DXMT native build dir: $DXMT_NATIVE_BUILD_DIR"
 require_file "$DXMT_NATIVE_BUILD_DIR/src/nativemetal/winemetal.dylib"
+require_file "$DXMT_NATIVE_BUILD_DIR/src/nativemetal/winemetal4.dylib"
 require_file "$DXMT_NATIVE_BUILD_DIR/src/dxgi/dxgi.dylib"
 require_file "$DXMT_NATIVE_BUILD_DIR/src/d3d12/d3d12.dylib"
 
@@ -36,6 +38,7 @@ mkdir -p "$(dirname "$SMOKE_LOG")"
 
 cmake -S "$ROOT_DIR" -B "$ROOT_BUILD_DIR" -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_OSX_ARCHITECTURES="$OSX_ARCHITECTURES" \
   -DAPITRACE_BUILD_METAL_BACKEND=ON \
   -DAPITRACE_BUILD_D3D_NATIVE_RETRACE=ON \
   -DAPITRACE_DXMT_NATIVE_BUILD_DIR="$DXMT_NATIVE_BUILD_DIR"

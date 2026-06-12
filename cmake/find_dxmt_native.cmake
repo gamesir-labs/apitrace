@@ -10,6 +10,7 @@
 #   apitrace_dxmt::d3d11
 #   apitrace_dxmt::dxgi
 #   apitrace_dxmt::winemetal
+#   apitrace_dxmt::winemetal4
 #
 # Sets APITRACE_DXMT_NATIVE_FOUND to TRUE/FALSE.
 
@@ -29,8 +30,9 @@ set(_dxmt_d3d12   "${APITRACE_DXMT_NATIVE_BUILD_DIR}/src/d3d12/d3d12.dylib")
 set(_dxmt_d3d11   "${APITRACE_DXMT_NATIVE_BUILD_DIR}/src/d3d11/d3d11.dylib")
 set(_dxmt_dxgi    "${APITRACE_DXMT_NATIVE_BUILD_DIR}/src/dxgi/dxgi.dylib")
 set(_dxmt_winemtl "${APITRACE_DXMT_NATIVE_BUILD_DIR}/src/nativemetal/winemetal.dylib")
+set(_dxmt_winemtl4 "${APITRACE_DXMT_NATIVE_BUILD_DIR}/src/nativemetal/winemetal4.dylib")
 
-foreach(_p IN ITEMS "${_dxmt_d3d12}" "${_dxmt_d3d11}" "${_dxmt_dxgi}" "${_dxmt_winemtl}")
+foreach(_p IN ITEMS "${_dxmt_d3d12}" "${_dxmt_d3d11}" "${_dxmt_dxgi}" "${_dxmt_winemtl}" "${_dxmt_winemtl4}")
     if(NOT EXISTS "${_p}")
         message(WARNING "apitrace: required DXMT dylib not found: ${_p}")
         return()
@@ -51,6 +53,7 @@ _apitrace_add_dxmt_lib(d3d12    "${_dxmt_d3d12}")
 _apitrace_add_dxmt_lib(d3d11    "${_dxmt_d3d11}")
 _apitrace_add_dxmt_lib(dxgi     "${_dxmt_dxgi}")
 _apitrace_add_dxmt_lib(winemetal "${_dxmt_winemtl}")
+_apitrace_add_dxmt_lib(winemetal4 "${_dxmt_winemtl4}")
 
 set(APITRACE_DXMT_NATIVE_FOUND TRUE)
 message(STATUS "apitrace: DXMT native build dir = ${APITRACE_DXMT_NATIVE_BUILD_DIR}")

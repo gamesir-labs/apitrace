@@ -62,6 +62,20 @@ std::uint32_t env_u32(const char *name, std::uint32_t fallback = 0)
   return static_cast<std::uint32_t>(parsed);
 }
 
+std::uint64_t env_u64(const char *name, std::uint64_t fallback = 0)
+{
+  const char *value = std::getenv(name);
+  if (!value || !*value) {
+    return fallback;
+  }
+  char *end = nullptr;
+  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  if (end == value || *end != '\0' || parsed > std::numeric_limits<std::uint64_t>::max()) {
+    return fallback;
+  }
+  return static_cast<std::uint64_t>(parsed);
+}
+
 #if defined(APITRACE_HAS_D3D_NATIVE)
 
 template <typename T>

@@ -1375,6 +1375,9 @@ private:
         queue_->ExecuteCommandLists(static_cast<UINT>(native_lists.size()), native_lists.data());
         wait_for_gpu();
       }
+      if (replay_stop_after_sequence_ != 0 && batch.execute_sequence >= replay_stop_after_sequence_) {
+        break;
+      }
       if (batch.presented) {
         UINT sync_interval = 1;
         UINT flags = 0;
@@ -1407,6 +1410,9 @@ private:
         if (!pump_messages()) {
           return fail(error, "replay window closed");
         }
+        if (replay_stop_after_present_frame_ != 0 && present_frame_index >= replay_stop_after_present_frame_) {
+          break;
+        }
       }
     }
     return true;
@@ -1424,7 +1430,11 @@ private:
     }
   }
 
-  bool capture_present_frame(std::uint64_t frame_index, UINT sync_interval, UINT flags, std::string &error)
+  bool capture_present_frame(
+      std::uint64_t frame_index,
+      UINT sync_interval,
+      UINT flags,
+      std::string &error)
   {
     if (!d3d12_retrace_present_frame_capture_enabled()) {
       return true;
@@ -3389,6 +3399,8 @@ private:
   const D3D12ReplayBackend &backend_;
   HWND hwnd_ = nullptr;
   UINT present_delay_ms_ = static_cast<UINT>(env_u32("APITRACE_D3D12_RETRACE_PRESENT_DELAY_MS"));
+  std::uint64_t replay_stop_after_present_frame_ = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME");
+  std::uint64_t replay_stop_after_sequence_ = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE");
   UINT64 fence_value_ = 0;
 #ifdef _WIN32
   HANDLE fence_event_ = nullptr;

@@ -13,6 +13,7 @@ target_compile_definitions(apitrace_native_d3d12_smoke PRIVATE
 # linking against them too gives more useful error messages early.
 target_link_libraries(apitrace_native_d3d12_smoke PRIVATE
     apitrace_dxmt::winemetal
+    apitrace_dxmt::winemetal4
     apitrace_dxmt::dxgi
     apitrace_dxmt::d3d12
 )

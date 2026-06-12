@@ -2,10 +2,10 @@
 //
 // Goal: prove that the vendored mingw-w64 standalone headers under
 // third_party/d3d-headers/ are ABI-compatible with the DXMT-built
-// d3d12.dylib / dxgi.dylib / winemetal.dylib. Loads the libraries via dlopen,
-// resolves D3D12CreateDevice and CreateDXGIFactory1, instantiates a device,
-// and queries one of the larger D3D12_FEATURE structs whose size is part of
-// the ABI contract.
+// d3d12.dylib / dxgi.dylib / winemetal*.dylib. Loads the libraries via
+// dlopen, resolves D3D12CreateDevice and CreateDXGIFactory1, instantiates a
+// device, and queries one of the larger D3D12_FEATURE structs whose size is
+// part of the ABI contract.
 //
 // Exit code 0 + stdout containing "ABI_SMOKE_OK" → success.
 
@@ -49,15 +49,18 @@ int main(int argc, char **argv)
 
     const std::string root = argv[1];
     const std::string winemetal_path = root + "/src/nativemetal/winemetal.dylib";
+    const std::string winemetal4_path = root + "/src/nativemetal/winemetal4.dylib";
     const std::string dxgi_path      = root + "/src/dxgi/dxgi.dylib";
     const std::string d3d12_path     = root + "/src/d3d12/d3d12.dylib";
 
     void *h_winemetal = load(winemetal_path.c_str());
     if (!h_winemetal) return 3;
+    void *h_winemetal4 = load(winemetal4_path.c_str());
+    if (!h_winemetal4) return 4;
     void *h_dxgi = load(dxgi_path.c_str());
-    if (!h_dxgi) return 4;
+    if (!h_dxgi) return 5;
     void *h_d3d12 = load(d3d12_path.c_str());
-    if (!h_d3d12) return 5;
+    if (!h_d3d12) return 6;
 
     using PFN_D3D12CreateDevice_t = HRESULT (WINAPI *)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
     using PFN_CreateDXGIFactory1_t = HRESULT (WINAPI *)(REFIID, void **);
@@ -87,10 +90,14 @@ int main(int argc, char **argv)
     using PFN_NSArrayCount_t = std::uint64_t (*)(void *);
     auto p_WMTCopyAllDevices = resolve<PFN_WMTCopyAllDevices_t>(h_winemetal, "WMTCopyAllDevices");
     auto p_NSArray_count = resolve<PFN_NSArrayCount_t>(h_winemetal, "NSArray_count");
+    auto p_WMT4CopyAllDevices = resolve<PFN_WMTCopyAllDevices_t>(h_winemetal4, "WMTCopyAllDevices");
     void *wmt_devices = p_WMTCopyAllDevices ? p_WMTCopyAllDevices() : nullptr;
     std::uint64_t wmt_count = (p_NSArray_count && wmt_devices) ? p_NSArray_count(wmt_devices) : 0;
-    std::fprintf(stderr, "[abi-smoke] WMTCopyAllDevices=%p NSArray_count=%llu\n",
-                 wmt_devices, static_cast<unsigned long long>(wmt_count));
+    void *wmt4_devices = p_WMT4CopyAllDevices ? p_WMT4CopyAllDevices() : nullptr;
+    std::uint64_t wmt4_count = (p_NSArray_count && wmt4_devices) ? p_NSArray_count(wmt4_devices) : 0;
+    std::fprintf(stderr, "[abi-smoke] WMTCopyAllDevices=%p NSArray_count=%llu WMT4CopyAllDevices=%p WMT4Count=%llu\n",
+                 wmt_devices, static_cast<unsigned long long>(wmt_count),
+                 wmt4_devices, static_cast<unsigned long long>(wmt4_count));
 #endif
 
     IDXGIFactory1 *factory = nullptr;
