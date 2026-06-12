@@ -96,6 +96,11 @@ Present boundary、FrameBegin / FrameEnd、`sync_interval`、`flags` 和 `frame_
   和 bug 诊断
 - `APITRACE_D3D12_RETRACE_PRESENT_DELAY_MS` 只用于人工观察窗口播放，默认值为 `0`；它不是 trace
   输入语义，也不参与逐帧像素对比验收
+- D3D12 retrace 范围控制只能限制 replay 何时停止，不能跳过前序 command stream。调试某个目标帧时，
+  仍然必须从 trace 开头重建资源、descriptor、pipeline、command list 和 submission，再在达到
+  `APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME` 或
+  `APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE` 后停止。不要加入 capture-time frame-range 过滤，
+  因为丢失前序命令会破坏资源状态和 replay 语义。
 
 默认 D3D12 retrace 会按收集到的语义重建 replay-side device、swapchain back buffer、resource、
 descriptor heap、root signature、PSO、command signature 和 command list，然后按
