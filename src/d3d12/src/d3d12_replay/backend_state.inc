@@ -671,6 +671,36 @@ bool D3D12ReplayBackend::validate_frame_boundaries(const trace::TraceBundleReade
     ++frame_end_index;
   }
 
+  if (reader.prefix_limited()) {
+    if (frame_begin_index == frame_end_index &&
+        frame_begin_index == present_semantics_.size() &&
+        open_frames.empty() &&
+        presented_frames.empty()) {
+      return true;
+    }
+    if (open_frames.size() == 1 && frame_begin_index == frame_end_index + 1) {
+      const auto tail_frame_index = open_frames.begin()->first;
+      const auto frame_it = frame_semantics_.find(tail_frame_index);
+      const bool valid_tail_frame =
+          frame_it != frame_semantics_.end() &&
+          tail_frame_index == frame_end_index &&
+          frame_it->second.has_begin &&
+          !frame_it->second.has_end;
+      bool valid_tail_present = false;
+      if (valid_tail_frame) {
+        valid_tail_present =
+            (!frame_it->second.has_present && presented_frames.empty() &&
+             present_semantics_.size() == frame_end_index) ||
+            (frame_it->second.has_present && presented_frames.size() == 1 &&
+             presented_frames.find(tail_frame_index) != presented_frames.end() &&
+             present_semantics_.size() == frame_begin_index);
+      }
+      if (valid_tail_frame && valid_tail_present) {
+        return true;
+      }
+    }
+  }
+
   if (frame_begin_index != frame_end_index) {
     last_error_ = "D3D12 frame boundary count does not match";
     return false;

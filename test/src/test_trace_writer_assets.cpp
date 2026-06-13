@@ -1505,6 +1505,53 @@ int main(int argc, char **argv)
     return 1;
   }
 
+  const auto corrupt_metal_sideband_bundle =
+      bundle.parent_path() / (bundle.filename().generic_string() + "-corrupt-metal-sideband");
+  std::filesystem::remove_all(corrupt_metal_sideband_bundle);
+  std::filesystem::copy(bundle, corrupt_metal_sideband_bundle, std::filesystem::copy_options::recursive);
+  {
+    std::ofstream output(
+        corrupt_metal_sideband_bundle / "metal-callstream.jsonl",
+        std::ios::binary | std::ios::trunc);
+    output << "{not valid json";
+  }
+  if (!refresh_checksum_entry(corrupt_metal_sideband_bundle, "metal-callstream.jsonl") ||
+      !refresh_bundle_hash(corrupt_metal_sideband_bundle)) {
+    std::cerr << "failed to refresh corrupt-metal-sideband checksums\n";
+    return 1;
+  }
+  apitrace::trace::TraceBundleReader strict_sideband_reader;
+  if (strict_sideband_reader.open(corrupt_metal_sideband_bundle)) {
+    std::cerr << "strict reader should reject malformed Metal sideband\n";
+    return 1;
+  }
+  apitrace::trace::TraceBundleReader light_sideband_reader;
+  apitrace::trace::TraceBundleReader::OpenOptions light_sideband_options;
+  light_sideband_options.load_metal_sideband = false;
+  if (!light_sideband_reader.open(corrupt_metal_sideband_bundle, light_sideband_options)) {
+    std::cerr << "light reader should ignore unused malformed Metal sideband: "
+              << light_sideband_reader.last_error() << "\n";
+    return 1;
+  }
+  if (!light_sideband_reader.metadata().has_metal_callstream ||
+      !light_sideband_reader.metal_events().empty()) {
+    std::cerr << "light reader should preserve Metal sideband presence without parsing events\n";
+    return 1;
+  }
+  apitrace::trace::TraceBundleReader prefix_reader;
+  auto prefix_options = light_sideband_options;
+  prefix_options.stop_after_sequence = 1;
+  if (!prefix_reader.open(corrupt_metal_sideband_bundle, prefix_options)) {
+    std::cerr << "prefix reader should open with stop-after-sequence: "
+              << prefix_reader.last_error() << "\n";
+    return 1;
+  }
+  if (prefix_reader.events().empty() ||
+      prefix_reader.events().back().callsite.sequence != 1) {
+    std::cerr << "prefix reader should stop at the requested sequence\n";
+    return 1;
+  }
+
 	  const auto callstream = read_text(bundle / "callstream.jsonl");
 	  const auto metal_callstream = read_text(bundle / "metal-callstream.jsonl");
 	  const auto pipeline_json = read_text(bundle / pipeline_reader_path);

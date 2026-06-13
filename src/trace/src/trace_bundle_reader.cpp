@@ -670,6 +670,22 @@ bool parse_bundle_header(
   return true;
 }
 
+std::uint64_t json_u64_field(const json &value, const char *name, std::uint64_t fallback = 0)
+{
+  const auto it = value.find(name);
+  if (it == value.end()) {
+    return fallback;
+  }
+  if (it->is_number_unsigned()) {
+    return it->get<std::uint64_t>();
+  }
+  if (it->is_number_integer()) {
+    const auto signed_value = it->get<std::int64_t>();
+    return signed_value < 0 ? fallback : static_cast<std::uint64_t>(signed_value);
+  }
+  return fallback;
+}
+
 bool parse_event_record(
     const json &record,
     const std::filesystem::path &callstream_path,
@@ -954,6 +970,7 @@ struct TraceBundleReader::Impl {
   std::unordered_set<std::string> validated_checksum_paths;
   std::string last_error;
   bool has_asset_index = false;
+  bool prefix_limited = false;
   bool open = false;
 
   // TODO: track reader phases explicitly so validation, parsing, and asset discovery can fail independently.
@@ -965,6 +982,11 @@ TraceBundleReader::TraceBundleReader() : impl_(std::make_unique<Impl>()) {}
 TraceBundleReader::~TraceBundleReader() = default;
 
 bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
+{
+  return open(bundle_root, OpenOptions{});
+}
+
+bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const OpenOptions &options)
 {
   impl_ = std::make_unique<Impl>();
   impl_->layout.root_path = bundle_root;
@@ -1024,8 +1046,14 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
       checksum_byte_limit(std::filesystem::path(kMetalCallstreamFileName));
   const auto callstream_byte_limit =
       checksum_byte_limit(std::filesystem::path(kCallstreamFileName));
+  const bool prefix_limited =
+      options.stop_after_sequence != 0 ||
+      options.stop_after_present_frame != 0;
+  impl_->prefix_limited = prefix_limited;
 
-  if (std::filesystem::is_regular_file(impl_->layout.metal_callstream_path) &&
+  const bool has_metal_callstream_file = std::filesystem::is_regular_file(impl_->layout.metal_callstream_path);
+
+  if (options.load_metal_sideband && has_metal_callstream_file &&
       !detail::parse_metal_callstream(
           impl_->layout.metal_callstream_path,
           impl_->metal_events,
@@ -1044,6 +1072,8 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
   std::unordered_map<std::string, std::size_t> metal_asset_indices_by_path;
   std::unordered_set<std::string> asset_blob_keys;
   std::unordered_set<std::string> metal_asset_blob_keys;
+  std::unordered_set<std::string> referenced_asset_paths;
+  std::unordered_set<std::string> referenced_metal_asset_paths;
   for (std::size_t index = 0; index < impl_->assets.size(); ++index) {
     asset_indices_by_path.emplace(impl_->assets[index].relative_path.generic_string(), index);
     asset_blob_keys.insert(impl_->assets[index].relative_path.generic_string() + "#" + std::to_string(impl_->assets[index].blob_id));
@@ -1079,7 +1109,9 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
 	    auto &indices_by_path = metal ? metal_asset_indices_by_path : asset_indices_by_path;
 	    auto &blob_keys = metal ? metal_asset_blob_keys : asset_blob_keys;
 	    auto &asset_list = metal ? impl_->metal_assets : impl_->assets;
+	    auto &referenced_paths = metal ? referenced_metal_asset_paths : referenced_asset_paths;
 	    const auto key = asset.relative_path.generic_string();
+	    referenced_paths.insert(key);
 	    const auto blob_key = key + "#" + std::to_string(blob_id);
     if (blob_id != 0 && !blob_keys.insert(blob_key).second) {
       return true;
@@ -1145,7 +1177,7 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
     return true;
   };
 
-  if (std::filesystem::is_regular_file(impl_->layout.metal_callstream_path)) {
+  if (options.load_metal_sideband && has_metal_callstream_file) {
     std::ifstream metal_input(impl_->layout.metal_callstream_path);
     std::string metal_line;
     std::uint64_t consumed_metal_callstream_bytes = 0;
@@ -1226,13 +1258,26 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
     if (!register_referenced_assets(record, event.blob_refs)) {
       return false;
     }
+
+    if (options.stop_after_sequence != 0 &&
+        event.callsite.sequence >= options.stop_after_sequence) {
+      break;
+    }
+
+    if (options.stop_after_present_frame != 0 &&
+        event.kind == EventKind::Boundary &&
+        event.boundary == BoundaryKind::Present &&
+        json_u64_field(payload, "frame_index", std::numeric_limits<std::uint64_t>::max()) >=
+            options.stop_after_present_frame) {
+      break;
+    }
   }
 
   if (!header_seen) {
     impl_->last_error = file_label(impl_->layout.callstream_path) + ": missing bundle_header";
     return false;
   }
-  if (!impl_->metal_events.empty()) {
+  if (has_metal_callstream_file) {
     impl_->metadata.has_metal_callstream = true;
   }
 
@@ -1243,6 +1288,9 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
         std::filesystem::path(kObjectsDirectoryName) / kObjectIndexFileName,
         std::filesystem::path(kAssetIndexFileName)}) {
     if (required_relative_path == kAssetIndexFileName && !std::filesystem::is_regular_file(impl_->layout.asset_index_path)) {
+      continue;
+    }
+    if (prefix_limited && required_relative_path == kCallstreamFileName) {
       continue;
     }
     if (!validate_checksum_entry(
@@ -1257,6 +1305,9 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
   }
 
   for (const auto &asset : impl_->assets) {
+    if (prefix_limited && referenced_asset_paths.find(asset.relative_path.generic_string()) == referenced_asset_paths.end()) {
+      continue;
+    }
     if (!validate_asset_index_record(
             impl_->layout.root_path,
             asset,
@@ -1276,7 +1327,8 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
     }
   }
 
-  for (const auto &entry : impl_->checksums.files) {
+  if (options.load_metal_sideband) {
+    for (const auto &entry : impl_->checksums.files) {
     MetalAssetKind metal_kind = MetalAssetKind::Library;
     if (!detail::is_metal_asset_path(entry.relative_path, &metal_kind)) {
       continue;
@@ -1290,8 +1342,9 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
       impl_->metal_assets.push_back(std::move(asset));
     }
   }
+  }
 
-  if (std::filesystem::is_regular_file(impl_->layout.metal_callstream_path) &&
+  if (options.load_metal_sideband && has_metal_callstream_file &&
       !validate_checksum_entry(
           impl_->layout.root_path,
           std::filesystem::path(kMetalCallstreamFileName),
@@ -1303,6 +1356,9 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root)
   }
 
   for (const auto &asset : impl_->metal_assets) {
+    if (prefix_limited && referenced_metal_asset_paths.find(asset.relative_path.generic_string()) == referenced_metal_asset_paths.end()) {
+      continue;
+    }
     if (!validate_asset_index_record(
             impl_->layout.root_path,
             asset,
@@ -1386,6 +1442,11 @@ const std::unordered_set<std::string> &TraceBundleReader::validated_checksum_pat
 bool TraceBundleReader::has_asset_index() const noexcept
 {
   return impl_ && impl_->has_asset_index;
+}
+
+bool TraceBundleReader::prefix_limited() const noexcept
+{
+  return impl_ && impl_->prefix_limited;
 }
 
 const std::string &TraceBundleReader::last_error() const noexcept

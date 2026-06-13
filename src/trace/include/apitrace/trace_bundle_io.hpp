@@ -8,6 +8,7 @@
 #include "apitrace/metal_event_types.hpp"
 #include "apitrace/object_types.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -70,10 +71,17 @@ private:
 
 class TraceBundleReader {
 public:
+  struct OpenOptions {
+    bool load_metal_sideband = true;
+    std::uint64_t stop_after_sequence = 0;
+    std::uint64_t stop_after_present_frame = 0;
+  };
+
   TraceBundleReader();
   ~TraceBundleReader();
 
   bool open(const std::filesystem::path &bundle_root);
+  bool open(const std::filesystem::path &bundle_root, const OpenOptions &options);
   void close();
 
   bool is_open() const noexcept;
@@ -87,6 +95,7 @@ public:
   const ChecksumIndex &checksums() const noexcept;
   const std::unordered_set<std::string> &validated_checksum_paths() const noexcept;
   bool has_asset_index() const noexcept;
+  bool prefix_limited() const noexcept;
   const std::string &last_error() const noexcept;
 
 private:

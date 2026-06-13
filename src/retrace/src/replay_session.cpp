@@ -8,8 +8,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -58,6 +60,20 @@ bool path_is_safe(const std::filesystem::path &path)
     }
   }
   return true;
+}
+
+std::uint64_t env_u64(const char *name, std::uint64_t fallback = 0)
+{
+  const char *value = std::getenv(name);
+  if (!value || !*value) {
+    return fallback;
+  }
+  char *end = nullptr;
+  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  if (end == value || *end != '\0' || parsed > std::numeric_limits<std::uint64_t>::max()) {
+    return fallback;
+  }
+  return static_cast<std::uint64_t>(parsed);
 }
 
 bool is_api_specific_resource_path(const std::filesystem::path &path)
@@ -2218,7 +2234,13 @@ bool ReplaySession::run()
     return false;
   }
 
-  if (!impl_->reader.open(impl_->options.bundle_root)) {
+  trace::TraceBundleReader::OpenOptions reader_options;
+  reader_options.load_metal_sideband = impl_->options.enable_metal_retrace;
+  if (!impl_->options.enable_metal_retrace && impl_->options.backend == BackendKind::NativeD3D12) {
+    reader_options.stop_after_sequence = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE");
+    reader_options.stop_after_present_frame = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME");
+  }
+  if (!impl_->reader.open(impl_->options.bundle_root, reader_options)) {
     impl_->last_error = impl_->reader.last_error().empty() ? "failed to open trace bundle" : impl_->reader.last_error();
     return false;
   }
