@@ -380,6 +380,7 @@ HRESULT STDMETHODCALLTYPE hook_device_create_placed_resource(
   if (SUCCEEDED(hr) && resource && *resource) {
     {
       std::lock_guard<std::mutex> lock(capture_state().mutex);
+      ensure_placed_resource_heap_object_locked(self, heap);
       const auto heap_object_id = lookup_object_id_locked(heap);
       const auto resource_object_id = register_fresh_object_locked(
           *resource,

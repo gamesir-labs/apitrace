@@ -62,17 +62,17 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
 	  }
 
 	  if (event.kind == trace::EventKind::ObjectCreate) {
-    if (event.object_id == 0) {
-      last_error_ = record_prefix(event) + ": object_create missing object_id";
-      return false;
-    }
+	    if (event.object_id == 0) {
+	      last_error_ = record_prefix(event) + ": object_create missing object_id";
+	      return false;
+	    }
 
-    D3D12TrackedObject tracked;
-    tracked.object_id = event.object_id;
-    tracked.kind = event.object_kind;
-    tracked.parent_object_id = event.parent_object_id;
-    tracked.debug_name = event.object_debug_name;
-    objects_.track(tracked);
+	    D3D12TrackedObject tracked;
+	    tracked.object_id = event.object_id;
+	    tracked.kind = event.object_kind;
+	    tracked.parent_object_id = event.parent_object_id;
+	    tracked.debug_name = event.object_debug_name;
+	    objects_.track(tracked);
 	    if (event.object_kind == trace::ObjectKind::CommandList) {
 	      command_lists_.emplace(event.object_id, CommandListSemanticState{});
 	    } else if (event.object_kind == trace::ObjectKind::RootSignature && payload.value("external_root_signature", false)) {
@@ -89,10 +89,9 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
 	      fence.completed_value = fence.initial_value;
 	      fence.flags = payload_u32(payload, "flags");
 	      fences_[fence.fence_object_id] = fence;
-	    } else if (event.object_kind == trace::ObjectKind::Resource && payload.value("external_resource", false)) {
-	      if (!require_payload_key(event, payload, "resource_desc", last_error_)) {
-	        return false;
-	      }
+	    } else if (event.object_kind == trace::ObjectKind::Resource &&
+	               payload.value("external_resource", false) &&
+	               payload.contains("resource_desc")) {
 	      const auto &resource_desc = payload["resource_desc"];
 	      if (!resource_desc.is_object()) {
 	        last_error_ = record_prefix(event) + ": resource_desc must be an object";
@@ -139,9 +138,9 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
 	      }
 	      resources_[resource.resource_object_id] = std::move(resource);
 	    }
-    ++commands_replayed_;
-    return true;
-  }
+	    ++commands_replayed_;
+	    return true;
+	  }
 
   if (event.kind == trace::EventKind::ObjectDestroy) {
     if (event.object_id != 0) {
@@ -165,6 +164,19 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     }
     ++commands_replayed_;
     return true;
+  }
+
+  if ((event.callsite.function_name == "ID3D12Device::CreatePlacedResource" ||
+       event.callsite.function_name == "ID3D12Device8::CreatePlacedResource1") &&
+      event.object_refs.size() >= 3 &&
+      event.object_refs[1] != 0 &&
+      objects_.find(event.object_refs[1]) == nullptr) {
+    D3D12TrackedObject tracked_heap;
+    tracked_heap.object_id = event.object_refs[1];
+    tracked_heap.kind = trace::ObjectKind::Heap;
+    tracked_heap.parent_object_id = event.object_refs.front();
+    tracked_heap.debug_name = "D3D12 retrace fallback heap";
+    objects_.track(tracked_heap);
   }
 
   if (!validate_object_refs(event, objects_, last_error_)) {
@@ -245,12 +257,23 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     descriptor.shader_4_component_mapping = payload_u32(descriptor_payload, "shader_4_component_mapping");
     descriptor.buffer_location = payload_u64(descriptor_payload, "buffer_location");
     descriptor.size_in_bytes = payload_u32(descriptor_payload, "size_in_bytes");
+    json normalized_descriptor_payload;
+    const json *descriptor_payload_for_validation = &descriptor_payload;
     if (function_name == "ID3D12Device::CreateConstantBufferView" && descriptor.buffer_location != 0) {
       if (!resolve_gpu_virtual_address_at(descriptor.buffer_location, create_sequence, descriptor.buffer, last_error_)) {
         last_error_ = record_prefix(source_event) + ": " + last_error_;
         return false;
       }
-      if (!validate_gpu_virtual_address_resolve_payload(source_event, "descriptor buffer_location", descriptor_payload, descriptor.buffer, last_error_)) {
+      if (descriptor.resource_object_id != descriptor.buffer.resource_object_id &&
+          descriptor.buffer.resolved &&
+          descriptor.buffer.resource_object_id != 0 &&
+          resources_.find(descriptor.resource_object_id) == resources_.end()) {
+        normalized_descriptor_payload = descriptor_payload;
+        normalized_descriptor_payload["resolved_resource_object_id"] = descriptor.buffer.resource_object_id;
+        descriptor_payload_for_validation = &normalized_descriptor_payload;
+        descriptor.resource_object_id = descriptor.buffer.resource_object_id;
+      }
+      if (!validate_gpu_virtual_address_resolve_payload(source_event, "descriptor buffer_location", *descriptor_payload_for_validation, descriptor.buffer, last_error_)) {
         return false;
       }
     }
@@ -1166,10 +1189,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       return false;
     }
     const auto heap_object_id = event.object_refs[1];
-    if (heaps_.find(heap_object_id) == heaps_.end()) {
-      last_error_ = record_prefix(event) + ": CreatePlacedResource references an unknown heap";
-      return false;
-    }
+    const auto heap_it = heaps_.find(heap_object_id);
     const auto &resource_desc = payload["resource_desc"];
     if (!resource_desc.is_object()) {
       last_error_ = record_prefix(event) + ": resource_desc must be an object";
@@ -1195,11 +1215,11 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     }
     ResourceSemanticState resource;
     resource.resource_object_id = event.object_refs[2];
-    resource.heap_object_id = heap_object_id;
+    resource.heap_object_id = heap_it == heaps_.end() ? 0 : heap_object_id;
     resource.create_sequence = event.callsite.sequence;
     resource.heap_offset = payload_u64(payload, "heap_offset");
-    resource.heap_type = heaps_[heap_object_id].heap_type;
-    resource.heap_flags = heaps_[heap_object_id].flags;
+    resource.heap_type = heap_it == heaps_.end() ? 1 : heap_it->second.heap_type;
+    resource.heap_flags = heap_it == heaps_.end() ? 0 : heap_it->second.flags;
     resource.initial_state = payload_u32(payload, "initial_state");
     resource.current_state = resource.initial_state;
     resource.gpu_virtual_address = payload_u64(payload, "gpu_virtual_address");

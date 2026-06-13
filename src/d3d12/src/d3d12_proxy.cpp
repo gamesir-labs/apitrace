@@ -1867,6 +1867,13 @@ apitrace::trace::ObjectId register_fresh_object_locked(
   return register_object_locked(object, kind, std::move(debug_name), parent_object_id);
 }
 
+bool object_kind_known_locked(const void *object, apitrace::trace::ObjectKind kind)
+{
+  const auto &state = capture_state();
+  const auto it = state.objects.find(object);
+  return it != state.objects.end() && it->second.kind == kind;
+}
+
 void remember_resource_capture_info_locked(
     ID3D12Resource *resource,
     apitrace::trace::ObjectId object_id,
@@ -2136,6 +2143,29 @@ D3D12_HEAP_DESC heap_desc(ID3D12Heap *heap)
 #else
   return heap->lpVtbl->GetDesc(heap);
 #endif
+}
+
+void ensure_placed_resource_heap_object_locked(ID3D12Device *device, ID3D12Heap *heap)
+{
+  if (!heap || object_kind_known_locked(heap, apitrace::trace::ObjectKind::Heap)) {
+    return;
+  }
+
+  const auto parent = lookup_object_id_locked(device);
+  register_fresh_object_locked(heap, apitrace::trace::ObjectKind::Heap, "ID3D12Heap", parent);
+  const D3D12_HEAP_DESC desc = heap_desc(heap);
+  capture_state().heap_types[heap] = static_cast<UINT>(desc.Properties.Type);
+  std::ostringstream payload;
+  payload << "{\"size_in_bytes\":" << desc.SizeInBytes
+          << ",\"alignment\":" << desc.Alignment
+          << ",\"heap_type\":" << static_cast<unsigned int>(desc.Properties.Type)
+          << ",\"cpu_page_property\":" << static_cast<unsigned int>(desc.Properties.CPUPageProperty)
+          << ",\"memory_pool_preference\":" << static_cast<unsigned int>(desc.Properties.MemoryPoolPreference)
+          << ",\"creation_node_mask\":" << desc.Properties.CreationNodeMask
+          << ",\"visible_node_mask\":" << desc.Properties.VisibleNodeMask
+          << ",\"flags\":" << static_cast<unsigned int>(desc.Flags)
+          << "}";
+  record_call_locked("ID3D12Device::OpenExistingHeap", S_OK, {device, heap}, {}, payload.str());
 }
 
 GpuVirtualAddressResolve resolve_gpu_virtual_address_locked(std::uint64_t address)
@@ -4710,10 +4740,10 @@ HRESULT STDMETHODCALLTYPE hook_device_create_placed_resource1(
   const HRESULT hr = hook.create_placed_resource1(self, heap, heap_offset, desc, initial_state, optimized_clear_value, riid, resource);
   if (SUCCEEDED(hr) && resource && *resource) {
     std::lock_guard<std::mutex> lock(capture_state().mutex);
-    const auto parent = lookup_object_id_locked(self);
+    ensure_placed_resource_heap_object_locked(reinterpret_cast<ID3D12Device *>(self), heap);
     const auto heap_object_id = lookup_object_id_locked(heap);
     const auto resource_object_id =
-        register_fresh_object_locked(*resource, apitrace::trace::ObjectKind::Resource, "ID3D12Resource", parent);
+        register_fresh_object_locked(*resource, apitrace::trace::ObjectKind::Resource, "ID3D12Resource", heap_object_id);
     const auto heap_type_it = capture_state().heap_types.find(heap);
     const auto heap_type = heap_type_it != capture_state().heap_types.end() ? heap_type_it->second : 0;
     const auto gpu_virtual_address = resource_gpu_virtual_address(static_cast<ID3D12Resource *>(*resource));

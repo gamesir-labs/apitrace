@@ -2581,6 +2581,44 @@ void ensure_external_resource_object(const void *resource, const char *reason)
       payload.str().c_str());
 }
 
+bool is_known_resource_object(const void *resource)
+{
+  std::lock_guard lock(g_object_mutex);
+  return object_kind_known_locked(resource, trace::ObjectKind::Resource);
+}
+
+bool query_resource_desc(ID3D12Resource *resource, D3D12_RESOURCE_DESC &desc)
+{
+  if (!resource || !resource->lpVtbl || !resource->lpVtbl->GetDesc) {
+    return false;
+  }
+  resource->lpVtbl->GetDesc(resource, &desc);
+  return true;
+}
+
+void ensure_external_resource_object_with_desc(ID3D12Resource *resource, const char *reason)
+{
+  if (!resource) {
+    return;
+  }
+  D3D12_RESOURCE_DESC desc{};
+  const bool has_desc = query_resource_desc(resource, desc);
+  std::ostringstream payload;
+  payload << "{\"external_resource\":true";
+  if (reason && *reason) {
+    payload << ",\"reason\":\"" << escape_json_string(reason) << "\"";
+  }
+  if (has_desc) {
+    payload << ",\"resource_desc\":" << resource_desc_json(&desc);
+  }
+  payload << "}";
+  record_external_object_create_if_needed(
+      resource,
+      CaptureObjectKind::Resource,
+      "ExternalD3D12Resource",
+      payload.str().c_str());
+}
+
 void ensure_external_swapchain_object(const void *swapchain, const char *reason)
 {
   if (!swapchain) {
@@ -3671,6 +3709,24 @@ std::uint64_t record_create_heap(ID3D12Device *device, const D3D12_HEAP_DESC *de
   return record_call(function_name ? function_name : "ID3D12Device::CreateHeap", payload.str().c_str(), refs, 2, nullptr, 0, result_code);
 }
 
+void ensure_placed_resource_heap_object(ID3D12Device *device, ID3D12Heap *heap)
+{
+  if (!heap) {
+    return;
+  }
+  {
+    std::lock_guard lock(g_object_mutex);
+    if (object_kind_known_locked(heap, trace::ObjectKind::Heap)) {
+      return;
+    }
+  }
+  D3D12_HEAP_DESC desc{};
+  if (heap->lpVtbl && heap->lpVtbl->GetDesc) {
+    heap->lpVtbl->GetDesc(heap, &desc);
+  }
+  record_create_heap(device, &desc, heap, 0, "ID3D12Device::OpenExistingHeap");
+}
+
 std::uint64_t record_create_placed_resource(
     ID3D12Device *device,
     const void *heap,
@@ -3684,6 +3740,7 @@ std::uint64_t record_create_placed_resource(
 {
   (void)optimized_clear_value;
   if (resource && result_code >= 0) {
+    ensure_placed_resource_heap_object(device, static_cast<ID3D12Heap *>(const_cast<void *>(heap)));
     record_object_create(resource, CaptureObjectKind::Resource, heap, "ID3D12Resource");
     std::lock_guard lock(g_object_mutex);
     g_resource_gpu_virtual_addresses[resource] = {
@@ -3826,7 +3883,9 @@ std::uint64_t record_create_constant_buffer_view(
 {
   const bool has_buffer_location = desc && desc->BufferLocation != 0;
   const bool has_resolved_resource = resolved_resource != nullptr;
-  ensure_external_resource_object(resolved_resource, "CreateConstantBufferViewGpuVA");
+  if (has_resolved_resource && !is_known_resource_object(resolved_resource)) {
+    ensure_external_resource_object_with_desc(static_cast<ID3D12Resource *>(const_cast<void *>(resolved_resource)), "CreateConstantBufferViewGpuVA");
+  }
   DescriptorViewOp op;
   op.descriptor = descriptor.ptr;
   if (has_buffer_location) {
@@ -3855,7 +3914,7 @@ std::uint64_t record_create_shader_resource_view(
     const D3D12_SHADER_RESOURCE_VIEW_DESC *desc,
     D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
 {
-  ensure_external_resource_object(resource, "CreateShaderResourceView");
+  ensure_external_resource_object_with_desc(static_cast<ID3D12Resource *>(const_cast<void *>(resource)), "CreateShaderResourceView");
   DescriptorViewOp op;
   op.descriptor = descriptor.ptr;
   op.format = desc ? static_cast<unsigned int>(desc->Format) : 0;
@@ -3877,8 +3936,8 @@ std::uint64_t record_create_unordered_access_view(
     const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc,
     D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
 {
-  ensure_external_resource_object(resource, "CreateUnorderedAccessView");
-  ensure_external_resource_object(counter_resource, "CreateUnorderedAccessViewCounter");
+  ensure_external_resource_object_with_desc(static_cast<ID3D12Resource *>(const_cast<void *>(resource)), "CreateUnorderedAccessView");
+  ensure_external_resource_object_with_desc(static_cast<ID3D12Resource *>(const_cast<void *>(counter_resource)), "CreateUnorderedAccessViewCounter");
   DescriptorViewOp op;
   op.descriptor = descriptor.ptr;
   op.format = desc ? static_cast<unsigned int>(desc->Format) : 0;
@@ -3898,7 +3957,7 @@ std::uint64_t record_create_render_target_view(
     const D3D12_RENDER_TARGET_VIEW_DESC *desc,
     D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
 {
-  ensure_external_resource_object(resource, "CreateRenderTargetView");
+  ensure_external_resource_object_with_desc(static_cast<ID3D12Resource *>(const_cast<void *>(resource)), "CreateRenderTargetView");
   DescriptorViewOp op;
   op.descriptor = descriptor.ptr;
   op.format = desc ? static_cast<unsigned int>(desc->Format) : 0;
@@ -3918,7 +3977,7 @@ std::uint64_t record_create_depth_stencil_view(
     const D3D12_DEPTH_STENCIL_VIEW_DESC *desc,
     D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
 {
-  ensure_external_resource_object(resource, "CreateDepthStencilView");
+  ensure_external_resource_object_with_desc(static_cast<ID3D12Resource *>(const_cast<void *>(resource)), "CreateDepthStencilView");
   DescriptorViewOp op;
   op.descriptor = descriptor.ptr;
   op.format = desc ? static_cast<unsigned int>(desc->Format) : 0;
@@ -4135,12 +4194,12 @@ std::uint64_t record_resource_barrier(
     for (std::uint32_t index = 0; index < barrier_count; ++index) {
       const auto &barrier = barriers[index];
       if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
-        ensure_external_resource_object(barrier.Transition.pResource, "ResourceBarrier");
+        ensure_external_resource_object_with_desc(barrier.Transition.pResource, "ResourceBarrier");
       } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
-        ensure_external_resource_object(barrier.Aliasing.pResourceBefore, "ResourceBarrierAliasingBefore");
-        ensure_external_resource_object(barrier.Aliasing.pResourceAfter, "ResourceBarrierAliasingAfter");
+        ensure_external_resource_object_with_desc(barrier.Aliasing.pResourceBefore, "ResourceBarrierAliasingBefore");
+        ensure_external_resource_object_with_desc(barrier.Aliasing.pResourceAfter, "ResourceBarrierAliasingAfter");
       } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
-        ensure_external_resource_object(barrier.UAV.pResource, "ResourceBarrierUAV");
+        ensure_external_resource_object_with_desc(barrier.UAV.pResource, "ResourceBarrierUAV");
       }
     }
   }
@@ -4198,8 +4257,8 @@ std::uint64_t record_copy_buffer_region(
     std::uint64_t src_offset,
     std::uint64_t byte_count)
 {
-  ensure_external_resource_object(dst_buffer, "CopyBufferRegionDst");
-  ensure_external_resource_object(src_buffer, "CopyBufferRegionSrc");
+  ensure_external_resource_object_with_desc(static_cast<ID3D12Resource *>(const_cast<void *>(dst_buffer)), "CopyBufferRegionDst");
+  ensure_external_resource_object_with_desc(static_cast<ID3D12Resource *>(const_cast<void *>(src_buffer)), "CopyBufferRegionSrc");
   std::lock_guard event_lock(g_event_order_mutex);
   flush_diagnostic_batches();
   const auto sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -4229,8 +4288,8 @@ std::uint64_t record_copy_texture_region(
     const D3D12_TEXTURE_COPY_LOCATION *src,
     const D3D12_BOX *src_box)
 {
-  ensure_external_resource_object(dst ? dst->pResource : nullptr, "CopyTextureRegionDst");
-  ensure_external_resource_object(src ? src->pResource : nullptr, "CopyTextureRegionSrc");
+  ensure_external_resource_object_with_desc(dst ? dst->pResource : nullptr, "CopyTextureRegionDst");
+  ensure_external_resource_object_with_desc(src ? src->pResource : nullptr, "CopyTextureRegionSrc");
   std::lock_guard event_lock(g_event_order_mutex);
   flush_diagnostic_batches();
   const auto sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
