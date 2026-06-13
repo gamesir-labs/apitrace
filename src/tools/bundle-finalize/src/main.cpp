@@ -2359,6 +2359,7 @@ std::unordered_map<std::string, AssetEntry> build_asset_by_effective_path(const 
 bool resolve_pipeline_shader_paths(
     json &pipeline,
     const std::unordered_map<std::uint64_t, ShaderAssetRef> &shader_ref_by_blob_id,
+    const std::unordered_map<std::string, ShaderAssetRef> &shader_ref_by_path,
     const std::unordered_map<std::uint64_t, ShaderAssetRef> &unique_shader_ref_by_size,
     std::vector<std::uint64_t> &shader_blob_refs)
 {
@@ -2386,6 +2387,18 @@ bool resolve_pipeline_shader_paths(
       shader->erase("blob_id");
       shader_blob_refs.push_back(ref_it->second.blob_id);
       continue;
+    }
+
+    const auto stage_path_key = std::string(stage) + "_path";
+    if (shader->contains(stage_path_key) && (*shader)[stage_path_key].is_string()) {
+      const auto stage_path = (*shader)[stage_path_key].get<std::string>();
+      const auto path_it = shader_ref_by_path.find(stage_path);
+      if (path_it != shader_ref_by_path.end() &&
+          (bytecode_size == 0 || path_it->second.byte_size == bytecode_size)) {
+        shader->erase("blob_id");
+        shader_blob_refs.push_back(path_it->second.blob_id);
+        continue;
+      }
     }
 
     const auto size_it = unique_shader_ref_by_size.find(bytecode_size);
@@ -2502,6 +2515,7 @@ bool rebuild_pipeline_event(
     std::uint64_t &next_blob_id,
     std::unordered_map<std::uint64_t, std::string> &path_by_blob_id,
     const std::unordered_map<std::uint64_t, ShaderAssetRef> &shader_ref_by_blob_id,
+    const std::unordered_map<std::string, ShaderAssetRef> &shader_ref_by_path,
     const std::unordered_map<std::uint64_t, ShaderAssetRef> &unique_shader_ref_by_size,
     std::unordered_map<std::string, AssetEntry> &assets_by_path,
     std::vector<AssetEntry> &assets,
@@ -2534,7 +2548,12 @@ bool rebuild_pipeline_event(
   pipeline["type"] = raw_kind;
 
   std::vector<std::uint64_t> shader_blob_refs;
-  if (!resolve_pipeline_shader_paths(pipeline, shader_ref_by_blob_id, unique_shader_ref_by_size, shader_blob_refs)) {
+  if (!resolve_pipeline_shader_paths(
+          pipeline,
+          shader_ref_by_blob_id,
+          shader_ref_by_path,
+          unique_shader_ref_by_size,
+          shader_blob_refs)) {
     ++stats.incomplete_d3d12_pipeline_semantics;
     return false;
   }
@@ -2943,6 +2962,7 @@ std::unordered_set<std::string> rebuild_d3d12_pipeline_semantics(
             next_blob_id,
             path_by_blob_id,
             shader_ref_by_blob_id,
+            shader_ref_by_path,
             unique_shader_ref_by_size,
             assets_by_path,
             assets,
