@@ -62,7 +62,11 @@ std::string format_statistics(const apitrace::replay::ReplayStatistics &statisti
       "metal_calls_replayed: " + std::to_string(statistics.metal_calls_replayed) + "\n" +
       "frames_seen: " + std::to_string(statistics.frames_seen) + "\n" +
       "presents_seen: " + std::to_string(statistics.presents_seen) + "\n" +
-      "metal_presents_seen: " + std::to_string(statistics.metal_presents_seen) + "\n";
+      "metal_presents_seen: " + std::to_string(statistics.metal_presents_seen) + "\n" +
+      "open_ms: " + std::to_string(statistics.open_ms) + "\n" +
+      "backend_init_ms: " + std::to_string(statistics.backend_init_ms) + "\n" +
+      "event_replay_ms: " + std::to_string(statistics.event_replay_ms) + "\n" +
+      "finalize_ms: " + std::to_string(statistics.finalize_ms) + "\n";
 }
 
 std::string shell_quote(const std::string &value)

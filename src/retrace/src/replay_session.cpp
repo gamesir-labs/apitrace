@@ -13,6 +13,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <chrono>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -28,6 +29,14 @@ namespace {
 using json = nlohmann::json;
 
 constexpr std::uint64_t kMetalTextureSwizzleAlpha = 5;
+
+std::uint64_t elapsed_ms(std::chrono::steady_clock::time_point begin)
+{
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - begin)
+          .count());
+}
 
 const char *backend_name(BackendKind backend)
 {
@@ -2236,14 +2245,24 @@ bool ReplaySession::run()
 
   trace::TraceBundleReader::OpenOptions reader_options;
   reader_options.load_metal_sideband = impl_->options.enable_metal_retrace;
+  reader_options.validate_checksum_contents = false;
   if (!impl_->options.enable_metal_retrace && impl_->options.backend == BackendKind::NativeD3D12) {
     reader_options.stop_after_sequence = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE");
     reader_options.stop_after_present_frame = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME");
+    const char *capture_present_frames = std::getenv("APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES");
+    reader_options.wait_for_present_frame_blob =
+        capture_present_frames && *capture_present_frames &&
+        std::string_view(capture_present_frames) != "0" &&
+        std::string_view(capture_present_frames) != "false" &&
+        std::string_view(capture_present_frames) != "FALSE";
   }
+  const auto open_begin = std::chrono::steady_clock::now();
   if (!impl_->reader.open(impl_->options.bundle_root, reader_options)) {
+    impl_->statistics.open_ms = elapsed_ms(open_begin);
     impl_->last_error = impl_->reader.last_error().empty() ? "failed to open trace bundle" : impl_->reader.last_error();
     return false;
   }
+  impl_->statistics.open_ms = elapsed_ms(open_begin);
 
   if (impl_->options.enable_metal_retrace) {
     if (!impl_->reader.metadata().has_metal_callstream && impl_->reader.metal_events().empty()) {
@@ -2344,15 +2363,20 @@ bool ReplaySession::run()
     }
 
     d3d12::D3D12ReplayBackend backend;
+    const auto backend_init_begin = std::chrono::steady_clock::now();
     if (!backend.initialize(impl_->reader)) {
+      impl_->statistics.backend_init_ms = elapsed_ms(backend_init_begin);
       impl_->last_error = backend.last_error().empty() ? "failed to initialize D3D12 replay backend" : backend.last_error();
       return false;
     }
+    impl_->statistics.backend_init_ms = elapsed_ms(backend_init_begin);
 
     impl_->statistics.backend_name =
         impl_->options.backend == BackendKind::NativeD3D12 ? "native-d3d12" : "bundle-d3d12";
+    const auto event_replay_begin = std::chrono::steady_clock::now();
     for (const auto &event : impl_->reader.events()) {
       if (!backend.replay_event(event)) {
+        impl_->statistics.event_replay_ms = elapsed_ms(event_replay_begin);
         if (!backend.last_error().empty()) {
           impl_->last_error = "sequence " + std::to_string(event.callsite.sequence) + " " +
                               event.callsite.function_name + ": " + backend.last_error();
@@ -2378,17 +2402,22 @@ bool ReplaySession::run()
         ++impl_->statistics.calls_replayed;
       }
     }
+    impl_->statistics.event_replay_ms = elapsed_ms(event_replay_begin);
+    const auto finalize_begin = std::chrono::steady_clock::now();
     if (impl_->options.validate_only) {
       if (!backend.validate_only()) {
+        impl_->statistics.finalize_ms = elapsed_ms(finalize_begin);
         impl_->last_error = backend.last_error().empty() ? "D3D12 replay validation failed" : backend.last_error();
         return false;
       }
     } else {
       if (!backend.finalize_replay()) {
+        impl_->statistics.finalize_ms = elapsed_ms(finalize_begin);
         impl_->last_error = backend.last_error().empty() ? "D3D12 replay finalization failed" : backend.last_error();
         return false;
       }
     }
+    impl_->statistics.finalize_ms = elapsed_ms(finalize_begin);
     backend.shutdown();
     return true;
   }

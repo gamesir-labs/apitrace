@@ -73,6 +73,8 @@ class TraceBundleReader {
 public:
   struct OpenOptions {
     bool load_metal_sideband = true;
+    bool validate_checksum_contents = true;
+    bool wait_for_present_frame_blob = false;
     std::uint64_t stop_after_sequence = 0;
     std::uint64_t stop_after_present_frame = 0;
   };

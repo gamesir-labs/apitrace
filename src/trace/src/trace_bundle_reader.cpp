@@ -13,6 +13,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <charconv>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -459,6 +460,416 @@ bool append_integer_array(
   return true;
 }
 
+void skip_json_whitespace(std::string_view text, std::size_t &pos)
+{
+  while (pos < text.size() &&
+         (text[pos] == ' ' || text[pos] == '\t' ||
+          text[pos] == '\r' || text[pos] == '\n')) {
+    ++pos;
+  }
+}
+
+bool find_raw_json_object_end(std::string_view text, std::size_t start, std::size_t &end)
+{
+  if (start >= text.size() || text[start] != '{') {
+    return false;
+  }
+  std::size_t depth = 0;
+  bool in_string = false;
+  bool escaped = false;
+  for (std::size_t pos = start; pos < text.size(); ++pos) {
+    const char c = text[pos];
+    if (in_string) {
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        in_string = false;
+      }
+      continue;
+    }
+    if (c == '"') {
+      in_string = true;
+      continue;
+    }
+    if (c == '{') {
+      ++depth;
+      continue;
+    }
+    if (c == '}') {
+      if (depth == 0) {
+        return false;
+      }
+      --depth;
+      if (depth == 0) {
+        end = pos + 1;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool parse_raw_json_string_view_at(std::string_view text, std::size_t &pos, std::string_view &output)
+{
+  if (pos >= text.size() || text[pos] != '"') {
+    return false;
+  }
+  ++pos;
+  const auto start = pos;
+  while (pos < text.size()) {
+    if (text[pos] == '\\') {
+      return false;
+    }
+    if (text[pos] == '"') {
+      output = text.substr(start, pos - start);
+      ++pos;
+      return true;
+    }
+    ++pos;
+  }
+  return false;
+}
+
+bool parse_raw_u64_at(std::string_view text, std::size_t &pos, std::uint64_t &output)
+{
+  if (pos >= text.size() || text[pos] < '0' || text[pos] > '9') {
+    return false;
+  }
+  const auto start = pos;
+  while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
+    ++pos;
+  }
+  const auto digits = text.substr(start, pos - start);
+  const auto *begin = digits.data();
+  const auto *end = begin + digits.size();
+  auto [ptr, error] = std::from_chars(begin, end, output);
+  return error == std::errc{} && ptr == end;
+}
+
+bool parse_raw_i32_at(std::string_view text, std::size_t &pos, std::int32_t &output)
+{
+  const auto start = pos;
+  if (pos < text.size() && text[pos] == '-') {
+    ++pos;
+  }
+  if (pos >= text.size() || text[pos] < '0' || text[pos] > '9') {
+    return false;
+  }
+  while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
+    ++pos;
+  }
+  const auto digits = text.substr(start, pos - start);
+  const auto *begin = digits.data();
+  const auto *end = begin + digits.size();
+  auto [ptr, error] = std::from_chars(begin, end, output);
+  return error == std::errc{} && ptr == end;
+}
+
+template <typename Integer>
+bool parse_raw_integer_array_at(std::string_view text, std::size_t &pos, std::vector<Integer> &output)
+{
+  if (pos >= text.size() || text[pos] != '[') {
+    return false;
+  }
+  ++pos;
+  output.clear();
+  skip_json_whitespace(text, pos);
+  if (pos < text.size() && text[pos] == ']') {
+    ++pos;
+    return true;
+  }
+  while (pos < text.size()) {
+    skip_json_whitespace(text, pos);
+    std::uint64_t value = 0;
+    if (!parse_raw_u64_at(text, pos, value)) {
+      return false;
+    }
+    output.push_back(static_cast<Integer>(value));
+    skip_json_whitespace(text, pos);
+    if (pos >= text.size()) {
+      return false;
+    }
+    if (text[pos] == ']') {
+      ++pos;
+      return true;
+    }
+    if (text[pos] != ',') {
+      return false;
+    }
+    ++pos;
+  }
+  return false;
+}
+
+bool find_raw_json_value_end(std::string_view text, std::size_t start, std::size_t &end)
+{
+  if (start >= text.size()) {
+    return false;
+  }
+  if (text[start] == '{') {
+    return find_raw_json_object_end(text, start, end);
+  }
+  if (text[start] == '[') {
+    std::size_t depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (std::size_t pos = start; pos < text.size(); ++pos) {
+      const char c = text[pos];
+      if (in_string) {
+        if (escaped) {
+          escaped = false;
+        } else if (c == '\\') {
+          escaped = true;
+        } else if (c == '"') {
+          in_string = false;
+        }
+        continue;
+      }
+      if (c == '"') {
+        in_string = true;
+        continue;
+      }
+      if (c == '[') {
+        ++depth;
+        continue;
+      }
+      if (c == ']') {
+        if (depth == 0) {
+          return false;
+        }
+        --depth;
+        if (depth == 0) {
+          end = pos + 1;
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  if (text[start] == '"') {
+    auto pos = start;
+    std::string_view ignored;
+    if (!parse_raw_json_string_view_at(text, pos, ignored)) {
+      return false;
+    }
+    end = pos;
+    return true;
+  }
+  auto pos = start;
+  while (pos < text.size() && text[pos] != ',' && text[pos] != '}') {
+    ++pos;
+  }
+  if (pos == start) {
+    return false;
+  }
+  end = pos;
+  return true;
+}
+
+struct RawEventFields {
+  std::string_view record_kind;
+  std::string_view function_name;
+  std::string_view object_kind;
+  std::string_view debug_name;
+  std::string_view boundary_name;
+  std::string_view payload;
+  bool has_payload = false;
+  std::uint64_t sequence = 0;
+  std::uint64_t time_ns = 0;
+  std::uint64_t elapsed_ns = 0;
+  std::int32_t result_code = 0;
+  std::uint64_t object_id = 0;
+  std::uint64_t parent_object_id = 0;
+  std::vector<ObjectId> object_refs;
+  std::vector<BlobId> blob_refs;
+};
+
+bool parse_raw_event_fields(std::string_view line, RawEventFields &fields)
+{
+  fields = RawEventFields{};
+  std::size_t pos = 0;
+  skip_json_whitespace(line, pos);
+  if (pos >= line.size() || line[pos] != '{') {
+    return false;
+  }
+  ++pos;
+  while (pos < line.size()) {
+    skip_json_whitespace(line, pos);
+    if (pos < line.size() && line[pos] == '}') {
+      ++pos;
+      return true;
+    }
+
+    std::string_view key;
+    if (!parse_raw_json_string_view_at(line, pos, key)) {
+      return false;
+    }
+    skip_json_whitespace(line, pos);
+    if (pos >= line.size() || line[pos] != ':') {
+      return false;
+    }
+    ++pos;
+    skip_json_whitespace(line, pos);
+
+    if (key == "record_kind") {
+      if (!parse_raw_json_string_view_at(line, pos, fields.record_kind)) {
+        return false;
+      }
+    } else if (key == "sequence") {
+      if (!parse_raw_u64_at(line, pos, fields.sequence)) {
+        return false;
+      }
+    } else if (key == "time_ns") {
+      if (!parse_raw_u64_at(line, pos, fields.time_ns)) {
+        return false;
+      }
+    } else if (key == "elapsed_ns") {
+      if (!parse_raw_u64_at(line, pos, fields.elapsed_ns)) {
+        return false;
+      }
+    } else if (key == "function") {
+      if (!parse_raw_json_string_view_at(line, pos, fields.function_name)) {
+        return false;
+      }
+    } else if (key == "result_code") {
+      if (!parse_raw_i32_at(line, pos, fields.result_code)) {
+        return false;
+      }
+    } else if (key == "object_refs") {
+      if (!parse_raw_integer_array_at<ObjectId>(line, pos, fields.object_refs)) {
+        return false;
+      }
+    } else if (key == "blob_refs") {
+      if (!parse_raw_integer_array_at<BlobId>(line, pos, fields.blob_refs)) {
+        return false;
+      }
+    } else if (key == "payload") {
+      std::size_t end = 0;
+      if (!find_raw_json_value_end(line, pos, end)) {
+        return false;
+      }
+      fields.payload = line.substr(pos, end - pos);
+      fields.has_payload = true;
+      pos = end;
+    } else if (key == "object_id") {
+      if (!parse_raw_u64_at(line, pos, fields.object_id)) {
+        return false;
+      }
+    } else if (key == "parent_object_id") {
+      if (!parse_raw_u64_at(line, pos, fields.parent_object_id)) {
+        return false;
+      }
+    } else if (key == "debug_name") {
+      if (!parse_raw_json_string_view_at(line, pos, fields.debug_name)) {
+        return false;
+      }
+    } else if (key == "object_kind") {
+      if (!parse_raw_json_string_view_at(line, pos, fields.object_kind)) {
+        return false;
+      }
+    } else if (key == "boundary") {
+      if (!parse_raw_json_string_view_at(line, pos, fields.boundary_name)) {
+        return false;
+      }
+    } else {
+      std::size_t end = 0;
+      if (!find_raw_json_value_end(line, pos, end)) {
+        return false;
+      }
+      pos = end;
+    }
+
+    skip_json_whitespace(line, pos);
+    if (pos >= line.size()) {
+      return false;
+    }
+    if (line[pos] == ',') {
+      ++pos;
+      continue;
+    }
+    if (line[pos] == '}') {
+      ++pos;
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+bool parse_event_record_fast(std::string_view line, EventRecord &event)
+{
+  event = EventRecord{};
+  RawEventFields fields;
+  if (!parse_raw_event_fields(line, fields) || fields.record_kind.empty()) {
+    return false;
+  }
+
+  if (fields.record_kind == "call") {
+    event.kind = EventKind::Call;
+    event.callsite.sequence = fields.sequence;
+    event.time_ns = fields.time_ns;
+    event.elapsed_ns = fields.elapsed_ns;
+    event.callsite.function_name.assign(fields.function_name);
+    event.callsite.result_code = fields.result_code;
+    event.object_refs = std::move(fields.object_refs);
+    event.blob_refs = std::move(fields.blob_refs);
+    if (!fields.has_payload) {
+      return false;
+    }
+    event.payload.assign(fields.payload);
+    return event.callsite.sequence != 0 && !event.callsite.function_name.empty();
+  }
+
+  if (fields.record_kind == "object_create" ||
+      fields.record_kind == "object_destroy" ||
+      fields.record_kind == "resource_blob") {
+    event.kind = fields.record_kind == "object_create" ? EventKind::ObjectCreate :
+                 fields.record_kind == "object_destroy" ? EventKind::ObjectDestroy :
+                                                          EventKind::ResourceBlob;
+    event.callsite.sequence = fields.sequence;
+    event.time_ns = fields.time_ns;
+    event.elapsed_ns = fields.elapsed_ns;
+    event.callsite.function_name.assign(fields.record_kind);
+    event.object_id = fields.object_id;
+    event.parent_object_id = fields.parent_object_id;
+    event.object_debug_name.assign(fields.debug_name);
+    event.object_refs = std::move(fields.object_refs);
+    event.blob_refs = std::move(fields.blob_refs);
+    event.payload.assign(fields.has_payload ? fields.payload : std::string_view("{}"));
+    const auto object_kind = object_kind_from_name(fields.object_kind);
+    if (!object_kind.has_value()) {
+      return false;
+    }
+    event.object_kind = *object_kind;
+    if (event.callsite.sequence == 0) {
+      return false;
+    }
+    if (event.kind != EventKind::ResourceBlob && event.object_id == 0) {
+      return false;
+    }
+    return true;
+  }
+
+  if (fields.record_kind == "boundary") {
+    event.kind = EventKind::Boundary;
+    event.callsite.sequence = fields.sequence;
+    event.time_ns = fields.time_ns;
+    event.elapsed_ns = fields.elapsed_ns;
+    event.payload.assign(fields.has_payload ? fields.payload : std::string_view("{}"));
+    const auto boundary_kind = boundary_kind_from_name(fields.boundary_name);
+    if (!boundary_kind.has_value()) {
+      return false;
+    }
+    event.boundary = *boundary_kind;
+    event.callsite.function_name.assign(fields.boundary_name);
+    return event.callsite.sequence != 0;
+  }
+
+  return false;
+}
+
 bool parse_checksums(
     const std::filesystem::path &checksums_path,
     ChecksumIndex &checksums,
@@ -838,7 +1249,8 @@ bool validate_checksum_entry(
     const std::unordered_map<std::string, ChecksumRecord> &lookup,
     const std::filesystem::path &checksums_path,
     std::unordered_set<std::string> &validated_paths,
-    std::string &error)
+    std::string &error,
+    bool validate_contents)
 {
   const auto key = relative_path.generic_string();
   if (validated_paths.find(key) != validated_paths.end())
@@ -861,6 +1273,16 @@ bool validate_checksum_entry(
   }
 
   const auto actual_size = file_size_or_max(absolute_path);
+  if (checksum_it->second.has_byte_size &&
+      actual_size != std::numeric_limits<std::uint64_t>::max() &&
+      actual_size < checksum_it->second.byte_size) {
+    error = "referenced file is shorter than checksum entry: " + key;
+    return false;
+  }
+  if (!validate_contents) {
+    validated_paths.insert(key);
+    return true;
+  }
   const auto use_prefix =
       checksum_it->second.has_byte_size &&
       actual_size != std::numeric_limits<std::uint64_t>::max() &&
@@ -954,6 +1376,45 @@ bool read_referenced_asset_json(
   }
   cache.emplace(key, asset_json);
   return true;
+}
+
+std::uint64_t payload_frame_index(const std::string &payload, std::uint64_t fallback)
+{
+  static constexpr std::string_view key = "\"frame_index\"";
+  const auto key_pos = payload.find(key);
+  if (key_pos == std::string::npos) {
+    return fallback;
+  }
+  auto pos = payload.find(':', key_pos + key.size());
+  if (pos == std::string::npos) {
+    return fallback;
+  }
+  ++pos;
+  while (pos < payload.size() &&
+         (payload[pos] == ' ' || payload[pos] == '\t' ||
+          payload[pos] == '\r' || payload[pos] == '\n')) {
+    ++pos;
+  }
+  if (pos >= payload.size() || payload[pos] < '0' || payload[pos] > '9') {
+    return fallback;
+  }
+  std::uint64_t value = 0;
+  while (pos < payload.size() && payload[pos] >= '0' && payload[pos] <= '9') {
+    const auto digit = static_cast<std::uint64_t>(payload[pos] - '0');
+    if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
+      return fallback;
+    }
+    value = value * 10 + digit;
+    ++pos;
+  }
+  return value;
+}
+
+bool is_present_frame_blob(const EventRecord &event)
+{
+  return event.kind == EventKind::ResourceBlob &&
+         (event.object_debug_name == "D3D11PresentFrame" ||
+          event.object_debug_name == "D3D12PresentFrame");
 }
 
 } // namespace
@@ -1127,52 +1588,23 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
     }
     return true;
   };
-  std::unordered_map<std::string, json> referenced_asset_json_cache;
-  auto register_referenced_assets = [&](const json &record, const std::vector<BlobId> &blob_refs) -> bool {
-    std::vector<std::string> referenced_paths;
-    collect_asset_paths(record, referenced_paths);
-    std::vector<std::string> nested_referenced_paths;
-    for (const auto &referenced_path : referenced_paths) {
-      const std::filesystem::path relative_path = referenced_path;
-      if (ends_with(relative_path.generic_string(), ".json")) {
-        json asset_json;
-        if (!read_referenced_asset_json(
-                impl_->layout.root_path,
-                relative_path,
-                referenced_asset_json_cache,
-                asset_json,
-                impl_->last_error)) {
-          return false;
-        }
-        collect_nested_asset_paths(asset_json, nested_referenced_paths);
-      }
+  auto register_referenced_assets = [&](const std::vector<BlobId> &blob_refs) -> bool {
+    if (!impl_->has_asset_index || indexed_blob_paths.empty()) {
+      impl_->last_error = "trace bundle is missing the required asset blob index";
+      return false;
     }
-
-    std::vector<std::string> all_paths = referenced_paths;
-    all_paths.insert(all_paths.end(), nested_referenced_paths.begin(), nested_referenced_paths.end());
-    std::size_t legacy_blob_ref_index = 0;
-    for (const auto &path_text : all_paths) {
-      const std::filesystem::path relative_path = path_text;
-      MetalAssetKind metal_kind = MetalAssetKind::Library;
-      BlobId blob_id = {};
-      if (impl_->has_asset_index) {
-        for (const auto candidate_blob_id : blob_refs) {
-          const auto indexed_path = indexed_blob_paths.find(candidate_blob_id);
-          if (indexed_path != indexed_blob_paths.end() && indexed_path->second == relative_path) {
-            blob_id = candidate_blob_id;
-            break;
-          }
-        }
-      }
-      if (blob_id == 0 && (!impl_->has_asset_index || indexed_blob_paths.empty()) &&
-          legacy_blob_ref_index < blob_refs.size()) {
-        blob_id = blob_refs[legacy_blob_ref_index];
-      }
-      const bool metal_asset = detail::is_metal_asset_path(relative_path, &metal_kind);
-      if (!register_asset_path(relative_path, blob_id, metal_asset)) {
+    for (const auto blob_id : blob_refs) {
+      const auto indexed_path = indexed_blob_paths.find(blob_id);
+      if (indexed_path == indexed_blob_paths.end()) {
+        impl_->last_error = "blob_ref missing from asset index: " + std::to_string(blob_id);
         return false;
       }
-      ++legacy_blob_ref_index;
+      MetalAssetKind metal_kind = MetalAssetKind::Library;
+      const bool metal_asset =
+          detail::is_metal_asset_path(indexed_path->second, &metal_kind);
+      if (!register_asset_path(indexed_path->second, blob_id, metal_asset)) {
+        return false;
+      }
     }
     return true;
   };
@@ -1198,7 +1630,7 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
       if (record.contains("blob_refs") && record["blob_refs"].is_array()) {
         blob_refs = record["blob_refs"].get<std::vector<BlobId>>();
       }
-      if (!register_referenced_assets(record, blob_refs)) {
+      if (!register_referenced_assets(blob_refs)) {
         return false;
       }
     }
@@ -1208,6 +1640,7 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
   std::string line;
   std::size_t line_number = 0;
   std::uint64_t consumed_callstream_bytes = 0;
+  std::uint64_t pending_stop_present_frame = std::numeric_limits<std::uint64_t>::max();
   while (std::getline(callstream_input, line)) {
     const auto line_bytes = static_cast<std::uint64_t>(line.size() + 1);
     if (consumed_callstream_bytes + line_bytes > callstream_byte_limit) {
@@ -1219,16 +1652,15 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
       continue;
     }
 
-    json record = json::parse(line, nullptr, false);
-    if (record.is_discarded()) {
-      std::ostringstream message;
-      message << file_label(impl_->layout.callstream_path) << ": invalid JSON at line " << line_number;
-      impl_->last_error = message.str();
-      return false;
-    }
-
-    const auto record_kind = record.value("record_kind", std::string());
     if (!header_seen) {
+      json record = json::parse(line, nullptr, false);
+      if (record.is_discarded()) {
+        std::ostringstream message;
+        message << file_label(impl_->layout.callstream_path) << ": invalid JSON at line " << line_number;
+        impl_->last_error = message.str();
+        return false;
+      }
+      const auto record_kind = record.value("record_kind", std::string());
       if (record_kind != "bundle_header") {
         impl_->last_error = file_label(impl_->layout.callstream_path) + ": first record must be bundle_header";
         return false;
@@ -1241,21 +1673,37 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
     }
 
     EventRecord event;
-    if (!parse_event_record(record, impl_->layout.callstream_path, event, impl_->last_error)) {
-      return false;
+    json record;
+    if (!parse_event_record_fast(line, event)) {
+      record = json::parse(line, nullptr, false);
+      if (record.is_discarded()) {
+        std::ostringstream message;
+        message << file_label(impl_->layout.callstream_path) << ": invalid JSON at line " << line_number;
+        impl_->last_error = message.str();
+        return false;
+      }
+
+      if (!parse_event_record(record, impl_->layout.callstream_path, event, impl_->last_error)) {
+        return false;
+      }
     }
+
+    if (pending_stop_present_frame != std::numeric_limits<std::uint64_t>::max()) {
+      if (is_present_frame_blob(event) &&
+          payload_frame_index(event.payload, std::numeric_limits<std::uint64_t>::max()) ==
+              pending_stop_present_frame) {
+        impl_->events.push_back(event);
+        if (!register_referenced_assets(event.blob_refs)) {
+          return false;
+        }
+        break;
+      }
+      continue;
+    }
+
     impl_->events.push_back(event);
 
-    json payload = json::parse(event.payload.empty() ? std::string("{}") : event.payload, nullptr, false);
-    if (payload.is_discarded()) {
-      std::ostringstream message;
-      message << file_label(impl_->layout.callstream_path) << ": sequence " << event.callsite.sequence
-              << " has invalid payload JSON";
-      impl_->last_error = message.str();
-      return false;
-    }
-
-    if (!register_referenced_assets(record, event.blob_refs)) {
+    if (!register_referenced_assets(event.blob_refs)) {
       return false;
     }
 
@@ -1267,9 +1715,12 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
     if (options.stop_after_present_frame != 0 &&
         event.kind == EventKind::Boundary &&
         event.boundary == BoundaryKind::Present &&
-        json_u64_field(payload, "frame_index", std::numeric_limits<std::uint64_t>::max()) >=
+        payload_frame_index(event.payload, std::numeric_limits<std::uint64_t>::max()) >=
             options.stop_after_present_frame) {
-      break;
+      if (!options.wait_for_present_frame_blob) {
+        break;
+      }
+      pending_stop_present_frame = payload_frame_index(event.payload, std::numeric_limits<std::uint64_t>::max());
     }
   }
 
@@ -1299,7 +1750,8 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
             checksum_lookup,
             impl_->layout.checksums_path,
             validated_checksum_paths,
-            impl_->last_error)) {
+            impl_->last_error,
+            options.validate_checksum_contents)) {
       return false;
     }
   }
@@ -1322,7 +1774,8 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
             checksum_lookup,
             impl_->layout.checksums_path,
             validated_checksum_paths,
-            impl_->last_error)) {
+            impl_->last_error,
+            options.validate_checksum_contents)) {
       return false;
     }
   }
@@ -1351,7 +1804,8 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
           checksum_lookup,
           impl_->layout.checksums_path,
           validated_checksum_paths,
-          impl_->last_error)) {
+          impl_->last_error,
+          options.validate_checksum_contents)) {
     return false;
   }
 
@@ -1373,7 +1827,8 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
             checksum_lookup,
             impl_->layout.checksums_path,
             validated_checksum_paths,
-            impl_->last_error)) {
+            impl_->last_error,
+            options.validate_checksum_contents)) {
       return false;
     }
   }

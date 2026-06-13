@@ -15,6 +15,10 @@ struct ReplayStatistics {
   std::uint64_t presents_seen = 0;
   std::uint64_t metal_calls_replayed = 0;
   std::uint64_t metal_presents_seen = 0;
+  std::uint64_t open_ms = 0;
+  std::uint64_t backend_init_ms = 0;
+  std::uint64_t event_replay_ms = 0;
+  std::uint64_t finalize_ms = 0;
   std::string backend_name;
 };
 
