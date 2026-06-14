@@ -75,6 +75,12 @@ public:
     bool load_metal_sideband = true;
     bool validate_checksum_contents = true;
     bool wait_for_present_frame_blob = false;
+    // When false, open() parses the bundle header (metadata) and validates assets/checksums but
+    // skips parsing the callstream into events(). Used by the retrace replay-model fast path, where
+    // the persisted object model replaces reconstruction and the event stream is never consumed —
+    // skipping the multi-GB callstream parse. The caller must re-open with this true if it then
+    // needs events() (e.g. model load failed and it must fall back to reconstruction).
+    bool parse_callstream_events = true;
     std::uint64_t stop_after_sequence = 0;
     std::uint64_t stop_after_present_frame = 0;
   };

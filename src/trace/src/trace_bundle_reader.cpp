@@ -1669,6 +1669,12 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
         return false;
       }
       header_seen = true;
+      // Fast path: caller only needs metadata (e.g. retrace loading a persisted replay model).
+      // Skip parsing the rest of the callstream into events(); asset/checksum validation below
+      // still runs (it uses the asset index, not the event stream).
+      if (!options.parse_callstream_events) {
+        break;
+      }
       continue;
     }
 

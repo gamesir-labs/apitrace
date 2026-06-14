@@ -2269,6 +2269,24 @@ bool ReplaySession::run()
         std::string_view(capture_present_frames) != "false" &&
         std::string_view(capture_present_frames) != "FALSE";
   }
+  // Replay-model fast path: if a persisted model is present and would be used, skip parsing the
+  // (multi-GB) callstream into events() during open() — the model replaces reconstruction and the
+  // event stream is never consumed. Mirrors the gate in the D3D12 branch below: D3D12 bundle,
+  // model files present, not IGNORE_MODEL, and not prefix-limited. If the model later fails to
+  // load, the D3D12 branch re-opens the reader with events to fall back to reconstruction.
+  bool will_try_replay_model = false;
+  if (!impl_->options.enable_metal_retrace &&
+      reader_options.stop_after_sequence == 0 &&
+      reader_options.stop_after_present_frame == 0 &&
+      !env_enabled("APITRACE_D3D12_RETRACE_IGNORE_MODEL")) {
+    std::error_code model_ec;
+    will_try_replay_model =
+        std::filesystem::exists(impl_->options.bundle_root / trace::kD3D12ReplayModelJsonName, model_ec) &&
+        std::filesystem::exists(impl_->options.bundle_root / trace::kD3D12ReplayModelBlobName, model_ec);
+  }
+  if (will_try_replay_model) {
+    reader_options.parse_callstream_events = false;
+  }
   const auto open_begin = std::chrono::steady_clock::now();
   if (!impl_->reader.open(impl_->options.bundle_root, reader_options)) {
     impl_->statistics.open_ms = elapsed_ms(open_begin);
@@ -2413,6 +2431,19 @@ bool ReplaySession::run()
           std::cerr << "retrace: failed to load persisted replay model ("
                     << (model_error.empty() ? "unknown error" : model_error)
                     << "), falling back to reconstruction\n";
+          // Events were skipped at open() for the fast path; the reconstruction fallback needs
+          // them, so re-open the reader with event parsing enabled. Paid only on this rare failure.
+          if (!reader_options.parse_callstream_events) {
+            reader_options.parse_callstream_events = true;
+            const auto reopen_begin = std::chrono::steady_clock::now();
+            if (!impl_->reader.open(impl_->options.bundle_root, reader_options)) {
+              impl_->last_error = impl_->reader.last_error().empty()
+                                      ? "failed to re-open trace bundle for reconstruction fallback"
+                                      : impl_->reader.last_error();
+              return false;
+            }
+            impl_->statistics.open_ms += elapsed_ms(reopen_begin);
+          }
         }
       }
     }
