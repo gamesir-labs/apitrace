@@ -1,6 +1,7 @@
 #include "apitrace/d3d12_replay.hpp"
 #include "trace/src/payload_object_refs.hpp"
 #include "apitrace/trace_bundle_io.hpp"
+#include "apitrace/tools/cli_entries.hpp"
 
 #include <cstdlib>
 #include <filesystem>
@@ -42,6 +43,7 @@ void print_usage(const char *argv0)
             << " [--require-metal-replay-closure]"
             << " [--require-d3d-present-frames] [--require-metal-present-frames]"
             << " [--strict-cross-api]"
+            << " [--verify-hashes]"
             << " <trace-bundle>\n";
 }
 
@@ -157,6 +159,7 @@ struct CheckOptions {
   bool require_metal_replay_closure = false;
   bool require_d3d_present_frames = false;
   bool require_metal_present_frames = false;
+  bool verify_hashes = false;
 };
 
 void enable_strict_cross_api(CheckOptions &options)
@@ -4306,7 +4309,7 @@ bool verify_d3d_replay_closure(
 
 } // namespace
 
-int main(int argc, char **argv)
+int apitrace::tools::run_bundle_check(int argc, char **argv)
 {
   CheckOptions options;
   std::filesystem::path bundle;
@@ -4356,6 +4359,10 @@ int main(int argc, char **argv)
       enable_strict_cross_api(options);
       continue;
     }
+    if (arg == "--verify-hashes") {
+      options.verify_hashes = true;
+      continue;
+    }
     if (arg.empty() || arg[0] == '-' || !bundle.empty()) {
       print_usage(argc > 0 ? argv[0] : nullptr);
       return 2;
@@ -4378,6 +4385,64 @@ int main(int argc, char **argv)
   if (!reader.open(bundle)) {
     std::cerr << "bundle-check failed: " << reader.last_error() << "\n";
     return 1;
+  }
+
+  // --verify-hashes: exhaustive integrity scan for network-transit / corruption damage. Re-hash
+  // EVERY checksums entry (ignoring the open-time validation skip) and report ALL bad files rather
+  // than bailing on the first, so a damaged bundle's full extent is visible in one run.
+  if (options.verify_hashes) {
+    std::size_t checked = 0;
+    std::size_t bad = 0;
+    for (const auto &record : reader.checksums().files) {
+      ++checked;
+      const auto relative = record.relative_path.generic_string();
+      if (record.algorithm != "sha256") {
+        std::cerr << "verify-hashes: unsupported algorithm for " << relative << "\n";
+        ++bad;
+        continue;
+      }
+      const auto absolute = reader.layout().root_path / record.relative_path;
+      std::error_code size_error;
+      if (!std::filesystem::is_regular_file(absolute, size_error) || size_error) {
+        std::cerr << "verify-hashes: MISSING " << relative << "\n";
+        ++bad;
+        continue;
+      }
+      const auto actual_size = static_cast<std::uint64_t>(std::filesystem::file_size(absolute, size_error));
+      if (size_error) {
+        std::cerr << "verify-hashes: unreadable " << relative << "\n";
+        ++bad;
+        continue;
+      }
+      if (record.has_byte_size && actual_size < record.byte_size) {
+        std::cerr << "verify-hashes: TRUNCATED " << relative
+                  << " (have " << actual_size << " bytes, expected " << record.byte_size << ")\n";
+        ++bad;
+        continue;
+      }
+      const auto use_prefix = record.has_byte_size && actual_size > record.byte_size;
+      const auto digest = use_prefix
+                              ? apitrace::trace::content_hash_file_prefix(absolute, record.byte_size)
+                              : apitrace::trace::content_hash_file(absolute);
+      if (digest != record.digest) {
+        std::cerr << "verify-hashes: CORRUPT " << relative
+                  << " (hash mismatch)\n";
+        ++bad;
+        continue;
+      }
+    }
+    const auto expected_bundle_hash = bundle_hash_from_records(reader.checksums().files);
+    if (!reader.checksums().bundle_hash.empty() &&
+        reader.checksums().bundle_hash != expected_bundle_hash) {
+      std::cerr << "verify-hashes: bundle_hash mismatch"
+                << " expected " << expected_bundle_hash
+                << " got " << reader.checksums().bundle_hash << "\n";
+      ++bad;
+    }
+    std::cout << "bundle-check verify-hashes: checked=" << checked << " bad=" << bad << "\n";
+    if (bad != 0) {
+      return 1;
+    }
   }
 
   for (const auto &record : reader.checksums().files) {

@@ -1,5 +1,8 @@
 #include "apitrace/asset_index.hpp"
 #include "apitrace/bundle_layout.hpp"
+#include "apitrace/d3d12_replay.hpp"
+#include "apitrace/trace_bundle_io.hpp"
+#include "apitrace/tools/cli_entries.hpp"
 
 #include "nlohmann/json.hpp"
 
@@ -95,6 +98,9 @@ struct Stats {
   std::size_t restored_inline_query_assets = 0;
   std::size_t rebuilt_d3d12_pipeline_assets = 0;
   std::size_t incomplete_d3d12_pipeline_semantics = 0;
+  bool d3d12_replay_model_written = false;
+  std::uint64_t d3d12_replay_model_json_bytes = 0;
+  std::uint64_t d3d12_replay_model_blob_bytes = 0;
   std::size_t preserved_referenced_duplicate_assets = 0;
   std::size_t dropped_unreferenced_missing_assets = 0;
   std::uint64_t hashed_asset_bytes = 0;
@@ -3487,10 +3493,78 @@ void write_checksums(
   }
 }
 
+// Reconstruct the D3D12 replay object model from the finalized callstream once and persist it,
+// so retrace can load it and skip the in-process initialize+replay_event reconstruction. Runs
+// only for D3D12 bundles; never touches the GPU (no finalize_replay). Best-effort: a failure is
+// reported but does not fail finalize (retrace falls back to in-process reconstruction).
+void persist_d3d12_replay_model(const fs::path &bundle_root, const Options &options, Stats &stats)
+{
+  if (options.dry_run) {
+    return;
+  }
+
+  apitrace::trace::TraceBundleReader reader;
+  // The D3D12 object-model reconstruction consumes only the D3D12 event stream; it never touches
+  // the Metal sideband. Skip loading metal-callstream.jsonl (can be multiple GB) — parsing it here
+  // would dominate finalize time for nothing. Also skip per-asset checksum re-validation: open()
+  // would otherwise sha256 every file in the (multi-GB, thousands-of-files) bundle, which is the
+  // job of bundle-check --verify-hashes, not of model reconstruction. We are inside finalize, which
+  // is recomputing checksums itself moments later, so the bytes are trusted here.
+  apitrace::trace::TraceBundleReader::OpenOptions reader_options;
+  reader_options.load_metal_sideband = false;
+  reader_options.validate_checksum_contents = false;
+  if (!reader.open(bundle_root, reader_options)) {
+    std::cerr << "warning: replay-model persist skipped: failed to reopen bundle\n";
+    return;
+  }
+  if (reader.metadata().api != apitrace::trace::ApiKind::D3D12) {
+    return;
+  }
+
+  apitrace::d3d12::D3D12ReplayBackend backend;
+  if (!backend.initialize(reader)) {
+    std::cerr << "warning: replay-model persist skipped: backend initialize failed: "
+              << backend.last_error() << "\n";
+    return;
+  }
+  for (const auto &event : reader.events()) {
+    if (!backend.replay_event(event)) {
+      std::cerr << "warning: replay-model persist skipped: replay_event failed at sequence "
+                << event.callsite.sequence << ": " << backend.last_error() << "\n";
+      return;
+    }
+  }
+
+  // Staleness binding is intentionally not recorded: retrace trusts the persisted model as valid
+  // input (finalize+retrace are a configured pipeline) rather than paying a multi-GB re-hash per
+  // run to catch a user swapping the callstream. Bundle-level integrity is still covered by
+  // checksums.json (which hashes the model files too). Leave source_bundle_hash empty; schema_version
+  // remains the format guard. Binding to the bundle_hash would also be circular — the model files
+  // are part of the bundle, so they change the very hash they would try to record.
+  const std::string source_bundle_hash;
+
+  const auto json_path = bundle_root / apitrace::trace::kD3D12ReplayModelJsonName;
+  const auto blob_path = bundle_root / apitrace::trace::kD3D12ReplayModelBlobName;
+  std::error_code dir_error;
+  fs::create_directories(json_path.parent_path(), dir_error);
+
+  std::string error;
+  if (!backend.save_replay_model(json_path, blob_path, source_bundle_hash, error)) {
+    std::cerr << "warning: replay-model persist failed: " << error << "\n";
+    return;
+  }
+
+  std::error_code size_error;
+  stats.d3d12_replay_model_written = true;
+  stats.d3d12_replay_model_json_bytes =
+      static_cast<std::uint64_t>(fs::file_size(json_path, size_error));
+  stats.d3d12_replay_model_blob_bytes =
+      static_cast<std::uint64_t>(fs::file_size(blob_path, size_error));
+}
+
 } // namespace
 
-int main(int argc, char **argv)
-{
+int apitrace::tools::run_bundle_finalize(int argc, char **argv){
   const auto parsed = parse_args(argc, argv);
   if (!parsed) {
     const auto help_requested = std::any_of(argv + 1, argv + argc, [](const char *arg) {
@@ -3507,7 +3581,7 @@ int main(int argc, char **argv)
   }
 
   const auto started = std::chrono::steady_clock::now();
-  constexpr std::size_t kStageCount = 18;
+  constexpr std::size_t kStageCount = 19;
   std::size_t stage_index = 0;
   ProgressReporter progress(options.progress);
   Stats stats;
@@ -3734,6 +3808,9 @@ int main(int argc, char **argv)
           &progress);
     }
   });
+  run_stage(options, progress, stage_index, kStageCount, "persist_d3d12_replay_model", [&] {
+    persist_d3d12_replay_model(options.bundle_root, options, stats);
+  });
   run_stage(options, progress, stage_index, kStageCount, "write_indexes", [&] {
     write_asset_index(
         options.bundle_root,
@@ -3768,6 +3845,9 @@ int main(int argc, char **argv)
             << " duplicate_bytes=" << stats.duplicate_bytes
             << " restored_inline_query_assets=" << stats.restored_inline_query_assets
             << " rebuilt_d3d12_pipeline_assets=" << stats.rebuilt_d3d12_pipeline_assets
+            << " d3d12_replay_model_written=" << (stats.d3d12_replay_model_written ? "true" : "false")
+            << " d3d12_replay_model_json_bytes=" << stats.d3d12_replay_model_json_bytes
+            << " d3d12_replay_model_blob_bytes=" << stats.d3d12_replay_model_blob_bytes
             << " repaired_d3d12_pipeline_events=" << stats.repaired_d3d12_pipeline_events
             << " incomplete_d3d12_pipeline_semantics=" << stats.incomplete_d3d12_pipeline_semantics
             << " unresolved_d3d12_pipeline_asset_refs=" << stats.unresolved_d3d12_pipeline_asset_refs

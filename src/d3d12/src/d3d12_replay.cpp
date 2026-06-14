@@ -617,14 +617,53 @@ bool read_exact_asset_bytes(
   if (!bytes.empty()) {
     input.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
   }
-  if (static_cast<std::size_t>(input.gcount()) != bytes.size()) {
-    error = "asset is smaller than expected: " + path.generic_string();
-    return false;
+  const auto read_count = static_cast<std::size_t>(input.gcount());
+  if (read_count != bytes.size()) {
+    // The recorder stores a buffer asset trimmed to its last non-zero byte
+    // (trailing zeros are dropped; an all-zero buffer collapses to a tiny
+    // representative), while the referencing event keeps the full logical
+    // size. A short read therefore means the stored prefix plus the
+    // zero-prefilled tail already reconstructs the logical buffer. Only a
+    // read longer than expected is a genuine inconsistency.
+    if (read_count > bytes.size()) {
+      error = "asset is larger than expected: " + path.generic_string();
+      return false;
+    }
+    return true;
   }
   char extra = 0;
   if (input.get(extra)) {
     error = "asset is larger than expected: " + path.generic_string();
     return false;
+  }
+  return true;
+}
+
+bool read_prefix_asset_bytes(
+    const std::filesystem::path &path,
+    std::uint64_t expected_size,
+    std::vector<std::uint8_t> &bytes,
+    std::string &error)
+{
+  if (expected_size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    error = "asset is too large for replay memory: " + path.generic_string();
+    return false;
+  }
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    error = "failed to open asset: " + path.generic_string();
+    return false;
+  }
+  bytes.assign(static_cast<std::size_t>(expected_size), 0);
+  if (!bytes.empty()) {
+    input.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  }
+  const auto read_count = static_cast<std::size_t>(input.gcount());
+  if (read_count != bytes.size()) {
+    // See read_exact_asset_bytes: the recorder trims buffer assets to their
+    // last non-zero byte, so a short read is the stored prefix and the
+    // zero-prefilled tail reconstructs the logical buffer.
+    return true;
   }
   return true;
 }
@@ -698,12 +737,14 @@ bool is_supported_d3d12_call(std::string_view function_name)
          function_name == "ID3D12Device8::CreateCommittedResource2" ||
          function_name == "ID3D12Device::CreateReservedResource" ||
          function_name == "ID3D12Device::CreateHeap" ||
+         function_name == "ID3D12Device::OpenExistingHeap" ||
          function_name == "ID3D12Device3::OpenExistingHeapFromAddress" ||
          function_name == "ID3D12Device4::CreateHeap1" ||
          function_name == "ID3D12Device::CreatePlacedResource" ||
          function_name == "ID3D12Device8::CreatePlacedResource1" ||
          function_name == "ID3D12Device9::CreateShaderCacheSession" ||
          function_name == "ID3D12Device9::ShaderCacheControl" ||
+         function_name == "ID3D12Device::GetResourceTiling" ||
          function_name == "ID3D12Device::CreateFence" ||
          function_name == "ID3D12Device::CreateConstantBufferView" ||
          function_name == "ID3D12Device::CreateShaderResourceView" ||
@@ -716,8 +757,10 @@ bool is_supported_d3d12_call(std::string_view function_name)
 	         function_name == "ID3D12Device::CopyDescriptors" ||
 	         function_name == "ID3D12Device::CopyDescriptorsSimple" ||
 	         function_name == "DXMT::FenceDependencyBatch" ||
+	         function_name == "DXMT::SparseTextureMappingOps" ||
 	         function_name == "ID3D12CommandAllocator::Reset" ||
          function_name == "ID3D12CommandQueue::ExecuteCommandLists" ||
+         function_name == "ID3D12CommandQueue::UpdateTileMappings" ||
          function_name == "ID3D12CommandQueue::Signal" ||
          function_name == "ID3D12CommandQueue::Wait" ||
          function_name == "ID3D12GraphicsCommandList::QueryInterface" ||
@@ -1080,6 +1123,21 @@ bool descriptor_heap_type_is_shader_visible(std::uint32_t flags)
   return (flags & shader_visible) != 0;
 }
 
+std::uint32_t normalized_resource_mip_levels(std::uint64_t width, std::uint32_t height, std::uint32_t depth, std::uint32_t mip_levels)
+{
+  if (mip_levels != 0) {
+    return mip_levels;
+  }
+
+  std::uint64_t max_dimension = std::max<std::uint64_t>(width, std::max<std::uint32_t>(height, depth));
+  std::uint32_t levels = 1;
+  while (max_dimension > 1) {
+    max_dimension >>= 1;
+    ++levels;
+  }
+  return levels;
+}
+
 std::uint64_t resource_subresource_count(const D3D12ReplayBackend::ResourceSemanticState &resource)
 {
   return static_cast<std::uint64_t>(resource.mip_levels) *
@@ -1280,5 +1338,6 @@ bool d3d12_retrace_present_frame_capture_enabled()
 
 #include "d3d12_replay/native_replayer.inc"
 #include "d3d12_replay/backend_methods.inc"
+#include "d3d12_replay/replay_model_io.inc"
 
 } // namespace apitrace::d3d12

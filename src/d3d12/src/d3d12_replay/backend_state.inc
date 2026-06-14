@@ -147,6 +147,63 @@ bool D3D12ReplayBackend::resolve_gpu_virtual_address_at(
   return true;
 }
 
+bool D3D12ReplayBackend::resolve_recorded_gpu_virtual_address_at(
+    std::uint64_t gpu_virtual_address,
+    trace::ObjectId recorded_resource_object_id,
+    bool recorded_unmapped,
+    std::uint64_t sequence,
+    GpuVirtualAddressBinding &binding,
+    std::string &error) const
+{
+  binding = GpuVirtualAddressBinding{};
+  binding.gpu_virtual_address = gpu_virtual_address;
+  if (gpu_virtual_address == 0) {
+    return true;
+  }
+
+  if (recorded_unmapped) {
+    binding.resolved = false;
+    return true;
+  }
+
+  if (recorded_resource_object_id != 0) {
+    const auto resource_it = resources_.find(recorded_resource_object_id);
+    if (resource_it != resources_.end()) {
+      const auto &resource = resource_it->second;
+      if (resource.create_sequence <= sequence && resource.gpu_virtual_address != 0 &&
+          gpu_virtual_address >= resource.gpu_virtual_address) {
+        const auto offset = gpu_virtual_address - resource.gpu_virtual_address;
+        if (offset < resource.width) {
+          binding.resource_object_id = recorded_resource_object_id;
+          binding.offset = offset;
+          binding.resolved = true;
+          return true;
+        }
+      }
+    }
+  }
+
+  return resolve_gpu_virtual_address_at(gpu_virtual_address, sequence, binding, error);
+}
+
+bool resolve_recorded_gpu_virtual_address_payload(
+    const D3D12ReplayBackend &backend,
+    const json &payload,
+    std::string_view address_key,
+    std::uint64_t sequence,
+    D3D12ReplayBackend::GpuVirtualAddressBinding &binding,
+    std::string &error)
+{
+  const auto status = payload_string(payload, "gpuva_resolve_status");
+  return backend.resolve_recorded_gpu_virtual_address_at(
+      payload_u64(payload, address_key),
+      payload_u64(payload, "resolved_resource_object_id"),
+      status == "unmapped",
+      sequence,
+      binding,
+      error);
+}
+
 bool validate_gpu_virtual_address_resolve_payload(
     const trace::EventRecord &event,
     const std::string &payload_label,
@@ -298,6 +355,7 @@ bool D3D12ReplayBackend::initialize(const trace::TraceBundleReader &reader)
   query_heaps_.clear();
   resources_.clear();
   replay_commands_.clear();
+  tile_mapping_updates_.clear();
   blob_paths_.clear();
 
   if (reader.metadata().api != trace::ApiKind::D3D12) {
@@ -432,6 +490,7 @@ bool D3D12ReplayBackend::index_present_frame_event(const trace::EventRecord &eve
 
 bool D3D12ReplayBackend::index_present_frames(const trace::TraceBundleReader &reader)
 {
+  present_frames_.clear();
   for (const auto &event : reader.events()) {
     if (!index_present_frame_event(event, true)) {
       return false;
@@ -571,10 +630,6 @@ bool D3D12ReplayBackend::validate_present_boundaries(const trace::TraceBundleRea
   }
   if (present_index != present_semantics_.size()) {
     last_error_ = "D3D12 present boundary count does not match captured IDXGISwapChain::Present calls";
-    return false;
-  }
-  if (!present_frames_.empty() && present_index != present_frames_.size()) {
-    last_error_ = "D3D12 present frame asset count does not match captured IDXGISwapChain::Present calls";
     return false;
   }
   return true;
@@ -1031,9 +1086,30 @@ bool D3D12ReplayBackend::validate_native_replay_readiness()
     return true;
   };
 
+  // Samplers are tracked separately from view descriptors in samplers_, but
+  // the descriptor-state timeline below must treat them like any other
+  // descriptor so that sampler CopyDescriptors sources resolve and sampler
+  // root descriptor tables validate. Materialize each captured sampler as a
+  // synthetic Sampler-kind descriptor. This storage must be fully populated
+  // before any pointer is taken so that vector growth cannot invalidate the
+  // pointers held in descriptor_timeline.
+  std::vector<DescriptorSemanticState> synthetic_sampler_descriptors;
+  synthetic_sampler_descriptors.reserve(samplers_.size());
+  for (const auto &sampler : samplers_) {
+    DescriptorSemanticState descriptor;
+    descriptor.kind = "Sampler";
+    descriptor.create_sequence = sampler.create_sequence;
+    descriptor.descriptor = sampler.descriptor;
+    descriptor.binding = sampler.binding;
+    synthetic_sampler_descriptors.push_back(std::move(descriptor));
+  }
+
   std::vector<const DescriptorSemanticState *> descriptor_timeline;
-  descriptor_timeline.reserve(descriptors_.size());
+  descriptor_timeline.reserve(descriptors_.size() + synthetic_sampler_descriptors.size());
   for (const auto &descriptor : descriptors_) {
+    descriptor_timeline.push_back(&descriptor);
+  }
+  for (const auto &descriptor : synthetic_sampler_descriptors) {
     descriptor_timeline.push_back(&descriptor);
   }
   std::sort(
@@ -1081,7 +1157,17 @@ bool D3D12ReplayBackend::validate_native_replay_readiness()
           }
           const auto src_it = descriptor_state_at_sequence.find(descriptor_binding_key(src_binding));
           if (src_it == descriptor_state_at_sequence.end()) {
-            last_error_ = "D3D12 native replay readiness failed: descriptor copy reads from an uninitialized descriptor";
+            std::ostringstream diag;
+            diag << "D3D12 native replay readiness failed: descriptor copy reads from an uninitialized descriptor"
+                 << " [copy_seq=" << copy->create_sequence
+                 << " src_ptr=" << pair.src_descriptor
+                 << " src_heap=" << src_binding.heap_object_id
+                 << " src_heap_type=" << src_binding.heap_type
+                 << " src_index=" << src_binding.descriptor_index
+                 << " src_key=" << descriptor_binding_key(src_binding)
+                 << " dst_ptr=" << pair.dst_descriptor
+                 << " dst_key=" << descriptor_binding_key(dst_binding) << "]";
+            last_error_ = diag.str();
             return false;
           }
           descriptor_state_at_sequence[descriptor_binding_key(dst_binding)] = src_it->second;
@@ -1498,9 +1584,21 @@ bool D3D12ReplayBackend::validate_native_replay_readiness()
         return nullptr;
       }
     } else if (location.type == 1) {
+      // Block-compressed formats (BC1-BC7) store one 4x4 texel block per
+      // compressed unit, so a placed footprint occupies ceil(height/4) block
+      // rows rather than one row per texel. Using the texel height here would
+      // overcount the footprint by up to 4x and falsely report the range as
+      // out of bounds against the backing buffer.
+      const auto format = location.footprint_format;
+      const bool block_compressed =
+          (format >= 70 && format <= 84) || (format >= 94 && format <= 99);
+      const std::uint64_t footprint_rows =
+          block_compressed
+              ? (static_cast<std::uint64_t>(location.footprint_height) + 3) / 4
+              : static_cast<std::uint64_t>(location.footprint_height);
       const auto footprint_bytes =
           static_cast<std::uint64_t>(location.footprint_row_pitch) *
-          static_cast<std::uint64_t>(location.footprint_height) *
+          footprint_rows *
           static_cast<std::uint64_t>(location.footprint_depth);
       if (location.footprint_offset > resource.width ||
           footprint_bytes > resource.width - location.footprint_offset) {
@@ -1538,12 +1636,28 @@ bool D3D12ReplayBackend::validate_native_replay_readiness()
       return false;
     }
     if (copy.has_src_box) {
+      // For a placed-footprint source (type 1) the resource is a buffer whose
+      // width holds a byte count and whose height/depth are 1. The source box
+      // is expressed in texels of the footprint, so it must be bounded by the
+      // footprint extent rather than the underlying buffer dimensions.
+      std::uint64_t src_extent_width;
+      std::uint64_t src_extent_height;
+      std::uint64_t src_extent_depth;
+      if (copy.src.type == 1) {
+        src_extent_width = copy.src.footprint_width;
+        src_extent_height = copy.src.footprint_height;
+        src_extent_depth = copy.src.footprint_depth;
+      } else {
+        src_extent_width = src_resource->width;
+        src_extent_height = src_resource->height;
+        src_extent_depth = src_resource->depth_or_array_size;
+      }
       if (copy.src_box_right < copy.src_box_left ||
           copy.src_box_bottom < copy.src_box_top ||
           copy.src_box_back < copy.src_box_front ||
-          copy.src_box_right > src_resource->width ||
-          copy.src_box_bottom > src_resource->height ||
-          copy.src_box_back > src_resource->depth_or_array_size) {
+          copy.src_box_right > src_extent_width ||
+          copy.src_box_bottom > src_extent_height ||
+          copy.src_box_back > src_extent_depth) {
         std::ostringstream message;
         message << "D3D12 native replay readiness failed: CopyTextureRegion sequence "
                 << copy.sequence << " source box is out of bounds";

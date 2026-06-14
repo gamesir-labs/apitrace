@@ -2637,6 +2637,61 @@ void ensure_external_swapchain_object(const void *swapchain, const char *reason)
       payload.str().c_str());
 }
 
+// Forward declaration: defined later in this file; needed by
+// record_swapchain_back_buffer below.
+std::uint64_t record_call_with_object_ids(
+    const char *opname,
+    const char *payload_json,
+    std::vector<trace::ObjectId> object_refs,
+    const std::uint64_t *blob_refs = nullptr,
+    std::uint32_t blob_ref_count = 0,
+    std::int32_t result_code = 0);
+
+void record_swapchain_back_buffer(
+    const void *device,
+    const void *swapchain,
+    ID3D12Resource *back_buffer,
+    std::uint32_t buffer_index)
+{
+  if (!back_buffer) {
+    return;
+  }
+  // Idempotent: the back buffer is also lazily captured as an external
+  // resource the first time it is used as an RTV/barrier target. Emitting the
+  // swapchain semantics here, before that first use, registers the resource
+  // with the swapchain marker so native retrace can map it onto the real
+  // swapchain back buffer and infer the window size. Skip if already known.
+  {
+    std::lock_guard lock(g_object_mutex);
+    if (object_kind_known_locked(back_buffer, trace::ObjectKind::Resource)) {
+      return;
+    }
+  }
+  ensure_external_swapchain_object(swapchain, "GetBuffer");
+  record_object_create(back_buffer, CaptureObjectKind::Resource, swapchain, "IDXGISwapChainBackBuffer");
+  D3D12_RESOURCE_DESC desc{};
+  const bool has_desc = query_resource_desc(back_buffer, desc);
+  std::ostringstream payload;
+  payload << "{\"heap_type\":" << static_cast<unsigned int>(D3D12_HEAP_TYPE_DEFAULT)
+          << ",\"heap_flags\":" << static_cast<unsigned int>(D3D12_HEAP_FLAG_NONE)
+          << ",\"initial_state\":" << static_cast<unsigned int>(D3D12_RESOURCE_STATE_PRESENT)
+          << ",\"gpu_virtual_address\":0"
+          << ",\"swapchain_back_buffer\":true"
+          << ",\"buffer_index\":" << buffer_index
+          << ",\"resource_desc\":" << (has_desc ? resource_desc_json(&desc) : std::string("null"))
+          << "}";
+  std::vector<trace::ObjectId> refs;
+  {
+    std::lock_guard lock(g_object_mutex);
+    append_object_ref_id(refs, existing_object_id_locked(device));
+    append_object_ref_id(refs, lookup_object_id_locked(back_buffer));
+  }
+  record_call_with_object_ids(
+      "ID3D12Device::CreateCommittedResource",
+      payload.str().c_str(),
+      std::move(refs));
+}
+
 
 std::uint64_t register_blob(const char *debug_name, const void *data, std::size_t size)
 {
@@ -2672,9 +2727,9 @@ std::uint64_t record_call_with_object_ids(
     const char *opname,
     const char *payload_json,
     std::vector<trace::ObjectId> object_refs,
-    const std::uint64_t *blob_refs = nullptr,
-    std::uint32_t blob_ref_count = 0,
-    std::int32_t result_code = 0)
+    const std::uint64_t *blob_refs,
+    std::uint32_t blob_ref_count,
+    std::int32_t result_code)
 {
   std::lock_guard event_lock(g_event_order_mutex);
   flush_diagnostic_batches();

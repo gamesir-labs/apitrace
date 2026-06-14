@@ -6,6 +6,7 @@
 #include <cstdint>
 
 struct ID3D12Device;
+struct ID3D12Resource;
 struct D3D12_COMMAND_QUEUE_DESC;
 struct D3D12_DESCRIPTOR_HEAP_DESC;
 struct D3D12_HEAP_PROPERTIES;
@@ -164,6 +165,11 @@ std::uint64_t record_dxgi_create_swapchain(
     const void *factory,
     const void *device,
     const void *swapchain);
+void record_swapchain_back_buffer(
+    const void *device,
+    const void *swapchain,
+    ID3D12Resource *back_buffer,
+    std::uint32_t buffer_index);
 std::uint64_t record_execute_command_lists(
     const void *queue,
     const void *command_list);

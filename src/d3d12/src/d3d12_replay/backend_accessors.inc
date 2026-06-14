@@ -21,6 +21,7 @@ void D3D12ReplayBackend::shutdown()
   root_signatures_.clear();
   fence_operations_.clear();
   replay_commands_.clear();
+  tile_mapping_updates_.clear();
   bundle_root_.clear();
   initialized_ = false;
   commands_replayed_ = 0;
@@ -62,4 +63,3 @@ D3D12ReplayBackend::replay_commands() const noexcept
 {
   return replay_commands_;
 }
-

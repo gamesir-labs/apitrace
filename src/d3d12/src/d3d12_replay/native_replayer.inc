@@ -363,7 +363,16 @@ private:
       NativeHeap native;
       HRESULT hr = device_->CreateHeap(&desc, IID_PPV_ARGS(native.heap.put()));
       if (FAILED(hr)) {
-        error = hresult_error("CreateHeap", hr);
+        std::ostringstream detail;
+        detail << "CreateHeap(object_id=" << object_id
+               << " size=" << desc.SizeInBytes
+               << " alignment=" << desc.Alignment
+               << " heap_type=" << static_cast<unsigned>(desc.Properties.Type)
+               << " cpu_page=" << static_cast<unsigned>(desc.Properties.CPUPageProperty)
+               << " mem_pool=" << static_cast<unsigned>(desc.Properties.MemoryPoolPreference)
+               << " flags=0x" << std::hex << static_cast<unsigned>(desc.Flags) << std::dec
+               << ")";
+        error = hresult_error(detail.str(), hr);
         return false;
       }
       heaps_.emplace(object_id, std::move(native));
@@ -379,7 +388,7 @@ private:
     desc.Width = resource.width;
     desc.Height = resource.height;
     desc.DepthOrArraySize = static_cast<UINT16>(resource.depth_or_array_size);
-    desc.MipLevels = static_cast<UINT16>(resource.mip_levels);
+    desc.MipLevels = static_cast<UINT16>(resource.recorded_mip_levels);
     desc.Format = static_cast<DXGI_FORMAT>(resource.format);
     desc.SampleDesc.Count = resource.sample_count;
     desc.SampleDesc.Quality = resource.sample_quality;
@@ -1368,7 +1377,8 @@ private:
         native_lists.push_back(native_it->second.list.get());
       }
       if (!sync_resource_data_until(batch.execute_sequence, error) ||
-          !sync_descriptors_until(batch.execute_sequence, error)) {
+          !sync_descriptors_until(batch.execute_sequence, error) ||
+          !sync_tile_mapping_updates_until(batch.execute_sequence, error)) {
         return false;
       }
       if (!native_lists.empty()) {
@@ -1418,6 +1428,136 @@ private:
     return true;
   }
 
+  bool sync_tile_mapping_updates_until(std::uint64_t sequence, std::string &error)
+  {
+    while (next_tile_mapping_update_index_ < backend_.tile_mapping_updates_.size() &&
+           backend_.tile_mapping_updates_[next_tile_mapping_update_index_].sequence <= sequence) {
+      if (!apply_tile_mapping_update(backend_.tile_mapping_updates_[next_tile_mapping_update_index_], error)) {
+        return false;
+      }
+      ++next_tile_mapping_update_index_;
+    }
+    return true;
+  }
+
+  bool apply_tile_mapping_update(
+      const D3D12ReplayBackend::TileMappingUpdateRecord &update,
+      std::string &error)
+  {
+    const auto resource_it = resources_.find(update.resource_object_id);
+    if (resource_it == resources_.end()) {
+      return fail(error, "UpdateTileMappings references an unknown resource");
+    }
+    ID3D12Heap *native_heap = nullptr;
+    if (update.heap_object_id != 0) {
+      const auto heap_it = heaps_.find(update.heap_object_id);
+      if (heap_it == heaps_.end()) {
+        return fail(error, "UpdateTileMappings references an unknown heap");
+      }
+      native_heap = heap_it->second.heap.get();
+    }
+
+    json payload = json::parse(update.payload, nullptr, false);
+    if (payload.is_discarded() || !payload.is_object()) {
+      return fail(error, "UpdateTileMappings payload must be a JSON object");
+    }
+    const auto region_count = payload_u32(payload, "region_count");
+    const auto range_count = payload_u32(payload, "range_count");
+    const auto regions_json = payload.find("regions");
+    const auto region_sizes_json = payload.find("region_sizes");
+    const auto range_flags_json = payload.find("range_flags");
+    const auto heap_offsets_json = payload.find("heap_range_offsets");
+    const auto tile_counts_json = payload.find("range_tile_counts");
+    if (regions_json == payload.end() || !regions_json->is_array() ||
+        region_sizes_json == payload.end() || !region_sizes_json->is_array() ||
+        range_flags_json == payload.end() || !range_flags_json->is_array() ||
+        heap_offsets_json == payload.end() || !heap_offsets_json->is_array() ||
+        tile_counts_json == payload.end() || !tile_counts_json->is_array()) {
+      return fail(error, "UpdateTileMappings payload arrays are missing");
+    }
+    if (regions_json->size() != region_count || region_sizes_json->size() != region_count ||
+        range_flags_json->size() != range_count || heap_offsets_json->size() != range_count ||
+        tile_counts_json->size() != range_count) {
+      return fail(error, "UpdateTileMappings payload counts do not match arrays");
+    }
+
+    std::vector<D3D12_TILED_RESOURCE_COORDINATE> regions;
+    std::vector<D3D12_TILE_REGION_SIZE> region_sizes;
+    std::vector<D3D12_TILE_RANGE_FLAGS> range_flags;
+    std::vector<UINT> heap_offsets;
+    std::vector<UINT> tile_counts;
+    regions.reserve(regions_json->size());
+    region_sizes.reserve(region_sizes_json->size());
+    range_flags.reserve(range_flags_json->size());
+    heap_offsets.reserve(heap_offsets_json->size());
+    tile_counts.reserve(tile_counts_json->size());
+
+    for (const auto &region_json : *regions_json) {
+      if (!region_json.is_object()) {
+        return fail(error, "UpdateTileMappings region must be an object");
+      }
+      D3D12_TILED_RESOURCE_COORDINATE region{};
+      region.Subresource = payload_u32(region_json, "subresource");
+      region.X = payload_u32(region_json, "x");
+      region.Y = payload_u32(region_json, "y");
+      region.Z = payload_u32(region_json, "z");
+      regions.push_back(region);
+    }
+    for (const auto &size_json : *region_sizes_json) {
+      if (!size_json.is_object()) {
+        return fail(error, "UpdateTileMappings region size must be an object");
+      }
+      D3D12_TILE_REGION_SIZE size{};
+      size.NumTiles = payload_u32(size_json, "num_tiles");
+      size.UseBox = payload_bool(size_json, "use_box");
+      size.Width = payload_u32(size_json, "width");
+      size.Height = payload_u32(size_json, "height");
+      size.Depth = payload_u32(size_json, "depth");
+      region_sizes.push_back(size);
+    }
+    for (const auto &flag_json : *range_flags_json) {
+      range_flags.push_back(static_cast<D3D12_TILE_RANGE_FLAGS>(json_u64(flag_json)));
+    }
+    for (const auto &offset_json : *heap_offsets_json) {
+      heap_offsets.push_back(static_cast<UINT>(json_u64(offset_json)));
+    }
+    for (const auto &count_json : *tile_counts_json) {
+      tile_counts.push_back(static_cast<UINT>(json_u64(count_json)));
+    }
+
+#ifdef _WIN32
+    // System (mingw) d3d12.h declares the standard 10-argument signature with
+    // the pHeap parameter. This build is capture-only and never replays, but
+    // it must compile.
+    queue_->UpdateTileMappings(
+        resource_it->second.resource.get(),
+        region_count,
+        regions.data(),
+        region_sizes.data(),
+        native_heap,
+        range_count,
+        range_flags.data(),
+        heap_offsets.data(),
+        tile_counts.data(),
+        static_cast<D3D12_TILE_MAPPING_FLAGS>(payload_u32(payload, "flags")));
+#else
+    // The vendored third_party/d3d-headers d3d12.h used by the native retrace
+    // build (matching DXMT's d3d12.dll vtable ABI) omits the pHeap parameter.
+    (void)native_heap;
+    queue_->UpdateTileMappings(
+        resource_it->second.resource.get(),
+        region_count,
+        regions.data(),
+        region_sizes.data(),
+        range_count,
+        range_flags.data(),
+        heap_offsets.data(),
+        tile_counts.data(),
+        static_cast<D3D12_TILE_MAPPING_FLAGS>(payload_u32(payload, "flags")));
+#endif
+    return true;
+  }
+
   void record_present_semantics(UINT sync_interval, UINT flags, HRESULT result)
   {
     if (!d3d12_retrace_present_frame_capture_enabled()) {
@@ -1440,10 +1580,16 @@ private:
       return true;
     }
 #ifdef _WIN32
+    // Capture needs either the proxy export (standalone capture d3d12.dll) or a
+    // direct file sink dir (real translation-layer d3d12.dll, e.g. DXMT). Bail
+    // early only if neither is available, so we don't do a pointless readback.
     static RecordPresentFrameFn proxy_record_present_frame =
         resolve_d3d12_export<RecordPresentFrameFn>("apitrace_d3d12_record_present_frame");
-    if (!proxy_record_present_frame) {
-      return fail(error, "APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES is enabled but the capture export is missing");
+    const char *sink_dir = std::getenv("APITRACE_D3D12_RETRACE_PRESENT_FRAME_DIR");
+    if (!proxy_record_present_frame && !(sink_dir && *sink_dir)) {
+      return fail(error,
+                  "APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES is enabled but neither the "
+                  "capture export nor APITRACE_D3D12_RETRACE_PRESENT_FRAME_DIR is available");
     }
 #endif
 
@@ -1453,8 +1599,17 @@ private:
     }
     ID3D12Resource *back_buffer = back_buffers_[back_buffer_index].get();
     const D3D12_RESOURCE_DESC desc = back_buffer->GetDesc();
-    if (desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM) {
-      return fail(error, "present-frame capture currently requires an RGBA8 swapchain");
+    // Present-frame capture always emits RGBA8 bytes downstream (the recorder
+    // tags the asset "format":"rgba8" and the readback copy assumes 4 bytes
+    // per pixel). Accept only source formats we can correctly decode into
+    // RGBA8; anything else would be byte-copied and misinterpreted, producing
+    // wrong colors rather than an error.
+    switch (desc.Format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+      break;
+    default:
+      return fail(error, "present-frame capture requires an RGBA8 or R10G10B10A2 swapchain");
     }
     if (desc.Width == 0 || desc.Height == 0 ||
         desc.Width > static_cast<UINT64>(std::numeric_limits<UINT>::max()) ||
@@ -1563,7 +1718,30 @@ private:
                               static_cast<std::size_t>(footprint.Offset) +
                               static_cast<std::size_t>(row) * footprint.Footprint.RowPitch;
         auto *dst_row = rgba.data() + static_cast<std::size_t>(row) * row_pitch;
-        std::memcpy(dst_row, src_row, row_pitch);
+        if (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+          // Source is 32-bit little-endian packed: R[0:10] G[10:20] B[20:30]
+          // A[30:32]. Unpack each channel to 8-bit UNORM (rounded) so the
+          // downstream RGBA8 assumption holds and colors stay correct.
+          for (UINT col = 0; col < width; ++col) {
+            const auto *src_px = src_row + static_cast<std::size_t>(col) * 4u;
+            const std::uint32_t px =
+                static_cast<std::uint32_t>(src_px[0]) |
+                (static_cast<std::uint32_t>(src_px[1]) << 8) |
+                (static_cast<std::uint32_t>(src_px[2]) << 16) |
+                (static_cast<std::uint32_t>(src_px[3]) << 24);
+            const std::uint32_t r10 = px & 0x3FFu;
+            const std::uint32_t g10 = (px >> 10) & 0x3FFu;
+            const std::uint32_t b10 = (px >> 20) & 0x3FFu;
+            const std::uint32_t a2 = (px >> 30) & 0x3u;
+            auto *dst_px = dst_row + static_cast<std::size_t>(col) * 4u;
+            dst_px[0] = static_cast<std::uint8_t>((r10 * 255u + 511u) / 1023u);
+            dst_px[1] = static_cast<std::uint8_t>((g10 * 255u + 511u) / 1023u);
+            dst_px[2] = static_cast<std::uint8_t>((b10 * 255u + 511u) / 1023u);
+            dst_px[3] = static_cast<std::uint8_t>(a2 * 85u);
+          }
+        } else {
+          std::memcpy(dst_row, src_row, row_pitch);
+        }
       }
       D3D12_RANGE written_range{0, 0};
       readback->Unmap(0, &written_range);
@@ -1585,6 +1763,69 @@ private:
   }
 
 #ifdef _WIN32
+  // Write captured RGBA8 present frames to a sink directory as raw .rgba blobs
+  // plus a viewable .ppm (P6, alpha dropped). Used when the loaded d3d12.dll is
+  // a real translation layer (e.g. DXMT) that does not export the proxy capture
+  // entry point. Returns false only on a genuine I/O error.
+  bool write_present_frame_to_dir(
+      const char *dir,
+      std::uint64_t frame_index,
+      UINT width,
+      UINT height,
+      UINT row_pitch,
+      const void *rgba_data,
+      SIZE_T rgba_size,
+      std::string &error)
+  {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(fs::path(dir), ec);
+    if (ec) {
+      return fail(error, "failed to create present-frame sink dir: " + ec.message());
+    }
+
+    char stem[64];
+    std::snprintf(stem, sizeof(stem), "present-frame-%06llu",
+                  static_cast<unsigned long long>(frame_index));
+    const auto *bytes = static_cast<const std::uint8_t *>(rgba_data);
+
+    // Raw RGBA8 (tightly packed width*4 per row, no padding).
+    const fs::path raw_path = fs::path(dir) / (std::string(stem) + ".rgba");
+    std::ofstream raw(raw_path, std::ios::binary | std::ios::trunc);
+    if (!raw) {
+      return fail(error, "failed to open present-frame raw file: " + raw_path.string());
+    }
+    raw.write(reinterpret_cast<const char *>(bytes), static_cast<std::streamsize>(rgba_size));
+    if (!raw) {
+      return fail(error, "failed to write present-frame raw file: " + raw_path.string());
+    }
+    raw.close();
+
+    // Viewable PPM (P6 = binary RGB); drop the alpha channel.
+    const fs::path ppm_path = fs::path(dir) / (std::string(stem) + ".ppm");
+    std::ofstream ppm(ppm_path, std::ios::binary | std::ios::trunc);
+    if (!ppm) {
+      return fail(error, "failed to open present-frame ppm file: " + ppm_path.string());
+    }
+    ppm << "P6\n" << width << ' ' << height << "\n255\n";
+    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(width) * 3u);
+    for (UINT row = 0; row < height; ++row) {
+      const auto *src_row = bytes + static_cast<std::size_t>(row) * row_pitch;
+      for (UINT col = 0; col < width; ++col) {
+        const auto *px = src_row + static_cast<std::size_t>(col) * 4u;
+        rgb[col * 3u + 0] = px[0];
+        rgb[col * 3u + 1] = px[1];
+        rgb[col * 3u + 2] = px[2];
+      }
+      ppm.write(reinterpret_cast<const char *>(rgb.data()),
+                static_cast<std::streamsize>(rgb.size()));
+    }
+    if (!ppm) {
+      return fail(error, "failed to write present-frame ppm file: " + ppm_path.string());
+    }
+    return true;
+  }
+
   bool record_present_frame(
       std::uint64_t frame_index,
       UINT width,
@@ -1598,11 +1839,20 @@ private:
   {
     static RecordPresentFrameFn record =
         resolve_d3d12_export<RecordPresentFrameFn>("apitrace_d3d12_record_present_frame");
-    if (!record) {
-      return fail(error, "APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES is enabled but the capture export is missing");
+    if (record) {
+      record(frame_index, width, height, row_pitch, sync_interval, flags, rgba_data, rgba_size);
+      return true;
     }
-    record(frame_index, width, height, row_pitch, sync_interval, flags, rgba_data, rgba_size);
-    return true;
+    // No proxy capture export (real translation-layer d3d12.dll): fall back to a
+    // direct file sink if the caller provided a target directory.
+    const char *sink_dir = std::getenv("APITRACE_D3D12_RETRACE_PRESENT_FRAME_DIR");
+    if (sink_dir && *sink_dir) {
+      return write_present_frame_to_dir(sink_dir, frame_index, width, height, row_pitch,
+                                        rgba_data, rgba_size, error);
+    }
+    return fail(error,
+                "APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES is enabled but neither the "
+                "capture export nor APITRACE_D3D12_RETRACE_PRESENT_FRAME_DIR is available");
   }
 #else
   bool ensure_capture_writer(std::string &error)
@@ -1799,6 +2049,37 @@ private:
     if (!backend_.resolve_gpu_virtual_address_at(original_address, sequence, binding, error)) {
       return false;
     }
+    return relocated_gpu_virtual_address(binding, original_address, relocated, error);
+  }
+
+  bool relocated_recorded_gpu_virtual_address(
+      const json &payload,
+      std::string_view address_key,
+      std::uint64_t sequence,
+      D3D12_GPU_VIRTUAL_ADDRESS &relocated,
+      std::string &error) const
+  {
+    relocated = 0;
+    D3D12ReplayBackend::GpuVirtualAddressBinding binding;
+    const auto status = payload_string(payload, "gpuva_resolve_status");
+    if (!backend_.resolve_recorded_gpu_virtual_address_at(
+            payload_u64(payload, address_key),
+            payload_u64(payload, "resolved_resource_object_id"),
+            status == "unmapped",
+            sequence,
+            binding,
+            error)) {
+      return false;
+    }
+    return relocated_gpu_virtual_address(binding, payload_u64(payload, address_key), relocated, error);
+  }
+
+  bool relocated_gpu_virtual_address(
+      const D3D12ReplayBackend::GpuVirtualAddressBinding &binding,
+      std::uint64_t original_address,
+      D3D12_GPU_VIRTUAL_ADDRESS &relocated,
+      std::string &error) const
+  {
     if (binding.resource_object_id == 0) {
       return original_address == 0;
     }
@@ -2003,7 +2284,7 @@ private:
         return fail(error, "WriteBufferImmediate write entry must be an object");
       }
       D3D12_GPU_VIRTUAL_ADDRESS relocated = 0;
-      if (!relocated_gpu_virtual_address(payload_u64(write, "dest"), command.sequence, relocated, error)) {
+      if (!relocated_recorded_gpu_virtual_address(write, "dest", command.sequence, relocated, error)) {
         return false;
       }
       D3D12_WRITEBUFFERIMMEDIATE_PARAMETER parameter{};
@@ -2138,19 +2419,10 @@ private:
       const json &payload,
       std::string &error)
   {
-    D3D12ReplayBackend::GpuVirtualAddressBinding binding;
-    if (!backend_.resolve_gpu_virtual_address_at(payload_u64(payload, "buffer_location"), command.sequence, binding, error)) {
+    D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+    if (!relocated_recorded_gpu_virtual_address(payload, "buffer_location", command.sequence, address, error)) {
       return false;
     }
-    if (binding.gpu_virtual_address != 0 && !binding.resolved) {
-      return fail(error, "root descriptor GPUVA cannot be relocated");
-    }
-    const auto resource_it = resources_.find(binding.resource_object_id);
-    if (binding.resource_object_id != 0 && resource_it == resources_.end()) {
-      return fail(error, "root descriptor resource cannot be relocated");
-    }
-    const D3D12_GPU_VIRTUAL_ADDRESS address =
-        binding.resource_object_id == 0 ? 0 : resource_it->second.resource->GetGPUVirtualAddress() + binding.offset;
     const UINT root_parameter_index = payload_u32(payload, "root_parameter_index");
     if (command.function_name == "ID3D12GraphicsCommandList::SetComputeRootConstantBufferView") {
       list->SetComputeRootConstantBufferView(root_parameter_index, address);
@@ -2972,15 +3244,11 @@ private:
         views.push_back(view);
         return true;
       }
-      D3D12ReplayBackend::GpuVirtualAddressBinding binding;
-      if (!backend_.resolve_gpu_virtual_address_at(buffer_location, command.sequence, binding, error)) {
+      D3D12_GPU_VIRTUAL_ADDRESS relocated = 0;
+      if (!relocated_recorded_gpu_virtual_address(view_json, "buffer_location", command.sequence, relocated, error)) {
         return false;
       }
-      const auto resource_it = resources_.find(binding.resource_object_id);
-      if (resource_it == resources_.end()) {
-        return fail(error, "vertex buffer resource cannot be relocated");
-      }
-      view.BufferLocation = resource_it->second.resource->GetGPUVirtualAddress() + binding.offset;
+      view.BufferLocation = relocated;
       views.push_back(view);
       return true;
     };
@@ -2991,14 +3259,17 @@ private:
       if (!views_json->is_array()) {
         return fail(error, "IASetVertexBuffers view payload must be an array");
       }
-      if (views_json->size() != view_count) {
+      if (!views_json->empty() && views_json->size() != view_count) {
         return fail(error, "IASetVertexBuffers views count does not match view_count");
       }
-      views.reserve(views_json->size());
+      views.reserve(static_cast<std::size_t>(view_count));
       for (const auto &view_json : *views_json) {
         if (!append_view(view_json)) {
           return false;
         }
+      }
+      while (views.size() < view_count) {
+        views.push_back(D3D12_VERTEX_BUFFER_VIEW{});
       }
     } else if (view_count == 0) {
       views.clear();
@@ -3027,16 +3298,12 @@ private:
       list->IASetIndexBuffer(nullptr);
       return true;
     }
-    D3D12ReplayBackend::GpuVirtualAddressBinding binding;
-    if (!backend_.resolve_gpu_virtual_address_at(payload_u64(payload, "buffer_location"), command.sequence, binding, error)) {
+    D3D12_GPU_VIRTUAL_ADDRESS relocated = 0;
+    if (!relocated_recorded_gpu_virtual_address(payload, "buffer_location", command.sequence, relocated, error)) {
       return false;
     }
-    const auto resource_it = resources_.find(binding.resource_object_id);
-    if (resource_it == resources_.end()) {
-      return fail(error, "index buffer resource cannot be relocated");
-    }
     D3D12_INDEX_BUFFER_VIEW view{};
-    view.BufferLocation = resource_it->second.resource->GetGPUVirtualAddress() + binding.offset;
+    view.BufferLocation = relocated;
     view.SizeInBytes = payload_u32(payload, "size_in_bytes");
     view.Format = static_cast<DXGI_FORMAT>(payload_u32(payload, "format"));
     list->IASetIndexBuffer(&view);
@@ -3429,6 +3696,7 @@ private:
   std::size_t next_sampler_index_ = 0;
   std::size_t next_descriptor_copy_index_ = 0;
   std::size_t next_resource_update_index_ = 0;
+  std::size_t next_tile_mapping_update_index_ = 0;
 #if !defined(_WIN32)
   std::unique_ptr<trace::TraceBundleWriter> capture_writer_;
   std::uint64_t capture_sequence_ = 0;

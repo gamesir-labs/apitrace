@@ -1,7 +1,9 @@
 #include "apitrace/api.hpp"
+#include "apitrace/tools/cli_entries.hpp"
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -39,6 +41,21 @@ void write_stdout(const std::string &message)
   }
 #endif
   std::cout << message;
+}
+
+// Mirror a message to APITRACE_RETRACE_LOG_FILE if set. Under Wine the console subsystem swallows
+// WriteFile(STD_OUTPUT/STD_ERROR), so stats and "retrace failed: ..." are otherwise invisible; a
+// file sink makes them observable. Best-effort: failure to open the file is ignored.
+void write_log_file(const std::string &message)
+{
+  const char *path = std::getenv("APITRACE_RETRACE_LOG_FILE");
+  if (path == nullptr || *path == '\0') {
+    return;
+  }
+  std::ofstream out(path, std::ios::app | std::ios::binary);
+  if (out) {
+    out << message;
+  }
 }
 
 void write_stderr(const std::string &message)
@@ -114,7 +131,7 @@ bool finalize_bundle(std::string_view argv0, const std::string &trace_path)
 
 } // namespace
 
-int main(int argc, char **argv)
+int apitrace::tools::run_retrace(int argc, char **argv)
 {
   std::string trace_path;
   bool finalize_first = false;
@@ -175,12 +192,15 @@ int main(int argc, char **argv)
     if (!statistics.backend_name.empty() || statistics.calls_replayed != 0 ||
         statistics.frames_seen != 0 || statistics.presents_seen != 0) {
       write_stdout(format_statistics(statistics));
+      write_log_file(format_statistics(statistics));
     }
     write_stderr("retrace failed: " + session.last_error() + "\n");
+    write_log_file("retrace failed: " + session.last_error() + "\n");
     return 1;
   }
 
   const auto &statistics = session.statistics();
   write_stdout(format_statistics(statistics));
+  write_log_file(format_statistics(statistics));
   return 0;
 }

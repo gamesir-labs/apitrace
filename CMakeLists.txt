@@ -62,6 +62,7 @@ set(APITRACE_PUBLIC_INCLUDE_DIRS
     ${PROJECT_SOURCE_DIR}/src/d3d12/include
     ${PROJECT_SOURCE_DIR}/src/metal/include
     ${PROJECT_SOURCE_DIR}/src/platform/macos/include
+    ${PROJECT_SOURCE_DIR}/src/tools/apitrace/include
 )
 
 set(APITRACE_PRIVATE_INCLUDE_DIRS
@@ -279,7 +280,9 @@ if(APPLE AND APITRACE_BUILD_METAL_BACKEND)
 endif()
 
 if(APITRACE_BUILD_TOOLS AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
-    add_executable(apitrace_retrace src/tools/retrace/src/main.cpp)
+    add_executable(apitrace_retrace
+        src/tools/retrace/src/standalone_main.cpp
+        src/tools/retrace/src/main.cpp)
     set_target_properties(apitrace_retrace PROPERTIES OUTPUT_NAME retrace)
     target_link_libraries(apitrace_retrace PRIVATE apitrace_core)
     target_include_directories(apitrace_retrace PRIVATE ${APITRACE_PUBLIC_INCLUDE_DIRS})
@@ -301,7 +304,9 @@ if(APITRACE_BUILD_TOOLS AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
         )
     endif()
 
-    add_executable(apitrace_bundle_check src/tools/bundle-check/src/main.cpp)
+    add_executable(apitrace_bundle_check
+        src/tools/bundle-check/src/standalone_main.cpp
+        src/tools/bundle-check/src/main.cpp)
     set_target_properties(apitrace_bundle_check PROPERTIES OUTPUT_NAME bundle-check)
     target_link_libraries(apitrace_bundle_check PRIVATE apitrace_core apitrace_nlohmann_json)
     if(APPLE AND APITRACE_BUILD_D3D_NATIVE_RETRACE)
@@ -312,7 +317,9 @@ if(APITRACE_BUILD_TOOLS AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
 endif()
 
 if(APITRACE_BUILD_TOOLS AND APITRACE_BUILD_BUNDLE_FINALIZE AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
-    add_executable(apitrace_bundle_finalize src/tools/bundle-finalize/src/main.cpp)
+    add_executable(apitrace_bundle_finalize
+        src/tools/bundle-finalize/src/standalone_main.cpp
+        src/tools/bundle-finalize/src/main.cpp)
     set_target_properties(apitrace_bundle_finalize PROPERTIES OUTPUT_NAME bundle-finalize)
     target_link_libraries(apitrace_bundle_finalize PRIVATE apitrace_core apitrace_nlohmann_json)
     if(APPLE AND APITRACE_BUILD_D3D_NATIVE_RETRACE)
@@ -320,6 +327,35 @@ if(APITRACE_BUILD_TOOLS AND APITRACE_BUILD_BUNDLE_FINALIZE AND NOT APITRACE_BUIL
     endif()
     target_include_directories(apitrace_bundle_finalize PRIVATE ${APITRACE_PUBLIC_INCLUDE_DIRS} ${APITRACE_PRIVATE_INCLUDE_DIRS})
     target_compile_features(apitrace_bundle_finalize PRIVATE cxx_std_17)
+endif()
+
+# Unified CLI: `apitrace <command>` dispatches to the same run_*() entry points as the standalone
+# tools (bundle-finalize / bundle-check / retrace). Built only when all three tools are available.
+if(APITRACE_BUILD_TOOLS AND APITRACE_BUILD_BUNDLE_FINALIZE AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
+    add_executable(apitrace_cli
+        src/tools/apitrace/src/main.cpp
+        src/tools/retrace/src/main.cpp
+        src/tools/bundle-check/src/main.cpp
+        src/tools/bundle-finalize/src/main.cpp)
+    set_target_properties(apitrace_cli PROPERTIES OUTPUT_NAME apitrace)
+    target_link_libraries(apitrace_cli PRIVATE apitrace_core apitrace_nlohmann_json)
+    target_include_directories(apitrace_cli PRIVATE ${APITRACE_PUBLIC_INCLUDE_DIRS} ${APITRACE_PRIVATE_INCLUDE_DIRS})
+    target_compile_features(apitrace_cli PRIVATE cxx_std_17)
+    if(APPLE AND APITRACE_BUILD_METAL_BACKEND)
+        target_link_libraries(apitrace_cli PRIVATE apitrace_platform_apple_metal)
+    endif()
+    if(APPLE AND APITRACE_BUILD_D3D_NATIVE_RETRACE)
+        target_sources(apitrace_cli PRIVATE src/platform/macos/src/dxmt_macdrv_shim.mm)
+        set_source_files_properties(src/platform/macos/src/dxmt_macdrv_shim.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+        target_link_libraries(apitrace_cli PRIVATE apitrace_platform_macos)
+        target_link_options(apitrace_cli PRIVATE
+            -Wl,-exported_symbol,_get_win_data
+            -Wl,-exported_symbol,_release_win_data
+            -Wl,-exported_symbol,_macdrv_view_create_metal_view
+            -Wl,-exported_symbol,_macdrv_view_get_metal_layer
+            -Wl,-exported_symbol,_macdrv_view_release_metal_view
+        )
+    endif()
 endif()
 
 if(NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
@@ -343,6 +379,15 @@ if(NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
         target_link_libraries(apitrace_test_d3d12_replay_semantics PRIVATE apitrace_platform_macos)
     endif()
     target_compile_features(apitrace_test_d3d12_replay_semantics PRIVATE cxx_std_17)
+
+    add_executable(apitrace_test_d3d12_replay_model_roundtrip test/src/test_d3d12_replay_model_roundtrip.cpp)
+    target_link_libraries(apitrace_test_d3d12_replay_model_roundtrip PRIVATE apitrace_core apitrace_nlohmann_json)
+    target_compile_definitions(apitrace_test_d3d12_replay_model_roundtrip PRIVATE APITRACE_ENABLE_TEST_HOOKS)
+    if(APPLE AND APITRACE_BUILD_D3D_NATIVE_RETRACE)
+        target_link_libraries(apitrace_test_d3d12_replay_model_roundtrip PRIVATE apitrace_platform_macos)
+    endif()
+    target_include_directories(apitrace_test_d3d12_replay_model_roundtrip PRIVATE ${APITRACE_PRIVATE_INCLUDE_DIRS})
+    target_compile_features(apitrace_test_d3d12_replay_model_roundtrip PRIVATE cxx_std_17)
 
     add_executable(apitrace_test_d3d12_native_replay_smoke test/src/test_d3d12_native_replay_smoke.cpp)
     target_link_libraries(apitrace_test_d3d12_native_replay_smoke PRIVATE apitrace_core)
@@ -431,6 +476,7 @@ endif()
 
 if(APITRACE_BUILD_TOOLS AND APITRACE_BUILD_BUNDLE_FINALIZE AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
     install(TARGETS apitrace_bundle_finalize RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(TARGETS apitrace_cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 if(WIN32 AND APITRACE_BUILD_WINDOWS_DLLS AND NOT APITRACE_BUILD_PE_CAPTURE_STATIC)

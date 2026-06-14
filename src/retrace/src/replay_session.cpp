@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <chrono>
@@ -83,6 +84,18 @@ std::uint64_t env_u64(const char *name, std::uint64_t fallback = 0)
     return fallback;
   }
   return static_cast<std::uint64_t>(parsed);
+}
+
+// Returns true when the named environment variable is set to a truthy value.
+// Empty, "0", "false", and "FALSE" are treated as not enabled.
+bool env_enabled(const char *name)
+{
+  const char *value = std::getenv(name);
+  if (!value || !*value) {
+    return false;
+  }
+  const std::string_view text(value);
+  return text != "0" && text != "false" && text != "FALSE";
 }
 
 bool is_api_specific_resource_path(const std::filesystem::path &path)
@@ -2363,46 +2376,87 @@ bool ReplaySession::run()
     }
 
     d3d12::D3D12ReplayBackend backend;
-    const auto backend_init_begin = std::chrono::steady_clock::now();
-    if (!backend.initialize(impl_->reader)) {
-      impl_->statistics.backend_init_ms = elapsed_ms(backend_init_begin);
-      impl_->last_error = backend.last_error().empty() ? "failed to initialize D3D12 replay backend" : backend.last_error();
-      return false;
-    }
-    impl_->statistics.backend_init_ms = elapsed_ms(backend_init_begin);
 
     impl_->statistics.backend_name =
         impl_->options.backend == BackendKind::NativeD3D12 ? "native-d3d12" : "bundle-d3d12";
-    const auto event_replay_begin = std::chrono::steady_clock::now();
-    for (const auto &event : impl_->reader.events()) {
-      if (!backend.replay_event(event)) {
-        impl_->statistics.event_replay_ms = elapsed_ms(event_replay_begin);
-        if (!backend.last_error().empty()) {
-          impl_->last_error = "sequence " + std::to_string(event.callsite.sequence) + " " +
-                              event.callsite.function_name + ": " + backend.last_error();
-        } else {
-          impl_->last_error = "sequence " + std::to_string(event.callsite.sequence) + " " +
-                              event.callsite.function_name + ": D3D12 replay failed";
-        }
-        return false;
-      }
 
-      if (event.kind == trace::EventKind::Boundary) {
-        switch (event.boundary) {
-        case trace::BoundaryKind::Frame:
-          ++impl_->statistics.frames_seen;
-          break;
-        case trace::BoundaryKind::Present:
-          ++impl_->statistics.presents_seen;
-          break;
-        default:
-          break;
+    // Fast path: if bundle-finalize persisted a reconstructed replay model, load it and skip the
+    // CPU-heavy initialize()+replay_event reconstruction, going straight to finalize/validate.
+    // Falls back to full reconstruction on any load failure so bundles without a model still work.
+    // Skipped when the reader is prefix-limited (stop-after-sequence / stop-after-present-frame),
+    // because the persisted model describes the full trace and would not honor the requested cutoff.
+    bool model_loaded = false;
+    if (!impl_->reader.prefix_limited() && !env_enabled("APITRACE_D3D12_RETRACE_IGNORE_MODEL")) {
+      const std::filesystem::path model_json_path =
+          impl_->options.bundle_root / trace::kD3D12ReplayModelJsonName;
+      const std::filesystem::path model_blob_path =
+          impl_->options.bundle_root / trace::kD3D12ReplayModelBlobName;
+      std::error_code model_ec;
+      if (std::filesystem::exists(model_json_path, model_ec) &&
+          std::filesystem::exists(model_blob_path, model_ec)) {
+        // Trust the persisted model as valid input: finalize and retrace are a configured pipeline,
+        // so the model is bound to the callstream it was built from by construction. We deliberately
+        // do NOT re-hash the (multi-GB) source to detect a user swapping in a mismatched callstream;
+        // that is user error to own, not a per-retrace cost to pay. Pass an empty expected hash to
+        // skip the staleness check. schema_version still guards serialization-format mismatch (our
+        // own concern), so a model written by older code is still rejected and falls back to rebuild.
+        const std::string expected_source_bundle_hash;
+        const auto model_load_begin = std::chrono::steady_clock::now();
+        std::string model_error;
+        if (backend.load_replay_model(
+                model_json_path, model_blob_path, expected_source_bundle_hash, model_error)) {
+          // Account the load against backend_init_ms; reconstruction is skipped (event_replay_ms = 0).
+          impl_->statistics.backend_init_ms = elapsed_ms(model_load_begin);
+          model_loaded = true;
+          std::cerr << "retrace: loaded persisted replay model, skipping reconstruction\n";
+        } else {
+          std::cerr << "retrace: failed to load persisted replay model ("
+                    << (model_error.empty() ? "unknown error" : model_error)
+                    << "), falling back to reconstruction\n";
         }
-      } else {
-        ++impl_->statistics.calls_replayed;
       }
     }
-    impl_->statistics.event_replay_ms = elapsed_ms(event_replay_begin);
+
+    if (!model_loaded) {
+      const auto backend_init_begin = std::chrono::steady_clock::now();
+      if (!backend.initialize(impl_->reader)) {
+        impl_->statistics.backend_init_ms = elapsed_ms(backend_init_begin);
+        impl_->last_error = backend.last_error().empty() ? "failed to initialize D3D12 replay backend" : backend.last_error();
+        return false;
+      }
+      impl_->statistics.backend_init_ms = elapsed_ms(backend_init_begin);
+
+      const auto event_replay_begin = std::chrono::steady_clock::now();
+      for (const auto &event : impl_->reader.events()) {
+        if (!backend.replay_event(event)) {
+          impl_->statistics.event_replay_ms = elapsed_ms(event_replay_begin);
+          if (!backend.last_error().empty()) {
+            impl_->last_error = "sequence " + std::to_string(event.callsite.sequence) + " " +
+                                event.callsite.function_name + ": " + backend.last_error();
+          } else {
+            impl_->last_error = "sequence " + std::to_string(event.callsite.sequence) + " " +
+                                event.callsite.function_name + ": D3D12 replay failed";
+          }
+          return false;
+        }
+
+        if (event.kind == trace::EventKind::Boundary) {
+          switch (event.boundary) {
+          case trace::BoundaryKind::Frame:
+            ++impl_->statistics.frames_seen;
+            break;
+          case trace::BoundaryKind::Present:
+            ++impl_->statistics.presents_seen;
+            break;
+          default:
+            break;
+          }
+        } else {
+          ++impl_->statistics.calls_replayed;
+        }
+      }
+      impl_->statistics.event_replay_ms = elapsed_ms(event_replay_begin);
+    }
     const auto finalize_begin = std::chrono::steady_clock::now();
     if (impl_->options.validate_only) {
       if (!backend.validate_only()) {

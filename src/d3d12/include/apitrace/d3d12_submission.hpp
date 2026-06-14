@@ -58,6 +58,25 @@ public:
   const D3D12SubmissionBatch &current_batch() const noexcept;
   const std::vector<D3D12SubmissionBatch> &completed_batches() const noexcept;
 
+  // Additive accessor/restore helpers used by replay-model serialization to round-trip the
+  // full tracker state (including pending_waits_, which has no other accessor). These do not
+  // change normal recording behavior; restore() overwrites the entire tracker state at once.
+  const std::vector<D3D12QueueWait> &pending_waits() const noexcept
+  {
+    return pending_waits_;
+  }
+  void restore(
+      const std::vector<D3D12SubmissionBatch> &completed_batches,
+      const D3D12SubmissionBatch &current_batch,
+      const std::vector<D3D12QueueWait> &pending_waits,
+      bool has_open_batch)
+  {
+    completed_batches_ = completed_batches;
+    current_batch_ = current_batch;
+    pending_waits_ = pending_waits;
+    has_open_batch_ = has_open_batch;
+  }
+
 private:
   D3D12SubmissionBatch current_batch_;
   std::vector<D3D12SubmissionBatch> completed_batches_;

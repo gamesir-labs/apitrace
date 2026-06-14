@@ -29,6 +29,21 @@ public:
   bool validate_only();
   void shutdown();
 
+  // Persisted replay-model schema. bundle-finalize reconstructs the object model once and
+  // serializes it via save_replay_model; retrace loads it via load_replay_model to skip the
+  // in-process initialize+replay_event reconstruction. Bump on any wire-format change.
+  static constexpr std::uint32_t kReplayModelSchemaVersion = 1;
+  bool save_replay_model(
+      const std::filesystem::path &json_path,
+      const std::filesystem::path &blob_path,
+      const std::string &source_bundle_hash,
+      std::string &error) const;
+  bool load_replay_model(
+      const std::filesystem::path &json_path,
+      const std::filesystem::path &blob_path,
+      const std::string &expected_source_bundle_hash,
+      std::string &error);
+
   const std::string &last_error() const noexcept;
   const std::vector<DescriptorSemanticState> &descriptors() const noexcept;
   enum class ReplayCommandKind {
@@ -75,6 +90,14 @@ public:
     trace::ObjectId command_list_object_id = 0;
     std::vector<trace::ObjectId> object_refs;
     std::string function_name;
+    std::string payload;
+  };
+
+  struct TileMappingUpdateRecord {
+    std::uint64_t sequence = 0;
+    trace::ObjectId queue_object_id = 0;
+    trace::ObjectId resource_object_id = 0;
+    trace::ObjectId heap_object_id = 0;
     std::string payload;
   };
 
@@ -184,6 +207,14 @@ public:
     std::uint64_t offset = 0;
     bool resolved = true;
   };
+
+  bool resolve_recorded_gpu_virtual_address_at(
+      std::uint64_t gpu_virtual_address,
+      trace::ObjectId recorded_resource_object_id,
+      bool recorded_unmapped,
+      std::uint64_t sequence,
+      GpuVirtualAddressBinding &binding,
+      std::string &error) const;
 
   struct Root32BitConstantsBinding {
     std::uint32_t root_parameter_index = 0;
@@ -615,6 +646,7 @@ public:
     std::uint32_t height = 0;
     std::uint32_t depth_or_array_size = 0;
     std::uint32_t mip_levels = 0;
+    std::uint32_t recorded_mip_levels = 0;
     std::uint32_t format = 0;
     std::uint32_t sample_count = 0;
     std::uint32_t sample_quality = 0;
@@ -623,6 +655,7 @@ public:
     bool has_optimized_clear_value = false;
     bool reserved_resource = false;
     bool swapchain_back_buffer = false;
+    bool external_resource = false;
     std::uint32_t swapchain_buffer_index = 0;
     std::uint32_t optimized_clear_format = 0;
     float optimized_clear_color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -876,6 +909,7 @@ private:
   std::unordered_map<trace::ObjectId, RootSignatureSemanticState> root_signatures_;
   std::vector<FenceOperationSemanticState> fence_operations_;
   std::vector<ReplayCommandRecord> replay_commands_;
+  std::vector<TileMappingUpdateRecord> tile_mapping_updates_;
 
   // TODO: split device bootstrap, descriptor reconstruction, and queue submission into explicit replay phases.
   // TODO: separate native D3D12 replay from translation-layer-backed D3D12 replay if backend expectations diverge.

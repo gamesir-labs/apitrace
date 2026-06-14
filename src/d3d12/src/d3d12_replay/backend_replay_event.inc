@@ -118,6 +118,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
 	      ResourceSemanticState resource;
 	      resource.resource_object_id = event.object_id;
 	      resource.create_sequence = event.callsite.sequence;
+	      resource.external_resource = true;
 	      resource.initial_state = 0;
 	      resource.current_state = 0;
 	      resource.width = payload_u64(resource_desc, "width");
@@ -125,12 +126,19 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
 	      resource.dimension = payload_u32(resource_desc, "dimension");
 	      resource.height = payload_u32(resource_desc, "height");
 	      resource.depth_or_array_size = payload_u32(resource_desc, "depth_or_array_size");
-	      resource.mip_levels = payload_u32(resource_desc, "mip_levels");
+	      resource.recorded_mip_levels = payload_u32(resource_desc, "mip_levels");
+	      resource.mip_levels = resource.recorded_mip_levels;
 	      resource.format = payload_u32(resource_desc, "format");
 	      resource.sample_count = payload_u32(resource_desc, "sample_count");
 	      resource.sample_quality = payload_u32(resource_desc, "sample_quality");
 	      resource.layout = payload_u32(resource_desc, "layout");
 	      resource.flags = payload_u32(resource_desc, "flags");
+	      if (resource.width == 0 && resource.height == 0 && resource.depth_or_array_size == 0 &&
+	          resource.mip_levels == 0 && resource.sample_count == 0) {
+	        resources_[resource.resource_object_id] = std::move(resource);
+	        ++commands_replayed_;
+	        return true;
+	      }
 	      if (resource.width == 0 || resource.height == 0 || resource.depth_or_array_size == 0 ||
 	          resource.mip_levels == 0 || resource.sample_count == 0) {
 	        last_error_ = record_prefix(event) + ": resource_desc has invalid dimensions or sample count";
@@ -179,7 +187,8 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     objects_.track(tracked_heap);
   }
 
-  if (!validate_object_refs(event, objects_, last_error_)) {
+  if (event.callsite.function_name != "ID3D12Device::GetResourceTiling" &&
+      !validate_object_refs(event, objects_, last_error_)) {
     return false;
   }
 
@@ -260,14 +269,48 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     json normalized_descriptor_payload;
     const json *descriptor_payload_for_validation = &descriptor_payload;
     if (function_name == "ID3D12Device::CreateConstantBufferView" && descriptor.buffer_location != 0) {
-      if (!resolve_gpu_virtual_address_at(descriptor.buffer_location, create_sequence, descriptor.buffer, last_error_)) {
+      if (descriptor.resource_object_id != 0 &&
+          payload_u64(descriptor_payload, "resolved_resource_object_id") == descriptor.resource_object_id) {
+        auto resource_it = resources_.find(descriptor.resource_object_id);
+        if (resource_it != resources_.end() && resource_it->second.external_resource) {
+          auto &resource = resource_it->second;
+          const auto recorded_offset = payload_u64(descriptor_payload, "resolved_resource_offset");
+          const auto recorded_width = payload_u64(descriptor_payload, "resolved_resource_width");
+          if (recorded_offset > descriptor.buffer_location) {
+            last_error_ = record_prefix(source_event) +
+                ": external ConstantBufferView resource has invalid recorded GPUVA offset";
+            return false;
+          }
+          resource.gpu_virtual_address = descriptor.buffer_location - recorded_offset;
+          resource.width = std::max<std::uint64_t>(recorded_width, descriptor.size_in_bytes);
+          resource.dimension = 1;
+          resource.height = 1;
+          resource.depth_or_array_size = 1;
+          resource.recorded_mip_levels = 1;
+          resource.mip_levels = 1;
+          resource.sample_count = 1;
+          resource.layout = 1;
+          resource.heap_type = 1;
+          resource.initial_state = 0x40;
+          resource.current_state = resource.initial_state;
+        }
+      }
+      if (!resolve_recorded_gpu_virtual_address_payload(
+              *this,
+              descriptor_payload,
+              "buffer_location",
+              create_sequence,
+              descriptor.buffer,
+              last_error_)) {
         last_error_ = record_prefix(source_event) + ": " + last_error_;
         return false;
       }
+      const auto descriptor_resource_it = resources_.find(descriptor.resource_object_id);
       if (descriptor.resource_object_id != descriptor.buffer.resource_object_id &&
           descriptor.buffer.resolved &&
           descriptor.buffer.resource_object_id != 0 &&
-          resources_.find(descriptor.resource_object_id) == resources_.end()) {
+          (descriptor_resource_it == resources_.end() ||
+           descriptor_resource_it->second.external_resource)) {
         normalized_descriptor_payload = descriptor_payload;
         normalized_descriptor_payload["resolved_resource_object_id"] = descriptor.buffer.resource_object_id;
         descriptor_payload_for_validation = &normalized_descriptor_payload;
@@ -696,8 +739,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       pipeline.sample_count = payload_u32(*sample_desc, "count");
       pipeline.sample_quality = payload_u32(*sample_desc, "quality");
       if (pipeline.sample_count == 0) {
-        last_error_ = record_prefix(event) + ": pipeline sample_desc count must be non-zero";
-        return false;
+        pipeline.sample_count = 1;
       }
     }
     pipeline.ib_strip_cut_value = payload_u32(pipeline_asset, "ib_strip_cut_value");
@@ -975,7 +1017,19 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         !require_payload_key(event, payload, "initial_state", last_error_)) {
       return false;
     }
-    if (event.object_refs.size() < 2 || event.object_refs[1] == 0) {
+    const bool is_swapchain_back_buffer = payload.value("swapchain_back_buffer", false);
+    // Swapchain back-buffer semantics records emit a single object ref (the
+    // back-buffer resource itself) because the recording device may not have a
+    // registered capture object id. For those, the resource id is refs[0].
+    // Normal CreateCommittedResource records carry [device, resource] so the
+    // resource id is refs[1].
+    trace::ObjectId committed_resource_id = 0;
+    if (is_swapchain_back_buffer && event.object_refs.size() == 1 &&
+        event.object_refs[0] != 0) {
+      committed_resource_id = event.object_refs[0];
+    } else if (event.object_refs.size() >= 2 && event.object_refs[1] != 0) {
+      committed_resource_id = event.object_refs[1];
+    } else {
       last_error_ = record_prefix(event) + ": CreateCommittedResource missing resource object id";
       return false;
     }
@@ -1003,7 +1057,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       }
     }
     ResourceSemanticState resource;
-    resource.resource_object_id = event.object_refs[1];
+    resource.resource_object_id = committed_resource_id;
     resource.create_sequence = event.callsite.sequence;
     resource.heap_type = payload_u32(payload, "heap_type");
     resource.heap_flags = payload_u32(payload, "heap_flags");
@@ -1017,7 +1071,12 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     resource.dimension = payload_u32(resource_desc, "dimension");
     resource.height = payload_u32(resource_desc, "height");
     resource.depth_or_array_size = payload_u32(resource_desc, "depth_or_array_size");
-    resource.mip_levels = payload_u32(resource_desc, "mip_levels");
+    resource.recorded_mip_levels = payload_u32(resource_desc, "mip_levels");
+    resource.mip_levels = normalized_resource_mip_levels(
+        resource.width,
+        resource.height,
+        resource.depth_or_array_size,
+        resource.recorded_mip_levels);
     resource.format = payload_u32(resource_desc, "format");
     resource.sample_count = payload_u32(resource_desc, "sample_count");
     resource.sample_quality = payload_u32(resource_desc, "sample_quality");
@@ -1105,7 +1164,12 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     resource.dimension = payload_u32(resource_desc, "dimension");
     resource.height = payload_u32(resource_desc, "height");
     resource.depth_or_array_size = payload_u32(resource_desc, "depth_or_array_size");
-    resource.mip_levels = payload_u32(resource_desc, "mip_levels");
+    resource.recorded_mip_levels = payload_u32(resource_desc, "mip_levels");
+    resource.mip_levels = normalized_resource_mip_levels(
+        resource.width,
+        resource.height,
+        resource.depth_or_array_size,
+        resource.recorded_mip_levels);
     resource.format = payload_u32(resource_desc, "format");
     resource.sample_count = payload_u32(resource_desc, "sample_count");
     resource.sample_quality = payload_u32(resource_desc, "sample_quality");
@@ -1150,6 +1214,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     resources_[resource.resource_object_id] = std::move(resource);
     ++semantic_calls_seen_;
   } else if (function_name == "ID3D12Device::CreateHeap" ||
+             function_name == "ID3D12Device::OpenExistingHeap" ||
              function_name == "ID3D12Device3::OpenExistingHeapFromAddress" ||
              function_name == "ID3D12Device4::CreateHeap1") {
     if (event.object_refs.size() < 2 || event.object_refs[1] == 0) {
@@ -1228,7 +1293,12 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     resource.dimension = payload_u32(resource_desc, "dimension");
     resource.height = payload_u32(resource_desc, "height");
     resource.depth_or_array_size = payload_u32(resource_desc, "depth_or_array_size");
-    resource.mip_levels = payload_u32(resource_desc, "mip_levels");
+    resource.recorded_mip_levels = payload_u32(resource_desc, "mip_levels");
+    resource.mip_levels = normalized_resource_mip_levels(
+        resource.width,
+        resource.height,
+        resource.depth_or_array_size,
+        resource.recorded_mip_levels);
     resource.format = payload_u32(resource_desc, "format");
     resource.sample_count = payload_u32(resource_desc, "sample_count");
     resource.sample_quality = payload_u32(resource_desc, "sample_quality");
@@ -1782,7 +1852,6 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
              function_name == "ID3D12GraphicsCommandList::SetGraphicsRoot32BitConstants" ||
              function_name == "ID3D12GraphicsCommandList::SetComputeRoot32BitConstants") {
     if (!require_payload_key(event, payload, "root_parameter_index", last_error_) ||
-        !require_payload_key(event, payload, "constant_count", last_error_) ||
         !require_payload_key(event, payload, "dst_offset", last_error_) ||
         !require_payload_key(event, payload, "values", last_error_)) {
       return false;
@@ -1792,7 +1861,9 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       last_error_ = record_prefix(event) + ": root 32-bit constants values must be an array";
       return false;
     }
-    const auto constant_count = payload_u32(payload, "constant_count");
+    const auto constant_count = payload_has(payload, "constant_count")
+                                    ? payload_u32(payload, "constant_count")
+                                    : static_cast<std::uint32_t>(values_payload.size());
     if (values_payload.size() != constant_count) {
       last_error_ = record_prefix(event) + ": root 32-bit constant_count does not match values payload";
       return false;
@@ -1834,7 +1905,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     }
     if (command_list_state) {
       GpuVirtualAddressBinding binding;
-      if (!resolve_gpu_virtual_address_at(payload_u64(payload, "buffer_location"), event.callsite.sequence, binding, last_error_)) {
+      if (!resolve_recorded_gpu_virtual_address_payload(*this, payload, "buffer_location", event.callsite.sequence, binding, last_error_)) {
         last_error_ = record_prefix(event) + ": " + last_error_;
         return false;
       }
@@ -2291,7 +2362,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
           last_error_ = record_prefix(event) + ": vertex buffer views must be an array";
           return false;
         }
-        if (views->size() != view_count) {
+        if (!views->empty() && views->size() != view_count) {
           last_error_ = record_prefix(event) + ": vertex buffer views count does not match view_count";
           return false;
         }
@@ -2308,7 +2379,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
           VertexBufferBinding binding;
           binding.sequence = event.callsite.sequence;
           binding.slot = start_slot + static_cast<std::uint32_t>(index);
-          if (!resolve_gpu_virtual_address_at(payload_u64(view, "buffer_location"), event.callsite.sequence, binding.address, last_error_)) {
+          if (!resolve_recorded_gpu_virtual_address_payload(*this, view, "buffer_location", event.callsite.sequence, binding.address, last_error_)) {
             last_error_ = record_prefix(event) + ": " + last_error_;
             return false;
           }
@@ -2333,7 +2404,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
           VertexBufferBinding binding;
           binding.sequence = event.callsite.sequence;
           binding.slot = payload_u32(payload, "start_slot");
-          if (!resolve_gpu_virtual_address_at(payload_u64(first_view, "buffer_location"), event.callsite.sequence, binding.address, last_error_)) {
+          if (!resolve_recorded_gpu_virtual_address_payload(*this, first_view, "buffer_location", event.callsite.sequence, binding.address, last_error_)) {
             last_error_ = record_prefix(event) + ": " + last_error_;
             return false;
           }
@@ -2354,7 +2425,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     if (command_list_state && payload_u64(payload, "buffer_location") != 0) {
       IndexBufferBinding binding;
       binding.sequence = event.callsite.sequence;
-      if (!resolve_gpu_virtual_address_at(payload_u64(payload, "buffer_location"), event.callsite.sequence, binding.address, last_error_)) {
+      if (!resolve_recorded_gpu_virtual_address_payload(*this, payload, "buffer_location", event.callsite.sequence, binding.address, last_error_)) {
         last_error_ = record_prefix(event) + ": " + last_error_;
         return false;
       }
@@ -2616,7 +2687,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
             last_error_ = record_prefix(event) + ": DispatchRays shader table range must be an object";
             return false;
           }
-          if (!resolve_gpu_virtual_address_at(payload_u64(*range, "start_address"), event.callsite.sequence, binding, last_error_)) {
+          if (!resolve_recorded_gpu_virtual_address_payload(*this, *range, "start_address", event.callsite.sequence, binding, last_error_)) {
             last_error_ = record_prefix(event) + ": " + last_error_;
             return false;
           }
@@ -2639,7 +2710,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
             last_error_ = record_prefix(event) + ": DispatchRays shader table range must be an object";
             return false;
           }
-          if (!resolve_gpu_virtual_address_at(payload_u64(*range, "start_address"), event.callsite.sequence, binding, last_error_)) {
+          if (!resolve_recorded_gpu_virtual_address_payload(*this, *range, "start_address", event.callsite.sequence, binding, last_error_)) {
             last_error_ = record_prefix(event) + ": " + last_error_;
             return false;
           }
@@ -2786,7 +2857,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         return false;
       }
       WriteBufferImmediateEntry entry;
-      if (!resolve_gpu_virtual_address_at(payload_u64(write, "dest"), event.callsite.sequence, entry.dest, last_error_)) {
+      if (!resolve_recorded_gpu_virtual_address_payload(*this, write, "dest", event.callsite.sequence, entry.dest, last_error_)) {
         last_error_ = record_prefix(event) + ": " + last_error_;
         return false;
       }
@@ -3267,7 +3338,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       const auto absolute_buffer_path = bundle_root_ / buffer_path;
       std::vector<std::uint8_t> bytes;
       std::string asset_error;
-      if (!read_exact_asset_bytes(absolute_buffer_path, written_end - written_begin, bytes, asset_error)) {
+      if (!read_prefix_asset_bytes(absolute_buffer_path, written_end - written_begin, bytes, asset_error)) {
         last_error_ = record_prefix(event) + ": " + asset_error;
         return false;
       }
@@ -3381,6 +3452,38 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       queue_it->second.last_execute_sequence = event.callsite.sequence;
       submissions_.end_batch();
     }
+    ++semantic_calls_seen_;
+  } else if (function_name == "ID3D12CommandQueue::UpdateTileMappings") {
+    if (event.object_refs.size() < 3 || event.object_refs[1] == 0) {
+      last_error_ = record_prefix(event) + ": UpdateTileMappings missing resource object id";
+      return false;
+    }
+    if (!require_payload_key(event, payload, "region_count", last_error_) ||
+        !require_payload_key(event, payload, "range_count", last_error_) ||
+        !require_payload_key(event, payload, "regions", last_error_) ||
+        !require_payload_key(event, payload, "region_sizes", last_error_) ||
+        !require_payload_key(event, payload, "range_flags", last_error_) ||
+        !require_payload_key(event, payload, "heap_range_offsets", last_error_) ||
+        !require_payload_key(event, payload, "range_tile_counts", last_error_)) {
+      return false;
+    }
+    const auto resource_object_id = event.object_refs[1];
+    if (resources_.find(resource_object_id) == resources_.end()) {
+      last_error_ = record_prefix(event) + ": UpdateTileMappings references an unknown resource";
+      return false;
+    }
+    const auto heap_object_id = event.object_refs.size() >= 3 ? event.object_refs[2] : trace::ObjectId{};
+    if (heap_object_id != 0 && heaps_.find(heap_object_id) == heaps_.end()) {
+      last_error_ = record_prefix(event) + ": UpdateTileMappings references an unknown heap";
+      return false;
+    }
+    TileMappingUpdateRecord update;
+    update.sequence = event.callsite.sequence;
+    update.queue_object_id = event.object_refs.empty() ? trace::ObjectId{} : event.object_refs.front();
+    update.resource_object_id = resource_object_id;
+    update.heap_object_id = heap_object_id;
+    update.payload = event.payload;
+    tile_mapping_updates_.push_back(std::move(update));
     ++semantic_calls_seen_;
   } else if (function_name == "ID3D12CommandQueue::Signal" ||
              function_name == "ID3D12CommandQueue::Wait" ||
@@ -3519,6 +3622,8 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
              function_name == "IDXGIFactory::CreateSwapChain" ||
              function_name == "ID3D12GraphicsCommandList::QueryInterface" ||
              function_name == "IDXGISwapChain::Present" ||
+             function_name == "ID3D12Device::GetResourceTiling" ||
+             function_name == "DXMT::SparseTextureMappingOps" ||
              function_name == "DXMT::FenceDependencyBatch") {
     if (function_name == "IDXGISwapChain::Present" &&
         (!require_payload_key(event, payload, "sync_interval", last_error_) ||

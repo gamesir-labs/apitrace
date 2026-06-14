@@ -25,6 +25,13 @@ public:
   bool contains(trace::ObjectId object_id) const noexcept;
   const D3D12TrackedObject *find(trace::ObjectId object_id) const noexcept;
 
+  // Read-only access to all tracked objects. Additive accessor used by replay-model
+  // serialization to enumerate registry contents deterministically.
+  const std::unordered_map<trace::ObjectId, D3D12TrackedObject> &tracked_objects() const noexcept
+  {
+    return objects_;
+  }
+
 private:
   std::unordered_map<trace::ObjectId, D3D12TrackedObject> objects_;
 
