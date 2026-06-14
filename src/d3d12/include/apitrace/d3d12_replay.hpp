@@ -32,7 +32,7 @@ public:
   // Persisted replay-model schema. bundle-finalize reconstructs the object model once and
   // serializes it via save_replay_model; retrace loads it via load_replay_model to skip the
   // in-process initialize+replay_event reconstruction. Bump on any wire-format change.
-  static constexpr std::uint32_t kReplayModelSchemaVersion = 1;
+  static constexpr std::uint32_t kReplayModelSchemaVersion = 2;
   bool save_replay_model(
       const std::filesystem::path &json_path,
       const std::filesystem::path &blob_path,
@@ -905,6 +905,12 @@ private:
   std::unordered_map<trace::ObjectId, CommandSignatureSemanticState> command_signatures_;
   std::unordered_map<trace::ObjectId, FenceSemanticState> fences_;
   std::unordered_map<trace::ObjectId, ResourceSemanticState> resources_;
+  // Append-only history of every resource create, in create_sequence order. resources_ keeps only
+  // the latest version per object_id (last-write-wins), which is wrong when a D3D12 resource pointer
+  // (object_id) is reused after release: a descriptor/command from the earlier lifetime must resolve
+  // to the version live at its own sequence, not the latest. The native replayer uses this to build
+  // per-version native resources and resolve by sequence. See bugs.md BUG-20260614-004.
+  std::vector<ResourceSemanticState> resource_versions_;
   std::unordered_map<trace::ObjectId, PipelineSemanticState> pipelines_;
   std::unordered_map<trace::ObjectId, RootSignatureSemanticState> root_signatures_;
   std::vector<FenceOperationSemanticState> fence_operations_;

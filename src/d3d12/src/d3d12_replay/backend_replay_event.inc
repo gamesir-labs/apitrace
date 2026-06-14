@@ -135,7 +135,8 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
 	      resource.flags = payload_u32(resource_desc, "flags");
 	      if (resource.width == 0 && resource.height == 0 && resource.depth_or_array_size == 0 &&
 	          resource.mip_levels == 0 && resource.sample_count == 0) {
-	        resources_[resource.resource_object_id] = std::move(resource);
+	        resource_versions_.push_back(resource);
+    resources_[resource.resource_object_id] = std::move(resource);
 	        ++commands_replayed_;
 	        return true;
 	      }
@@ -144,7 +145,8 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
 	        last_error_ = record_prefix(event) + ": resource_desc has invalid dimensions or sample count";
 	        return false;
 	      }
-	      resources_[resource.resource_object_id] = std::move(resource);
+	      resource_versions_.push_back(resource);
+    resources_[resource.resource_object_id] = std::move(resource);
 	    }
 	    ++commands_replayed_;
 	    return true;
@@ -1118,6 +1120,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         resource.optimized_clear_stencil = payload_u32(*optimized_clear_value, "stencil");
       }
     }
+    resource_versions_.push_back(resource);
     resources_[resource.resource_object_id] = std::move(resource);
     ++semantic_calls_seen_;
   } else if (function_name == "ID3D12Device::CreateReservedResource") {
@@ -1211,6 +1214,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         resource.optimized_clear_stencil = payload_u32(*optimized_clear_value, "stencil");
       }
     }
+    resource_versions_.push_back(resource);
     resources_[resource.resource_object_id] = std::move(resource);
     ++semantic_calls_seen_;
   } else if (function_name == "ID3D12Device::CreateHeap" ||
@@ -1340,6 +1344,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         resource.optimized_clear_stencil = payload_u32(*optimized_clear_value, "stencil");
       }
     }
+    resource_versions_.push_back(resource);
     resources_[resource.resource_object_id] = std::move(resource);
     ++semantic_calls_seen_;
 

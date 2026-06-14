@@ -1230,6 +1230,20 @@ struct D3D12ReplayBackendTestHook {
     backend.command_signatures_[f.u64()] = make_command_signature(f);
     backend.fences_[f.u64()] = make_fence(f);
     backend.resources_[f.u64()] = make_resource(f);
+    // Append-only resource history: include duplicate object_ids with different formats to exercise
+    // the pointer-reuse case the versioned resolver depends on.
+    {
+      B::ResourceSemanticState ver_a = make_resource(f);
+      ver_a.resource_object_id = 0x4000;
+      ver_a.create_sequence = 10;
+      ver_a.format = 71;  // DXGI_FORMAT_R8G8B8A8_UNORM
+      backend.resource_versions_.push_back(ver_a);
+      B::ResourceSemanticState ver_b = make_resource(f);
+      ver_b.resource_object_id = 0x4000;  // same object_id, later lifetime
+      ver_b.create_sequence = 250;
+      ver_b.format = 2;  // DXGI_FORMAT_R32G32B32A32_FLOAT
+      backend.resource_versions_.push_back(ver_b);
+    }
     backend.pipelines_[f.u64()] = make_pipeline(f);
     backend.root_signatures_[f.u64()] = make_root_signature(f);
 
@@ -1305,6 +1319,7 @@ struct D3D12ReplayBackendTestHook {
     CHECK(a.command_signatures_ == b.command_signatures_, "command_signatures_");
     CHECK(a.fences_ == b.fences_, "fences_");
     CHECK(a.resources_ == b.resources_, "resources_");
+    CHECK(a.resource_versions_ == b.resource_versions_, "resource_versions_");
     CHECK(a.pipelines_ == b.pipelines_, "pipelines_");
     CHECK(a.root_signatures_ == b.root_signatures_, "root_signatures_");
     CHECK(a.fence_operations_ == b.fence_operations_, "fence_operations_");

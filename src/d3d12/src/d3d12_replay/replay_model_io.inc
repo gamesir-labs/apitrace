@@ -1345,6 +1345,10 @@ bool D3D12ReplayBackend::save_replay_model(
 
   // Blob-bearing maps (resources carry data-update bytes; serialize_fields routes them to the pool).
   a.map(self.resources_);
+  // Append-only per-create history of resources (object_id pointer reuse: a descriptor/command from
+  // an earlier resource lifetime must resolve to the version live at its own sequence). Same element
+  // serializer as resources_' values, including bytes/transitions/data_updates.
+  a.vec(self.resource_versions_);
   a.map(self.pipelines_);
   a.map(self.root_signatures_);
 
@@ -1556,6 +1560,7 @@ bool D3D12ReplayBackend::load_replay_model(
 
   // Blob-bearing maps.
   a.map(resources_);
+  a.vec(resource_versions_);
   a.map(pipelines_);
   a.map(root_signatures_);
 

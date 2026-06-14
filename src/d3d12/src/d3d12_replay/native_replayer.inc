@@ -513,66 +513,96 @@ private:
     return value;
   }
 
+  bool make_native_resource(
+      const D3D12ReplayBackend::ResourceSemanticState &resource,
+      NativeResource &native,
+      std::string &error)
+  {
+    native.state = static_cast<D3D12_RESOURCE_STATES>(resource.initial_state);
+    native.swapchain_back_buffer = resource.swapchain_back_buffer;
+    if (resource.swapchain_back_buffer) {
+      if (resource.swapchain_buffer_index >= kBufferCount || !back_buffers_[resource.swapchain_buffer_index]) {
+        return fail(error, "swapchain back-buffer index is out of range");
+      }
+      back_buffers_[resource.swapchain_buffer_index]->AddRef();
+      native.resource.reset(back_buffers_[resource.swapchain_buffer_index].get());
+      return true;
+    }
+
+    const auto desc = resource_desc(resource);
+    const auto optimized_clear = resource.has_optimized_clear_value ? clear_value(resource) : D3D12_CLEAR_VALUE{};
+    HRESULT hr = S_OK;
+    if (resource.reserved_resource) {
+      hr = device_->CreateReservedResource(
+          &desc, static_cast<D3D12_RESOURCE_STATES>(resource.initial_state),
+          resource.has_optimized_clear_value ? &optimized_clear : nullptr,
+          IID_PPV_ARGS(native.resource.put()));
+      if (FAILED(hr)) {
+        error = hresult_error("CreateReservedResource", hr);
+        return false;
+      }
+    } else if (resource.heap_object_id != 0) {
+      const auto heap_it = heaps_.find(resource.heap_object_id);
+      if (heap_it == heaps_.end()) {
+        return fail(error, "placed resource references an unknown heap");
+      }
+      hr = device_->CreatePlacedResource(
+          heap_it->second.heap.get(), resource.heap_offset, &desc,
+          static_cast<D3D12_RESOURCE_STATES>(resource.initial_state),
+          resource.has_optimized_clear_value ? &optimized_clear : nullptr,
+          IID_PPV_ARGS(native.resource.put()));
+      if (FAILED(hr)) {
+        error = hresult_error("CreatePlacedResource", hr);
+        return false;
+      }
+    } else {
+      const auto heap = heap_properties(resource.heap_type);
+      hr = device_->CreateCommittedResource(
+          &heap, static_cast<D3D12_HEAP_FLAGS>(resource.heap_flags), &desc,
+          static_cast<D3D12_RESOURCE_STATES>(resource.initial_state),
+          resource.has_optimized_clear_value ? &optimized_clear : nullptr,
+          IID_PPV_ARGS(native.resource.put()));
+      if (FAILED(hr)) {
+        error = hresult_error("CreateCommittedResource", hr);
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool create_resources(std::string &error)
   {
+    // Latest version per object_id (covers the common, non-reused case and all readers that index
+    // resources_ directly).
     for (const auto &[object_id, resource] : backend_.resources_) {
       NativeResource native;
-      native.state = static_cast<D3D12_RESOURCE_STATES>(resource.initial_state);
-      native.swapchain_back_buffer = resource.swapchain_back_buffer;
-      if (resource.swapchain_back_buffer) {
-        if (resource.swapchain_buffer_index >= kBufferCount || !back_buffers_[resource.swapchain_buffer_index]) {
-          return fail(error, "swapchain back-buffer index is out of range");
-        }
-        back_buffers_[resource.swapchain_buffer_index]->AddRef();
-        native.resource.reset(back_buffers_[resource.swapchain_buffer_index].get());
-        resources_.emplace(object_id, std::move(native));
-        continue;
-      }
-
-      const auto desc = resource_desc(resource);
-      const auto optimized_clear = resource.has_optimized_clear_value ? clear_value(resource) : D3D12_CLEAR_VALUE{};
-      HRESULT hr = S_OK;
-      if (resource.reserved_resource) {
-        hr = device_->CreateReservedResource(
-            &desc,
-            static_cast<D3D12_RESOURCE_STATES>(resource.initial_state),
-            resource.has_optimized_clear_value ? &optimized_clear : nullptr,
-            IID_PPV_ARGS(native.resource.put()));
-        if (FAILED(hr)) {
-          error = hresult_error("CreateReservedResource", hr);
-          return false;
-        }
-      } else if (resource.heap_object_id != 0) {
-        const auto heap_it = heaps_.find(resource.heap_object_id);
-        if (heap_it == heaps_.end()) {
-          return fail(error, "placed resource references an unknown heap");
-        }
-        hr = device_->CreatePlacedResource(
-            heap_it->second.heap.get(),
-            resource.heap_offset,
-            &desc,
-            static_cast<D3D12_RESOURCE_STATES>(resource.initial_state),
-            resource.has_optimized_clear_value ? &optimized_clear : nullptr,
-            IID_PPV_ARGS(native.resource.put()));
-        if (FAILED(hr)) {
-          error = hresult_error("CreatePlacedResource", hr);
-          return false;
-        }
-      } else {
-        const auto heap = heap_properties(resource.heap_type);
-        hr = device_->CreateCommittedResource(
-            &heap,
-            static_cast<D3D12_HEAP_FLAGS>(resource.heap_flags),
-            &desc,
-            static_cast<D3D12_RESOURCE_STATES>(resource.initial_state),
-            resource.has_optimized_clear_value ? &optimized_clear : nullptr,
-            IID_PPV_ARGS(native.resource.put()));
-        if (FAILED(hr)) {
-          error = hresult_error("CreateCommittedResource", hr);
-          return false;
-        }
+      if (!make_native_resource(resource, native, error)) {
+        return false;
       }
       resources_.emplace(object_id, std::move(native));
+    }
+
+    // For object_ids created more than once (D3D12 pointer reuse across lifetimes), build a native
+    // resource per version so descriptors/commands resolve to the version live at their sequence.
+    std::unordered_map<trace::ObjectId, std::size_t> version_counts;
+    for (const auto &resource : backend_.resource_versions_) {
+      ++version_counts[resource.resource_object_id];
+    }
+    for (const auto &resource : backend_.resource_versions_) {
+      if (version_counts[resource.resource_object_id] < 2) {
+        continue;  // single version: resources_ already holds it
+      }
+      NativeResource native;
+      if (!make_native_resource(resource, native, error)) {
+        return false;
+      }
+      resource_version_natives_[resource.resource_object_id].emplace_back(
+          resource.create_sequence, std::move(native));
+    }
+    for (auto &[object_id, versions] : resource_version_natives_) {
+      (void)object_id;
+      std::stable_sort(versions.begin(), versions.end(),
+                       [](const auto &a, const auto &b) { return a.first < b.first; });
     }
     return true;
   }
@@ -917,6 +947,8 @@ private:
     if (dst.ptr == 0) {
       return fail(error, "descriptor destination cannot be relocated");
     }
+    // Resolve resource references to the version live when this descriptor was created.
+    current_replay_sequence_ = semantic.create_sequence;
     ID3D12Resource *resource = semantic.resource_object_id == 0 ? nullptr : resource_for(semantic.resource_object_id, error);
     if (semantic.resource_object_id != 0 && !resource) {
       return false;
@@ -2182,6 +2214,26 @@ private:
 
   ID3D12Resource *resource_for(trace::ObjectId object_id, std::string &error) const
   {
+    // If this object_id was reused across lifetimes, resolve to the version live at the current
+    // replay sequence (largest create_sequence <= cursor); otherwise fall back to the flat map.
+    const auto ver_it = resource_version_natives_.find(object_id);
+    if (ver_it != resource_version_natives_.end() && !ver_it->second.empty()) {
+      const auto &versions = ver_it->second;
+      const NativeResource *chosen = nullptr;
+      for (const auto &[create_seq, native] : versions) {
+        if (create_seq <= current_replay_sequence_) {
+          chosen = &native;
+        } else {
+          break;  // sorted by create_sequence
+        }
+      }
+      if (chosen == nullptr) {
+        chosen = &versions.front().second;  // before first create: use earliest
+      }
+      if (chosen->resource) {
+        return chosen->resource.get();
+      }
+    }
     const auto resource_it = resources_.find(object_id);
     if (resource_it == resources_.end() || !resource_it->second.resource) {
       error = "D3D12 native command replay incomplete: command references an unknown resource";
@@ -2264,6 +2316,8 @@ private:
     if (payload.is_discarded() || !payload.is_object()) {
       return fail(error, "command payload is not JSON");
     }
+    // Resolve resource references to the version live when this command was recorded.
+    current_replay_sequence_ = command.sequence;
     if (!sync_resource_data_until(command.sequence, error) ||
         !sync_descriptors_until(command.sequence, error)) {
       return false;
@@ -3885,6 +3939,13 @@ private:
   std::unordered_map<trace::ObjectId, NativeHeap> heaps_;
   std::unordered_map<trace::ObjectId, ComPtr<ID3D12QueryHeap>> query_heaps_;
   std::unordered_map<trace::ObjectId, NativeResource> resources_;
+  // Per-version native resources for object_ids reused across lifetimes (BUG-20260614-004). Built
+  // from backend_.resource_versions_ when more than one version exists for an id. Each entry is a
+  // (create_sequence, native resource) sorted by create_sequence; resource_for resolves to the
+  // version live at current_replay_sequence_. Empty when no id is reused (resources_ suffices).
+  std::unordered_map<trace::ObjectId, std::vector<std::pair<std::uint64_t, NativeResource>>>
+      resource_version_natives_;
+  std::uint64_t current_replay_sequence_ = 0;
   std::unordered_map<trace::ObjectId, NativeCommandList> command_lists_;
   std::vector<const D3D12ReplayBackend::DescriptorSemanticState *> descriptor_timeline_;
   std::vector<const D3D12ReplayBackend::SamplerSemanticState *> sampler_timeline_;
