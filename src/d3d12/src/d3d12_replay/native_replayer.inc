@@ -230,6 +230,29 @@ private:
     return false;
   }
 
+  // Headless replay (env APITRACE_D3D12_RETRACE_HEADLESS): render to offscreen back-buffer
+  // resources instead of an on-screen window + DXGI swapchain. Avoids the win32u display-device
+  // lock deadlock under wine-on-macOS (CreateWindowExA / CreateSwapChainForHwnd enumerate the
+  // display, which deadlocks from the replay worker thread). Present-frame capture still works
+  // (it reads the back-buffer via a READBACK copy, never the screen). See bugs.md BUG-20260614-002.
+  bool headless_enabled() const
+  {
+    return env_enabled("APITRACE_D3D12_RETRACE_HEADLESS", false);
+  }
+
+  // Find the recorded swapchain back-buffer resource (for its true format/dims). Returns nullptr
+  // if the trace has no swapchain back-buffer semantics.
+  const D3D12ReplayBackend::ResourceSemanticState *recorded_back_buffer() const
+  {
+    for (const auto &[object_id, resource] : backend_.resources_) {
+      (void)object_id;
+      if (resource.swapchain_back_buffer) {
+        return &resource;
+      }
+    }
+    return nullptr;
+  }
+
   bool bootstrap(std::string &error)
   {
     UINT width = 0;
@@ -265,6 +288,41 @@ private:
       return false;
     }
 
+    const bool headless = headless_enabled();
+    if (headless) {
+      // Offscreen path: create kBufferCount committed render-target textures matching the recorded
+      // back-buffer (true format — e.g. R10G10B10A2 for FH4, NOT the swapchain's hardcoded RGBA8).
+      // No window, no swapchain -> no win32u display query -> no deadlock. create_resources() later
+      // aliases the trace's swapchain resources onto these exactly as it does for real back-buffers.
+      const auto *bb = recorded_back_buffer();
+      if (!bb) {
+        return fail(error, "headless replay: trace is missing swapchain back-buffer semantics");
+      }
+      D3D12_RESOURCE_DESC desc{};
+      desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      desc.Alignment = 0;
+      desc.Width = bb->width != 0 ? bb->width : width;
+      desc.Height = bb->height != 0 ? bb->height : height;
+      desc.DepthOrArraySize = 1;
+      desc.MipLevels = 1;
+      desc.Format = static_cast<DXGI_FORMAT>(bb->format);
+      desc.SampleDesc.Count = 1;
+      desc.SampleDesc.Quality = 0;
+      desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+      desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+      D3D12_HEAP_PROPERTIES heap = heap_properties(D3D12_HEAP_TYPE_DEFAULT);
+      for (UINT index = 0; index < kBufferCount; ++index) {
+        // COMMON (== PRESENT, both 0) matches the resting state the trace's barriers assume.
+        hr = device_->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+            IID_PPV_ARGS(back_buffers_[index].put()));
+        if (FAILED(hr)) {
+          error = hresult_error("CreateCommittedResource(headless back-buffer)", hr);
+          return false;
+        }
+      }
+    } else {
 #ifdef _WIN32
     HINSTANCE instance = GetModuleHandleA(nullptr);
     WNDCLASSA wc{};
@@ -347,6 +405,7 @@ private:
         return false;
       }
     }
+    }
 
     hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence_.put()));
     if (FAILED(hr)) {
@@ -391,7 +450,15 @@ private:
       desc.SizeInBytes = heap.size_in_bytes;
       desc.Properties = heap_properties(heap);
       desc.Alignment = heap.alignment;
-      desc.Flags = static_cast<D3D12_HEAP_FLAGS>(heap.flags);
+      // Offline single-device replay never shares heaps across processes or adapters, so the
+      // SHARED / SHARED_CROSS_ADAPTER flags are no-ops here. Strip them: a CUSTOM heap with
+      // SHARED_CROSS_ADAPTER + a CPU-visible page property is invalid per the D3D12 spec (DXMT
+      // rejects it as "custom-cross-adapter-cpu-visible"), and we render into the heap identically
+      // without sharing. The matching resource ALLOW_CROSS_ADAPTER flag is stripped in resource_desc.
+      auto heap_flags = static_cast<D3D12_HEAP_FLAGS>(heap.flags);
+      heap_flags = static_cast<D3D12_HEAP_FLAGS>(
+          heap_flags & ~(D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER));
+      desc.Flags = heap_flags;
       NativeHeap native;
       HRESULT hr = device_->CreateHeap(&desc, IID_PPV_ARGS(native.heap.put()));
       if (FAILED(hr)) {
@@ -425,7 +492,11 @@ private:
     desc.SampleDesc.Count = resource.sample_count;
     desc.SampleDesc.Quality = resource.sample_quality;
     desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(resource.layout);
-    desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(resource.flags);
+    // Strip ALLOW_CROSS_ADAPTER to stay consistent with the SHARED_CROSS_ADAPTER strip in
+    // create_heaps: offline single-adapter replay does not share, and DXMT's placed-resource
+    // validation requires the heap and resource cross-adapter flags to agree.
+    desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+        resource.flags & ~D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
     return desc;
   }
 
@@ -849,6 +920,25 @@ private:
     ID3D12Resource *resource = semantic.resource_object_id == 0 ? nullptr : resource_for(semantic.resource_object_id, error);
     if (semantic.resource_object_id != 0 && !resource) {
       return false;
+    }
+    // Diagnostic: a view format incompatible with the recorded resource format (e.g. RG11B10F view
+    // on a BC7 resource) makes DXMT's Metal texture-view creation assert. Log the offending
+    // descriptor so we can tell a wrong-resource resolution from a recorded-format issue.
+    if (resource && semantic.format != 0 && (semantic.kind == "ShaderResourceView" ||
+        semantic.kind == "UnorderedAccessView" || semantic.kind == "RenderTargetView")) {
+      const auto res_it = backend_.resources_.find(semantic.resource_object_id);
+      if (res_it != backend_.resources_.end()) {
+        const auto res_fmt = res_it->second.format;
+        const auto is_bc = [](std::uint32_t f) { return (f >= 70 && f <= 84) || (f >= 94 && f <= 99); };
+        if (is_bc(res_fmt) != is_bc(semantic.format) && res_fmt != semantic.format) {
+          replay_milestone((std::string("descriptor:format-mismatch kind=") + semantic.kind +
+                            " resource=" + std::to_string(semantic.resource_object_id) +
+                            " resource_format=" + std::to_string(res_fmt) +
+                            " view_format=" + std::to_string(semantic.format) +
+                            " view_dim=" + std::to_string(semantic.view_dimension) +
+                            " create_seq=" + std::to_string(semantic.create_sequence)).c_str());
+        }
+      }
     }
     if (semantic.kind == "RenderTargetView") {
       D3D12_RENDER_TARGET_VIEW_DESC desc{};
@@ -1285,9 +1375,14 @@ private:
   bool create_command_objects(std::string &error)
   {
     for (const auto &[object_id, command_list] : backend_.command_lists_) {
-      if (command_list.type != static_cast<std::uint32_t>(D3D12_COMMAND_LIST_TYPE_DIRECT) &&
-          command_list.type != static_cast<std::uint32_t>(D3D12_COMMAND_LIST_TYPE_BUNDLE)) {
-        return fail(error, "only direct and bundle command lists are currently supported");
+      switch (static_cast<D3D12_COMMAND_LIST_TYPE>(command_list.type)) {
+      case D3D12_COMMAND_LIST_TYPE_DIRECT:
+      case D3D12_COMMAND_LIST_TYPE_BUNDLE:
+      case D3D12_COMMAND_LIST_TYPE_COMPUTE:
+      case D3D12_COMMAND_LIST_TYPE_COPY:
+        break;
+      default:
+        return fail(error, "unsupported command list type for native replay");
       }
       NativeCommandList native;
       native.type = static_cast<D3D12_COMMAND_LIST_TYPE>(command_list.type);
@@ -1414,6 +1509,15 @@ private:
         return false;
       }
       if (!native_lists.empty()) {
+        // Route the batch to a queue matching its command-list type (DIRECT/COMPUTE/COPY). All
+        // lists in a batch share a type (they executed on one queue). With a full wait_for_gpu after
+        // every batch, cross-queue ordering (e.g. compute auto-exposure -> graphics tonemap) is
+        // preserved by serialization without needing captured fence replay.
+        D3D12_COMMAND_LIST_TYPE batch_type = command_lists_.at(batch.command_list_ids.front()).type;
+        ID3D12CommandQueue *batch_queue = get_or_create_queue(batch_type);
+        if (!batch_queue) {
+          return fail(error, "failed to create command queue for batch list type");
+        }
         // Bounded per-batch markers: every batch for the first few, then sparse. Lets us see
         // whether a stall is between ExecuteCommandLists and wait_for_gpu (DXMT submission) or in
         // the GPU wait itself, without flooding for a full replay.
@@ -1421,14 +1525,15 @@ private:
         if (trace_batch) {
           replay_milestone((std::string("submit:execute batch=") +
                             std::to_string(replay_batch_index_) +
-                            " seq=" + std::to_string(batch.execute_sequence)).c_str());
+                            " seq=" + std::to_string(batch.execute_sequence) +
+                            " qtype=" + std::to_string(static_cast<int>(batch_type))).c_str());
         }
-        queue_->ExecuteCommandLists(static_cast<UINT>(native_lists.size()), native_lists.data());
+        batch_queue->ExecuteCommandLists(static_cast<UINT>(native_lists.size()), native_lists.data());
         if (trace_batch) {
           replay_milestone((std::string("submit:executed batch=") +
                             std::to_string(replay_batch_index_)).c_str());
         }
-        wait_for_gpu();
+        wait_for_gpu(batch_queue);
         if (trace_batch) {
           replay_milestone((std::string("submit:waited batch=") +
                             std::to_string(replay_batch_index_)).c_str());
@@ -1454,11 +1559,19 @@ private:
         if (!capture_present_frame(present_frame_index, sync_interval, flags, error)) {
           return false;
         }
-        HRESULT hr = swap_chain_->Present(sync_interval, flags);
-        record_present_semantics(sync_interval, flags, hr);
-        if (FAILED(hr)) {
-          error = hresult_error("IDXGISwapChain::Present", hr);
-          return false;
+        if (swap_chain_) {
+          HRESULT hr = swap_chain_->Present(sync_interval, flags);
+          record_present_semantics(sync_interval, flags, hr);
+          if (FAILED(hr)) {
+            error = hresult_error("IDXGISwapChain::Present", hr);
+            return false;
+          }
+        } else {
+          // Headless: no swapchain to flip. Capture already read the rendered back-buffer above.
+          // Rotate the back-buffer index to mirror FLIP_DISCARD's 0,1,0,1 alternation so the
+          // trace's per-resource swapchain_buffer_index aliasing stays consistent.
+          record_present_semantics(sync_interval, flags, S_OK);
+          headless_back_buffer_index_ = (headless_back_buffer_index_ + 1) % kBufferCount;
         }
         if (present_delay_ms_ != 0) {
 #ifdef _WIN32
@@ -1467,7 +1580,7 @@ private:
           std::this_thread::sleep_for(std::chrono::milliseconds(present_delay_ms_));
 #endif
         }
-        if (!pump_messages()) {
+        if (swap_chain_ && !pump_messages()) {
           return fail(error, "replay window closed");
         }
         if (replay_stop_after_present_frame_ != 0 && present_frame_index >= replay_stop_after_present_frame_) {
@@ -1643,7 +1756,8 @@ private:
     }
 #endif
 
-    const UINT back_buffer_index = swap_chain_->GetCurrentBackBufferIndex();
+    const UINT back_buffer_index =
+        swap_chain_ ? swap_chain_->GetCurrentBackBufferIndex() : headless_back_buffer_index_;
     if (back_buffer_index >= kBufferCount || !back_buffers_[back_buffer_index]) {
       return fail(error, "swapchain back-buffer is missing for present-frame capture");
     }
@@ -2219,6 +2333,12 @@ private:
       return record_dispatch(list, command, payload, error);
     case D3D12ReplayBackend::ReplayCommandKind::MapResource:
     case D3D12ReplayBackend::ReplayCommandKind::UnmapResource:
+      return true;
+    case D3D12ReplayBackend::ReplayCommandKind::BeginCommandList:
+    case D3D12ReplayBackend::ReplayCommandKind::EndCommandList:
+      // Recording-lifetime markers (CreateCommandList / Reset / Close). The replayer drives list
+      // open/close itself in record_command_list via its own Reset()/Close(); an interior marker
+      // (e.g. a list created then Reset to re-record) is a no-op here, not a real GPU command.
       return true;
     default:
       return fail(error, "unsupported command " + command.function_name);
@@ -3684,13 +3804,38 @@ private:
     return true;
   }
 
-  void wait_for_gpu()
+  // Return a native command queue of the given list type, creating+caching it on first use.
+  // The DIRECT queue is the primary queue_ (also used for swapchain/present); COMPUTE/COPY queues
+  // are created on demand so COMPUTE/COPY command lists execute on a type-matching queue (D3D12
+  // requires the command-list type to match its execution queue). Returns nullptr on failure.
+  ID3D12CommandQueue *get_or_create_queue(D3D12_COMMAND_LIST_TYPE type)
   {
-    if (!queue_ || !fence_) {
+    if (type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+      return queue_.get();
+    }
+    auto it = queues_by_type_.find(static_cast<UINT>(type));
+    if (it != queues_by_type_.end()) {
+      return it->second.get();
+    }
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    desc.Type = type;
+    ComPtr<ID3D12CommandQueue> q;
+    if (FAILED(device_->CreateCommandQueue(&desc, IID_PPV_ARGS(q.put()))) || !q) {
+      return nullptr;
+    }
+    auto *raw = q.get();
+    queues_by_type_.emplace(static_cast<UINT>(type), std::move(q));
+    return raw;
+  }
+
+  void wait_for_gpu(ID3D12CommandQueue *signal_queue = nullptr)
+  {
+    ID3D12CommandQueue *q = signal_queue ? signal_queue : queue_.get();
+    if (!q || !fence_) {
       return;
     }
     const UINT64 value = ++fence_value_;
-    if (FAILED(queue_->Signal(fence_.get(), value))) {
+    if (FAILED(q->Signal(fence_.get(), value))) {
       return;
     }
 #ifdef _WIN32
@@ -3720,6 +3865,8 @@ private:
   std::uint64_t replay_stop_after_sequence_ = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE");
   UINT64 fence_value_ = 0;
   std::uint64_t replay_batch_index_ = 0;
+  UINT headless_back_buffer_index_ = 0;
+  std::unordered_map<UINT, ComPtr<ID3D12CommandQueue>> queues_by_type_;
 #ifdef _WIN32
   HANDLE fence_event_ = nullptr;
 #endif
