@@ -88,21 +88,49 @@ public:
       error = "D3D12 native command replay incomplete";
       return false;
     }
-    if (!bootstrap(error) ||
-        !create_heaps(error) ||
-        !create_resources(error) ||
-        !create_descriptor_heaps(error) ||
-        !create_query_heaps(error) ||
-        !create_root_signatures(error) ||
-        !create_pipelines(error) ||
-        !create_command_signatures(error) ||
-        !prepare_chronological_state(error) ||
-        !create_command_objects(error) ||
-        !replay_submissions(error)) {
+    replay_milestone("replay:begin");
+    if (!log_stage("bootstrap", [&] { return bootstrap(error); }) ||
+        !log_stage("create_heaps", [&] { return create_heaps(error); }) ||
+        !log_stage("create_resources", [&] { return create_resources(error); }) ||
+        !log_stage("create_descriptor_heaps", [&] { return create_descriptor_heaps(error); }) ||
+        !log_stage("create_query_heaps", [&] { return create_query_heaps(error); }) ||
+        !log_stage("create_root_signatures", [&] { return create_root_signatures(error); }) ||
+        !log_stage("create_pipelines", [&] { return create_pipelines(error); }) ||
+        !log_stage("create_command_signatures", [&] { return create_command_signatures(error); }) ||
+        !log_stage("prepare_chronological_state", [&] { return prepare_chronological_state(error); }) ||
+        !log_stage("create_command_objects", [&] { return create_command_objects(error); }) ||
+        !log_stage("replay_submissions", [&] { return replay_submissions(error); })) {
       return false;
     }
     wait_for_gpu();
+    replay_milestone("replay:done");
     return true;
+  }
+
+  // Append a flushed milestone line to APITRACE_D3D12_REPLAY_MILESTONE_LOG (if set). Used to
+  // observe exactly which replay stage runs / stalls under Wine, where console output is swallowed.
+  void replay_milestone(const char *what) const
+  {
+    const char *path = std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG");
+    if (path == nullptr || *path == '\0') {
+      return;
+    }
+    std::ofstream out(path, std::ios::app | std::ios::binary);
+    if (out) {
+      out << what << "\n";
+      out.flush();
+    }
+  }
+
+  template <typename Fn>
+  bool log_stage(const char *name, Fn &&fn)
+  {
+    std::string begin = std::string("stage:begin ") + name;
+    replay_milestone(begin.c_str());
+    const bool ok = fn();
+    std::string end = std::string(ok ? "stage:end   " : "stage:FAIL  ") + name;
+    replay_milestone(end.c_str());
+    return ok;
   }
 
 private:
@@ -251,13 +279,17 @@ private:
 
     RECT rect{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+    // Use an explicit (0,0) origin instead of CW_USEDEFAULT: under headless wine-on-macOS the
+    // CW_USEDEFAULT placement makes win32u query the virtual screen rect (NtGdiOpenDCW ->
+    // get_virtual_screen_rect -> lock_display_devices), which deadlocks on the display-device lock
+    // when called from the replay worker thread. An explicit origin skips that query.
     hwnd_ = CreateWindowExA(
         0,
         wc.lpszClassName,
         "apitrace D3D12 native retrace",
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
+        0,
+        0,
         rect.right - rect.left,
         rect.bottom - rect.top,
         nullptr,
@@ -1382,9 +1414,27 @@ private:
         return false;
       }
       if (!native_lists.empty()) {
+        // Bounded per-batch markers: every batch for the first few, then sparse. Lets us see
+        // whether a stall is between ExecuteCommandLists and wait_for_gpu (DXMT submission) or in
+        // the GPU wait itself, without flooding for a full replay.
+        const bool trace_batch = replay_batch_index_ < 8 || (replay_batch_index_ % 500) == 0;
+        if (trace_batch) {
+          replay_milestone((std::string("submit:execute batch=") +
+                            std::to_string(replay_batch_index_) +
+                            " seq=" + std::to_string(batch.execute_sequence)).c_str());
+        }
         queue_->ExecuteCommandLists(static_cast<UINT>(native_lists.size()), native_lists.data());
+        if (trace_batch) {
+          replay_milestone((std::string("submit:executed batch=") +
+                            std::to_string(replay_batch_index_)).c_str());
+        }
         wait_for_gpu();
+        if (trace_batch) {
+          replay_milestone((std::string("submit:waited batch=") +
+                            std::to_string(replay_batch_index_)).c_str());
+        }
       }
+      ++replay_batch_index_;
       if (replay_stop_after_sequence_ != 0 && batch.execute_sequence >= replay_stop_after_sequence_) {
         break;
       }
@@ -3669,6 +3719,7 @@ private:
   std::uint64_t replay_stop_after_present_frame_ = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME");
   std::uint64_t replay_stop_after_sequence_ = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE");
   UINT64 fence_value_ = 0;
+  std::uint64_t replay_batch_index_ = 0;
 #ifdef _WIN32
   HANDLE fence_event_ = nullptr;
 #endif
