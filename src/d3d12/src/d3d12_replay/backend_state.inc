@@ -109,6 +109,32 @@ bool D3D12ReplayBackend::resolve_gpu_virtual_address(
   return resolve_gpu_virtual_address_at(gpu_virtual_address, std::numeric_limits<std::uint64_t>::max(), binding, error);
 }
 
+void D3D12ReplayBackend::build_resource_version_index()
+{
+  resource_versions_by_id_.clear();
+  resource_versions_by_va_.clear();
+  max_resource_va_width_ = 0;
+  for (const auto &resource : resource_versions_) {
+    resource_versions_by_id_[resource.resource_object_id].push_back(&resource);
+    if (resource.gpu_virtual_address != 0 && resource.width != 0) {
+      resource_versions_by_va_.emplace_back(resource.gpu_virtual_address, &resource);
+      max_resource_va_width_ = std::max(max_resource_va_width_, resource.width);
+    }
+  }
+  for (auto &[object_id, versions] : resource_versions_by_id_) {
+    (void)object_id;
+    std::sort(versions.begin(), versions.end(),
+              [](const ResourceSemanticState *a, const ResourceSemanticState *b) {
+                return a->create_sequence < b->create_sequence;
+              });
+  }
+  std::sort(resource_versions_by_va_.begin(), resource_versions_by_va_.end(),
+            [](const std::pair<std::uint64_t, const ResourceSemanticState *> &a,
+               const std::pair<std::uint64_t, const ResourceSemanticState *> &b) {
+              return a.first < b.first;
+            });
+}
+
 bool D3D12ReplayBackend::resolve_gpu_virtual_address_at(
     std::uint64_t gpu_virtual_address,
     std::uint64_t sequence,
@@ -120,21 +146,56 @@ bool D3D12ReplayBackend::resolve_gpu_virtual_address_at(
   if (gpu_virtual_address == 0) {
     return true;
   }
+  // Resolve the address to the resource lifetime version covering it. resources_ keeps only the LAST
+  // version per object_id (a pointer), so when an object_id is reused across lifetimes (e.g. a BC
+  // texture then a vertex buffer at the same address) the flat map's GPUVA/width belong to the wrong
+  // version. resource_versions_ has every version with its own create_sequence/gpu_virtual_address/
+  // width; we keep the largest create_sequence <= sequence among versions whose [va, va+width) covers
+  // the address. The address-sorted index (resource_versions_by_va_) makes this a binary search plus
+  // a short leftward walk bounded by max_resource_va_width_, instead of an O(total versions) scan per
+  // binding (which stalls heavy anchor batches for minutes). Falls back to the flat map only when no
+  // version history exists (older schema-1 models have an empty resource_versions_).
   const ResourceSemanticState *best_resource = nullptr;
   trace::ObjectId best_resource_object_id = 0;
-  for (const auto &[resource_object_id, resource] : resources_) {
-    if (resource.gpu_virtual_address == 0 ||
-        resource.create_sequence > sequence ||
+  const auto consider = [&](const ResourceSemanticState &resource, trace::ObjectId object_id) {
+    if (resource.gpu_virtual_address == 0 || resource.create_sequence > sequence ||
         gpu_virtual_address < resource.gpu_virtual_address) {
-      continue;
+      return;
     }
-    const auto offset = gpu_virtual_address - resource.gpu_virtual_address;
-    if (offset >= resource.width) {
-      continue;
+    if (gpu_virtual_address - resource.gpu_virtual_address >= resource.width) {
+      return;
     }
     if (!best_resource || resource.create_sequence > best_resource->create_sequence) {
       best_resource = &resource;
-      best_resource_object_id = resource_object_id;
+      best_resource_object_id = object_id;
+    }
+  };
+  if (!resource_versions_by_va_.empty()) {
+    // Any resource covering `gpu_virtual_address` has va in [gpu_virtual_address - max_width + 1,
+    // gpu_virtual_address]. Binary search the upper bound for the address, then walk left over that
+    // bounded window.
+    const std::uint64_t low_bound = (gpu_virtual_address >= max_resource_va_width_)
+                                        ? gpu_virtual_address - max_resource_va_width_ + 1
+                                        : 0;
+    auto it = std::upper_bound(
+        resource_versions_by_va_.begin(), resource_versions_by_va_.end(), gpu_virtual_address,
+        [](std::uint64_t addr, const std::pair<std::uint64_t, const ResourceSemanticState *> &e) {
+          return addr < e.first;
+        });
+    while (it != resource_versions_by_va_.begin()) {
+      --it;
+      if (it->first < low_bound) {
+        break;
+      }
+      consider(*it->second, it->second->resource_object_id);
+    }
+  } else if (!resource_versions_.empty()) {
+    for (const auto &resource : resource_versions_) {
+      consider(resource, resource.resource_object_id);
+    }
+  } else {
+    for (const auto &[resource_object_id, resource] : resources_) {
+      consider(resource, resource_object_id);
     }
   }
   if (best_resource) {
@@ -167,18 +228,35 @@ bool D3D12ReplayBackend::resolve_recorded_gpu_virtual_address_at(
   }
 
   if (recorded_resource_object_id != 0) {
-    const auto resource_it = resources_.find(recorded_resource_object_id);
-    if (resource_it != resources_.end()) {
-      const auto &resource = resource_it->second;
-      if (resource.create_sequence <= sequence && resource.gpu_virtual_address != 0 &&
-          gpu_virtual_address >= resource.gpu_virtual_address) {
-        const auto offset = gpu_virtual_address - resource.gpu_virtual_address;
-        if (offset < resource.width) {
-          binding.resource_object_id = recorded_resource_object_id;
-          binding.offset = offset;
-          binding.resolved = true;
-          return true;
-        }
+    // Use the version of this object_id live at `sequence` (largest create_sequence <= sequence),
+    // not the flat resources_ last-version, so a reused object_id (pointer) resolves to the lifetime
+    // that was actually bound here. The per-object_id index gives O(log versions); falls back to the
+    // flat map when the index is empty (schema-1 models without version history). Falls through to
+    // the address scan if no matching version covers the address.
+    const ResourceSemanticState *recorded = nullptr;
+    const auto index_it = resource_versions_by_id_.find(recorded_resource_object_id);
+    if (index_it != resource_versions_by_id_.end()) {
+      const auto &versions = index_it->second;  // sorted ascending by create_sequence
+      auto upper = std::upper_bound(
+          versions.begin(), versions.end(), sequence,
+          [](std::uint64_t seq, const ResourceSemanticState *v) { return seq < v->create_sequence; });
+      if (upper != versions.begin()) {
+        recorded = *(upper - 1);  // last version with create_sequence <= sequence
+      }
+    } else {
+      const auto resource_it = resources_.find(recorded_resource_object_id);
+      if (resource_it != resources_.end() && resource_it->second.create_sequence <= sequence) {
+        recorded = &resource_it->second;
+      }
+    }
+    if (recorded != nullptr && recorded->gpu_virtual_address != 0 &&
+        gpu_virtual_address >= recorded->gpu_virtual_address) {
+      const auto offset = gpu_virtual_address - recorded->gpu_virtual_address;
+      if (offset < recorded->width) {
+        binding.resource_object_id = recorded_resource_object_id;
+        binding.offset = offset;
+        binding.resolved = true;
+        return true;
       }
     }
   }
@@ -2344,6 +2422,9 @@ bool D3D12ReplayBackend::finalize_replay()
   if (!validate_replay_closure() || !validate_native_replay_readiness()) {
     return false;
   }
+  // resource_versions_ is fully populated by now (reconstruction or model load). Build the
+  // per-object_id version index once so GPUVA resolution during replay is O(log) per binding.
+  build_resource_version_index();
   D3D12NativeReplayer native_replayer(*this);
   return native_replayer.replay(last_error_);
 }

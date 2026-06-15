@@ -3,6 +3,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>

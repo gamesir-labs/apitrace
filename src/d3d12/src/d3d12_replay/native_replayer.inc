@@ -100,9 +100,22 @@ public:
         !log_stage("prepare_chronological_state", [&] { return prepare_chronological_state(error); }) ||
         !log_stage("create_command_objects", [&] { return create_command_objects(error); }) ||
         !log_stage("replay_submissions", [&] { return replay_submissions(error); })) {
+      // Guarantee a non-empty error even if a deep return-false path forgot to set one (e.g. a GPU
+      // device-removed fault surfaced asynchronously). Without this, the retrace CLI falls back to a
+      // generic "finalization failed" and we lose the failing batch, which is invisible under Wine.
+      if (error.empty()) {
+        error = "D3D12 native command replay incomplete: replay stage failed at batch=" +
+                std::to_string(replay_batch_index_);
+        const std::string removed = device_removed_detail();
+        if (!removed.empty()) {
+          error += " (" + removed + ")";
+        }
+      }
       return false;
     }
     wait_for_gpu();
+    replay_milestone((std::string("dbg:setpso_calls=") + std::to_string(dbg_setpso_calls_) +
+                      " copy_calls=" + std::to_string(dbg_copy_calls_)).c_str());
     replay_milestone("replay:done");
     return true;
   }
@@ -120,6 +133,29 @@ public:
       out << what << "\n";
       out.flush();
     }
+  }
+
+  // Log the top command kinds by cumulative record time, prefixed with `prefix`. Shared by the
+  // per-batch batch:slow log and the mid-grind watchdog so a slow/stuck list is attributable.
+  void dump_command_kind_breakdown(const char *prefix) const
+  {
+    std::array<std::size_t, kCommandKindCount> order{};
+    for (std::size_t i = 0; i < kCommandKindCount; ++i) {
+      order[i] = i;
+    }
+    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+      return command_kind_micros_[a] > command_kind_micros_[b];
+    });
+    std::string top;
+    for (std::size_t r = 0; r < 4; ++r) {
+      const std::size_t k = order[r];
+      if (command_kind_micros_[k] == 0) {
+        break;
+      }
+      top += " kind" + std::to_string(k) + "=" + std::to_string(command_kind_micros_[k] / 1000) +
+             "ms/" + std::to_string(command_kind_counts_[k]);
+    }
+    replay_milestone((std::string(prefix) + " cumtop:" + top).c_str());
   }
 
   template <typename Fn>
@@ -939,6 +975,24 @@ private:
     return handle;
   }
 
+  // BUG-007 diagnostic: log when a clear/set-render-target binding targets a known back-buffer RTV
+  // slot, so we can tell whether the back-buffer is bound as a DRAW target vs only cleared.
+  void note_back_buffer_rtv_use(const D3D12ReplayBackend::DescriptorBinding &binding,
+                                const char *how, std::uint64_t sequence)
+  {
+    if (back_buffer_rtv_slots_.empty()) {
+      return;
+    }
+    const std::uint64_t key =
+        (static_cast<std::uint64_t>(binding.heap_object_id) << 20) ^ binding.descriptor_index;
+    if (back_buffer_rtv_slots_.count(key)) {
+      replay_milestone((std::string("bb:rtv-use ") + how + " heap=" +
+                        std::to_string(binding.heap_object_id) + " idx=" +
+                        std::to_string(binding.descriptor_index) + " seq=" +
+                        std::to_string(sequence)).c_str());
+    }
+  }
+
   bool apply_descriptor(
       const D3D12ReplayBackend::DescriptorSemanticState &semantic,
       std::string &error)
@@ -1018,6 +1072,25 @@ private:
         desc_ptr = &desc;
       }
       device_->CreateRenderTargetView(resource, desc_ptr, dst);
+      // Diagnostic (BUG-007): record which descriptor slots hold an RTV that points at a swapchain
+      // back-buffer, so the clear/set-render-target paths can report whether the back-buffer is ever
+      // bound as a DRAW target (OMSetRenderTargets) vs only cleared.
+      if (std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG") && resource != nullptr) {
+        for (UINT bi = 0; bi < kBufferCount; ++bi) {
+          if (back_buffers_[bi] && back_buffers_[bi].get() == resource) {
+            back_buffer_rtv_slots_.insert(
+                (static_cast<std::uint64_t>(semantic.binding.heap_object_id) << 20) ^
+                semantic.binding.descriptor_index);
+            replay_milestone((std::string("bb:rtv-created slot heap=") +
+                              std::to_string(semantic.binding.heap_object_id) + " idx=" +
+                              std::to_string(semantic.binding.descriptor_index) + " bb=" +
+                              std::to_string(bi) + " res=" +
+                              std::to_string(semantic.resource_object_id) +
+                              " seq=" + std::to_string(semantic.create_sequence)).c_str());
+            break;
+          }
+        }
+      }
     } else if (semantic.kind == "DepthStencilView") {
       D3D12_DEPTH_STENCIL_VIEW_DESC desc{};
       D3D12_DEPTH_STENCIL_VIEW_DESC *desc_ptr = nullptr;
@@ -1278,11 +1351,17 @@ private:
     while (next_resource_update_index_ < resource_update_timeline_.size() &&
            resource_update_timeline_[next_resource_update_index_].sequence <= sequence) {
       const auto &entry = resource_update_timeline_[next_resource_update_index_];
-      auto native_it = resources_.find(entry.resource_object_id);
-      if (native_it == resources_.end()) {
-        return fail(error, "resource update references an unknown resource");
+      // Resolve the SAME version that reads (record_copy/bindings via resource_for) will see at this
+      // update's sequence, NOT the flat resources_ last-version. For a reused object_id (a per-frame
+      // ring/pool upload buffer, e.g. one seen reused 192x), the flat map points at the final native
+      // while reads resolve the sequence-correct native -> the read version never gets the data ->
+      // textures/constants read empty -> draws render black (BUG-007 layer 2).
+      current_replay_sequence_ = entry.sequence;
+      ID3D12Resource *target = resource_for(entry.resource_object_id, error);
+      if (!target) {
+        return false;
       }
-      if (!upload_resource_data(native_it->second.resource.get(), *entry.update, error)) {
+      if (!upload_resource_data(target, *entry.update, error)) {
         return false;
       }
       ++next_resource_update_index_;
@@ -1445,6 +1524,75 @@ private:
     return true;
   }
 
+  // One closed [begin_index, end_index] command interval for a command list, with the sequence of
+  // its EndCommandList. Per list_id these are appended in scan order (ascending index/sequence).
+  struct CommandListInterval {
+    std::size_t begin_index = 0;
+    std::size_t end_index = 0;
+    std::uint64_t end_sequence = 0;
+  };
+
+  // Build, in a single O(replay_commands_) pass, the closed command intervals per command_list_id.
+  // find_submitted_interval / find_closed_interval_before previously each scanned all replay_commands_
+  // from index 0 on every call (once per list per batch) = O(total commands) per batch, which stalls
+  // the heavy anchor batches for minutes once replay_commands_ holds millions of entries. With this
+  // index those lookups become a binary search over one list's intervals.
+  void build_command_list_intervals()
+  {
+    command_list_intervals_.clear();
+    std::unordered_map<trace::ObjectId, std::size_t> open_begin;
+    for (std::size_t index = 0; index < backend_.replay_commands_.size(); ++index) {
+      const auto &command = backend_.replay_commands_[index];
+      if (command.kind == D3D12ReplayBackend::ReplayCommandKind::BeginCommandList) {
+        open_begin[command.command_list_object_id] = index;
+      } else if (command.kind == D3D12ReplayBackend::ReplayCommandKind::EndCommandList) {
+        const auto it = open_begin.find(command.command_list_object_id);
+        if (it != open_begin.end()) {
+          command_list_intervals_[command.command_list_object_id].push_back(
+              CommandListInterval{it->second, index, command.sequence});
+          open_begin.erase(it);
+        }
+      }
+    }
+    // Lazily-filled per-command parsed-payload cache. Command intervals are re-recorded across many
+    // batches (a recorded list submitted repeatedly), so the same command index is parsed multiple
+    // times (measured: ~1.5x+ for the hottest kinds). Parsing each payload at most once and reusing
+    // the DOM removes that redundant json::parse, the dominant retrace-side CPU cost. is_discarded()
+    // marks "not yet parsed" (a successfully parsed payload is an object, never discarded).
+    payload_dom_cache_.assign(backend_.replay_commands_.size(), json(json::value_t::discarded));
+  }
+
+  // Parsed payload for a command index, parsed at most once and cached. Returns a null/discarded json
+  // if the payload is not valid JSON (callers already handle non-object payloads).
+  const json &cached_payload(std::size_t index, const std::string &payload_text)
+  {
+    json &slot = payload_dom_cache_[index];
+    if (slot.is_discarded()) {
+      slot = json::parse(payload_text, nullptr, false);
+    }
+    return slot;
+  }
+
+  // Largest closed interval for list_id whose EndCommandList sequence is < limit_sequence. Mirrors
+  // the old linear scans (which returned the last closed Begin/End pair before encountering a command
+  // of that list at sequence >= the limit), now via binary search over the per-list interval index.
+  const CommandListInterval *interval_before(trace::ObjectId command_list_id,
+                                             std::uint64_t limit_sequence) const
+  {
+    const auto it = command_list_intervals_.find(command_list_id);
+    if (it == command_list_intervals_.end() || it->second.empty()) {
+      return nullptr;
+    }
+    const auto &intervals = it->second;  // ascending by end_sequence
+    auto upper = std::upper_bound(
+        intervals.begin(), intervals.end(), limit_sequence,
+        [](std::uint64_t seq, const CommandListInterval &iv) { return seq <= iv.end_sequence; });
+    if (upper == intervals.begin()) {
+      return nullptr;
+    }
+    return &*(upper - 1);
+  }
+
   bool find_submitted_interval(
       trace::ObjectId command_list_id,
       std::uint64_t execute_sequence,
@@ -1452,31 +1600,13 @@ private:
       std::size_t &end_index,
       std::string &error) const
   {
-    constexpr auto invalid = std::numeric_limits<std::size_t>::max();
-    auto current_begin = invalid;
-    begin_index = invalid;
-    end_index = invalid;
-    for (std::size_t index = 0; index < backend_.replay_commands_.size(); ++index) {
-      const auto &command = backend_.replay_commands_[index];
-      if (command.command_list_object_id != command_list_id) {
-        continue;
-      }
-      if (command.sequence >= execute_sequence) {
-        break;
-      }
-      if (command.kind == D3D12ReplayBackend::ReplayCommandKind::BeginCommandList) {
-        current_begin = index;
-      } else if (command.kind == D3D12ReplayBackend::ReplayCommandKind::EndCommandList && current_begin != invalid) {
-        begin_index = current_begin;
-        end_index = index;
-        current_begin = invalid;
-      }
+    if (const CommandListInterval *iv = interval_before(command_list_id, execute_sequence)) {
+      begin_index = iv->begin_index;
+      end_index = iv->end_index;
+      return true;
     }
-    if (begin_index == invalid || end_index == invalid) {
-      error = "D3D12 native command replay incomplete: submitted command list has no closed interval";
-      return false;
-    }
-    return true;
+    error = "D3D12 native command replay incomplete: submitted command list has no closed interval";
+    return false;
   }
 
   bool find_closed_interval_before(
@@ -1486,38 +1616,27 @@ private:
       std::size_t &end_index,
       std::string &error) const
   {
-    constexpr auto invalid = std::numeric_limits<std::size_t>::max();
-    auto current_begin = invalid;
-    begin_index = invalid;
-    end_index = invalid;
-    for (std::size_t index = 0; index < backend_.replay_commands_.size(); ++index) {
-      const auto &command = backend_.replay_commands_[index];
-      if (command.command_list_object_id != command_list_id) {
-        continue;
-      }
-      if (command.sequence >= sequence_limit) {
-        break;
-      }
-      if (command.kind == D3D12ReplayBackend::ReplayCommandKind::BeginCommandList) {
-        current_begin = index;
-        continue;
-      }
-      if (command.kind == D3D12ReplayBackend::ReplayCommandKind::EndCommandList && current_begin != invalid) {
-        begin_index = current_begin;
-        end_index = index;
-        current_begin = invalid;
-      }
+    if (const CommandListInterval *iv = interval_before(command_list_id, sequence_limit)) {
+      begin_index = iv->begin_index;
+      end_index = iv->end_index;
+      return true;
     }
-    if (begin_index == invalid || end_index == invalid) {
-      error = "D3D12 native command replay incomplete: command list has no closed interval";
-      return false;
-    }
-    return true;
+    error = "D3D12 native command replay incomplete: command list has no closed interval";
+    return false;
   }
 
   bool replay_submissions(std::string &error)
   {
+    // Build the per-command-list interval index once, so per-batch interval lookups are a binary
+    // search instead of a full scan of replay_commands_ (which is O(total commands) per batch).
+    build_command_list_intervals();
     for (const auto &batch : backend_.submissions_.completed_batches()) {
+      // Per-batch timing + command-count instrumentation: a batch that takes a long time gets a
+      // milestone with how many commands it recorded, so a slow anchor batch is attributable to
+      // command volume (json parse / record cost) vs per-binding resolution cost. Cheap (one clock
+      // read per batch); only logs above a threshold so it does not flood.
+      const auto batch_begin = std::chrono::steady_clock::now();
+      std::size_t batch_command_count = 0;
       std::vector<ID3D12CommandList *> native_lists;
       native_lists.reserve(batch.command_list_ids.size());
       for (const auto command_list_id : batch.command_list_ids) {
@@ -1528,9 +1647,18 @@ private:
         std::size_t begin_index = 0;
         std::size_t end_index = 0;
         if (!find_submitted_interval(command_list_id, batch.execute_sequence, begin_index, end_index, error)) {
+          if (error.empty()) {
+            error = "find_submitted_interval failed (batch=" + std::to_string(replay_batch_index_) +
+                    " list=" + std::to_string(command_list_id) + ")";
+          }
           return false;
         }
+        batch_command_count += (end_index > begin_index) ? (end_index - begin_index) : 0;
         if (!record_command_list(native_it->second, begin_index, end_index, error)) {
+          if (error.empty()) {
+            error = "record_command_list failed (batch=" + std::to_string(replay_batch_index_) +
+                    " list=" + std::to_string(command_list_id) + ")";
+          }
           return false;
         }
         native_lists.push_back(native_it->second.list.get());
@@ -1538,6 +1666,10 @@ private:
       if (!sync_resource_data_until(batch.execute_sequence, error) ||
           !sync_descriptors_until(batch.execute_sequence, error) ||
           !sync_tile_mapping_updates_until(batch.execute_sequence, error)) {
+        if (error.empty()) {
+          error = "batch pre-submit sync failed (batch=" + std::to_string(replay_batch_index_) +
+                  " seq=" + std::to_string(batch.execute_sequence) + ")";
+        }
         return false;
       }
       if (!native_lists.empty()) {
@@ -1553,7 +1685,7 @@ private:
         // Bounded per-batch markers: every batch for the first few, then sparse. Lets us see
         // whether a stall is between ExecuteCommandLists and wait_for_gpu (DXMT submission) or in
         // the GPU wait itself, without flooding for a full replay.
-        const bool trace_batch = replay_batch_index_ < 8 || (replay_batch_index_ % 500) == 0;
+        const bool trace_batch = replay_batch_index_ < 8 || (replay_batch_index_ % 50) == 0;
         if (trace_batch) {
           replay_milestone((std::string("submit:execute batch=") +
                             std::to_string(replay_batch_index_) +
@@ -1569,6 +1701,29 @@ private:
         if (trace_batch) {
           replay_milestone((std::string("submit:waited batch=") +
                             std::to_string(replay_batch_index_)).c_str());
+        }
+        // Detect an asynchronous GPU fault from this batch's submission. wait_for_gpu() cannot tell
+        // a completed fence from a removed device, so check explicitly and stop at the offending
+        // batch with the actual reason instead of failing opaquely much later.
+        const std::string removed = device_removed_detail();
+        if (!removed.empty()) {
+          return fail(error, "batch=" + std::to_string(replay_batch_index_) +
+                                 " seq=" + std::to_string(batch.execute_sequence) + ": " + removed);
+        }
+      }
+      // Attribute a slow batch: how long it took and how many commands it recorded. Threshold keeps
+      // the common fast batches quiet. This pinpoints whether a stall is command-volume bound.
+      {
+        const auto batch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now() - batch_begin)
+                                  .count();
+        if (batch_ms >= 1000) {
+          dump_command_kind_breakdown(
+              (std::string("batch:slow batch=") + std::to_string(replay_batch_index_) +
+               " seq=" + std::to_string(batch.execute_sequence) +
+               " commands=" + std::to_string(batch_command_count) +
+               " elapsed_ms=" + std::to_string(batch_ms))
+                  .c_str());
         }
       }
       ++replay_batch_index_;
@@ -1589,6 +1744,10 @@ private:
           break;
         }
         if (!capture_present_frame(present_frame_index, sync_interval, flags, error)) {
+          if (error.empty()) {
+            error = "capture_present_frame failed (batch=" + std::to_string(replay_batch_index_) +
+                    " frame=" + std::to_string(present_frame_index) + ")";
+          }
           return false;
         }
         if (swap_chain_) {
@@ -1765,6 +1924,213 @@ private:
     }
   }
 
+  static std::string hex32(std::uint32_t v)
+  {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%08x", v);
+    return std::string(buf);
+  }
+
+  // Read the center texel (raw 32-bit little-endian) of back_buffers_[index] via a tiny readback.
+  // Diagnostic only: tells whether a back-buffer holds a flat clear color vs a real image.
+  bool probe_back_buffer_center(UINT index, std::uint32_t &out, std::string &error)
+  {
+    if (index >= kBufferCount || !back_buffers_[index]) {
+      return fail(error, "probe: back-buffer missing");
+    }
+    ID3D12Resource *bb = back_buffers_[index].get();
+    const D3D12_RESOURCE_DESC desc = bb->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    UINT rows = 0; UINT64 row_size = 0, total = 0;
+    device_->GetCopyableFootprints(&desc, 0, 1, 0, &fp, &rows, &row_size, &total);
+    if (total == 0) {
+      return fail(error, "probe: zero footprint");
+    }
+    D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total;
+    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ScopedD3D12CaptureSuppression suppress;
+    ComPtr<ID3D12Resource> rb;
+    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(rb.put())))) {
+      return fail(error, "probe: readback alloc failed");
+    }
+    ReadbackCommandObjects cmds;
+    if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(cmds.allocator.put()))) ||
+        FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmds.allocator.get(), nullptr, IID_PPV_ARGS(cmds.list.put())))) {
+      return fail(error, "probe: cmd alloc failed");
+    }
+    const auto to_src = transition_barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmds.list->ResourceBarrier(1, &to_src);
+    D3D12_TEXTURE_COPY_LOCATION src{}; src.pResource = bb; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource = rb.get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = fp;
+    cmds.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    const auto to_present = transition_barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+    cmds.list->ResourceBarrier(1, &to_present);
+    if (FAILED(cmds.list->Close())) {
+      return fail(error, "probe: close failed");
+    }
+    ID3D12CommandList *lists[] = {cmds.list.get()};
+    queue_->ExecuteCommandLists(1, lists);
+    wait_for_gpu();
+    void *mapped = nullptr;
+    if (FAILED(rb->Map(0, nullptr, &mapped)) || !mapped) {
+      return fail(error, "probe: map failed");
+    }
+    const UINT cx = static_cast<UINT>(desc.Width) / 2, cy = static_cast<UINT>(desc.Height) / 2;
+    const auto *px = static_cast<const std::uint8_t *>(mapped) + static_cast<std::size_t>(fp.Offset) +
+                     static_cast<std::size_t>(cy) * fp.Footprint.RowPitch + static_cast<std::size_t>(cx) * 4u;
+    out = static_cast<std::uint32_t>(px[0]) | (static_cast<std::uint32_t>(px[1]) << 8) |
+          (static_cast<std::uint32_t>(px[2]) << 16) | (static_cast<std::uint32_t>(px[3]) << 24);
+    // Full-buffer nonzero scan (sampled): how many sampled texels have any non-zero RGB bits. Tells
+    // whether THIS back-buffer holds a real image even if the center texel is black (sky/road).
+    probe_last_nonzero_permille_ = 0;
+    {
+      const UINT w = static_cast<UINT>(desc.Width), h = static_cast<UINT>(desc.Height);
+      std::uint64_t nz = 0, cnt = 0;
+      const auto *base = static_cast<const std::uint8_t *>(mapped) + static_cast<std::size_t>(fp.Offset);
+      for (UINT y = 0; y < h; y += 8) {
+        const auto *row = base + static_cast<std::size_t>(y) * fp.Footprint.RowPitch;
+        for (UINT x = 0; x < w; x += 8) {
+          const auto *p = row + static_cast<std::size_t>(x) * 4u;
+          // R10G10B10A2 little-endian: nonzero if any of the 30 RGB bits set (mask off the 2 alpha bits)
+          const std::uint32_t v = static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8) |
+                                  (static_cast<std::uint32_t>(p[2]) << 16) | (static_cast<std::uint32_t>(p[3]) << 24);
+          if (v & 0x3FFFFFFFu) ++nz;
+          ++cnt;
+        }
+      }
+      if (cnt) probe_last_nonzero_permille_ = static_cast<std::uint32_t>(nz * 1000 / cnt);
+    }
+    D3D12_RANGE none{0, 0};
+    rb->Unmap(0, &none);
+    return true;
+  }
+
+  // Probe an arbitrary TEXTURE2D resource (by object_id) for non-zero content (sampled). Transitions
+  // from COMMON (decay-safe for most resources). Diagnostic only (BUG-007): tells whether an offscreen
+  // render target (e.g. scene-color) holds a real image, to separate "scene render empty" from
+  // "back-buffer composite/present issue". Logs a milestone; returns false on setup failure.
+  bool probe_texture_nonzero(trace::ObjectId object_id, std::uint64_t frame_index)
+  {
+    std::string ignore;
+    ID3D12Resource *res = resource_for(object_id, ignore);
+    if (!res) {
+      replay_milestone((std::string("probe-tex object=") + std::to_string(object_id) +
+                        " UNRESOLVED").c_str());
+      return false;
+    }
+    const D3D12_RESOURCE_DESC desc = res->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+      replay_milestone((std::string("probe-tex object=") + std::to_string(object_id) +
+                        " not-tex2d dim=" + std::to_string(static_cast<int>(desc.Dimension))).c_str());
+      return false;
+    }
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    UINT rows = 0; UINT64 row_size = 0, total = 0;
+    device_->GetCopyableFootprints(&desc, 0, 1, 0, &fp, &rows, &row_size, &total);
+    if (total == 0) return false;
+    D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total;
+    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ScopedD3D12CaptureSuppression suppress;
+    ComPtr<ID3D12Resource> rb;
+    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(rb.put())))) return false;
+    ReadbackCommandObjects cmds;
+    if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(cmds.allocator.put()))) ||
+        FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmds.allocator.get(), nullptr, IID_PPV_ARGS(cmds.list.put())))) return false;
+    // No explicit barrier: an explicit transition from a guessed before-state (e.g. COMMON) fought
+    // DXMT's own state tracking and caused a device fault. Rely on implicit COMMON promotion / DXMT's
+    // tracking; a state mismatch only warns. Diagnostic copy only.
+    D3D12_TEXTURE_COPY_LOCATION src{}; src.pResource = res; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource = rb.get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = fp;
+    cmds.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    if (FAILED(cmds.list->Close())) return false;
+    ID3D12CommandList *lists[] = {cmds.list.get()};
+    queue_->ExecuteCommandLists(1, lists);
+    wait_for_gpu();
+    void *mapped = nullptr;
+    if (FAILED(rb->Map(0, nullptr, &mapped)) || !mapped) return false;
+    const UINT w = static_cast<UINT>(desc.Width), h = static_cast<UINT>(desc.Height);
+    const auto *base = static_cast<const std::uint8_t *>(mapped) + static_cast<std::size_t>(fp.Offset);
+    std::uint64_t nz = 0, cnt = 0;
+    for (UINT y = 0; y < h; y += 8) {
+      const auto *row = base + static_cast<std::size_t>(y) * fp.Footprint.RowPitch;
+      for (UINT x = 0; x < w; x += 8) {
+        const auto *p = row + static_cast<std::size_t>(x) * 4u;
+        if (p[0] || p[1] || p[2] || p[3]) ++nz;
+        ++cnt;
+      }
+    }
+    D3D12_RANGE none{0, 0};
+    rb->Unmap(0, &none);
+    replay_milestone((std::string("probe-tex object=") + std::to_string(object_id) +
+                      " frame=" + std::to_string(frame_index) + " fmt=" +
+                      std::to_string(static_cast<int>(desc.Format)) + " " +
+                      std::to_string(w) + "x" + std::to_string(h) +
+                      " nonzero_permille=" + std::to_string(cnt ? nz * 1000 / cnt : 0)).c_str());
+    return true;
+  }
+
+  // Read the first `count` bytes of a DEFAULT/any-heap resource by GPU-copying into a readback
+  // buffer. Diagnostic only (BUG-007): tells whether a vertex/index/texture resource that a draw
+  // reads actually holds non-zero data, i.e. whether the upload->copy chain populated it.
+  bool probe_resource_head(trace::ObjectId object_id, std::size_t count, std::string &error)
+  {
+    std::string ignore;
+    ID3D12Resource *res = resource_for(object_id, ignore);
+    if (!res) {
+      return fail(error, "probe-res: object not resolvable");
+    }
+    const D3D12_RESOURCE_DESC desc = res->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+      return fail(error, "probe-res: not a buffer");
+    }
+    const std::size_t n = std::min<std::size_t>(count, static_cast<std::size_t>(desc.Width));
+    D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = n;
+    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ScopedD3D12CaptureSuppression suppress;
+    ComPtr<ID3D12Resource> rb;
+    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(rb.put())))) {
+      return fail(error, "probe-res: readback alloc failed");
+    }
+    ReadbackCommandObjects cmds;
+    if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(cmds.allocator.put()))) ||
+        FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmds.allocator.get(), nullptr, IID_PPV_ARGS(cmds.list.put())))) {
+      return fail(error, "probe-res: cmd alloc failed");
+    }
+    cmds.list->CopyBufferRegion(rb.get(), 0, res, 0, n);
+    if (FAILED(cmds.list->Close())) {
+      return fail(error, "probe-res: close failed");
+    }
+    ID3D12CommandList *lists[] = {cmds.list.get()};
+    queue_->ExecuteCommandLists(1, lists);
+    wait_for_gpu();
+    void *mapped = nullptr;
+    if (FAILED(rb->Map(0, nullptr, &mapped)) || !mapped) {
+      return fail(error, "probe-res: map failed");
+    }
+    const auto *b = static_cast<const std::uint8_t *>(mapped);
+    std::size_t nz = 0;
+    std::string head;
+    for (std::size_t i = 0; i < n; ++i) {
+      if (b[i] != 0) ++nz;
+      if (i < 16) head += hex32(b[i]).substr(6);  // last 2 hex chars = the byte
+    }
+    D3D12_RANGE none{0, 0};
+    rb->Unmap(0, &none);
+    replay_milestone((std::string("probe-res object=") + std::to_string(object_id) +
+                      " bytes=" + std::to_string(n) + " nonzero=" + std::to_string(nz) +
+                      " head=" + head).c_str());
+    return true;
+  }
+
   bool capture_present_frame(
       std::uint64_t frame_index,
       UINT sync_interval,
@@ -1772,6 +2138,23 @@ private:
       std::string &error)
   {
     if (!d3d12_retrace_present_frame_capture_enabled()) {
+      return true;
+    }
+    // Optional lower bound: only capture frames >= APITRACE_D3D12_RETRACE_CAPTURE_FROM_FRAME. Lets a
+    // replay seek to a deep frame (e.g. the anomaly anchor) without writing thousands of GB of
+    // earlier frames, and lets perf runs capture only the frames of interest. The GPU readback is
+    // also skipped for earlier frames, so it adds no per-frame cost before the window.
+    static const std::uint64_t capture_from_frame =
+        env_u64("APITRACE_D3D12_RETRACE_CAPTURE_FROM_FRAME");
+    if (capture_from_frame != 0 && frame_index < capture_from_frame) {
+      return true;
+    }
+    // Optional stride: with APITRACE_D3D12_RETRACE_CAPTURE_STRIDE=N capture only every Nth present
+    // frame (relative to capture_from_frame), so a long replay yields a sparse set of frames to eyeball
+    // for correctness instead of one per present. N=0/1 means capture every frame.
+    static const std::uint64_t capture_stride =
+        env_u64("APITRACE_D3D12_RETRACE_CAPTURE_STRIDE");
+    if (capture_stride > 1 && ((frame_index - capture_from_frame) % capture_stride) != 0) {
       return true;
     }
 #ifdef _WIN32
@@ -1792,6 +2175,39 @@ private:
         swap_chain_ ? swap_chain_->GetCurrentBackBufferIndex() : headless_back_buffer_index_;
     if (back_buffer_index >= kBufferCount || !back_buffers_[back_buffer_index]) {
       return fail(error, "swapchain back-buffer is missing for present-frame capture");
+    }
+    // Diagnostic: dump the center texel of EVERY back-buffer at this present. If all are a flat
+    // color, the scene never landed on any swapchain back-buffer (RTV/binding bug); if one holds a
+    // real image, the captured index is just rotated wrong. Gated on the milestone log being set.
+    if (std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG")) {
+      for (UINT bi = 0; bi < kBufferCount; ++bi) {
+        std::uint32_t center = 0;
+        std::string probe_err;
+        if (probe_back_buffer_center(bi, center, probe_err)) {
+          replay_milestone((std::string("capture:probe frame=") + std::to_string(frame_index) +
+                            " using_index=" + std::to_string(back_buffer_index) +
+                            " bb[" + std::to_string(bi) + "]_center=0x" +
+                            hex32(center) + " nonzero_permille=" +
+                            std::to_string(probe_last_nonzero_permille_)).c_str());
+        } else {
+          replay_milestone((std::string("capture:probe frame=") + std::to_string(frame_index) +
+                            " bb[" + std::to_string(bi) + "] FAILED: " + probe_err).c_str());
+        }
+      }
+      // Optional: probe a specific resource's head bytes (APITRACE_D3D12_RETRACE_PROBE_RESOURCE) to
+      // see whether a vertex/index/texture buffer a draw reads is actually populated.
+      if (const std::uint64_t probe_obj = env_u64("APITRACE_D3D12_RETRACE_PROBE_RESOURCE")) {
+        std::string probe_err;
+        if (!probe_resource_head(static_cast<trace::ObjectId>(probe_obj), 64, probe_err)) {
+          replay_milestone((std::string("probe-res frame=") + std::to_string(frame_index) +
+                            " FAILED: " + probe_err).c_str());
+        }
+      }
+      // Optional: probe an offscreen TEXTURE2D (APITRACE_D3D12_RETRACE_PROBE_TEXTURE) for non-zero
+      // content -> distinguishes "scene render empty" from "back-buffer composite issue".
+      if (const std::uint64_t probe_tex = env_u64("APITRACE_D3D12_RETRACE_PROBE_TEXTURE")) {
+        probe_texture_nonzero(static_cast<trace::ObjectId>(probe_tex), frame_index);
+      }
     }
     ID3D12Resource *back_buffer = back_buffers_[back_buffer_index].get();
     const D3D12_RESOURCE_DESC desc = back_buffer->GetDesc();
@@ -2122,6 +2538,29 @@ private:
   }
 #endif
 
+  // Resolve the initial pipeline state recorded on the BeginCommandList marker at `begin_index`
+  // (CreateCommandList/Reset initial_pipeline_state_object_id). Returns nullptr if none / unresolved.
+  ID3D12PipelineState *initial_pipeline_state_for(std::size_t begin_index)
+  {
+    if (begin_index >= backend_.replay_commands_.size()) {
+      return nullptr;
+    }
+    const auto &begin_cmd = backend_.replay_commands_[begin_index];
+    if (begin_cmd.kind != D3D12ReplayBackend::ReplayCommandKind::BeginCommandList) {
+      return nullptr;
+    }
+    const json payload = json::parse(begin_cmd.payload, nullptr, false);
+    if (payload.is_discarded() || !payload.is_object()) {
+      return nullptr;
+    }
+    const auto pso_id = payload_u64(payload, "initial_pipeline_state_object_id");
+    if (pso_id == 0) {
+      return nullptr;
+    }
+    const auto it = pipelines_.find(static_cast<trace::ObjectId>(pso_id));
+    return it == pipelines_.end() ? nullptr : it->second.get();
+  }
+
   bool record_command_list(
       NativeCommandList &native,
       std::size_t begin_index,
@@ -2133,13 +2572,85 @@ private:
       error = hresult_error("ID3D12CommandAllocator::Reset", hr);
       return false;
     }
-    hr = native.list->Reset(native.allocator.get(), nullptr);
+    // Reset with the RECORDED initial pipeline state, not nullptr. FH4 binds its graphics PSO via
+    // the Reset/CreateCommandList initial-PSO parameter (initial_pipeline_state_object_id) and then
+    // draws WITHOUT a separate SetPipelineState. Passing nullptr here left the list with no PSO, so
+    // DXMT skipped every such draw ("draw skipped without graphics pipeline state") -> blank frames
+    // (BUG-007). The BeginCommandList marker at begin_index carries that initial PSO id.
+    ID3D12PipelineState *initial_pso = initial_pipeline_state_for(begin_index);
+    // Diagnostic (BUG-007): a native list whose TYPE is not DIRECT but whose recorded interval has
+    // Draw commands is the mismatch (graphics PSO/draw on a COPY/COMPUTE list -> DXMT drops them).
+    if (std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG")) {
+      static int dbg = 0;
+      std::size_t n_setpso = 0, n_draw = 0;
+      for (std::size_t i = begin_index + 1; i < end_index; ++i) {
+        const auto k = backend_.replay_commands_[i].kind;
+        if (k == D3D12ReplayBackend::ReplayCommandKind::SetPipelineState) ++n_setpso;
+        else if (k == D3D12ReplayBackend::ReplayCommandKind::Draw) ++n_draw;
+      }
+      if (n_draw > 0 && native.type != D3D12_COMMAND_LIST_TYPE_DIRECT && dbg < 16) {
+        ++dbg;
+        replay_milestone((std::string("listtypebug list=") +
+                          std::to_string(backend_.replay_commands_[begin_index].command_list_object_id) +
+                          " native_type=" + std::to_string(static_cast<int>(native.type)) +
+                          " draws=" + std::to_string(n_draw) + " setpso=" + std::to_string(n_setpso) +
+                          " begin=" + std::to_string(begin_index)).c_str());
+      }
+    }
+    hr = native.list->Reset(native.allocator.get(), initial_pso);
     if (FAILED(hr)) {
       error = hresult_error("ID3D12GraphicsCommandList::Reset", hr);
       return false;
     }
+    const auto record_begin = std::chrono::steady_clock::now();
+    bool grind_warned = false;
+    // replay_commands_ is a GLOBAL sequence-ordered stream; when the app records multiple command
+    // lists concurrently their commands INTERLEAVE, so a [Begin,End] index window can contain other
+    // lists' commands. Record ONLY commands belonging to THIS list, or we would dump e.g. graphics
+    // draws into a COPY/COMPUTE native list and DXMT would drop them (BUG-007).
+    const trace::ObjectId this_list_id =
+        backend_.replay_commands_[begin_index].command_list_object_id;
     for (std::size_t index = begin_index + 1; index < end_index; ++index) {
-      if (!record_command(native.list.get(), backend_.replay_commands_[index], error)) {
+      const auto &cmd_ref = backend_.replay_commands_[index];
+      if (cmd_ref.command_list_object_id != this_list_id) {
+        continue;  // interleaved command from another concurrently-recorded list
+      }
+      // Mid-grind watchdog: if a single command list is taking pathologically long to record, dump
+      // the cumulative per-kind breakdown WHILE still inside the loop (the per-batch batch:slow log
+      // only fires at the end, which never happens for a stuck list). Checked sparsely so the check
+      // itself is free.
+      if (!grind_warned && (index - begin_index) % 2000 == 0) {
+        const auto grind_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now() - record_begin)
+                                  .count();
+        if (grind_ms >= 12000) {
+          grind_warned = true;
+          dump_command_kind_breakdown(
+              (std::string("batch:grinding batch=") + std::to_string(replay_batch_index_) +
+               " at_index=" + std::to_string(index - begin_index) + "/" +
+               std::to_string(end_index - begin_index) + " grind_ms=" + std::to_string(grind_ms) +
+               " cur_kind=" + std::to_string(static_cast<int>(cmd_ref.kind)) +
+               " cur_fn=" + cmd_ref.function_name + " cur_seq=" + std::to_string(cmd_ref.sequence))
+                  .c_str());
+        }
+      }
+      const auto cmd_begin = std::chrono::steady_clock::now();
+      const bool ok = record_command(native.list.get(), cmd_ref,
+                                     cached_payload(index, cmd_ref.payload), error);
+      const auto kind_idx = static_cast<std::size_t>(cmd_ref.kind);
+      if (kind_idx < kCommandKindCount) {
+        command_kind_micros_[kind_idx] += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - cmd_begin)
+                .count());
+        ++command_kind_counts_[kind_idx];
+      }
+      if (!ok) {
+        if (error.empty()) {
+          error = "record_command failed with no detail: " + cmd_ref.function_name +
+                  " (kind=" + std::to_string(static_cast<int>(cmd_ref.kind)) +
+                  " seq=" + std::to_string(cmd_ref.sequence) + ")";
+        }
         return false;
       }
     }
@@ -2297,7 +2808,18 @@ private:
       std::string &error) const
   {
     if (binding.resource_object_id == 0) {
-      return original_address == 0;
+      if (original_address == 0) {
+        return true;
+      }
+      // A non-zero recorded GPU virtual address that resolves to no live resource at this replay
+      // sequence. Surface it with the address so it is diagnosable instead of failing opaquely.
+      // Causes seen: the backing buffer's gpu_virtual_address was not captured, the resource is not
+      // yet created at this sequence, or an object_id was reused (see resource lifetime versioning).
+      std::ostringstream out;
+      out << "recorded GPU virtual address 0x" << std::hex << original_address
+          << " resolves to no live resource at replay sequence " << std::dec
+          << current_replay_sequence_;
+      return fail(error, out.str());
     }
     const auto resource_it = resources_.find(binding.resource_object_id);
     if (resource_it == resources_.end()) {
@@ -2310,9 +2832,9 @@ private:
   bool record_command(
       ID3D12GraphicsCommandList *list,
       const D3D12ReplayBackend::ReplayCommandRecord &command,
+      const json &payload,
       std::string &error)
   {
-    json payload = json::parse(command.payload, nullptr, false);
     if (payload.is_discarded() || !payload.is_object()) {
       return fail(error, "command payload is not JSON");
     }
@@ -2549,6 +3071,7 @@ private:
       return fail(error, "SetPipelineState references an unknown PSO");
     }
     list->SetPipelineState(pipeline_it->second.get());
+    ++dbg_setpso_calls_;
     return true;
   }
 
@@ -2699,7 +3222,15 @@ private:
       return fail(error, "RSSetViewports first viewport cannot cover multiple viewports");
     }
     list->RSSetViewports(static_cast<UINT>(viewports.size()), viewports.data());
-    (void)error;
+    static bool logged_vp = false;
+    if (!logged_vp && std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG") && !viewports.empty()) {
+      logged_vp = true;
+      replay_milestone((std::string("viewport:first count=") + std::to_string(viewports.size()) +
+                        " w=" + std::to_string(static_cast<long long>(viewports[0].Width)) +
+                        " h=" + std::to_string(static_cast<long long>(viewports[0].Height)) +
+                        " x=" + std::to_string(static_cast<long long>(viewports[0].TopLeftX)) +
+                        " y=" + std::to_string(static_cast<long long>(viewports[0].TopLeftY))).c_str());
+    }
     return true;
   }
 
@@ -2736,6 +3267,13 @@ private:
       return fail(error, "RSSetScissorRects first rect cannot cover multiple rects");
     }
     list->RSSetScissorRects(static_cast<UINT>(rects.size()), rects.data());
+    static bool logged_sc = false;
+    if (!logged_sc && std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG") && !rects.empty()) {
+      logged_sc = true;
+      replay_milestone((std::string("scissor:first count=") + std::to_string(rects.size()) +
+                        " l=" + std::to_string(rects[0].left) + " t=" + std::to_string(rects[0].top) +
+                        " r=" + std::to_string(rects[0].right) + " b=" + std::to_string(rects[0].bottom)).c_str());
+    }
     return true;
   }
 
@@ -2790,6 +3328,7 @@ private:
       if (!backend_.resolve_descriptor_binding_at(descriptor, false, command.sequence, binding, error)) {
         return false;
       }
+      note_back_buffer_rtv_use(binding, "OMSetRenderTargets", command.sequence);
       D3D12_CPU_DESCRIPTOR_HANDLE handle{};
       if (!descriptor_handle(binding, handle, error)) {
         return false;
@@ -2826,6 +3365,16 @@ private:
     D3D12ReplayBackend::DescriptorBinding binding;
     if (!backend_.resolve_descriptor_binding_at(payload_u64(payload, "descriptor"), false, command.sequence, binding, error)) {
       return false;
+    }
+    note_back_buffer_rtv_use(binding, "ClearRTV", command.sequence);
+    // A/B diagnostic (BUG-007): optionally skip clears that target a back-buffer RTV slot, to test
+    // whether clears executing after the scene draws are wiping rendered content (ordering bug).
+    if (std::getenv("APITRACE_D3D12_RETRACE_SKIP_BB_CLEAR") && !back_buffer_rtv_slots_.empty()) {
+      const std::uint64_t key =
+          (static_cast<std::uint64_t>(binding.heap_object_id) << 20) ^ binding.descriptor_index;
+      if (back_buffer_rtv_slots_.count(key)) {
+        return true;  // skip this back-buffer clear
+      }
     }
     D3D12_CPU_DESCRIPTOR_HANDLE handle{};
     if (!descriptor_handle(binding, handle, error)) {
@@ -3629,6 +4178,7 @@ private:
       const json &payload,
       std::string &error)
   {
+    ++dbg_copy_calls_;  // BUG-007 layer2 diagnostic: count copy commands actually recorded/executed
     if (command.function_name == "ID3D12GraphicsCommandList::CopyBufferRegionBatch") {
       const auto ops = payload.find("ops");
       if (ops == payload.end() || !ops->is_array()) {
@@ -3904,6 +4454,25 @@ private:
 #endif
   }
 
+  // Returns a human-readable device-removed reason if the device has faulted, else an empty string.
+  // A removed device makes wait_for_gpu() return immediately (GetCompletedValue() == UINT64_MAX),
+  // so an illegal submission (e.g. binding a BC7 resource as an RTV) otherwise fails silently and we
+  // only learn about it as a generic finalize failure. This surfaces the actual GPU fault reason.
+  std::string device_removed_detail() const
+  {
+    if (!device_) {
+      return {};
+    }
+    const HRESULT reason = device_->GetDeviceRemovedReason();
+    if (reason == S_OK) {
+      return {};
+    }
+    std::ostringstream out;
+    out << "device removed, GetDeviceRemovedReason=0x" << std::hex
+        << static_cast<unsigned long>(reason);
+    return out.str();
+  }
+
   static constexpr UINT kBufferCount = 2;
 
   struct ResourceDataUpdateRef {
@@ -3919,6 +4488,17 @@ private:
   std::uint64_t replay_stop_after_sequence_ = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE");
   UINT64 fence_value_ = 0;
   std::uint64_t replay_batch_index_ = 0;
+  // Per-command-kind cumulative record time (microseconds) + invocation counts, to attribute a slow
+  // batch to a specific command kind. kCommandKindCount covers the ReplayCommandKind enum with slack.
+  static constexpr std::size_t kCommandKindCount = 64;
+  std::array<std::uint64_t, kCommandKindCount> command_kind_micros_{};
+  std::array<std::uint64_t, kCommandKindCount> command_kind_counts_{};
+  std::unordered_map<trace::ObjectId, std::vector<CommandListInterval>> command_list_intervals_;
+  std::vector<json> payload_dom_cache_;
+  std::unordered_set<std::uint64_t> back_buffer_rtv_slots_;
+  std::uint64_t dbg_setpso_calls_ = 0;
+  std::uint64_t dbg_copy_calls_ = 0;
+  std::uint32_t probe_last_nonzero_permille_ = 0;
   UINT headless_back_buffer_index_ = 0;
   std::unordered_map<UINT, ComPtr<ID3D12CommandQueue>> queues_by_type_;
 #ifdef _WIN32

@@ -911,6 +911,21 @@ private:
   // to the version live at its own sequence, not the latest. The native replayer uses this to build
   // per-version native resources and resolve by sequence. See bugs.md BUG-20260614-004.
   std::vector<ResourceSemanticState> resource_versions_;
+  // Index over resource_versions_ keyed by object_id, each value sorted ascending by create_sequence.
+  // Built once (after reconstruction or model load) so GPU-virtual-address resolution can find the
+  // version live at a command's sequence in O(log versions-per-id) instead of scanning the whole
+  // resource_versions_ vector per binding (which is O(total versions) and dominates replay time on
+  // FH4-scale traces). Pointers reference resource_versions_ entries; rebuild if that vector changes.
+  std::unordered_map<trace::ObjectId, std::vector<const ResourceSemanticState *>>
+      resource_versions_by_id_;
+  // Address-sorted index over resource_versions_ entries that have a non-zero GPU virtual address,
+  // sorted ascending by gpu_virtual_address. Used by the address-range fallback resolution (a GPUVA
+  // with no recorded object_id) so it is a bounded binary search + short leftward walk instead of an
+  // O(total versions) scan per binding. max_resource_va_width_ bounds the leftward walk: any resource
+  // covering address A must start within [A - max_width, A].
+  std::vector<std::pair<std::uint64_t, const ResourceSemanticState *>> resource_versions_by_va_;
+  std::uint64_t max_resource_va_width_ = 0;
+  void build_resource_version_index();
   std::unordered_map<trace::ObjectId, PipelineSemanticState> pipelines_;
   std::unordered_map<trace::ObjectId, RootSignatureSemanticState> root_signatures_;
   std::vector<FenceOperationSemanticState> fence_operations_;

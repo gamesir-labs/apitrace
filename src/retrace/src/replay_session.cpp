@@ -98,6 +98,23 @@ bool env_enabled(const char *name)
   return text != "0" && text != "false" && text != "FALSE";
 }
 
+// Append a line to the replay milestone log (APITRACE_D3D12_REPLAY_MILESTONE_LOG) if it is set.
+// This is the one diagnostic channel that survives Wine, where stderr is swallowed. We use it here
+// to record the model fast-path decision (loaded vs fell back, with reason) so a silent fallback to
+// reconstruction — which is the dominant retrace cost — is observable.
+void milestone_log(const std::string &line)
+{
+  const char *path = std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG");
+  if (path == nullptr || *path == '\0') {
+    return;
+  }
+  std::ofstream out(path, std::ios::app | std::ios::binary);
+  if (out) {
+    out << line << "\n";
+    out.flush();
+  }
+}
+
 bool is_api_specific_resource_path(const std::filesystem::path &path)
 {
   auto part = path.begin();
@@ -2427,10 +2444,14 @@ bool ReplaySession::run()
           impl_->statistics.backend_init_ms = elapsed_ms(model_load_begin);
           model_loaded = true;
           std::cerr << "retrace: loaded persisted replay model, skipping reconstruction\n";
+          milestone_log("model:loaded persisted replay model, skipping reconstruction");
         } else {
           std::cerr << "retrace: failed to load persisted replay model ("
                     << (model_error.empty() ? "unknown error" : model_error)
                     << "), falling back to reconstruction\n";
+          milestone_log(std::string("model:load FAILED (") +
+                        (model_error.empty() ? "unknown error" : model_error) +
+                        "), falling back to reconstruction");
           // Events were skipped at open() for the fast path; the reconstruction fallback needs
           // them, so re-open the reader with event parsing enabled. Paid only on this rare failure.
           if (!reader_options.parse_callstream_events) {
@@ -2445,7 +2466,15 @@ bool ReplaySession::run()
             impl_->statistics.open_ms += elapsed_ms(reopen_begin);
           }
         }
+      } else {
+        milestone_log(std::string("model:skipped — model files not present at ") +
+                      model_json_path.generic_string());
       }
+    } else {
+      milestone_log(
+          std::string("model:skipped — ") +
+          (impl_->reader.prefix_limited() ? "reader is prefix-limited (stop-after cutoff)"
+                                          : "APITRACE_D3D12_RETRACE_IGNORE_MODEL set"));
     }
 
     if (!model_loaded) {
