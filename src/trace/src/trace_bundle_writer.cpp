@@ -3448,10 +3448,24 @@ bool payload_may_reference_asset_alias(
 struct RewriteAssetReferenceResult {
   std::vector<std::filesystem::path> rewritten_relative_paths;
   std::unordered_map<std::string, std::string> rewritten_digests;
+  std::unordered_set<std::string> unresolved_alias_sources;
   std::uint64_t candidates_scanned = 0;
   std::uint64_t candidates_skipped_clean = 0;
+  std::uint64_t candidates_failed = 0;
   std::uint64_t replacements = 0;
 };
+
+void collect_asset_alias_sources_in_text(
+    std::string_view text,
+    const std::unordered_map<std::string, std::string> &path_aliases,
+    std::unordered_set<std::string> &unresolved)
+{
+  for (const auto &[source, _] : path_aliases) {
+    if (!source.empty() && text.find(source) != std::string_view::npos) {
+      unresolved.insert(source);
+    }
+  }
+}
 
 RewriteAssetReferenceResult rewrite_bundle_asset_references(
     const BundleLayout &layout,
@@ -3471,8 +3485,10 @@ RewriteAssetReferenceResult rewrite_bundle_asset_references(
     ++result.candidates_scanned;
 
     std::ifstream input(source_path, std::ios::binary);
-    if (!input.is_open())
+    if (!input.is_open()) {
+      ++result.candidates_failed;
       continue;
+    }
 
     bool needs_rewrite = false;
     std::string line;
@@ -3490,13 +3506,17 @@ RewriteAssetReferenceResult rewrite_bundle_asset_references(
 
     input.clear();
     input.open(source_path, std::ios::binary);
-    if (!input.is_open())
+    if (!input.is_open()) {
+      ++result.candidates_failed;
       continue;
+    }
 
     const auto temporary_path = source_path.string() + ".rewrite.tmp";
     std::ofstream output(temporary_path, std::ios::binary | std::ios::trunc);
-    if (!output.is_open())
+    if (!output.is_open()) {
+      ++result.candidates_failed;
       continue;
+    }
 
     Sha256 rewritten_digest;
     std::size_t replacement_count = 0;
@@ -3521,17 +3541,41 @@ RewriteAssetReferenceResult rewrite_bundle_asset_references(
     std::error_code error;
     std::filesystem::rename(temporary_path, source_path, error);
     if (error) {
+      error.clear();
       std::filesystem::copy_file(
           temporary_path,
           source_path,
           std::filesystem::copy_options::overwrite_existing,
           error);
+      if (!error) {
+        std::filesystem::remove(temporary_path);
+      }
+    }
+    if (error) {
+      ++result.candidates_failed;
       std::filesystem::remove(temporary_path);
+      continue;
     }
     const auto relative_path = bundle_relative_path(source_path, layout.root_path);
     if (relative_path) {
       result.rewritten_relative_paths.push_back(*relative_path);
       result.rewritten_digests[relative_path->generic_string()] = rewritten_digest.final_hex();
+    }
+  }
+  for (const auto &source_path : candidate_paths) {
+    if (source_path.empty() ||
+        source_path == layout.checksums_path ||
+        !std::filesystem::is_regular_file(source_path) ||
+        !is_rewrite_candidate(source_path)) {
+      continue;
+    }
+    std::ifstream input(source_path, std::ios::binary);
+    if (!input.is_open()) {
+      continue;
+    }
+    std::string line;
+    while (std::getline(input, line)) {
+      collect_asset_alias_sources_in_text(line, path_aliases, result.unresolved_alias_sources);
     }
   }
   return result;
@@ -3682,9 +3726,12 @@ struct TraceBundleWriter::Impl {
   std::uint64_t async_path_aliases = 0;
   std::uint64_t asset_rewrite_candidates_scanned = 0;
   std::uint64_t asset_rewrite_candidates_skipped_clean = 0;
+  std::uint64_t asset_rewrite_candidates_failed = 0;
   std::uint64_t asset_rewrite_replacements = 0;
   std::uint64_t asset_rewrite_digest_reuses = 0;
   std::uint64_t rewritten_asset_reference_files = 0;
+  std::uint64_t asset_rewrite_unresolved_aliases = 0;
+  std::uint64_t asset_rewrite_preserved_temporary_files = 0;
   std::unordered_set<std::string> asset_payloads_may_reference_alias;
   std::uint64_t callstream_peak_pending_bytes = 0;
   std::uint64_t metal_callstream_peak_pending_bytes = 0;
@@ -3954,9 +4001,12 @@ struct TraceBundleWriter::Impl {
            << ",\"async_path_aliases\":" << async_path_aliases
            << ",\"asset_rewrite_candidates_scanned\":" << asset_rewrite_candidates_scanned
            << ",\"asset_rewrite_candidates_skipped_clean\":" << asset_rewrite_candidates_skipped_clean
+           << ",\"asset_rewrite_candidates_failed\":" << asset_rewrite_candidates_failed
            << ",\"asset_rewrite_replacements\":" << asset_rewrite_replacements
            << ",\"asset_rewrite_digest_reuses\":" << asset_rewrite_digest_reuses
            << ",\"rewritten_asset_reference_files\":" << rewritten_asset_reference_files
+           << ",\"asset_rewrite_unresolved_aliases\":" << asset_rewrite_unresolved_aliases
+           << ",\"asset_rewrite_preserved_temporary_files\":" << asset_rewrite_preserved_temporary_files
            << ",\"assets_indexed\":" << assets.size()
            << ",\"metal_assets_indexed\":" << metal_assets.size()
            << ",\"checksum_files\":" << checksum_file_count
@@ -4477,7 +4527,9 @@ struct TraceBundleWriter::Impl {
         this->async_path_aliases = async_path_aliases.size();
         asset_rewrite_candidates_scanned += rewrite_result.candidates_scanned;
         asset_rewrite_candidates_skipped_clean += rewrite_result.candidates_skipped_clean;
+        asset_rewrite_candidates_failed += rewrite_result.candidates_failed;
         asset_rewrite_replacements += rewrite_result.replacements;
+        asset_rewrite_unresolved_aliases += rewrite_result.unresolved_alias_sources.size();
         rewritten_asset_reference_files += rewrite_result.rewritten_relative_paths.size();
         for (const auto &entry : rewrite_result.rewritten_digests) {
           known_file_digests_snapshot[entry.first] = entry.second;
@@ -4518,7 +4570,9 @@ struct TraceBundleWriter::Impl {
         this->async_path_aliases = async_path_aliases.size();
         asset_rewrite_candidates_scanned += rewrite_result.candidates_scanned;
         asset_rewrite_candidates_skipped_clean += rewrite_result.candidates_skipped_clean;
+        asset_rewrite_candidates_failed += rewrite_result.candidates_failed;
         asset_rewrite_replacements += rewrite_result.replacements;
+        asset_rewrite_unresolved_aliases += rewrite_result.unresolved_alias_sources.size();
         rewritten_asset_reference_files += rewrite_result.rewritten_relative_paths.size();
         for (const auto &entry : rewrite_result.rewritten_digests) {
           known_file_digests_snapshot[entry.first] = entry.second;
@@ -4849,6 +4903,8 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
   TimedWriterPhase total_phase(impl_->writer_stats ? &impl_->asset_register_phase_total : nullptr);
   AssetRecord finalized = std::move(asset);
   const bool moved_payload = !finalized.payload_bytes.empty();
+  const bool force_synchronous_write = finalized.force_synchronous_write;
+  finalized.force_synchronous_write = false;
   ++impl_->asset_register_calls;
 	  if (finalized.payload_bytes.empty()) {
 	    ++impl_->asset_empty_payloads;
@@ -4976,21 +5032,23 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
           impl_->asset_exact_dedup_compare_bytes += cached.compared_bytes;
         }
       }
-	    if (cached.asset) {
-	      ++impl_->asset_completed_cache_hits;
-	      finalized = alias_asset_record(std::move(finalized), *cached.asset);
-	      finalized = impl_->publish_asset(std::move(finalized));
-	      return finalized;
-	    }
-	  }
+		    if (cached.asset && !force_synchronous_write) {
+		      ++impl_->asset_completed_cache_hits;
+		      finalized = alias_asset_record(std::move(finalized), *cached.asset);
+		      finalized = impl_->publish_asset(std::move(finalized));
+		      return finalized;
+		    }
+		  }
 
-	  if (finalized.content_hash.empty()) {
-	    if (finalized.relative_path.empty()) {
-	      finalized.relative_path = generated_asset_relative_path(
-	          asset_directory_name(finalized.kind),
-	          asset_extension(finalized.kind),
-	          impl_->next_asset_id.fetch_add(1, std::memory_order_relaxed));
-	    }
+  bool generated_temporary_relative_path = false;
+		  if (finalized.content_hash.empty()) {
+		    if (finalized.relative_path.empty()) {
+		      finalized.relative_path = generated_asset_relative_path(
+		          asset_directory_name(finalized.kind),
+		          asset_extension(finalized.kind),
+		          impl_->next_asset_id.fetch_add(1, std::memory_order_relaxed));
+      generated_temporary_relative_path = true;
+		    }
 	    finalized = impl_->reserve_blob_id(std::move(finalized));
 	    const auto target_path = impl_->layout.root_path / finalized.relative_path;
 	    const auto content_key = std::string();
@@ -5013,8 +5071,9 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
 		      } else {
 		        impl_->foreground_alias_lock_bypass_count.fetch_add(1, std::memory_order_relaxed);
 		      }
-		    }
+	    }
 	    bool enqueued = false;
+	    if (!force_synchronous_write) {
 	    {
 	      TimedWriterPhase phase(impl_->writer_stats ? &impl_->asset_register_phase_async_enqueue : nullptr);
 	      enqueued = impl_->asset_writer.enqueue(
@@ -5041,6 +5100,7 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
 		              impl->publish_queued_asset_for_async_write(finalized, false);
 		            });
 	    }
+	    }
 	    if (enqueued) {
 	      ++impl_->asset_async_enqueued;
 	      if (hash_only_if_final_exists)
@@ -5056,11 +5116,18 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
 	      finalized.content_hash = sha256_bytes(*payload);
 	    }
 	  }
+  const auto canonical_relative_path =
+      std::filesystem::path(asset_directory_name(finalized.kind)) /
+      (finalized.content_hash + asset_extension(finalized.kind));
+  if (finalized.relative_path.empty() || (force_synchronous_write && generated_temporary_relative_path)) {
+    finalized.relative_path = canonical_relative_path;
+  }
   const auto content_key = asset_content_key(finalized.kind, finalized.content_hash);
   {
     TimedWriterLock lock(impl_->asset_mutex, impl_->writer_stats ? &impl_->asset_lock_stats : nullptr);
     if (const auto existing = impl_->assets_by_content_hash.find(content_key);
-        existing != impl_->assets_by_content_hash.end()) {
+        existing != impl_->assets_by_content_hash.end() &&
+        (!force_synchronous_write || existing->second.relative_path == canonical_relative_path)) {
       ++impl_->asset_hash_dedup_hits;
       finalized = alias_asset_record(std::move(finalized), existing->second);
       finalized = impl_->publish_asset(std::move(finalized));
@@ -5069,13 +5136,9 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
     if (!fingerprint_key.empty())
       impl_->content_hash_by_fast_fingerprint[fingerprint_key] = finalized.content_hash;
   }
-  if (finalized.relative_path.empty()) {
-    finalized.relative_path =
-        std::filesystem::path(asset_directory_name(finalized.kind)) / (finalized.content_hash + asset_extension(finalized.kind));
-  }
   finalized = impl_->reserve_blob_id(std::move(finalized));
 
-  if (payload->size() >= impl_->async_asset_threshold) {
+  if (!force_synchronous_write && payload->size() >= impl_->async_asset_threshold) {
     const auto target_path = impl_->layout.root_path / finalized.relative_path;
     bool enqueued = false;
     {
@@ -5168,7 +5231,11 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
   }
   {
     TimedWriterLock lock(impl_->asset_mutex, impl_->writer_stats ? &impl_->asset_lock_stats : nullptr);
-    impl_->assets_by_content_hash.emplace(content_key, finalized);
+    if (force_synchronous_write) {
+      impl_->assets_by_content_hash.insert_or_assign(content_key, finalized);
+    } else {
+      impl_->assets_by_content_hash.emplace(content_key, finalized);
+    }
     impl_->known_file_digests[finalized.relative_path.generic_string()] = finalized.content_hash;
     impl_->known_file_sizes[finalized.relative_path.generic_string()] = finalized.byte_size;
   }
@@ -5682,7 +5749,9 @@ void TraceBundleWriter::close()
     }
     impl_->asset_rewrite_candidates_scanned = rewrite_result.candidates_scanned;
     impl_->asset_rewrite_candidates_skipped_clean = rewrite_result.candidates_skipped_clean;
+    impl_->asset_rewrite_candidates_failed = rewrite_result.candidates_failed;
     impl_->asset_rewrite_replacements = rewrite_result.replacements;
+    impl_->asset_rewrite_unresolved_aliases = rewrite_result.unresolved_alias_sources.size();
     const auto &rewritten_paths = rewrite_result.rewritten_relative_paths;
     impl_->rewritten_asset_reference_files = rewritten_paths.size();
     if (!rewritten_paths.empty()) {
@@ -5702,9 +5771,22 @@ void TraceBundleWriter::close()
     }
     for (const auto &entry : async_path_aliases) {
       if (entry.first != entry.second) {
+        if (rewrite_result.candidates_failed != 0 ||
+            rewrite_result.unresolved_alias_sources.find(entry.first) !=
+                rewrite_result.unresolved_alias_sources.end()) {
+          ++impl_->asset_rewrite_preserved_temporary_files;
+          continue;
+        }
         std::error_code remove_error;
         std::filesystem::remove(impl_->layout.root_path / entry.first, remove_error);
       }
+    }
+    if (rewrite_result.candidates_failed != 0 || !rewrite_result.unresolved_alias_sources.empty()) {
+      std::cerr << "apitrace warning: preserved " << impl_->asset_rewrite_preserved_temporary_files
+                << " async asset temporary files after alias rewrite failures"
+                << " failed_candidates=" << rewrite_result.candidates_failed
+                << " unresolved_aliases=" << rewrite_result.unresolved_alias_sources.size()
+                << "\n";
     }
   }
 

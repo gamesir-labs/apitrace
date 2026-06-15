@@ -1068,7 +1068,22 @@ bool descriptor_heap_type_is_shader_visible(std::uint32_t flags)
 
 std::uint64_t resource_subresource_count(const D3D12ReplayBackend::ResourceSemanticState &resource)
 {
-  return static_cast<std::uint64_t>(resource.mip_levels) *
+  auto mip_levels = resource.mip_levels;
+  if (mip_levels == 0) {
+    std::uint64_t largest_extent = resource.width;
+    if (resource.dimension >= 3) {
+      largest_extent = std::max<std::uint64_t>(largest_extent, resource.height);
+    }
+    if (resource.dimension == 4) {
+      largest_extent = std::max<std::uint64_t>(largest_extent, resource.depth_or_array_size);
+    }
+    mip_levels = 1;
+    while (largest_extent > 1) {
+      largest_extent >>= 1;
+      ++mip_levels;
+    }
+  }
+  return static_cast<std::uint64_t>(mip_levels) *
          static_cast<std::uint64_t>(resource.depth_or_array_size);
 }
 

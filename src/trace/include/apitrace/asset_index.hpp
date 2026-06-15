@@ -37,6 +37,7 @@ struct AssetRecord {
   std::string fast_fingerprint;
   std::uint64_t byte_size = 0;
   bool binary_payload = true;
+  bool force_synchronous_write = false;
   std::vector<std::uint8_t> payload_bytes;
 
   // TODO: split raw-asset identity from derived-analysis identity if analysis outputs grow.

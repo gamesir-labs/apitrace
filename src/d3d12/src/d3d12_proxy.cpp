@@ -907,8 +907,13 @@ bool capture_recording_suppressed()
 
 bool env_flag_enabled(const char *name)
 {
-  if (const char *value = std::getenv(name)) {
-    return *value && std::strcmp(value, "0") != 0 &&
+  char value[16] = {};
+  const DWORD length = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+  if (length != 0) {
+    if (length >= sizeof(value)) {
+      return true;
+    }
+    return value[0] && std::strcmp(value, "0") != 0 &&
            std::strcmp(value, "false") != 0 &&
            std::strcmp(value, "FALSE") != 0;
   }
@@ -923,6 +928,11 @@ bool alias_probes_disabled()
 bool queue_hooks_disabled()
 {
   return env_flag_enabled("APITRACE_D3D12_DISABLE_QUEUE_HOOKS");
+}
+
+bool fence_hooks_disabled()
+{
+  return env_flag_enabled("APITRACE_D3D12_DISABLE_FENCE_HOOKS");
 }
 
 bool resource_hooks_disabled()
@@ -1074,6 +1084,12 @@ void patch_vtable_field(VTable *vtable, Field VTable::*field, Field replacement)
   DWORD ignored = 0;
   VirtualProtect(reinterpret_cast<void *>(page_start), protect_size, old_protect, &ignored);
   FlushInstructionCache(GetCurrentProcess(), slot, sizeof(*slot));
+}
+
+template <typename VTable, typename Field>
+void patch_cloned_vtable_field(VTable *vtable, Field VTable::*field, Field replacement)
+{
+  vtable->*field = replacement;
 }
 
 std::size_t readable_vtable_clone_size(const void *source, std::size_t minimum_size)
@@ -1907,7 +1923,7 @@ void remember_command_list_interface_aliases(ID3D12GraphicsCommandList *command_
 
 void remember_fence_interface_aliases(ID3D12Fence *fence)
 {
-  if (alias_probes_disabled()) {
+  if (alias_probes_disabled() || fence_hooks_disabled()) {
     return;
   }
   if (!fence || !fence->lpVtbl || !fence->lpVtbl->QueryInterface) {
@@ -2483,12 +2499,14 @@ apitrace::trace::AssetRecord register_asset_bytes_locked(
     apitrace::trace::AssetKind kind,
     std::string debug_name,
     const void *data,
-    std::size_t size)
+    std::size_t size,
+    bool force_synchronous_write = false)
 {
   apitrace::trace::AssetRecord asset;
   asset.blob_id = ++capture_state().next_blob_id;
   asset.kind = kind;
   asset.debug_name = std::move(debug_name);
+  asset.force_synchronous_write = force_synchronous_write;
   asset.payload_bytes.resize(size);
   if (size != 0 && data) {
     std::memcpy(asset.payload_bytes.data(), data, size);
@@ -3184,11 +3202,11 @@ std::string graphics_pipeline_asset_json_locked(
           << "\"sample_desc\":{\"count\":" << desc->SampleDesc.Count
           << ",\"quality\":" << desc->SampleDesc.Quality << "},"
           << "\"ib_strip_cut_value\":" << static_cast<unsigned int>(desc->IBStripCutValue) << ","
-          << shader_asset_json_locked("vs", desc->VS, blob_refs) << ","
-          << shader_asset_json_locked("ps", desc->PS, blob_refs) << ","
-          << shader_asset_json_locked("ds", desc->DS, blob_refs) << ","
-          << shader_asset_json_locked("hs", desc->HS, blob_refs) << ","
-          << shader_asset_json_locked("gs", desc->GS, blob_refs)
+          << shader_asset_metadata_json_locked("vs", desc->VS, blob_refs).asset_json << ","
+          << shader_asset_metadata_json_locked("ps", desc->PS, blob_refs).asset_json << ","
+          << shader_asset_metadata_json_locked("ds", desc->DS, blob_refs).asset_json << ","
+          << shader_asset_metadata_json_locked("hs", desc->HS, blob_refs).asset_json << ","
+          << shader_asset_metadata_json_locked("gs", desc->GS, blob_refs).asset_json
           << "}";
   return payload.str();
 }
@@ -3208,7 +3226,7 @@ std::string compute_pipeline_asset_json_locked(
           << object_id_json(ensure_external_root_signature_object_locked(desc->pRootSignature, "CreateComputePipelineState")) << ","
           << "\"node_mask\":" << desc->NodeMask << ","
           << "\"flags\":" << static_cast<unsigned int>(desc->Flags) << ","
-          << shader_asset_json_locked("cs", desc->CS, blob_refs)
+          << shader_asset_metadata_json_locked("cs", desc->CS, blob_refs).asset_json
           << "}";
   return payload.str();
 }
@@ -3894,7 +3912,8 @@ void snapshot_upload_resource(ID3D12Resource *resource, const char *reason)
     auto *copy = capture_arena_alloc_locked(size);
     if (copy) {
       std::memcpy(copy, mapped, size);
-      const auto asset = register_asset_bytes_locked(apitrace::trace::AssetKind::Buffer, "d3d12-upload-snapshot", copy, size);
+      const auto asset =
+          register_asset_bytes_locked(apitrace::trace::AssetKind::Buffer, "d3d12-upload-snapshot", copy, size, true);
       const auto buffer_path = asset.relative_path.generic_string();
 
       std::ostringstream map_payload;
@@ -4604,13 +4623,23 @@ void patch_command_list6(ID3D12GraphicsCommandList6 *command_list)
 
 void patch_fence(ID3D12Fence *fence)
 {
+  if (fence_hooks_disabled()) {
+    return;
+  }
   if (!fence || !fence->lpVtbl) {
     return;
   }
-  std::lock_guard<std::mutex> lock(capture_state().mutex);
   auto *original_vtable = fence->lpVtbl;
-  if (capture_state().fence_hooks.find(original_vtable) != capture_state().fence_hooks.end()) {
-    return;
+  {
+    std::lock_guard<std::mutex> lock(capture_state().mutex);
+    auto &state = capture_state();
+    if (state.fence_hooks.find(original_vtable) != state.fence_hooks.end()) {
+      return;
+    }
+    if (state.fence_hooks.empty()) {
+      state.fence_hooks.reserve(256);
+      state.patched_object_vtables.reserve(1024);
+    }
   }
   auto *vtable = clone_vtable(original_vtable);
   if (!vtable) {
@@ -4623,20 +4652,32 @@ void patch_fence(ID3D12Fence *fence)
   hook.set_event_on_completion = original_vtable->SetEventOnCompletion;
   hook.signal = original_vtable->Signal;
   hook.get_completed_value = original_vtable->GetCompletedValue;
-  capture_state().fence_hooks.emplace(vtable, hook);
-  fence->lpVtbl = vtable;
-  remember_patched_object_vtable_locked(fence, vtable, original_vtable);
-  patch_vtable_field(vtable, &ID3D12FenceVtbl::QueryInterface, hook_fence_query_interface);
-  patch_vtable_field(vtable, &ID3D12FenceVtbl::SetEventOnCompletion, hook_fence_set_event_on_completion);
-  patch_vtable_field(vtable, &ID3D12FenceVtbl::Signal, hook_fence_signal);
-  patch_vtable_field(vtable, &ID3D12FenceVtbl::GetCompletedValue, hook_fence_get_completed_value);
+  patch_cloned_vtable_field(vtable, &ID3D12FenceVtbl::QueryInterface, hook_fence_query_interface);
+  patch_cloned_vtable_field(vtable, &ID3D12FenceVtbl::SetEventOnCompletion, hook_fence_set_event_on_completion);
+  patch_cloned_vtable_field(vtable, &ID3D12FenceVtbl::Signal, hook_fence_signal);
+  patch_cloned_vtable_field(vtable, &ID3D12FenceVtbl::GetCompletedValue, hook_fence_get_completed_value);
+  const bool query_interface_patched = vtable->QueryInterface == hook_fence_query_interface;
+  const bool set_event_patched = vtable->SetEventOnCompletion == hook_fence_set_event_on_completion;
+  const bool signal_patched = vtable->Signal == hook_fence_signal;
+  const bool completed_patched = vtable->GetCompletedValue == hook_fence_get_completed_value;
+  {
+    std::lock_guard<std::mutex> lock(capture_state().mutex);
+    auto &state = capture_state();
+    if (fence->lpVtbl != original_vtable || state.fence_hooks.find(fence->lpVtbl) != state.fence_hooks.end()) {
+      std::free(vtable);
+      return;
+    }
+    state.fence_hooks.emplace(vtable, hook);
+    remember_patched_object_vtable_locked(fence, vtable, original_vtable);
+    fence->lpVtbl = vtable;
+  }
   proxy_debug_logf(
       "patch_fence vtable=%p qi=%d set_event=%d signal=%d completed=%d",
       static_cast<void *>(vtable),
-      vtable->QueryInterface == hook_fence_query_interface,
-      vtable->SetEventOnCompletion == hook_fence_set_event_on_completion,
-      vtable->Signal == hook_fence_signal,
-      vtable->GetCompletedValue == hook_fence_get_completed_value);
+      query_interface_patched,
+      set_event_patched,
+      signal_patched,
+      completed_patched);
 }
 
 void patch_resource(ID3D12Resource *resource)

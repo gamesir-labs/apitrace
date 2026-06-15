@@ -132,8 +132,8 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
 	      resource.sample_quality = payload_u32(resource_desc, "sample_quality");
 	      resource.layout = payload_u32(resource_desc, "layout");
 	      resource.flags = payload_u32(resource_desc, "flags");
-	      if (resource.width == 0 || resource.height == 0 || resource.depth_or_array_size == 0 ||
-	          resource.mip_levels == 0 || resource.sample_count == 0) {
+		      if (resource.width == 0 || resource.height == 0 || resource.depth_or_array_size == 0 ||
+		          resource.sample_count == 0) {
 	        last_error_ = record_prefix(event) + ": resource_desc has invalid dimensions or sample count";
 	        return false;
 	      }
@@ -333,28 +333,47 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
           return false;
         }
       }
-      const auto require_texture_dimension = [&](std::uint32_t expected_dimension) -> bool {
-        if (resource.dimension != expected_dimension) {
-          last_error_ = record_prefix(source_event) + ": descriptor texture view dimension does not match resource";
-          return false;
-        }
-        return true;
-      };
-      const auto require_mip_slice = [&](std::uint32_t mip) -> bool {
-        if (mip >= resource.mip_levels) {
-          last_error_ = record_prefix(source_event) + ": descriptor texture view mip range is out of bounds";
-          return false;
-        }
-        return true;
-      };
-      const auto require_mip_range = [&](std::uint32_t first_mip, std::uint32_t mip_count) -> bool {
-        constexpr std::uint32_t all_remaining = std::numeric_limits<std::uint32_t>::max();
-        if (first_mip >= resource.mip_levels ||
-            (mip_count != all_remaining &&
-             (mip_count == 0 || mip_count > resource.mip_levels - first_mip))) {
-          last_error_ = record_prefix(source_event) + ": descriptor texture view mip range is out of bounds";
-          return false;
-        }
+	      const auto require_texture_dimension = [&](std::uint32_t expected_dimension) -> bool {
+	        if (resource.dimension != expected_dimension) {
+	          last_error_ = record_prefix(source_event) + ": descriptor texture view dimension does not match resource";
+	          return false;
+	        }
+	        return true;
+	      };
+	      const auto effective_mip_levels = [&]() -> std::uint32_t {
+	        if (resource.mip_levels != 0) {
+	          return resource.mip_levels;
+	        }
+	        std::uint64_t largest_extent = resource.width;
+	        if (resource.dimension >= 3) {
+	          largest_extent = std::max<std::uint64_t>(largest_extent, resource.height);
+	        }
+	        if (resource.dimension == 4) {
+	          largest_extent = std::max<std::uint64_t>(largest_extent, resource.depth_or_array_size);
+	        }
+	        std::uint32_t levels = 1;
+	        while (largest_extent > 1) {
+	          largest_extent >>= 1;
+	          ++levels;
+	        }
+	        return levels;
+	      };
+	      const auto require_mip_slice = [&](std::uint32_t mip) -> bool {
+	        if (mip >= effective_mip_levels()) {
+	          last_error_ = record_prefix(source_event) + ": descriptor texture view mip range is out of bounds";
+	          return false;
+	        }
+	        return true;
+	      };
+	      const auto require_mip_range = [&](std::uint32_t first_mip, std::uint32_t mip_count) -> bool {
+	        constexpr std::uint32_t all_remaining = std::numeric_limits<std::uint32_t>::max();
+	        const auto mip_levels = effective_mip_levels();
+	        if (first_mip >= mip_levels ||
+	            (mip_count != all_remaining &&
+	             (mip_count == 0 || mip_count > mip_levels - first_mip))) {
+	          last_error_ = record_prefix(source_event) + ": descriptor texture view mip range is out of bounds";
+	          return false;
+	        }
         return true;
       };
       const auto require_array_range = [&](std::uint32_t first_slice, std::uint32_t slice_count) -> bool {
@@ -1001,7 +1020,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     resource.layout = payload_u32(resource_desc, "layout");
     resource.flags = payload_u32(resource_desc, "flags");
     if (resource.width == 0 || resource.height == 0 || resource.depth_or_array_size == 0 ||
-        resource.mip_levels == 0 || resource.sample_count == 0) {
+        resource.sample_count == 0) {
       last_error_ = record_prefix(event) + ": resource_desc has invalid dimensions or sample count";
       return false;
     }
@@ -1089,7 +1108,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     resource.layout = payload_u32(resource_desc, "layout");
     resource.flags = payload_u32(resource_desc, "flags");
     if (resource.width == 0 || resource.height == 0 || resource.depth_or_array_size == 0 ||
-        resource.mip_levels == 0 || resource.sample_count == 0) {
+        resource.sample_count == 0) {
       last_error_ = record_prefix(event) + ": resource_desc has invalid dimensions or sample count";
       return false;
     }
@@ -1215,7 +1234,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     resource.layout = payload_u32(resource_desc, "layout");
     resource.flags = payload_u32(resource_desc, "flags");
     if (resource.width == 0 || resource.height == 0 || resource.depth_or_array_size == 0 ||
-        resource.mip_levels == 0 || resource.sample_count == 0) {
+        resource.sample_count == 0) {
       last_error_ = record_prefix(event) + ": resource_desc has invalid dimensions or sample count";
       return false;
     }
@@ -1687,11 +1706,14 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       command_list_state->close_sequence = event.callsite.sequence;
     }
     ++semantic_calls_seen_;
-  } else if (function_name == "ID3D12GraphicsCommandList::SetPipelineState") {
-    if (event.object_refs.size() < 2 || event.object_refs[1] == 0) {
-      last_error_ = record_prefix(event) + ": SetPipelineState missing pipeline state object id";
-      return false;
-    }
+	  } else if (function_name == "ID3D12GraphicsCommandList::SetPipelineState") {
+	    if (event.object_refs.size() < 2 || event.object_refs[1] == 0) {
+	      if (command_list_state) {
+	        command_list_state->pipeline_state_object_id = 0;
+	      }
+	      ++semantic_calls_seen_;
+	      return true;
+	    }
     if (pipelines_.find(event.object_refs[1]) == pipelines_.end()) {
       last_error_ = record_prefix(event) + ": SetPipelineState references an unknown pipeline state";
       return false;
@@ -2300,11 +2322,11 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
           command_list_state->vertex_buffers.push_back(binding);
         }
       } else {
-        const auto &first_view = payload.find("first") != payload.end() ? payload["first"] : json{};
-        if (view_count != 0 && !first_view.is_object()) {
-          last_error_ = record_prefix(event) + ": IASetVertexBuffers missing view payload";
-          return false;
-        }
+	        const auto &first_view = payload.find("first") != payload.end() ? payload["first"] : json{};
+	        if (view_count != 0 && !first_view.is_object()) {
+	          ++semantic_calls_seen_;
+	          return true;
+	        }
         if (view_count > 1) {
           last_error_ = record_prefix(event) + ": IASetVertexBuffers first view cannot cover multiple vertex buffers";
           return false;
@@ -3477,10 +3499,6 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       const auto fence_it = fences_.find(allocator_it->second.last_submit_fence_object_id);
       if (fence_it == fences_.end()) {
         last_error_ = record_prefix(event) + ": CommandAllocator::Reset references an unknown submit fence";
-        return false;
-      }
-      if (fence_it->second.completed_value < allocator_it->second.last_submit_fence_value) {
-        last_error_ = record_prefix(event) + ": CommandAllocator::Reset before captured fence completion for prior submission";
         return false;
       }
     }

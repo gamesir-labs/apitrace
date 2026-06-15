@@ -954,6 +954,27 @@ int main(int argc, char **argv)
     return 1;
   }
 
+  std::vector<std::uint8_t> synchronous_bytes(3 * 1024 * 1024);
+  for (std::size_t index = 0; index < synchronous_bytes.size(); ++index)
+    synchronous_bytes[index] = static_cast<std::uint8_t>((index * 17u) & 0xff);
+  const auto synchronous_hash =
+      apitrace::trace::content_hash_bytes(synchronous_bytes.data(), synchronous_bytes.size());
+  apitrace::trace::AssetRecord synchronous_asset;
+  synchronous_asset.blob_id = 21;
+  synchronous_asset.kind = apitrace::trace::AssetKind::Buffer;
+  synchronous_asset.debug_name = "synchronous-large-buffer";
+  synchronous_asset.force_synchronous_write = true;
+  synchronous_asset.payload_bytes = synchronous_bytes;
+  synchronous_asset = writer.register_asset(std::move(synchronous_asset));
+  const auto expected_synchronous_path =
+      std::filesystem::path("buffers") / (synchronous_hash + ".buffer");
+  if (synchronous_asset.relative_path != expected_synchronous_path ||
+      synchronous_asset.relative_path.generic_string().find("asset-") != std::string::npos ||
+      !std::filesystem::is_regular_file(bundle / synchronous_asset.relative_path)) {
+    std::cerr << "forced synchronous large buffer did not return a stable content-addressed path\n";
+    return 1;
+  }
+
   std::vector<std::uint8_t> known_hash_bytes(96 * 1024, 0x6b);
   const auto known_hash_digest =
       apitrace::trace::content_hash_bytes(known_hash_bytes.data(), known_hash_bytes.size());
@@ -1437,8 +1458,8 @@ int main(int argc, char **argv)
     std::cerr << "\n";
     return 1;
   }
-  if (reader.assets().size() != 21) {
-    std::cerr << "expected twenty-one reader-visible blob aliases, got " << reader.assets().size() << "\n";
+  if (reader.assets().size() != 22) {
+    std::cerr << "expected twenty-two reader-visible blob aliases, got " << reader.assets().size() << "\n";
     return 1;
   }
   bool found_first = false;
@@ -1455,6 +1476,7 @@ int main(int argc, char **argv)
   bool found_sparse = false;
   bool found_small_second = false;
   bool found_known_hash_second = false;
+  bool found_synchronous = false;
   std::filesystem::path sparse_reader_path;
   std::filesystem::path pipeline_reader_path;
   for (const auto &asset : reader.assets()) {
@@ -1471,6 +1493,7 @@ int main(int argc, char **argv)
     found_hash_only_large_second = found_hash_only_large_second || asset.blob_id == hash_only_large_second.blob_id;
     found_small_second = found_small_second || asset.blob_id == small_second.blob_id;
     found_known_hash_second = found_known_hash_second || asset.blob_id == known_hash_second.blob_id;
+    found_synchronous = found_synchronous || asset.blob_id == synchronous_asset.blob_id;
 	    if (asset.blob_id == sparse_asset.blob_id) {
 	      found_sparse = true;
 	      sparse_reader_path = asset.relative_path;
@@ -1482,7 +1505,7 @@ int main(int argc, char **argv)
 	  if (!found_first || !found_texture || !found_collision || !found_cached || !found_hash_only_first ||
 	      !found_second || !found_metal_buffer || !found_metal_texture || !found_hash_only_second ||
 	      !found_hash_only_large_first || !found_hash_only_large_second ||
-	      !found_small_second || !found_known_hash_second || !found_sparse) {
+	      !found_small_second || !found_known_hash_second || !found_synchronous || !found_sparse) {
 	    std::cerr << "reader-visible blob ids did not match registered assets\n";
 	    return 1;
 	  }
@@ -1606,6 +1629,10 @@ int main(int argc, char **argv)
     std::cerr << "checksum digest did not match sparse buffer asset\n";
     return 1;
   }
+  if (!checksum_matches_file(checksums_json, bundle, synchronous_asset.relative_path.generic_string())) {
+    std::cerr << "checksum digest did not match forced synchronous buffer asset\n";
+    return 1;
+  }
   const auto sparse_path = bundle / sparse_reader_path;
   if (std::filesystem::file_size(sparse_path) != sparse_bytes.size()) {
     std::cerr << "sparse buffer logical file size changed\n";
@@ -1626,9 +1653,12 @@ int main(int argc, char **argv)
 	      json_u64_field(writer_stats, "async_path_aliases") < 6 ||
       json_u64_field(writer_stats, "asset_rewrite_candidates_scanned") < 4 ||
       json_u64_field(writer_stats, "asset_rewrite_candidates_skipped_clean") < 1 ||
+      json_u64_field(writer_stats, "asset_rewrite_candidates_failed") != 0 ||
       json_u64_field(writer_stats, "asset_rewrite_replacements") < 4 ||
       json_u64_field(writer_stats, "asset_rewrite_digest_reuses") < 1 ||
       json_u64_field(writer_stats, "rewritten_asset_reference_files") < 1 ||
+      json_u64_field(writer_stats, "asset_rewrite_unresolved_aliases") != 0 ||
+      json_u64_field(writer_stats, "asset_rewrite_preserved_temporary_files") != 0 ||
       json_u64_field(writer_stats, "checksum_files") < 12 ||
       json_u64_field(writer_stats, "genericized_metal_resources") != 2 ||
       json_u64_field(writer_stats, "sparse_zero_run_count") < 1 ||

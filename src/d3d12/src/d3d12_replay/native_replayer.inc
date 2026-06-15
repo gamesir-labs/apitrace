@@ -2021,14 +2021,14 @@ private:
     return true;
   }
 
-  bool record_set_pipeline_state(
-      ID3D12GraphicsCommandList *list,
-      const D3D12ReplayBackend::ReplayCommandRecord &command,
-      std::string &error)
-  {
-    if (command.object_refs.size() < 2) {
-      return fail(error, "SetPipelineState missing PSO object");
-    }
+	  bool record_set_pipeline_state(
+	      ID3D12GraphicsCommandList *list,
+	      const D3D12ReplayBackend::ReplayCommandRecord &command,
+	      std::string &error)
+	  {
+	    if (command.object_refs.size() < 2 || command.object_refs[1] == 0) {
+	      return true;
+	    }
     const auto pipeline_it = pipelines_.find(command.object_refs[1]);
     if (pipeline_it == pipelines_.end()) {
       return fail(error, "SetPipelineState references an unknown PSO");
@@ -2992,11 +2992,13 @@ private:
       }
     } else if (view_count == 0) {
       views.clear();
-    } else if (view_count == 1) {
-      const auto first_json = payload.find("first");
-      if (first_json == payload.end() || !first_json->is_object()) {
-        return fail(error, "IASetVertexBuffers missing view payload");
-      }
+	    } else if (view_count == 1) {
+	      const auto first_json = payload.find("first");
+	      if (first_json == payload.end() || !first_json->is_object()) {
+	        views.clear();
+	        list->IASetVertexBuffers(payload_u32(payload, "start_slot"), 0, nullptr);
+	        return true;
+	      }
       if (!append_view(*first_json)) {
         return false;
       }

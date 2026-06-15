@@ -442,8 +442,10 @@ HRESULT STDMETHODCALLTYPE hook_device_create_fence(
       payload << "{\"initial_value\":" << initial_value << ",\"flags\":" << static_cast<unsigned int>(flags) << "}";
       record_call_locked("ID3D12Device::CreateFence", hr, {self, *fence}, {}, payload.str());
     }
-    patch_fence(static_cast<ID3D12Fence *>(*fence));
-    remember_fence_interface_aliases(static_cast<ID3D12Fence *>(*fence));
+    if (!fence_hooks_disabled()) {
+      patch_fence(static_cast<ID3D12Fence *>(*fence));
+      remember_fence_interface_aliases(static_cast<ID3D12Fence *>(*fence));
+    }
   }
   return hr;
 }
@@ -2051,7 +2053,12 @@ void STDMETHODCALLTYPE hook_resource_unmap(
       } else {
         const auto size = static_cast<std::size_t>(size64);
         const auto *bytes = static_cast<const std::uint8_t *>(mapped_data) + static_cast<std::size_t>(begin);
-        const auto asset = register_asset_bytes_locked(apitrace::trace::AssetKind::Buffer, "d3d12-mapped-resource", bytes, size);
+        const auto asset = register_asset_bytes_locked(
+            apitrace::trace::AssetKind::Buffer,
+            "d3d12-mapped-resource",
+            bytes,
+            size,
+            true);
         blob_refs.push_back(asset.blob_id);
         buffer_path = asset.relative_path.generic_string();
         captured_begin = begin;
