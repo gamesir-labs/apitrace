@@ -1411,16 +1411,18 @@ trace::AssetRecord register_asset_bytes(
     const void *data,
     std::size_t size)
 {
+  auto *session = session_for(trace::ApiKind::D3D12);
+  if (!session) {
+    return {};
+  }
+
   trace::AssetRecord asset;
   asset.blob_id = g_blob_id.fetch_add(1, std::memory_order_relaxed) + 1;
   asset.kind = kind;
   asset.debug_name = debug_name ? debug_name : "";
 
   if (!data || size == 0) {
-    if (auto *session = session_for(trace::ApiKind::D3D12)) {
-      asset = session->register_asset(std::move(asset));
-    }
-    return asset;
+    return session->register_asset(std::move(asset));
   }
 
   const auto *bytes = static_cast<const std::uint8_t *>(data);
@@ -1428,11 +1430,7 @@ trace::AssetRecord register_asset_bytes(
   if (kind == trace::AssetKind::Texture && asset.debug_name == "d3d12-present-frame") {
     asset.content_hash = trace::content_hash_bytes(data, size);
   }
-  if (auto *session = session_for(trace::ApiKind::D3D12)) {
-    asset = session->register_asset(std::move(asset));
-  }
-
-  return asset;
+  return session->register_asset(std::move(asset));
 }
 
 std::string hex_encode_bytes(const void *data, std::size_t size)
@@ -1568,6 +1566,9 @@ std::string raw_shader_asset_json(
       (std::string("d3d12-") + field_name).c_str(),
       bytecode.pShaderBytecode,
       bytecode.BytecodeLength);
+  if (asset.blob_id == 0 || asset.relative_path.empty()) {
+    return std::string("\"") + field_name + "\":null";
+  }
   blob_refs.push_back(asset.blob_id);
   std::ostringstream payload;
   payload << "\"" << field_name << "\":{"
@@ -1597,6 +1598,10 @@ ShaderAssetMetadataJson shader_asset_metadata_json(
       (std::string("d3d12-") + field_name).c_str(),
       bytecode.pShaderBytecode,
       bytecode.BytecodeLength);
+  if (asset.blob_id == 0 || asset.relative_path.empty()) {
+    const auto null_field = std::string("\"") + field_name + "\":null";
+    return {null_field, null_field};
+  }
   blob_refs.push_back(asset.blob_id);
   std::ostringstream asset_payload;
   asset_payload << "\"" << field_name << "\":{"
@@ -2994,6 +2999,9 @@ void record_present_frame(
       "d3d12-present-frame",
       rgba_data,
       rgba_size);
+  if (asset.blob_id == 0 || asset.relative_path.empty()) {
+    return;
+  }
 
   std::ostringstream payload;
   payload << "{\"frame_index\":" << frame_index
@@ -3027,20 +3035,31 @@ void record_resource_unmap(
       "d3d12-resource-unmap",
       written_data,
       written_size);
+  if (asset.blob_id == 0 || asset.relative_path.empty()) {
+    return;
+  }
 
-  std::ostringstream payload;
-  payload << "{\"resource_object_id\":" << object_id(resource)
-          << ",\"subresource\":" << subresource
-          << ",\"written_begin\":" << written_begin
-          << ",\"written_end\":" << written_end
-          << ",\"written_size\":" << static_cast<std::uint64_t>(written_size)
-          << ",\"buffer_path\":\"" << asset.relative_path.generic_string() << "\""
-          << "}";
+  const auto buffer_path = asset.relative_path.generic_string();
+  std::string payload;
+  payload.reserve(192 + buffer_path.size());
+  payload += "{\"resource_object_id\":";
+  payload += std::to_string(object_id(resource));
+  payload += ",\"subresource\":";
+  payload += std::to_string(subresource);
+  payload += ",\"written_begin\":";
+  payload += std::to_string(written_begin);
+  payload += ",\"written_end\":";
+  payload += std::to_string(written_end);
+  payload += ",\"written_size\":";
+  payload += std::to_string(static_cast<std::uint64_t>(written_size));
+  payload += ",\"buffer_path\":\"";
+  payload += buffer_path;
+  payload += "\"}";
   const void *refs[] = {resource};
   const auto blob_id = static_cast<std::uint64_t>(asset.blob_id);
   record_call(
       "ID3D12Resource::Unmap",
-      payload.str().c_str(),
+      payload.c_str(),
       refs,
       1,
       &blob_id,
@@ -3096,6 +3115,9 @@ void record_resolve_query_data_result(
       "d3d12-query-resolve",
       resolved_data,
       resolved_size);
+  if (asset.blob_id == 0 || asset.relative_path.empty()) {
+    return;
+  }
 
   std::ostringstream payload;
   payload << "{\"query_heap_object_id\":" << object_id(query_heap)
@@ -3693,7 +3715,7 @@ std::uint64_t record_create_root_signature(
   std::ostringstream payload;
   payload << "{\"node_mask\":" << node_mask
           << ",\"bytecode_size\":" << static_cast<std::uint64_t>(bytecode_length);
-  if (asset.blob_id != 0) {
+  if (asset.blob_id != 0 && !asset.relative_path.empty()) {
     payload << ",\"root_signature_path\":\"" << asset.relative_path.generic_string() << "\"";
   }
   if (desc) {
@@ -3707,8 +3729,8 @@ std::uint64_t record_create_root_signature(
       payload.str().c_str(),
       refs,
       2,
-      asset.blob_id ? &asset.blob_id : nullptr,
-      asset.blob_id ? 1 : 0,
+      asset.blob_id != 0 && !asset.relative_path.empty() ? &asset.blob_id : nullptr,
+      asset.blob_id != 0 && !asset.relative_path.empty() ? 1 : 0,
       result_code);
 }
 

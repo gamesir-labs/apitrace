@@ -213,6 +213,9 @@ extern "C" void WINAPI apitrace_d3d12_record_present_frame(
       "d3d12-present-frame",
       rgba_data,
       static_cast<std::size_t>(rgba_size));
+  if (asset.blob_id == 0 || asset.relative_path.empty()) {
+    return;
+  }
 
   std::ostringstream payload;
   payload << "{"

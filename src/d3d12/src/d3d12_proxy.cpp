@@ -2057,6 +2057,11 @@ apitrace::trace::AssetRecord register_asset_bytes_locked(
     const void *data,
     std::size_t size)
 {
+  auto *session = apitrace::runtime::ensure_process_trace_session(apitrace::trace::ApiKind::D3D12);
+  if (!session) {
+    return {};
+  }
+
   apitrace::trace::AssetRecord asset;
   asset.blob_id = ++capture_state().next_blob_id;
   asset.kind = kind;
@@ -2065,10 +2070,7 @@ apitrace::trace::AssetRecord register_asset_bytes_locked(
   if (size != 0 && data) {
     std::memcpy(asset.payload_bytes.data(), data, size);
   }
-  if (auto *session = apitrace::runtime::ensure_process_trace_session(apitrace::trace::ApiKind::D3D12)) {
-    return session->register_asset(std::move(asset));
-  }
-  return asset;
+  return session->register_asset(std::move(asset));
 }
 
 apitrace::trace::AssetRecord register_asset_text_locked(
@@ -2437,6 +2439,9 @@ std::string shader_asset_json_locked(const char *field_name, const D3D12_SHADER_
       std::string("d3d12-") + field_name,
       bytecode.pShaderBytecode,
       bytecode.BytecodeLength);
+  if (asset.blob_id == 0 || asset.relative_path.empty()) {
+    return std::string("\"") + field_name + "\":null";
+  }
   blob_refs.push_back(asset.blob_id);
   std::ostringstream payload;
   payload << "\"" << field_name << "\":{"
@@ -2467,6 +2472,10 @@ ShaderAssetMetadataJson shader_asset_metadata_json_locked(
       std::string("d3d12-") + field_name,
       bytecode.pShaderBytecode,
       bytecode.BytecodeLength);
+  if (asset.blob_id == 0 || asset.relative_path.empty()) {
+    const auto null_field = std::string("\"") + field_name + "\":null";
+    return {null_field, null_field};
+  }
   blob_refs.push_back(asset.blob_id);
 
   std::ostringstream asset_payload;
@@ -4480,8 +4489,10 @@ HRESULT STDMETHODCALLTYPE hook_device_create_root_signature(
     std::string root_sig_path;
     if (bytecode && bytecode_length != 0) {
       const auto asset = register_asset_bytes_locked(apitrace::trace::AssetKind::RootSignature, "d3d12-root-signature", bytecode, bytecode_length);
-      blob_refs.push_back(asset.blob_id);
-      root_sig_path = asset.relative_path.generic_string();
+      if (asset.blob_id != 0 && !asset.relative_path.empty()) {
+        blob_refs.push_back(asset.blob_id);
+        root_sig_path = asset.relative_path.generic_string();
+      }
     }
     std::ostringstream payload;
     payload << "{\"node_mask\":" << node_mask << ",\"bytecode_size\":" << static_cast<std::uint64_t>(bytecode_length);
