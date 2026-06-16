@@ -102,6 +102,9 @@ struct Stats {
   std::size_t preserved_referenced_missing_assets = 0;
   std::size_t sanitized_jsonl_files = 0;
   std::size_t dropped_jsonl_lines = 0;
+  std::size_t truncated_inconsistent_jsonl_files = 0;
+  std::uint64_t truncated_inconsistent_jsonl_bytes = 0;
+  std::size_t dropped_unreferenced_truncated_assets = 0;
   std::size_t refreshed_asset_hashes = 0;
   std::size_t checksum_files = 0;
   std::size_t checksum_hashed_files = 0;
@@ -1936,6 +1939,40 @@ void drop_unreferenced_missing_assets(
   stats.preserved_referenced_missing_assets += preserved_missing;
 }
 
+void drop_unreferenced_truncated_assets(
+    std::vector<AssetEntry> &assets,
+    const std::unordered_set<std::string> &referenced_paths_after_rewrite,
+    const std::unordered_set<std::uint64_t> &referenced_blob_ids_after_rewrite,
+    Stats &stats)
+{
+  const auto old_size = assets.size();
+  assets.erase(
+      std::remove_if(
+          assets.begin(),
+          assets.end(),
+          [&](const AssetEntry &asset) {
+            if (asset.path.empty()) {
+              return false;
+            }
+            if (asset.blob_id != 0 &&
+                referenced_blob_ids_after_rewrite.find(asset.blob_id) != referenced_blob_ids_after_rewrite.end()) {
+              return false;
+            }
+            const auto effective_path = effective_asset_path(asset);
+            if (referenced_paths_after_rewrite.find(asset.path) != referenced_paths_after_rewrite.end() ||
+                referenced_paths_after_rewrite.find(effective_path) != referenced_paths_after_rewrite.end()) {
+              return false;
+            }
+            if (!asset.canonical_path.empty() &&
+                referenced_paths_after_rewrite.find(asset.canonical_path) != referenced_paths_after_rewrite.end()) {
+              return false;
+            }
+            return true;
+          }),
+      assets.end());
+  stats.dropped_unreferenced_truncated_assets += old_size - assets.size();
+}
+
 bool rewrite_path_refs(json &node, const std::unordered_map<std::string, std::string> &aliases)
 {
   bool changed = false;
@@ -2831,6 +2868,428 @@ std::unordered_map<std::uint64_t, AssetEntry> build_asset_by_blob_id(const std::
     }
   }
   return by_blob_id;
+}
+
+bool asset_payload_materialized(const AssetEntry &asset)
+{
+  if (asset.file_exists) {
+    return true;
+  }
+  return !asset.payload_path.empty() && asset.payload_slice_exists;
+}
+
+struct CallstreamPrefixResult {
+  bool truncated = false;
+  std::uint64_t kept_frame_count = 0;
+};
+
+std::uint64_t json_u64_or_max(const json &node, const char *key)
+{
+  const auto it = node.find(key);
+  if (it == node.end()) {
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  if (it->is_number_unsigned() || it->is_number_integer()) {
+    return it->get<std::uint64_t>();
+  }
+  return std::numeric_limits<std::uint64_t>::max();
+}
+
+bool payload_metadata_match(const json &lhs, const json &rhs)
+{
+  for (const auto *key : {"frame_index", "sync_interval", "flags"}) {
+    if (!lhs.contains(key) || !rhs.contains(key) ||
+        !(lhs[key].is_number_unsigned() || lhs[key].is_number_integer()) ||
+        !(rhs[key].is_number_unsigned() || rhs[key].is_number_integer()) ||
+        lhs[key].get<std::uint64_t>() != rhs[key].get<std::uint64_t>()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool validate_record_asset_refs(
+    const fs::path &bundle_root,
+    const std::unordered_map<std::uint64_t, AssetEntry> &asset_by_blob_id,
+    const json &record,
+    bool has_blob_refs,
+    std::string &reason,
+    bool &recoverable_by_rewrite)
+{
+  recoverable_by_rewrite = false;
+  if (!record.is_object() || !has_blob_refs) {
+    return true;
+  }
+
+  std::vector<std::uint64_t> blob_refs;
+  std::vector<std::string> paths;
+  collect_asset_references_from_json(record, blob_refs, paths);
+  for (const auto blob_id : blob_refs) {
+    const auto asset_it = asset_by_blob_id.find(blob_id);
+    if (asset_it == asset_by_blob_id.end()) {
+      reason = "missing blob_id " + std::to_string(blob_id);
+      return false;
+    }
+    if (!asset_payload_materialized(asset_it->second)) {
+      reason = "missing payload for blob_id " + std::to_string(blob_id);
+      return false;
+    }
+  }
+
+  const bool refs_and_paths_are_paired = blob_refs.size() == paths.size();
+  for (std::size_t index = 0; index < paths.size(); ++index) {
+    const fs::path relative_path(paths[index]);
+    if (!safe_relative_path(relative_path)) {
+      reason = "unsafe asset path " + paths[index];
+      return false;
+    }
+  }
+
+  if (!refs_and_paths_are_paired) {
+    return true;
+  }
+
+  for (std::size_t index = 0; index < blob_refs.size() && index < paths.size(); ++index) {
+    const auto asset_it = asset_by_blob_id.find(blob_refs[index]);
+    if (asset_it == asset_by_blob_id.end()) {
+      continue;
+    }
+    const auto expected_path = effective_asset_path(asset_it->second);
+    if (!expected_path.empty() && expected_path != paths[index] && asset_it->second.path != paths[index]) {
+      reason = "blob_id " + std::to_string(blob_refs[index]) + " path mismatch";
+      recoverable_by_rewrite = true;
+      return false;
+    }
+    const fs::path relative_path(paths[index]);
+    if (!fs::is_regular_file(bundle_root / relative_path) && !asset_payload_materialized(asset_it->second)) {
+      reason = "missing asset path " + paths[index];
+      return false;
+    }
+  }
+  return true;
+}
+
+bool extract_payload(const json &record, json &payload)
+{
+  const auto payload_it = record.find("payload");
+  if (payload_it == record.end()) {
+    payload = json::object();
+    return true;
+  }
+  if (!payload_it->is_object()) {
+    return false;
+  }
+  payload = *payload_it;
+  return true;
+}
+
+CallstreamPrefixResult truncate_callstream_to_complete_prefix(
+    const fs::path &bundle_root,
+    const std::vector<AssetEntry> &assets,
+    const Options &options,
+    Stats &stats,
+    std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> &rewritten_digests)
+{
+  CallstreamPrefixResult result;
+  const auto callstream_path = bundle_root / apitrace::trace::kCallstreamFileName;
+  if (!fs::is_regular_file(callstream_path)) {
+    return result;
+  }
+
+  const auto asset_by_blob_id = build_asset_by_blob_id(assets);
+  std::ifstream input(callstream_path, std::ios::binary);
+  if (!input.is_open()) {
+    return result;
+  }
+  ++stats.jsonl_passes;
+
+  std::uint64_t offset = 0;
+  std::uint64_t line_number = 0;
+  std::uint64_t header_end_offset = 0;
+  std::uint64_t last_complete_offset = 0;
+  std::uint64_t last_complete_frame = std::numeric_limits<std::uint64_t>::max();
+  std::uint64_t last_present_boundary_offset = 0;
+  std::uint64_t last_present_boundary_frame = std::numeric_limits<std::uint64_t>::max();
+  std::unordered_map<std::uint64_t, json> present_calls;
+  std::unordered_set<std::uint64_t> present_boundaries;
+  bool saw_d3d_present_frame_asset = false;
+  bool inconsistent = false;
+  std::string inconsistent_reason;
+  std::uint64_t inconsistent_sequence = 0;
+  std::string line;
+  while (std::getline(input, line)) {
+    const auto line_bytes = static_cast<std::uint64_t>(line.size() + (input.eof() ? 0 : 1));
+    const auto line_end_offset = offset + line_bytes;
+    ++line_number;
+    ++stats.jsonl_records;
+    stats.input_bytes += line_bytes;
+    if (line.empty()) {
+      offset = line_end_offset;
+      continue;
+    }
+
+    const auto record = json::parse(line, nullptr, false);
+    if (record.is_discarded() || !record.is_object()) {
+      inconsistent = true;
+      inconsistent_reason = "invalid JSON at line " + std::to_string(line_number);
+      break;
+    }
+
+    bool recoverable_by_rewrite = false;
+    if (!validate_record_asset_refs(
+            bundle_root,
+            asset_by_blob_id,
+            record,
+            text_may_contain_blob_refs(line),
+            inconsistent_reason,
+            recoverable_by_rewrite)) {
+      if (recoverable_by_rewrite) {
+        offset = line_end_offset;
+        continue;
+      }
+      inconsistent = true;
+      inconsistent_sequence = record.value("sequence", 0ull);
+      break;
+    }
+
+    const auto record_kind = record.value("record_kind", std::string());
+    if (line_number == 1 && record_kind == "bundle_header") {
+      header_end_offset = line_end_offset;
+    }
+
+    json payload;
+    if (!extract_payload(record, payload)) {
+      inconsistent = true;
+      inconsistent_reason = "payload is not an object at line " + std::to_string(line_number);
+      inconsistent_sequence = record.value("sequence", 0ull);
+      break;
+    }
+    const auto frame_index = json_u64_or_max(payload, "frame_index");
+    const auto function = record.value("function", std::string());
+    if (record_kind == "call" &&
+        (function == "IDXGISwapChain::Present" ||
+         function == "IDXGISwapChain1::Present" ||
+         function == "IDXGISwapChain1::Present1") &&
+        frame_index != std::numeric_limits<std::uint64_t>::max()) {
+      present_calls[frame_index] = payload;
+    } else if (record_kind == "boundary" &&
+               record.value("boundary", std::string()) == "Present" &&
+               frame_index != std::numeric_limits<std::uint64_t>::max()) {
+      const auto call_it = present_calls.find(frame_index);
+      if (call_it == present_calls.end() || !payload_metadata_match(call_it->second, payload)) {
+        inconsistent = true;
+        inconsistent_reason = "Present boundary does not match captured Present call";
+        inconsistent_sequence = record.value("sequence", 0ull);
+        break;
+      }
+      present_boundaries.insert(frame_index);
+      if (frame_index == 0 ||
+          (last_present_boundary_frame != std::numeric_limits<std::uint64_t>::max() &&
+           frame_index == last_present_boundary_frame + 1)) {
+        last_present_boundary_frame = frame_index;
+        last_present_boundary_offset = line_end_offset;
+      }
+    } else if (record_kind == "resource_blob" &&
+               (record.value("debug_name", std::string()) == "D3D11PresentFrame" ||
+                record.value("debug_name", std::string()) == "D3D12PresentFrame") &&
+               frame_index != std::numeric_limits<std::uint64_t>::max()) {
+      if (present_boundaries.find(frame_index) == present_boundaries.end()) {
+        inconsistent = true;
+        inconsistent_reason = "D3D12PresentFrame precedes Present boundary";
+        inconsistent_sequence = record.value("sequence", 0ull);
+        break;
+      }
+      saw_d3d_present_frame_asset = true;
+      if (frame_index == 0 ||
+          (last_complete_frame != std::numeric_limits<std::uint64_t>::max() &&
+           frame_index == last_complete_frame + 1)) {
+        last_complete_frame = frame_index;
+        last_complete_offset = line_end_offset;
+      }
+    }
+
+    offset = line_end_offset;
+  }
+
+  if (!inconsistent) {
+    const auto frame = saw_d3d_present_frame_asset ? last_complete_frame : last_present_boundary_frame;
+    result.kept_frame_count = frame == std::numeric_limits<std::uint64_t>::max() ? 0 : frame + 1;
+    return result;
+  }
+
+  const auto target_offset =
+      last_complete_offset != 0 ? last_complete_offset :
+      last_present_boundary_offset != 0 ? last_present_boundary_offset :
+      header_end_offset;
+  std::error_code size_error;
+  const auto old_size = fs::file_size(callstream_path, size_error);
+  if (size_error || old_size <= target_offset) {
+    return result;
+  }
+  result.truncated = true;
+  const auto kept_frame =
+      last_complete_offset != 0 ? last_complete_frame :
+      last_present_boundary_offset != 0 ? last_present_boundary_frame :
+      std::numeric_limits<std::uint64_t>::max();
+  result.kept_frame_count = kept_frame == std::numeric_limits<std::uint64_t>::max() ? 0 : kept_frame + 1;
+  stats.truncated_inconsistent_jsonl_bytes += static_cast<std::uint64_t>(old_size - target_offset);
+  ++stats.truncated_inconsistent_jsonl_files;
+  std::cerr << "warning: truncating callstream.jsonl at " << target_offset
+            << " bytes after " << result.kept_frame_count
+            << " complete frames due to " << inconsistent_reason;
+  if (inconsistent_sequence != 0) {
+    std::cerr << " at sequence " << inconsistent_sequence;
+  }
+  std::cerr << "\n";
+  if (options.dry_run) {
+    return result;
+  }
+  std::error_code resize_error;
+  fs::resize_file(callstream_path, target_offset, resize_error);
+  if (resize_error) {
+    std::cerr << "warning: failed to truncate callstream.jsonl: " << resize_error.message() << "\n";
+    result.truncated = false;
+    return result;
+  }
+  rewritten_digests.erase(apitrace::trace::kCallstreamFileName);
+  return result;
+}
+
+std::optional<std::uint64_t> metal_present_frame_index(const json &record)
+{
+  if (!record.is_object() || record.value("call_kind", std::string()) != "PresentDrawable") {
+    return std::nullopt;
+  }
+  const auto payload_it = record.find("payload");
+  if (payload_it == record.end() || !payload_it->is_object()) {
+    return std::nullopt;
+  }
+  const auto frame_index = json_u64_or_max(*payload_it, "frame_index");
+  if (frame_index == std::numeric_limits<std::uint64_t>::max()) {
+    return std::nullopt;
+  }
+  return frame_index;
+}
+
+void truncate_metal_callstream_to_frame_count(
+    const fs::path &bundle_root,
+    std::uint64_t frame_count,
+    const Options &options,
+    Stats &stats,
+    std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> &rewritten_digests)
+{
+  const auto metal_callstream_path = bundle_root / apitrace::trace::kMetalCallstreamFileName;
+  if (!fs::is_regular_file(metal_callstream_path)) {
+    return;
+  }
+
+  std::uint64_t target_offset = 0;
+  if (frame_count != 0) {
+    std::ifstream input(metal_callstream_path, std::ios::binary);
+    if (!input.is_open()) {
+      return;
+    }
+    ++stats.jsonl_passes;
+    std::uint64_t offset = 0;
+    std::string line;
+    while (std::getline(input, line)) {
+      const auto line_bytes = static_cast<std::uint64_t>(line.size() + (input.eof() ? 0 : 1));
+      const auto line_end_offset = offset + line_bytes;
+      if (line.find("\"PresentDrawable\"") != std::string::npos &&
+          line.find("\"frame_index\"") != std::string::npos) {
+        const auto record = json::parse(line, nullptr, false);
+        if (!record.is_discarded()) {
+          if (const auto frame_index = metal_present_frame_index(record);
+              frame_index && *frame_index + 1 == frame_count) {
+            target_offset = line_end_offset;
+          }
+        }
+      }
+      offset = line_end_offset;
+    }
+    if (target_offset == 0) {
+      return;
+    }
+  }
+
+  std::error_code size_error;
+  const auto old_size = fs::file_size(metal_callstream_path, size_error);
+  if (size_error || old_size <= target_offset) {
+    return;
+  }
+  ++stats.truncated_inconsistent_jsonl_files;
+  stats.truncated_inconsistent_jsonl_bytes += static_cast<std::uint64_t>(old_size - target_offset);
+  std::cerr << "warning: truncating metal-callstream.jsonl at " << target_offset
+            << " bytes to match " << frame_count << " complete D3D frames\n";
+  if (options.dry_run) {
+    return;
+  }
+  std::error_code resize_error;
+  fs::resize_file(metal_callstream_path, target_offset, resize_error);
+  if (resize_error) {
+    std::cerr << "warning: failed to truncate metal-callstream.jsonl: " << resize_error.message() << "\n";
+    return;
+  }
+  rewritten_digests.erase(apitrace::trace::kMetalCallstreamFileName);
+}
+
+void truncate_translation_links_to_frame_count(
+    const fs::path &bundle_root,
+    std::uint64_t frame_count,
+    const Options &options,
+    Stats &stats,
+    std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> &rewritten_digests)
+{
+  const fs::path relative_path =
+      fs::path(apitrace::trace::kAnalysisDirectoryName) / apitrace::trace::kTranslationLinksFileName;
+  const auto link_path = bundle_root / relative_path;
+  if (!fs::is_regular_file(link_path)) {
+    return;
+  }
+
+  std::ifstream input(link_path, std::ios::binary);
+  if (!input.is_open()) {
+    return;
+  }
+  ++stats.jsonl_passes;
+  std::uint64_t offset = 0;
+  std::uint64_t target_offset = 0;
+  std::string line;
+  while (std::getline(input, line)) {
+    const auto line_bytes = static_cast<std::uint64_t>(line.size() + (input.eof() ? 0 : 1));
+    const auto line_end_offset = offset + line_bytes;
+    if (!line.empty()) {
+      const auto record = json::parse(line, nullptr, false);
+      if (!record.is_discarded() && record.is_object()) {
+        const auto frame_id = record.value("frame_id", 0ull);
+        if (frame_id >= frame_count) {
+          break;
+        }
+      }
+    }
+    target_offset = line_end_offset;
+    offset = line_end_offset;
+  }
+
+  std::error_code size_error;
+  const auto old_size = fs::file_size(link_path, size_error);
+  if (size_error || old_size <= target_offset) {
+    return;
+  }
+  ++stats.truncated_inconsistent_jsonl_files;
+  stats.truncated_inconsistent_jsonl_bytes += static_cast<std::uint64_t>(old_size - target_offset);
+  std::cerr << "warning: truncating translation-links.jsonl at " << target_offset
+            << " bytes to match " << frame_count << " complete D3D frames\n";
+  if (options.dry_run) {
+    return;
+  }
+  std::error_code resize_error;
+  fs::resize_file(link_path, target_offset, resize_error);
+  if (resize_error) {
+    std::cerr << "warning: failed to truncate translation-links.jsonl: " << resize_error.message() << "\n";
+    return;
+  }
+  rewritten_digests.erase(relative_path.generic_string());
 }
 
 std::unordered_map<std::uint64_t, ShaderAssetRef> build_shader_ref_by_blob_id(const std::vector<AssetEntry> &assets)
@@ -4178,7 +4637,7 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
   }
 
   const auto started = std::chrono::steady_clock::now();
-  constexpr std::size_t kStageCount = 21;
+  constexpr std::size_t kStageCount = 22;
   std::size_t stage_index = 0;
   ProgressReporter progress(options.progress);
   Stats stats;
@@ -4226,6 +4685,7 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
     }
   });
 
+  std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> rewritten_digests;
   std::unordered_map<std::uint64_t, std::uint64_t> blob_id_remap;
   std::unordered_map<std::uint64_t, std::unordered_map<std::string, std::uint64_t>> blob_id_remap_by_path;
   run_stage(options, progress, stage_index, kStageCount, "normalize_blob_ids", [&] {
@@ -4235,7 +4695,6 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
   std::unordered_map<std::string, std::uint64_t> blob_id_by_effective_path;
   std::unordered_map<std::uint64_t, std::string> effective_path_by_blob_id;
   std::unordered_set<std::string> referenced_paths_after_rewrite;
-  std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> rewritten_digests;
   run_stage(options, progress, stage_index, kStageCount, "build_aliases", [&] {
     aliases = build_aliases(assets);
     for (const auto &[from, to] : canonical_aliases) {
@@ -4252,6 +4711,7 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
   });
   std::unordered_set<std::string> rewritten_paths;
   bool rebuilt_assets_changed = false;
+  CallstreamPrefixResult callstream_prefix;
   run_stage(options, progress, stage_index, kStageCount, "rewrite_references", [&] {
     const auto callstream = options.bundle_root / apitrace::trace::kCallstreamFileName;
     const auto metal_callstream = options.bundle_root / apitrace::trace::kMetalCallstreamFileName;
@@ -4285,6 +4745,26 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
         metal_callstream, blob_id_remap, options, stats, &progress, 2, 3, &digest_cache, &rewritten_digests);
     sanitize_and_rewrite_jsonl_file(
         translation_links, blob_id_remap, options, stats, &progress, 3, 3, &digest_cache, &rewritten_digests);
+  });
+  run_stage(options, progress, stage_index, kStageCount, "truncate_inconsistent_streams", [&] {
+    callstream_prefix =
+        truncate_callstream_to_complete_prefix(options.bundle_root, assets, options, stats, rewritten_digests);
+    if (!callstream_prefix.truncated) {
+      return;
+    }
+    truncate_metal_callstream_to_frame_count(
+        options.bundle_root,
+        callstream_prefix.kept_frame_count,
+        options,
+        stats,
+        rewritten_digests);
+    truncate_translation_links_to_frame_count(
+        options.bundle_root,
+        callstream_prefix.kept_frame_count,
+        options,
+        stats,
+        rewritten_digests);
+    referenced_paths_after_rewrite.clear();
   });
   run_stage(options, progress, stage_index, kStageCount, "rebuild_semantics", [&] {
     const auto rebuilt_paths =
@@ -4411,6 +4891,13 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
     }
     const auto referenced_blob_ids_after_rewrite = collect_referenced_blob_ids(options.bundle_root);
     stats.referenced_paths_collected = referenced_paths_after_rewrite.size();
+    if (callstream_prefix.truncated && !options.dry_run) {
+      drop_unreferenced_truncated_assets(
+          assets,
+          referenced_paths_after_rewrite,
+          referenced_blob_ids_after_rewrite,
+          stats);
+    }
     drop_unreferenced_missing_assets(assets, referenced_paths_after_rewrite, referenced_blob_ids_after_rewrite, stats);
   });
   run_stage(options, progress, stage_index, kStageCount, "remove_duplicate_files", [&] {
@@ -4479,6 +4966,7 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
             << " unresolved_d3d12_pipeline_asset_refs=" << stats.unresolved_d3d12_pipeline_asset_refs
             << " preserved_referenced_duplicate_assets=" << stats.preserved_referenced_duplicate_assets
             << " dropped_unreferenced_missing_assets=" << stats.dropped_unreferenced_missing_assets
+            << " dropped_unreferenced_truncated_assets=" << stats.dropped_unreferenced_truncated_assets
             << " removed_orphan_asset_files=" << stats.removed_orphan_asset_files
             << " remapped_blob_ids=" << stats.remapped_blob_ids
             << " rewritten_text_files=" << stats.rewritten_text_files
@@ -4487,6 +4975,8 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
             << " preserved_referenced_missing_assets=" << stats.preserved_referenced_missing_assets
             << " sanitized_jsonl_files=" << stats.sanitized_jsonl_files
             << " dropped_jsonl_lines=" << stats.dropped_jsonl_lines
+            << " truncated_inconsistent_jsonl_files=" << stats.truncated_inconsistent_jsonl_files
+            << " truncated_inconsistent_jsonl_bytes=" << stats.truncated_inconsistent_jsonl_bytes
             << " refreshed_asset_hashes=" << stats.refreshed_asset_hashes
             << " hashed_unique_files=" << stats.hashed_unique_files
             << " hashed_asset_bytes=" << stats.hashed_asset_bytes
