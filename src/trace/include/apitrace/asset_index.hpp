@@ -36,6 +36,8 @@ struct AssetRecord {
   std::string content_hash;
   std::string fast_fingerprint;
   std::uint64_t byte_size = 0;
+  std::filesystem::path payload_path;
+  std::uint64_t payload_offset = 0;
   bool binary_payload = true;
   std::vector<std::uint8_t> payload_bytes;
 

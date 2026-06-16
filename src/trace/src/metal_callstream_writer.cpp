@@ -279,7 +279,7 @@ bool parse_metal_callstream(
   std::size_t line_number = 0;
   std::uint64_t consumed_bytes = 0;
   while (std::getline(input, line)) {
-    const auto line_bytes = static_cast<std::uint64_t>(line.size() + 1);
+    const auto line_bytes = static_cast<std::uint64_t>(line.size() + (input.eof() ? 0 : 1));
     if (consumed_bytes + line_bytes > byte_limit) {
       break;
     }

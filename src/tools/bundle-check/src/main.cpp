@@ -3,16 +3,20 @@
 #include "apitrace/trace_bundle_io.hpp"
 #include "apitrace/tools/cli_entries.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -22,6 +26,11 @@ namespace {
 using json = nlohmann::json;
 
 constexpr std::uint64_t kMetalTextureSwizzleAlpha = 5;
+
+std::size_t default_job_count()
+{
+  return static_cast<std::size_t>(std::thread::hardware_concurrency()) + 2;
+}
 
 struct AssetJsonCache {
   std::unordered_map<std::string, json> parsed;
@@ -44,6 +53,7 @@ void print_usage(const char *argv0)
             << " [--require-d3d-present-frames] [--require-metal-present-frames]"
             << " [--strict-cross-api]"
             << " [--verify-hashes]"
+            << " [--jobs N]"
             << " <trace-bundle>\n";
 }
 
@@ -160,6 +170,7 @@ struct CheckOptions {
   bool require_d3d_present_frames = false;
   bool require_metal_present_frames = false;
   bool verify_hashes = false;
+  std::size_t jobs = default_job_count();
 };
 
 void enable_strict_cross_api(CheckOptions &options)
@@ -216,6 +227,8 @@ struct TranslationLinkStats {
   std::size_t draw_scope_links = 0;
   std::size_t draw_scope_links_with_metal_work = 0;
   std::size_t draw_scope_links_to_d3d_pipeline_work = 0;
+  std::uint64_t max_frame_id = 0;
+  bool has_frame_id = false;
 };
 
 bool is_d3d12_pipeline_dependent_function(std::string_view function_name)
@@ -284,6 +297,111 @@ std::string bundle_hash_from_records(const std::vector<apitrace::trace::Checksum
   return "sha256:" + apitrace::trace::content_hash_bytes(
                        bundle_fingerprint_source.data(),
                        bundle_fingerprint_source.size());
+}
+
+struct ChecksumValidationIssue {
+  std::string relative;
+  std::string message;
+};
+
+struct ChecksumValidationResult {
+  std::size_t checked = 0;
+  std::vector<ChecksumValidationIssue> issues;
+};
+
+std::optional<ChecksumValidationIssue> validate_checksum_record_contents(
+    const apitrace::trace::BundleLayout &layout,
+    const apitrace::trace::ChecksumRecord &record)
+{
+  const auto relative = record.relative_path.generic_string();
+  if (record.algorithm != "sha256") {
+    return ChecksumValidationIssue{relative, "unsupported algorithm"};
+  }
+  const auto absolute = layout.root_path / record.relative_path;
+  std::error_code size_error;
+  if (!std::filesystem::is_regular_file(absolute, size_error) || size_error) {
+    return ChecksumValidationIssue{relative, "MISSING"};
+  }
+  const auto actual_size = static_cast<std::uint64_t>(
+      std::filesystem::file_size(absolute, size_error));
+  if (size_error) {
+    return ChecksumValidationIssue{relative, "unreadable"};
+  }
+  if (record.has_byte_size && actual_size < record.byte_size) {
+    return ChecksumValidationIssue{
+        relative,
+        "TRUNCATED (have " + std::to_string(actual_size) +
+            " bytes, expected " + std::to_string(record.byte_size) + ")"};
+  }
+  const auto use_prefix = record.has_byte_size && actual_size > record.byte_size;
+  const auto digest = use_prefix
+                          ? apitrace::trace::content_hash_file_prefix(absolute, record.byte_size)
+                          : apitrace::trace::content_hash_file(absolute);
+  if (digest != record.digest) {
+    return ChecksumValidationIssue{relative, "CORRUPT (hash mismatch)"};
+  }
+  return std::nullopt;
+}
+
+ChecksumValidationResult validate_checksum_records_parallel(
+    const apitrace::trace::BundleLayout &layout,
+    const std::vector<apitrace::trace::ChecksumRecord> &records,
+    const std::unordered_set<std::string> &already_validated,
+    std::size_t jobs,
+    bool collect_all_issues)
+{
+  std::vector<const apitrace::trace::ChecksumRecord *> tasks;
+  tasks.reserve(records.size());
+  for (const auto &record : records) {
+    if (already_validated.find(record.relative_path.generic_string()) == already_validated.end()) {
+      tasks.push_back(&record);
+    }
+  }
+
+  ChecksumValidationResult result;
+  result.checked = tasks.size();
+  if (tasks.empty()) {
+    return result;
+  }
+
+  const auto thread_count = std::max<std::size_t>(
+      1,
+      std::min<std::size_t>(jobs == 0 ? 1 : jobs, tasks.size()));
+  std::atomic<std::size_t> next_task{0};
+  std::atomic<bool> stop{false};
+  std::vector<std::vector<ChecksumValidationIssue>> thread_issues(thread_count);
+  std::vector<std::thread> workers;
+  workers.reserve(thread_count);
+  for (std::size_t thread_index = 0; thread_index < thread_count; ++thread_index) {
+    workers.emplace_back([&, thread_index]() {
+      for (;;) {
+        if (!collect_all_issues && stop.load(std::memory_order_relaxed)) {
+          return;
+        }
+        const auto task_index = next_task.fetch_add(1, std::memory_order_relaxed);
+        if (task_index >= tasks.size()) {
+          return;
+        }
+        if (auto issue = validate_checksum_record_contents(layout, *tasks[task_index])) {
+          thread_issues[thread_index].push_back(std::move(*issue));
+          if (!collect_all_issues) {
+            stop.store(true, std::memory_order_relaxed);
+            return;
+          }
+        }
+      }
+    });
+  }
+  for (auto &worker : workers) {
+    worker.join();
+  }
+  for (auto &issues : thread_issues) {
+    result.issues.insert(
+        result.issues.end(),
+        std::make_move_iterator(issues.begin()),
+        std::make_move_iterator(issues.end()));
+  }
+  return result;
 }
 
 void collect_asset_paths(const json &value, std::vector<std::string> &paths)
@@ -2381,7 +2499,7 @@ bool metal_event_creates_object(apitrace::trace::MetalCallKind kind)
   }
 }
 
-bool verify_bundle_references(
+bool verify_bundle_references_serial(
     const apitrace::trace::TraceBundleReader &reader,
     std::size_t &d3d_object_refs,
     std::size_t &metal_object_refs,
@@ -2839,6 +2957,724 @@ bool verify_bundle_references(
   return true;
 }
 
+struct BundleReferenceCounters {
+  std::size_t d3d_object_refs = 0;
+  std::size_t metal_object_refs = 0;
+  std::size_t blob_refs = 0;
+  std::size_t asset_path_refs = 0;
+
+  void add(const BundleReferenceCounters &other)
+  {
+    d3d_object_refs += other.d3d_object_refs;
+    metal_object_refs += other.metal_object_refs;
+    blob_refs += other.blob_refs;
+    asset_path_refs += other.asset_path_refs;
+  }
+};
+
+struct BundleReferenceIssue {
+  std::uint64_t order = 0;
+  std::string message;
+};
+
+struct ParallelReferenceState {
+  BundleReferenceCounters counters;
+  std::unordered_set<std::string> existing_asset_paths;
+  std::unordered_map<std::uint64_t, std::string> observed_blob_paths;
+  AssetJsonCache asset_json_cache;
+  std::vector<BundleReferenceIssue> issues;
+};
+
+struct ObjectKnownIndex {
+  std::unordered_map<std::uint64_t, std::uint64_t> d3d_first_known_position;
+  std::unordered_set<std::uint64_t> metal_initial_known;
+  std::unordered_map<std::uint64_t, std::uint64_t> metal_first_known_position;
+};
+
+bool object_known_at(
+    const std::unordered_map<std::uint64_t, std::uint64_t> &first_known_position,
+    std::uint64_t object_id,
+    std::uint64_t position)
+{
+  const auto it = first_known_position.find(object_id);
+  return it != first_known_position.end() && it->second <= position;
+}
+
+ObjectKnownIndex build_object_known_index(const apitrace::trace::TraceBundleReader &reader)
+{
+  ObjectKnownIndex index;
+  index.d3d_first_known_position.reserve(reader.objects().size() + reader.events().size());
+  index.metal_initial_known.reserve(reader.objects().size() + reader.events().size());
+
+  for (const auto &object : reader.objects()) {
+    if (object.object_id == 0) {
+      continue;
+    }
+    index.d3d_first_known_position.emplace(object.object_id, 0);
+    index.metal_initial_known.insert(object.object_id);
+  }
+
+  for (std::size_t event_index = 0; event_index < reader.events().size(); ++event_index) {
+    const auto &event = reader.events()[event_index];
+    if ((event.kind != apitrace::trace::EventKind::ObjectCreate &&
+         event.kind != apitrace::trace::EventKind::ObjectDestroy) ||
+        event.object_id == 0) {
+      continue;
+    }
+    const auto position = static_cast<std::uint64_t>(event_index + 1);
+    const auto [it, inserted] = index.d3d_first_known_position.emplace(event.object_id, position);
+    if (!inserted && position < it->second) {
+      it->second = position;
+    }
+    index.metal_initial_known.insert(event.object_id);
+  }
+
+  index.metal_first_known_position.reserve(reader.metal_events().size());
+  for (std::size_t event_index = 0; event_index < reader.metal_events().size(); ++event_index) {
+    const auto &event = reader.metal_events()[event_index];
+    if (event.object_id == 0 || !metal_event_creates_object(event.call_kind)) {
+      continue;
+    }
+    const auto position = static_cast<std::uint64_t>(event_index + 1);
+    const auto [it, inserted] = index.metal_first_known_position.emplace(event.object_id, position);
+    if (!inserted && position < it->second) {
+      it->second = position;
+    }
+  }
+
+  return index;
+}
+
+bool metal_object_known_at(const ObjectKnownIndex &index, std::uint64_t object_id, std::uint64_t position)
+{
+  return index.metal_initial_known.find(object_id) != index.metal_initial_known.end() ||
+         object_known_at(index.metal_first_known_position, object_id, position);
+}
+
+template <typename ValidateOne>
+bool validate_references_parallel(
+    std::size_t item_count,
+    std::size_t jobs,
+    ValidateOne validate_one,
+    BundleReferenceCounters &counters,
+    std::string &error)
+{
+  if (item_count == 0) {
+    return true;
+  }
+
+  const auto thread_count = std::max<std::size_t>(
+      1,
+      std::min<std::size_t>(jobs == 0 ? 1 : jobs, item_count));
+  constexpr std::size_t kChunkSize = 2048;
+  std::atomic<std::size_t> next_item{0};
+  std::atomic<bool> stop{false};
+  std::vector<ParallelReferenceState> states(thread_count);
+  std::vector<std::thread> workers;
+  workers.reserve(thread_count);
+
+  for (std::size_t thread_index = 0; thread_index < thread_count; ++thread_index) {
+    workers.emplace_back([&, thread_index]() {
+      auto &state = states[thread_index];
+      while (!stop.load(std::memory_order_relaxed)) {
+        const auto begin = next_item.fetch_add(kChunkSize, std::memory_order_relaxed);
+        if (begin >= item_count) {
+          return;
+        }
+        const auto end = std::min(item_count, begin + kChunkSize);
+        for (std::size_t index = begin; index < end; ++index) {
+          if (stop.load(std::memory_order_relaxed)) {
+            return;
+          }
+          BundleReferenceIssue issue;
+          if (!validate_one(index, state, issue)) {
+            state.issues.push_back(std::move(issue));
+            stop.store(true, std::memory_order_relaxed);
+            return;
+          }
+        }
+      }
+    });
+  }
+  for (auto &worker : workers) {
+    worker.join();
+  }
+
+  std::optional<BundleReferenceIssue> first_issue;
+  for (const auto &state : states) {
+    for (const auto &issue : state.issues) {
+      if (!first_issue || issue.order < first_issue->order) {
+        first_issue = issue;
+      }
+    }
+  }
+  if (first_issue) {
+    error = std::move(first_issue->message);
+    return false;
+  }
+
+  for (const auto &state : states) {
+    counters.add(state.counters);
+  }
+  return true;
+}
+
+bool validate_d3d_event_references(
+    const apitrace::trace::TraceBundleReader &reader,
+    const std::unordered_map<std::uint64_t, std::string> &blob_paths,
+    const std::unordered_map<std::string, const apitrace::trace::ChecksumRecord *> &checksum_records,
+    const ObjectKnownIndex &object_index,
+    std::size_t event_index,
+    ParallelReferenceState &state,
+    BundleReferenceIssue &issue)
+{
+  const auto &event = reader.events()[event_index];
+  const auto order = static_cast<std::uint64_t>(event_index);
+  const auto position = static_cast<std::uint64_t>(event_index + 1);
+  const auto event_label = "sequence " + std::to_string(event.callsite.sequence);
+  std::string error;
+
+  json payload;
+  if (!parse_payload(event.payload, payload, error)) {
+    issue = {order, event_label + ": " + error};
+    return false;
+  }
+  payload["__debug_name"] = event.object_debug_name;
+  if (!verify_present_frame_payload(reader, blob_paths, event_label, payload, event.blob_refs, error)) {
+    issue = {order, error};
+    return false;
+  }
+
+  for (const auto object_id : event.object_refs) {
+    if (object_id == 0) {
+      continue;
+    }
+    ++state.counters.d3d_object_refs;
+    if (!object_known_at(object_index.d3d_first_known_position, object_id, position)) {
+      issue = {order, event_label + ": object_refs contains unknown object id " + std::to_string(object_id)};
+      return false;
+    }
+  }
+
+  std::vector<std::uint64_t> payload_object_ids;
+  apitrace::trace::append_payload_object_refs(payload, payload_object_ids);
+  for (const auto object_id : payload_object_ids) {
+    if (object_id == 0) {
+      continue;
+    }
+    ++state.counters.d3d_object_refs;
+    if (!object_known_at(object_index.d3d_first_known_position, object_id, position)) {
+      issue = {order, event_label + ": payload references unknown object id " + std::to_string(object_id)};
+      return false;
+    }
+  }
+  if (event.kind == apitrace::trace::EventKind::Call) {
+    for (const auto object_id : payload_object_ids) {
+      if (object_id == 0) {
+        continue;
+      }
+      if (!object_refs_contain(event.object_refs, object_id)) {
+        issue = {order, event_label + ": payload object id is missing from object_refs " +
+                            std::to_string(object_id)};
+        return false;
+      }
+    }
+  }
+
+  std::vector<std::uint64_t> resolved_resource_object_ids;
+  collect_resolved_resource_object_ids(payload, resolved_resource_object_ids);
+  for (const auto object_id : resolved_resource_object_ids) {
+    if (object_id == 0) {
+      continue;
+    }
+    if (!object_refs_contain(event.object_refs, object_id)) {
+      issue = {order, event_label + ": payload resolved_resource_object_id is missing from object_refs " +
+                          std::to_string(object_id)};
+      return false;
+    }
+  }
+
+  std::vector<std::string> paths;
+  if (!collect_asset_paths_with_nested_json(reader, payload, state.asset_json_cache, paths, error)) {
+    issue = {order, event_label + ": " + error};
+    return false;
+  }
+  if (event.kind == apitrace::trace::EventKind::ResourceBlob && paths.size() != event.blob_refs.size()) {
+    issue = {order, event_label + ": resource blob asset path count does not match blob_refs"};
+    return false;
+  }
+  if (!verify_blob_refs_cover_asset_paths(event_label, event.blob_refs, paths, blob_paths, error)) {
+    issue = {order, error};
+    return false;
+  }
+  if (!bind_blob_paths(event_label, event.blob_refs, paths, blob_paths, state.observed_blob_paths, error)) {
+    issue = {order, error};
+    return false;
+  }
+  for (const auto &path : paths) {
+    ++state.counters.asset_path_refs;
+    if (!verify_asset_path(reader, checksum_records, path, state.existing_asset_paths, error)) {
+      issue = {order, event_label + ": " + error};
+      return false;
+    }
+  }
+  for (const auto blob_id : event.blob_refs) {
+    if (blob_id == 0) {
+      continue;
+    }
+    ++state.counters.blob_refs;
+    if (blob_paths.find(blob_id) == blob_paths.end()) {
+      issue = {order, event_label + ": blob_refs contains unknown blob id " + std::to_string(blob_id)};
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool validate_metal_event_references(
+    const apitrace::trace::TraceBundleReader &reader,
+    const std::unordered_map<std::uint64_t, std::string> &blob_paths,
+    const std::unordered_map<std::string, const apitrace::trace::ChecksumRecord *> &checksum_records,
+    const ObjectKnownIndex &object_index,
+    std::uint64_t order_base,
+    std::size_t event_index,
+    ParallelReferenceState &state,
+    BundleReferenceIssue &issue)
+{
+  const auto &event = reader.metal_events()[event_index];
+  const auto order = order_base + static_cast<std::uint64_t>(event_index);
+  const auto position = static_cast<std::uint64_t>(event_index + 1);
+  const auto event_label = "metal sequence " + std::to_string(event.metal_sequence);
+  std::string error;
+
+  json payload;
+  if (!parse_payload(event.payload, payload, error)) {
+    issue = {order, event_label + ": " + error};
+    return false;
+  }
+
+  if (event.object_id != 0 &&
+      !metal_event_creates_object(event.call_kind) &&
+      !metal_object_known_at(object_index, event.object_id, position)) {
+    issue = {order, event_label + ": object_id references unknown object id " +
+                        std::to_string(event.object_id)};
+    return false;
+  }
+  for (const auto object_id : event.object_refs) {
+    if (object_id == 0) {
+      continue;
+    }
+    ++state.counters.metal_object_refs;
+    if (!metal_object_known_at(object_index, object_id, position)) {
+      issue = {order, event_label + ": object_refs contains unknown object id " + std::to_string(object_id)};
+      return false;
+    }
+  }
+
+  std::vector<std::uint64_t> payload_object_ids;
+  apitrace::trace::append_payload_object_refs(payload, payload_object_ids);
+  for (const auto object_id : payload_object_ids) {
+    if (object_id == 0) {
+      continue;
+    }
+    ++state.counters.metal_object_refs;
+    if (!metal_object_known_at(object_index, object_id, position)) {
+      issue = {order, event_label + ": payload references unknown object id " + std::to_string(object_id)};
+      return false;
+    }
+  }
+  for (const auto object_id : payload_object_ids) {
+    if (object_id == 0) {
+      continue;
+    }
+    if (event.object_id != object_id && !object_refs_contain(event.object_refs, object_id)) {
+      issue = {order, event_label + ": payload object id is missing from object_refs " +
+                          std::to_string(object_id)};
+      return false;
+    }
+  }
+
+  std::vector<std::string> paths;
+  if (!collect_asset_paths_with_nested_json(reader, payload, state.asset_json_cache, paths, error)) {
+    issue = {order, event_label + ": " + error};
+    return false;
+  }
+  if (!verify_blob_refs_cover_asset_paths(event_label, event.blob_refs, paths, blob_paths, error)) {
+    issue = {order, error};
+    return false;
+  }
+  if (!bind_blob_paths(event_label, event.blob_refs, paths, blob_paths, state.observed_blob_paths, error)) {
+    issue = {order, error};
+    return false;
+  }
+  for (const auto &path : paths) {
+    ++state.counters.asset_path_refs;
+    if (!verify_asset_path(reader, checksum_records, path, state.existing_asset_paths, error)) {
+      issue = {order, event_label + ": " + error};
+      return false;
+    }
+  }
+  for (const auto blob_id : event.blob_refs) {
+    if (blob_id == 0) {
+      continue;
+    }
+    ++state.counters.blob_refs;
+    if (blob_paths.find(blob_id) == blob_paths.end()) {
+      issue = {order, event_label + ": blob_refs contains unknown blob id " + std::to_string(blob_id)};
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool verify_present_sequences(
+    const apitrace::trace::TraceBundleReader &reader,
+    PresentFrameStats &present_stats,
+    std::string &error)
+{
+  std::unordered_map<std::uint64_t, PresentFrameMetadata> metal_present_frames;
+  std::unordered_map<std::string, PresentFrameMetadata> previous_present_frames_by_kind;
+  std::set<std::string> d3d_present_frame_kinds;
+  std::unordered_map<std::uint64_t, PresentFrameMetadata> d3d_present_calls;
+  std::unordered_map<std::uint64_t, PresentFrameMetadata> d3d_present_boundaries;
+  std::unordered_map<std::string, std::unordered_map<std::uint64_t, PresentFrameMetadata>> d3d_present_frames_by_kind;
+
+  for (const auto &event : reader.events()) {
+    const bool present_frame_blob =
+        event.kind == apitrace::trace::EventKind::ResourceBlob &&
+        is_present_frame_debug_name(event.object_debug_name);
+    const bool captured_present_call =
+        event.kind == apitrace::trace::EventKind::Call &&
+        !present_frame_debug_name_for_present_call(event.callsite.function_name).empty();
+    const bool present_boundary =
+        event.kind == apitrace::trace::EventKind::Boundary &&
+        event.boundary == apitrace::trace::BoundaryKind::Present;
+    if (!present_frame_blob && !captured_present_call && !present_boundary) {
+      continue;
+    }
+
+    json payload;
+    if (!parse_payload(event.payload, payload, error)) {
+      error = "sequence " + std::to_string(event.callsite.sequence) + ": " + error;
+      return false;
+    }
+
+    if (present_frame_blob && payload.contains("frame_path")) {
+      const auto metadata = present_frame_metadata_from_payload(payload, event.callsite.sequence);
+      const auto previous_it = previous_present_frames_by_kind.find(event.object_debug_name);
+      if (previous_it != previous_present_frames_by_kind.end() &&
+          metadata.frame_index <= previous_it->second.frame_index) {
+        error = "sequence " + std::to_string(event.callsite.sequence) +
+                ": " + event.object_debug_name + " frame_index is not strictly increasing (" +
+                std::to_string(metadata.frame_index) + " after " +
+                std::to_string(previous_it->second.frame_index) + ")";
+        return false;
+      }
+      previous_present_frames_by_kind[event.object_debug_name] = metadata;
+      if (event.object_debug_name == "D3D11PresentFrame" || event.object_debug_name == "D3D12PresentFrame") {
+        d3d_present_frame_kinds.insert(event.object_debug_name);
+        if (!d3d_present_frames_by_kind[event.object_debug_name].emplace(metadata.frame_index, metadata).second) {
+          error = "sequence " + std::to_string(event.callsite.sequence) +
+                  ": duplicate " + event.object_debug_name + " frame_index " + std::to_string(metadata.frame_index);
+          return false;
+        }
+      }
+      if (event.object_debug_name == "MetalPresentFrame" &&
+          !metal_present_frames.emplace(metadata.frame_index, metadata).second) {
+        error = "sequence " + std::to_string(event.callsite.sequence) +
+                ": duplicate MetalPresentFrame frame_index " + std::to_string(metadata.frame_index);
+        return false;
+      }
+    }
+
+    if (captured_present_call) {
+      if (payload_is_test_present(payload) && !payload.contains("frame_index")) {
+        continue;
+      }
+      PresentFrameMetadata metadata;
+      std::string missing_key;
+      if (!payload_present_metadata(payload, event.callsite.sequence, metadata, missing_key)) {
+        error = "sequence " + std::to_string(event.callsite.sequence) +
+                ": captured Present call is missing " + missing_key;
+        return false;
+      }
+      if (metadata.frame_index != d3d_present_calls.size()) {
+        error = "sequence " + std::to_string(event.callsite.sequence) +
+                ": captured Present call frame_index is not contiguous";
+        return false;
+      }
+      auto &present_call = d3d_present_calls[metadata.frame_index];
+      if (present_call.has_call) {
+        error = "sequence " + std::to_string(event.callsite.sequence) +
+                ": duplicate captured Present call frame_index " + std::to_string(metadata.frame_index);
+        return false;
+      }
+      metadata.has_call = true;
+      present_call = metadata;
+    }
+
+    if (present_boundary) {
+      PresentFrameMetadata metadata;
+      std::string missing_key;
+      if (!payload_present_metadata(payload, event.callsite.sequence, metadata, missing_key)) {
+        error = "sequence " + std::to_string(event.callsite.sequence) +
+                ": Present boundary is missing " + missing_key;
+        return false;
+      }
+      if (metadata.frame_index != d3d_present_boundaries.size()) {
+        error = "sequence " + std::to_string(event.callsite.sequence) +
+                ": Present boundary frame_index is not contiguous";
+        return false;
+      }
+      const auto call_it = d3d_present_calls.find(metadata.frame_index);
+      if (call_it == d3d_present_calls.end()) {
+        error = "sequence " + std::to_string(event.callsite.sequence) +
+                ": Present boundary is missing matching IDXGISwapChain::Present call";
+        return false;
+      }
+      if (!present_parameters_match(call_it->second, metadata)) {
+        error = "sequence " + std::to_string(event.callsite.sequence) +
+                ": Present boundary does not match captured Present parameters";
+        return false;
+      }
+      auto &present_boundary_metadata = d3d_present_boundaries[metadata.frame_index];
+      if (present_boundary_metadata.has_boundary) {
+        error = "sequence " + std::to_string(event.callsite.sequence) +
+                ": duplicate Present boundary frame_index " + std::to_string(metadata.frame_index);
+        return false;
+      }
+      metadata.has_boundary = true;
+      present_boundary_metadata = metadata;
+    }
+  }
+
+  if (d3d_present_boundaries.size() != d3d_present_calls.size()) {
+    error = "D3D Present boundary count does not match captured IDXGISwapChain::Present calls";
+    return false;
+  }
+  if (d3d_present_frame_kinds.size() > 1) {
+    error = "bundle contains multiple D3D PresentFrame debug kinds";
+    return false;
+  }
+  if (!d3d_present_frame_kinds.empty()) {
+    const auto &debug_name = *d3d_present_frame_kinds.begin();
+    const auto &frames = d3d_present_frames_by_kind[debug_name];
+    if (d3d_present_calls.empty()) {
+      error = api_name_for_present_frame_debug_name(debug_name) +
+              " present frames exist without captured IDXGISwapChain::Present calls";
+      return false;
+    }
+    if (frames.size() != d3d_present_calls.size()) {
+      std::uint64_t last_frame = 0;
+      for (const auto &[frame_index, frame] : frames) {
+        (void)frame;
+        last_frame = std::max(last_frame, frame_index);
+      }
+      if (frames.size() != last_frame + 1) {
+        error = api_name_for_present_frame_debug_name(debug_name) +
+                " present frame assets are not contiguous from frame_index 0";
+        return false;
+      }
+    }
+    for (const auto &[frame_index, frame] : frames) {
+      const auto call_it = d3d_present_calls.find(frame_index);
+      if (call_it == d3d_present_calls.end()) {
+        error = "sequence " + std::to_string(frame.sequence) + ": " + debug_name +
+                " has no matching IDXGISwapChain::Present call frame_index " + std::to_string(frame_index);
+        return false;
+      }
+      const auto boundary_it = d3d_present_boundaries.find(frame_index);
+      if (boundary_it == d3d_present_boundaries.end()) {
+        error = "sequence " + std::to_string(frame.sequence) + ": " + debug_name +
+                " has no matching Present boundary frame_index " + std::to_string(frame_index);
+        return false;
+      }
+      if (!present_parameters_match(call_it->second, frame) ||
+          !present_parameters_match(boundary_it->second, frame)) {
+        error = "sequence " + std::to_string(frame.sequence) + ": " + debug_name +
+                " metadata does not match captured Present parameters for frame_index " +
+                std::to_string(frame_index);
+        return false;
+      }
+    }
+  }
+
+  std::unordered_map<std::uint64_t, PresentFrameMetadata> metal_present_events;
+  for (const auto &event : reader.metal_events()) {
+    if (event.call_kind != apitrace::trace::MetalCallKind::PresentDrawable) {
+      continue;
+    }
+    json payload;
+    if (!parse_payload(event.payload, payload, error)) {
+      error = "metal sequence " + std::to_string(event.metal_sequence) + ": " + error;
+      return false;
+    }
+    const auto metadata = present_frame_metadata_from_payload(payload, event.metal_sequence);
+    if (!metal_present_events.emplace(metadata.frame_index, metadata).second) {
+      error = "metal sequence " + std::to_string(event.metal_sequence) +
+              ": duplicate PresentDrawable frame_index " + std::to_string(metadata.frame_index);
+      return false;
+    }
+  }
+
+  for (const auto &[frame_index, frame] : metal_present_frames) {
+    const auto present_it = metal_present_events.find(frame_index);
+    if (present_it == metal_present_events.end()) {
+      error = "sequence " + std::to_string(frame.sequence) +
+              ": MetalPresentFrame has no matching PresentDrawable frame_index " +
+              std::to_string(frame_index);
+      return false;
+    }
+    if (!present_frame_metadata_matches(present_it->second, frame)) {
+      error = "sequence " + std::to_string(frame.sequence) +
+              ": MetalPresentFrame metadata does not match PresentDrawable frame_index " +
+              std::to_string(frame_index);
+      return false;
+    }
+  }
+
+  present_stats.d3d_present_calls = d3d_present_calls.size();
+  present_stats.d3d_present_boundaries = d3d_present_boundaries.size();
+  if (!d3d_present_frame_kinds.empty()) {
+    const auto &debug_name = *d3d_present_frame_kinds.begin();
+    const auto &frames = d3d_present_frames_by_kind[debug_name];
+    present_stats.d3d_present_frame_assets = frames.size();
+    for (const auto &[frame_index, frame] : frames) {
+      (void)frame;
+      if (d3d_present_calls.find(frame_index) != d3d_present_calls.end()) {
+        ++present_stats.d3d_present_calls_with_frame_assets;
+      }
+      if (d3d_present_boundaries.find(frame_index) != d3d_present_boundaries.end()) {
+        ++present_stats.d3d_present_boundaries_with_frame_assets;
+      }
+    }
+  }
+  present_stats.metal_present_drawables = metal_present_events.size();
+  present_stats.metal_present_frame_assets = metal_present_frames.size();
+  return true;
+}
+
+bool verify_bundle_references(
+    const apitrace::trace::TraceBundleReader &reader,
+    std::size_t jobs,
+    std::size_t &d3d_object_refs,
+    std::size_t &metal_object_refs,
+    std::size_t &blob_refs,
+    std::size_t &asset_path_refs,
+    PresentFrameStats &present_stats,
+    std::string &error)
+{
+  if (jobs <= 1) {
+    return verify_bundle_references_serial(
+        reader,
+        d3d_object_refs,
+        metal_object_refs,
+        blob_refs,
+        asset_path_refs,
+        present_stats,
+        error);
+  }
+
+  std::unordered_map<std::uint64_t, std::string> blob_paths;
+  for (const auto &asset : reader.assets()) {
+    if (!add_blob_path(blob_paths, asset.blob_id, asset.relative_path, "reader asset index", error)) {
+      return false;
+    }
+  }
+  for (const auto &asset : reader.metal_assets()) {
+    if (!add_blob_path(blob_paths, asset.blob_id, asset.relative_path, "reader Metal asset index", error)) {
+      return false;
+    }
+  }
+
+  std::unordered_map<std::string, const apitrace::trace::ChecksumRecord *> checksum_records;
+  checksum_records.reserve(reader.checksums().files.size());
+  for (const auto &record : reader.checksums().files) {
+    if (!path_is_safe(record.relative_path)) {
+      error = "unsafe checksum path: " + record.relative_path.generic_string();
+      return false;
+    }
+    checksum_records[record.relative_path.generic_string()] = &record;
+  }
+
+  BundleReferenceCounters counters;
+  std::unordered_map<std::string, std::uint64_t> asset_file_sizes;
+  std::unordered_set<std::string> existing_asset_paths;
+  for (const auto &asset : reader.assets()) {
+    if (!asset.relative_path.empty()) {
+      ++counters.asset_path_refs;
+      if (!verify_asset_index_record(reader, checksum_records, asset, asset_file_sizes, existing_asset_paths, error)) {
+        error = "reader asset index: " + error;
+        return false;
+      }
+    }
+  }
+  for (const auto &asset : reader.metal_assets()) {
+    if (!asset.relative_path.empty()) {
+      ++counters.asset_path_refs;
+      if (!verify_asset_index_record(reader, checksum_records, asset, asset_file_sizes, existing_asset_paths, error)) {
+        error = "reader Metal asset index: " + error;
+        return false;
+      }
+    }
+  }
+
+  const auto object_index = build_object_known_index(reader);
+  BundleReferenceCounters d3d_counters;
+  if (!validate_references_parallel(
+          reader.events().size(),
+          jobs,
+          [&](std::size_t event_index, ParallelReferenceState &state, BundleReferenceIssue &issue) {
+            return validate_d3d_event_references(
+                reader,
+                blob_paths,
+                checksum_records,
+                object_index,
+                event_index,
+                state,
+                issue);
+          },
+          d3d_counters,
+          error)) {
+    return false;
+  }
+  counters.add(d3d_counters);
+
+  BundleReferenceCounters metal_counters;
+  const auto metal_order_base = static_cast<std::uint64_t>(reader.events().size());
+  if (!validate_references_parallel(
+          reader.metal_events().size(),
+          jobs,
+          [&](std::size_t event_index, ParallelReferenceState &state, BundleReferenceIssue &issue) {
+            return validate_metal_event_references(
+                reader,
+                blob_paths,
+                checksum_records,
+                object_index,
+                metal_order_base,
+                event_index,
+                state,
+                issue);
+          },
+          metal_counters,
+          error)) {
+    return false;
+  }
+  counters.add(metal_counters);
+
+  if (!verify_present_sequences(reader, present_stats, error)) {
+    return false;
+  }
+
+  d3d_object_refs = counters.d3d_object_refs;
+  metal_object_refs = counters.metal_object_refs;
+  blob_refs = counters.blob_refs;
+  asset_path_refs = counters.asset_path_refs;
+  return true;
+}
+
 bool verify_sequences(
     const apitrace::trace::TraceBundleReader &reader,
     std::string &error)
@@ -2905,6 +3741,60 @@ bool verify_sequences(
   return true;
 }
 
+struct FrameStreamExtents {
+  std::uint64_t max_d3d_present_frame = 0;
+  std::uint64_t max_metal_present_frame = 0;
+  bool has_d3d_present = false;
+  bool has_metal_present = false;
+};
+
+FrameStreamExtents collect_frame_stream_extents(const apitrace::trace::TraceBundleReader &reader)
+{
+  FrameStreamExtents extents;
+  for (const auto &event : reader.events()) {
+    if (event.kind != apitrace::trace::EventKind::Call ||
+        present_frame_debug_name_for_present_call(event.callsite.function_name).empty()) {
+      continue;
+    }
+    json payload;
+    std::string error;
+    if (!parse_payload(event.payload, payload, error) || !payload.contains("frame_index")) {
+      continue;
+    }
+    extents.has_d3d_present = true;
+    extents.max_d3d_present_frame = std::max(
+        extents.max_d3d_present_frame,
+        payload.value("frame_index", 0ull));
+  }
+  for (const auto &event : reader.metal_events()) {
+    if (event.call_kind != apitrace::trace::MetalCallKind::PresentDrawable) {
+      continue;
+    }
+    json payload;
+    std::string error;
+    if (!parse_payload(event.payload, payload, error) || !payload.contains("frame_index")) {
+      continue;
+    }
+    extents.has_metal_present = true;
+    extents.max_metal_present_frame = std::max(
+        extents.max_metal_present_frame,
+        payload.value("frame_index", 0ull));
+  }
+  return extents;
+}
+
+bool frame_id_exceeds_stream_extent(
+    std::uint64_t frame_id,
+    std::uint64_t max_frame,
+    bool has_present)
+{
+  constexpr std::uint64_t kInFlightFrameSlack = 1;
+  if (!has_present || frame_id <= max_frame) {
+    return false;
+  }
+  return frame_id - max_frame > kInFlightFrameSlack;
+}
+
 bool verify_translation_links(
     const apitrace::trace::TraceBundleReader &reader,
     TranslationLinkStats &stats,
@@ -2936,6 +3826,8 @@ bool verify_translation_links(
     }
   }
 
+  const auto frame_extents = collect_frame_stream_extents(reader);
+
   std::ifstream input(link_path);
   if (!input.is_open()) {
     error = "failed to open translation link stream";
@@ -2962,6 +3854,31 @@ bool verify_translation_links(
     const auto metal_sequence_begin = record.value("metal_sequence_begin", 0ull);
     const auto metal_sequence_end = record.value("metal_sequence_end", 0ull);
     const auto scope_kind = record.value("scope_kind", std::string());
+    const auto frame_id = record.value("frame_id", 0ull);
+    stats.has_frame_id = stats.has_frame_id || record.contains("frame_id");
+    stats.max_frame_id = std::max(stats.max_frame_id, frame_id);
+    if (frame_id_exceeds_stream_extent(
+            frame_id,
+            frame_extents.max_d3d_present_frame,
+            frame_extents.has_d3d_present)) {
+      std::ostringstream message;
+      message << "translation-links.jsonl reaches frame_id " << frame_id
+              << " but callstream.jsonl only reaches D3D Present frame_index "
+              << frame_extents.max_d3d_present_frame;
+      error = message.str();
+      return false;
+    }
+    if (frame_id_exceeds_stream_extent(
+            frame_id,
+            frame_extents.max_metal_present_frame,
+            frame_extents.has_metal_present)) {
+      std::ostringstream message;
+      message << "translation-links.jsonl reaches frame_id " << frame_id
+              << " but metal-callstream.jsonl only reaches PresentDrawable frame_index "
+              << frame_extents.max_metal_present_frame;
+      error = message.str();
+      return false;
+    }
     const bool d3d_sequence_known = d3d_sequence != 0 && d3d_sequences.find(d3d_sequence) != d3d_sequences.end();
     if (d3d_sequence == 0) {
       std::ostringstream message;
@@ -4363,6 +5280,20 @@ int apitrace::tools::run_bundle_check(int argc, char **argv)
       options.verify_hashes = true;
       continue;
     }
+    if (arg == "--jobs") {
+      if (index + 1 >= argc) {
+        print_usage(argc > 0 ? argv[0] : nullptr);
+        return 2;
+      }
+      try {
+        const auto jobs = std::stoull(argv[++index]);
+        options.jobs = static_cast<std::size_t>(std::max<std::uint64_t>(1, jobs));
+      } catch (...) {
+        print_usage(argc > 0 ? argv[0] : nullptr);
+        return 2;
+      }
+      continue;
+    }
     if (arg.empty() || arg[0] == '-' || !bundle.empty()) {
       print_usage(argc > 0 ? argv[0] : nullptr);
       return 2;
@@ -4382,56 +5313,30 @@ int apitrace::tools::run_bundle_check(int argc, char **argv)
   }
 
   apitrace::trace::TraceBundleReader reader;
-  if (!reader.open(bundle)) {
+  apitrace::trace::TraceBundleReader::OpenOptions reader_options;
+  reader_options.validate_checksum_contents = false;
+  reader_options.discover_referenced_assets = false;
+  if (!reader.open(bundle, reader_options)) {
     std::cerr << "bundle-check failed: " << reader.last_error() << "\n";
     return 1;
   }
 
+  bool checksum_contents_validated = false;
   // --verify-hashes: exhaustive integrity scan for network-transit / corruption damage. Re-hash
   // EVERY checksums entry (ignoring the open-time validation skip) and report ALL bad files rather
   // than bailing on the first, so a damaged bundle's full extent is visible in one run.
   if (options.verify_hashes) {
-    std::size_t checked = 0;
-    std::size_t bad = 0;
-    for (const auto &record : reader.checksums().files) {
-      ++checked;
-      const auto relative = record.relative_path.generic_string();
-      if (record.algorithm != "sha256") {
-        std::cerr << "verify-hashes: unsupported algorithm for " << relative << "\n";
-        ++bad;
-        continue;
-      }
-      const auto absolute = reader.layout().root_path / record.relative_path;
-      std::error_code size_error;
-      if (!std::filesystem::is_regular_file(absolute, size_error) || size_error) {
-        std::cerr << "verify-hashes: MISSING " << relative << "\n";
-        ++bad;
-        continue;
-      }
-      const auto actual_size = static_cast<std::uint64_t>(std::filesystem::file_size(absolute, size_error));
-      if (size_error) {
-        std::cerr << "verify-hashes: unreadable " << relative << "\n";
-        ++bad;
-        continue;
-      }
-      if (record.has_byte_size && actual_size < record.byte_size) {
-        std::cerr << "verify-hashes: TRUNCATED " << relative
-                  << " (have " << actual_size << " bytes, expected " << record.byte_size << ")\n";
-        ++bad;
-        continue;
-      }
-      const auto use_prefix = record.has_byte_size && actual_size > record.byte_size;
-      const auto digest = use_prefix
-                              ? apitrace::trace::content_hash_file_prefix(absolute, record.byte_size)
-                              : apitrace::trace::content_hash_file(absolute);
-      if (digest != record.digest) {
-        std::cerr << "verify-hashes: CORRUPT " << relative
-                  << " (hash mismatch)\n";
-        ++bad;
-        continue;
-      }
-    }
+    const auto hash_result = validate_checksum_records_parallel(
+        reader.layout(),
+        reader.checksums().files,
+        {},
+        options.jobs,
+        true);
     const auto expected_bundle_hash = bundle_hash_from_records(reader.checksums().files);
+    auto bad = hash_result.issues.size();
+    for (const auto &issue : hash_result.issues) {
+      std::cerr << "verify-hashes: " << issue.message << " " << issue.relative << "\n";
+    }
     if (!reader.checksums().bundle_hash.empty() &&
         reader.checksums().bundle_hash != expected_bundle_hash) {
       std::cerr << "verify-hashes: bundle_hash mismatch"
@@ -4439,46 +5344,12 @@ int apitrace::tools::run_bundle_check(int argc, char **argv)
                 << " got " << reader.checksums().bundle_hash << "\n";
       ++bad;
     }
-    std::cout << "bundle-check verify-hashes: checked=" << checked << " bad=" << bad << "\n";
+    std::cout << "bundle-check verify-hashes: checked=" << hash_result.checked
+              << " bad=" << bad << "\n";
     if (bad != 0) {
       return 1;
     }
-  }
-
-  for (const auto &record : reader.checksums().files) {
-    if (record.algorithm != "sha256") {
-      std::cerr << "bundle-check failed: unsupported checksum algorithm for "
-                << record.relative_path.generic_string() << "\n";
-      return 1;
-    }
-    if (reader.validated_checksum_paths().find(record.relative_path.generic_string()) !=
-        reader.validated_checksum_paths().end()) {
-      continue;
-    }
-    const auto absolute = reader.layout().root_path / record.relative_path;
-    if (!std::filesystem::is_regular_file(absolute)) {
-      std::cerr << "bundle-check failed: missing checksum file "
-                << record.relative_path.generic_string() << "\n";
-      return 1;
-    }
-    const auto actual_size = std::filesystem::file_size(absolute);
-    const auto use_prefix = record.has_byte_size && actual_size > record.byte_size;
-    const auto digest = use_prefix
-                            ? apitrace::trace::content_hash_file_prefix(absolute, record.byte_size)
-                            : apitrace::trace::content_hash_file(absolute);
-    if (digest != record.digest) {
-      std::cerr << "bundle-check failed: checksum mismatch for "
-                << record.relative_path.generic_string() << "\n";
-      return 1;
-    }
-  }
-  const auto expected_bundle_hash = bundle_hash_from_records(reader.checksums().files);
-  if (!reader.checksums().bundle_hash.empty() &&
-      reader.checksums().bundle_hash != expected_bundle_hash) {
-    std::cerr << "bundle-check failed: bundle_hash mismatch"
-              << " expected " << expected_bundle_hash
-              << " got " << reader.checksums().bundle_hash << "\n";
-    return 1;
+    checksum_contents_validated = true;
   }
 
   std::size_t d3d_object_refs = 0;
@@ -4494,6 +5365,7 @@ int apitrace::tools::run_bundle_check(int argc, char **argv)
   }
   if (!verify_bundle_references(
           reader,
+          options.jobs,
           d3d_object_refs,
           metal_object_refs,
           blob_refs,
@@ -4531,6 +5403,29 @@ int apitrace::tools::run_bundle_check(int argc, char **argv)
     }
   }
 
+  if (!checksum_contents_validated) {
+    const auto hash_result = validate_checksum_records_parallel(
+        reader.layout(),
+        reader.checksums().files,
+        {},
+        options.jobs,
+        false);
+    if (!hash_result.issues.empty()) {
+      const auto &issue = hash_result.issues.front();
+      std::cerr << "bundle-check failed: " << issue.message
+                << " for " << issue.relative << "\n";
+      return 1;
+    }
+    const auto expected_bundle_hash = bundle_hash_from_records(reader.checksums().files);
+    if (!reader.checksums().bundle_hash.empty() &&
+        reader.checksums().bundle_hash != expected_bundle_hash) {
+      std::cerr << "bundle-check failed: bundle_hash mismatch"
+                << " expected " << expected_bundle_hash
+                << " got " << reader.checksums().bundle_hash << "\n";
+      return 1;
+    }
+  }
+
   std::cout << "bundle-check PASS\n";
   std::cout << "events=" << reader.events().size() << "\n";
   std::cout << "metal_events=" << reader.metal_events().size() << "\n";
@@ -4543,6 +5438,9 @@ int apitrace::tools::run_bundle_check(int argc, char **argv)
   std::cout << "blob_refs=" << blob_refs << "\n";
   std::cout << "asset_path_refs=" << asset_path_refs << "\n";
   std::cout << "translation_links=" << translation_stats.total << "\n";
+  if (translation_stats.has_frame_id) {
+    std::cout << "translation_max_frame_id=" << translation_stats.max_frame_id << "\n";
+  }
   std::cout << "translation_draw_scope_links=" << translation_stats.draw_scope_links << "\n";
   std::cout << "translation_draw_scope_links_with_metal_work="
             << translation_stats.draw_scope_links_with_metal_work << "\n";

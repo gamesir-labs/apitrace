@@ -81,6 +81,10 @@ public:
     // skipping the multi-GB callstream parse. The caller must re-open with this true if it then
     // needs events() (e.g. model load failed and it must fall back to reconstruction).
     bool parse_callstream_events = true;
+    // When true, open() discovers extra readable asset records from event payload paths and
+    // validates blob_refs against assets.json while parsing the streams. Tools that perform their
+    // own full reference validation can disable this to avoid a duplicate serial stream pass.
+    bool discover_referenced_assets = true;
     std::uint64_t stop_after_sequence = 0;
     std::uint64_t stop_after_present_frame = 0;
   };

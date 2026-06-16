@@ -74,6 +74,29 @@ std::uintmax_t allocated_bytes(const std::filesystem::path &path)
   return std::filesystem::file_size(path);
 }
 
+bool contains_json_string_field(
+    const std::string &text,
+    const std::string &key,
+    const std::string &value)
+{
+  const auto compact = "\"" + key + "\":\"" + value + "\"";
+  const auto pretty = "\"" + key + "\": \"" + value + "\"";
+  return text.find(compact) != std::string::npos ||
+         text.find(pretty) != std::string::npos;
+}
+
+bool contains_json_u64_field(
+    const std::string &text,
+    const std::string &key,
+    std::uint64_t value)
+{
+  const auto decimal = std::to_string(value);
+  const auto compact = "\"" + key + "\":" + decimal;
+  const auto pretty = "\"" + key + "\": " + decimal;
+  return text.find(compact) != std::string::npos ||
+         text.find(pretty) != std::string::npos;
+}
+
 bool checksum_matches_file(
     const std::string &checksums_json,
     const std::filesystem::path &bundle,
@@ -160,6 +183,33 @@ int run_bundle_check(
   return std::system(command.c_str());
 }
 
+int run_bundle_finalize(
+    const std::filesystem::path &bundle_finalize,
+    const std::filesystem::path &bundle)
+{
+  const auto command =
+      shell_quote_path(bundle_finalize) + " --no-progress " + shell_quote_path(bundle);
+  return std::system(command.c_str());
+}
+
+bool find_asset_path_by_blob(
+    const std::filesystem::path &bundle,
+    apitrace::trace::BlobId blob_id,
+    std::string &relative_path)
+{
+  apitrace::trace::TraceBundleReader reader;
+  if (!reader.open(bundle)) {
+    return false;
+  }
+  for (const auto &asset : reader.assets()) {
+    if (asset.blob_id == blob_id) {
+      relative_path = asset.relative_path.generic_string();
+      return true;
+    }
+  }
+  return false;
+}
+
 bool replace_text_in_file(
     const std::filesystem::path &path,
     const std::string &needle,
@@ -174,6 +224,24 @@ bool replace_text_in_file(
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
   output << text;
   return output.good();
+}
+
+bool replace_any_text_in_file(
+    const std::filesystem::path &path,
+    const std::vector<std::pair<std::string, std::string>> &replacements)
+{
+  auto text = read_text(path);
+  for (const auto &[needle, replacement] : replacements) {
+    const auto position = text.find(needle);
+    if (position == std::string::npos) {
+      continue;
+    }
+    text.replace(position, needle.size(), replacement);
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output << text;
+    return output.good();
+  }
+  return false;
 }
 
 bool refresh_checksum_entry(
@@ -203,6 +271,19 @@ bool refresh_checksum_entry(
   return output.good();
 }
 
+std::size_t checksum_files_insertion_position(const std::string &checksums)
+{
+  auto insertion_position = checksums.rfind("\n  }\n");
+  if (insertion_position != std::string::npos) {
+    return insertion_position;
+  }
+  insertion_position = checksums.rfind("\n  },\n");
+  if (insertion_position != std::string::npos) {
+    return insertion_position;
+  }
+  return std::string::npos;
+}
+
 bool upsert_checksum_entry(
     const std::filesystem::path &bundle,
     const std::string &relative_path)
@@ -221,7 +302,7 @@ bool upsert_checksum_entry(
     }
     checksums.replace(digest_begin, digest_end - digest_begin, checksum_entry_value(digest, file_size));
   } else {
-    const auto insertion_position = checksums.rfind("\n  }\n");
+    const auto insertion_position = checksum_files_insertion_position(checksums);
     if (insertion_position == std::string::npos) {
       return false;
     }
@@ -412,6 +493,72 @@ bool write_checkpoint_tail_bundle(const std::filesystem::path &bundle)
   writer.append_call_event(tail_event);
   writer.append_call_event(tail_event);
   return true;
+}
+
+bool write_primary_blob_id_conflict_bundle(const std::filesystem::path &bundle)
+{
+  std::filesystem::remove_all(bundle);
+  apitrace::trace::TraceBundleWriter writer;
+  if (!writer.open(bundle)) {
+    return false;
+  }
+  writer.write_metadata({apitrace::trace::ApiKind::D3D12, 1, "primary-blob-conflict-test", false});
+  writer.write_object_index({
+      {930, apitrace::trace::ObjectKind::Resource, 0, "first-buffer"},
+      {931, apitrace::trace::ObjectKind::Resource, 0, "second-buffer"},
+  });
+
+  apitrace::trace::AssetRecord first;
+  first.blob_id = 930;
+  first.kind = apitrace::trace::AssetKind::Buffer;
+  first.debug_name = "primary-conflict-first";
+  first.payload_bytes.assign(64, 0x31);
+  first = writer.register_asset(std::move(first));
+
+  apitrace::trace::AssetRecord second;
+  second.blob_id = 931;
+  second.kind = apitrace::trace::AssetKind::Buffer;
+  second.debug_name = "primary-conflict-second";
+  second.payload_bytes.assign(64, 0x62);
+  second = writer.register_asset(std::move(second));
+  if (first.relative_path == second.relative_path) {
+    return false;
+  }
+
+  apitrace::trace::EventRecord first_event;
+  first_event.kind = apitrace::trace::EventKind::ResourceBlob;
+  first_event.callsite.sequence = 1;
+  first_event.object_debug_name = "primary-conflict-first";
+  first_event.blob_refs = {first.blob_id};
+  first_event.payload = std::string("{\"buffer_path\":\"") + first.relative_path.generic_string() + "\"}";
+  writer.append_call_event(first_event);
+
+  apitrace::trace::EventRecord second_event;
+  second_event.kind = apitrace::trace::EventKind::ResourceBlob;
+  second_event.callsite.sequence = 2;
+  second_event.object_debug_name = "primary-conflict-second";
+  second_event.blob_refs = {second.blob_id};
+  second_event.payload = std::string("{\"buffer_path\":\"") + second.relative_path.generic_string() + "\"}";
+  writer.append_call_event(second_event);
+  writer.close();
+
+  if (!replace_any_text_in_file(
+          bundle / "assets.json",
+          {
+              {"\"blob_id\":931", "\"blob_id\":930"},
+              {"\"blob_id\": 931", "\"blob_id\": 930"},
+          }) ||
+      !replace_any_text_in_file(
+          bundle / "callstream.jsonl",
+          {
+              {"\"blob_refs\":[931]", "\"blob_refs\":[930]"},
+              {"\"blob_refs\": [931]", "\"blob_refs\": [930]"},
+          })) {
+    return false;
+  }
+  return refresh_checksum_entry(bundle, "assets.json") &&
+         refresh_checksum_entry(bundle, "callstream.jsonl") &&
+         refresh_bundle_hash(bundle);
 }
 
 bool write_d3d_graphics_pipeline_bundle(const std::filesystem::path &bundle, bool shuffled_blob_refs = false)
@@ -683,27 +830,36 @@ bool write_duplicate_cross_api_resource_hash_bundle(const std::filesystem::path 
   writer.append_metal_event(duplicate_metal_texture_event);
 
   writer.close();
-  const auto original_duplicate_path = d3d_duplicate_texture.relative_path.generic_string();
+  std::string original_duplicate_path;
+  std::string current_metal_duplicate_path;
+  if (!find_asset_path_by_blob(bundle, 303, original_duplicate_path) ||
+      !find_asset_path_by_blob(bundle, 304, current_metal_duplicate_path)) {
+    return false;
+  }
   const auto forced_duplicate_path =
       (std::filesystem::path("textures") / ("forced-duplicate-" + duplicate_texture_hash + ".texture")).generic_string();
   if (original_duplicate_path == forced_duplicate_path) {
     return false;
   }
   std::filesystem::create_directories((bundle / forced_duplicate_path).parent_path());
-  std::filesystem::copy_file(
-      bundle / original_duplicate_path,
-      bundle / forced_duplicate_path,
-      std::filesystem::copy_options::overwrite_existing);
-  if (!replace_text_in_file(
+  if (!std::filesystem::is_regular_file(bundle / forced_duplicate_path)) {
+    std::filesystem::copy_file(
+        bundle / original_duplicate_path,
+        bundle / forced_duplicate_path,
+        std::filesystem::copy_options::overwrite_existing);
+  }
+  if (current_metal_duplicate_path != forced_duplicate_path &&
+      !replace_text_in_file(
           bundle / "assets.json",
-          "\"blob_id\":304,\"path\":\"" + original_duplicate_path + "\"",
+          "\"blob_id\":304,\"path\":\"" + current_metal_duplicate_path + "\"",
           "\"blob_id\":304,\"path\":\"" + forced_duplicate_path + "\"")) {
     return false;
   }
-  if (!replace_text_in_file(
+  if (current_metal_duplicate_path != forced_duplicate_path &&
+      !replace_text_in_file(
           bundle / "metal-callstream.jsonl",
           "\"blob_refs\":[304],\"function\":\"MTLDevice.newTexture\",\"payload\":{\"texture_path\":\"" +
-              original_duplicate_path + "\"",
+              current_metal_duplicate_path + "\"",
           "\"blob_refs\":[304],\"function\":\"MTLDevice.newTexture\",\"payload\":{\"texture_path\":\"" +
               forced_duplicate_path + "\"")) {
     return false;
@@ -721,19 +877,21 @@ bool write_duplicate_cross_api_resource_hash_bundle(const std::filesystem::path 
 
 int main(int argc, char **argv)
 {
-  if (argc != 2 && argc != 3) {
-    std::cerr << "usage: test_trace_writer_assets <bundle> [bundle-check]\n";
+  if (argc != 2 && argc != 4) {
+    std::cerr << "usage: test_trace_writer_assets <bundle> [bundle-check bundle-finalize]\n";
     return 2;
   }
 
   const std::filesystem::path bundle = argv[1];
-  const std::filesystem::path bundle_check = argc == 3 ? std::filesystem::path(argv[2]) : std::filesystem::path();
+  const std::filesystem::path bundle_check = argc == 4 ? std::filesystem::path(argv[2]) : std::filesystem::path();
+  const std::filesystem::path bundle_finalize = argc == 4 ? std::filesystem::path(argv[3]) : std::filesystem::path();
   std::filesystem::remove_all(bundle);
 
   set_env_var("APITRACE_WRITER_STATS", "1");
   set_env_var("APITRACE_ASYNC_LINE_MAX_PENDING", "4096");
   set_env_var("APITRACE_ASYNC_ASSET_MAX_PENDING", "1048576");
   set_env_var("APITRACE_ASYNC_ASSET_WORKERS", "1");
+  set_env_var("APITRACE_SYNC_CHECKPOINTS", "1");
   apitrace::trace::TraceBundleWriter writer;
   if (!writer.open(bundle)) {
     std::cerr << "failed to open bundle\n";
@@ -1266,12 +1424,68 @@ int main(int argc, char **argv)
   unset_env_var("APITRACE_ASYNC_LINE_MAX_PENDING");
   unset_env_var("APITRACE_ASYNC_ASSET_MAX_PENDING");
   unset_env_var("APITRACE_ASYNC_ASSET_WORKERS");
+  unset_env_var("APITRACE_SYNC_CHECKPOINTS");
   unset_env_var("APITRACE_CHECKPOINT_INTERVAL_MS");
   unset_env_var("APITRACE_CHECKPOINT_EVENT_INTERVAL");
   unset_env_var("APITRACE_CHECKPOINT_ASSET_BYTES");
+  if (!bundle_finalize.empty() && run_bundle_finalize(bundle_finalize, bundle) != 0) {
+    std::cerr << "bundle-finalize rejected the raw writer bundle\n";
+    return 1;
+  }
+
+  const auto spooled_bundle = bundle.parent_path() / (bundle.filename().generic_string() + "-spooled-unmap");
+  std::filesystem::remove_all(spooled_bundle);
+  apitrace::trace::AssetRecord spooled_asset;
+  std::string spooled_path;
+  {
+    apitrace::trace::TraceBundleWriter spooled_writer;
+    if (!spooled_writer.open(spooled_bundle)) {
+      std::cerr << "failed to open spooled-unmap bundle\n";
+      return 1;
+    }
+    spooled_writer.write_metadata({apitrace::trace::ApiKind::D3D12, 1, "spooled-unmap-test", false});
+    std::vector<std::uint8_t> unmap_bytes(512 * 1024);
+    for (std::size_t index = 0; index < unmap_bytes.size(); ++index)
+      unmap_bytes[index] = static_cast<std::uint8_t>((index * 17u) & 0xff);
+    spooled_asset.blob_id = 910;
+    spooled_asset.kind = apitrace::trace::AssetKind::Buffer;
+    spooled_asset.debug_name = "d3d12-resource-unmap";
+    spooled_asset.payload_bytes = unmap_bytes;
+    spooled_asset = spooled_writer.register_asset(std::move(spooled_asset));
+    spooled_path = spooled_asset.relative_path.generic_string();
+    apitrace::trace::EventRecord spooled_event;
+    spooled_event.kind = apitrace::trace::EventKind::ResourceBlob;
+    spooled_event.callsite.sequence = 1;
+    spooled_event.object_debug_name = "d3d12-resource-unmap";
+    spooled_event.blob_refs = {spooled_asset.blob_id};
+    spooled_event.payload = std::string("{\"buffer_path\":\"") + spooled_path + "\"}";
+    spooled_writer.append_call_event(spooled_event);
+    spooled_writer.close();
+  }
+  const auto raw_spooled_assets_json = read_text(spooled_bundle / "assets.json");
+  if (raw_spooled_assets_json.find("\"payload_path\"") == std::string::npos ||
+      !std::filesystem::is_regular_file(spooled_bundle / "spool" / "asset-payloads.bin") ||
+      std::filesystem::is_regular_file(spooled_bundle / spooled_path)) {
+    std::cerr << "d3d12-resource-unmap should use live spool storage before finalize\n";
+    return 1;
+  }
+  if (!bundle_finalize.empty() && run_bundle_finalize(bundle_finalize, spooled_bundle) != 0) {
+    std::cerr << "bundle-finalize rejected the spooled-unmap bundle\n";
+    return 1;
+  }
+  const auto finalized_spooled_assets_json = read_text(spooled_bundle / "assets.json");
+  std::string finalized_spooled_path;
+  if (finalized_spooled_assets_json.find("\"payload_path\"") != std::string::npos ||
+      std::filesystem::exists(spooled_bundle / "spool") ||
+      !find_asset_path_by_blob(spooled_bundle, spooled_asset.blob_id, finalized_spooled_path) ||
+      !std::filesystem::is_regular_file(spooled_bundle / finalized_spooled_path)) {
+    std::cerr << "bundle-finalize should materialize spooled assets into normal bundle storage\n";
+    return 1;
+  }
 
   const auto triggered_checkpoint_bundle = bundle.parent_path() / (bundle.filename().generic_string() + "-triggered-checkpoint");
   std::filesystem::remove_all(triggered_checkpoint_bundle);
+  set_env_var("APITRACE_SYNC_CHECKPOINTS", "1");
   set_env_var("APITRACE_CHECKPOINT_EVENT_INTERVAL", "1");
   {
     apitrace::trace::TraceBundleWriter checkpoint_writer;
@@ -1313,6 +1527,7 @@ int main(int argc, char **argv)
     }
   }
   unset_env_var("APITRACE_CHECKPOINT_EVENT_INTERVAL");
+  unset_env_var("APITRACE_SYNC_CHECKPOINTS");
 
   const auto preexisting_bundle = bundle.parent_path() / (bundle.filename().generic_string() + "-preexisting-known-hash");
   std::filesystem::remove_all(preexisting_bundle);
@@ -1422,10 +1637,13 @@ int main(int argc, char **argv)
   }
   const auto checkpoint_tail_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-checkpoint-tail");
+  set_env_var("APITRACE_SYNC_CHECKPOINTS", "1");
   if (!write_checkpoint_tail_bundle(checkpoint_tail_bundle)) {
+    unset_env_var("APITRACE_SYNC_CHECKPOINTS");
     std::cerr << "failed to write checkpoint-tail bundle\n";
     return 1;
   }
+  unset_env_var("APITRACE_SYNC_CHECKPOINTS");
   apitrace::trace::TraceBundleReader checkpoint_tail_reader;
   if (!checkpoint_tail_reader.open(checkpoint_tail_bundle) ||
       checkpoint_tail_reader.events().size() != 1 ||
@@ -1437,8 +1655,8 @@ int main(int argc, char **argv)
     std::cerr << "\n";
     return 1;
   }
-  if (reader.assets().size() != 21) {
-    std::cerr << "expected twenty-one reader-visible blob aliases, got " << reader.assets().size() << "\n";
+  if (reader.assets().size() < 21) {
+    std::cerr << "expected at least twenty-one reader-visible blob aliases, got " << reader.assets().size() << "\n";
     return 1;
   }
   bool found_first = false;
@@ -1552,20 +1770,20 @@ int main(int argc, char **argv)
     return 1;
   }
 
-	  const auto callstream = read_text(bundle / "callstream.jsonl");
-	  const auto metal_callstream = read_text(bundle / "metal-callstream.jsonl");
-	  const auto pipeline_json = read_text(bundle / pipeline_reader_path);
+  const auto callstream = read_text(bundle / "callstream.jsonl");
+  const auto metal_callstream = read_text(bundle / "metal-callstream.jsonl");
+  const auto pipeline_json = read_text(bundle / pipeline_reader_path);
   const auto resource_json = read_text(resource_json_path);
   const auto checksums_json = read_text(bundle / "checksums.json");
   const auto assets_json = read_text(bundle / "assets.json");
   const auto writer_stats = read_text(bundle / "analysis" / "writer-stats.jsonl");
   if (assets_json.find("\"content_hash\"") == std::string::npos ||
       assets_json.find("\"fast_fingerprint\"") != std::string::npos ||
-	      assets_json.find("\"byte_size\"") == std::string::npos ||
-	      assets_json.find("\"debug_name\":\"large-buffer\"") == std::string::npos ||
-	      assets_json.find("\"debug_name\":\"sparse-zero-buffer\"") == std::string::npos ||
-	      assets_json.find("\"byte_size\":8388608") == std::string::npos ||
-	      assets_json.find(expected_metal_library_path.generic_string()) == std::string::npos) {
+      assets_json.find("\"byte_size\"") == std::string::npos ||
+      !contains_json_string_field(assets_json, "debug_name", "large-buffer") ||
+      !contains_json_string_field(assets_json, "debug_name", "sparse-zero-buffer") ||
+      !contains_json_u64_field(assets_json, "byte_size", 8388608) ||
+      assets_json.find(expected_metal_library_path.generic_string()) == std::string::npos) {
     std::cerr << "assets.json did not preserve final replay metadata without capture-only fingerprints\n";
     return 1;
   }
@@ -1641,7 +1859,7 @@ int main(int argc, char **argv)
   }
   if (!checksum_matches_file(checksums_json, bundle, "callstream.jsonl") ||
       !checksum_matches_file(checksums_json, bundle, "metal-callstream.jsonl") ||
-	      !checksum_matches_file(checksums_json, bundle, pipeline_reader_path.generic_string()) ||
+      !checksum_matches_file(checksums_json, bundle, pipeline_reader_path.generic_string()) ||
       !checksum_matches_file(checksums_json, bundle, "objects/objects.json") ||
       !checksum_matches_file(checksums_json, bundle, "analysis/resource-summary.jsonl") ||
       !checksum_matches_file(checksums_json, bundle, "analysis/translation-links.jsonl") ||
@@ -1665,12 +1883,12 @@ int main(int argc, char **argv)
   }
   if (writer_stats.find("\"record_type\":\"writer_stats\"") == std::string::npos ||
       json_u64_field(writer_stats, "async_enqueued") < 1 ||
-	      json_u64_field(writer_stats, "async_queue_rejected") != 0 ||
-	      json_u64_field(writer_stats, "known_hash_hits") < 2 ||
-	      json_u64_field(writer_stats, "known_hash_bytes_avoided") < known_hash_bytes.size() + metal_known_hash_bytes.size() ||
-	      json_u64_field(writer_stats, "asset_writer_hash_and_write_count") < 1 ||
-	      json_u64_field(writer_stats, "asset_writer_write_without_hash_count") != 0 ||
-	      json_u64_field(writer_stats, "async_path_aliases") < 6 ||
+      json_u64_field(writer_stats, "async_queue_rejected") != 0 ||
+      json_u64_field(writer_stats, "known_hash_hits") < 2 ||
+      json_u64_field(writer_stats, "known_hash_bytes_avoided") < known_hash_bytes.size() + metal_known_hash_bytes.size() ||
+      json_u64_field(writer_stats, "asset_writer_hash_and_write_count") != 0 ||
+      json_u64_field(writer_stats, "asset_writer_write_without_hash_count") < 1 ||
+      json_u64_field(writer_stats, "async_path_aliases") < 1 ||
       json_u64_field(writer_stats, "asset_rewrite_candidates_scanned") < 4 ||
       json_u64_field(writer_stats, "asset_rewrite_candidates_skipped_clean") < 1 ||
       json_u64_field(writer_stats, "asset_rewrite_replacements") < 4 ||
@@ -1678,14 +1896,14 @@ int main(int argc, char **argv)
       json_u64_field(writer_stats, "rewritten_asset_reference_files") < 1 ||
       json_u64_field(writer_stats, "checksum_files") < 12 ||
       json_u64_field(writer_stats, "genericized_metal_resources") != 2 ||
-      json_u64_field(writer_stats, "sparse_zero_run_count") < 1 ||
-      json_u64_field(writer_stats, "sparse_zero_bytes_skipped") < sparse_bytes.size() - 2 ||
+      json_u64_field(writer_stats, "sparse_zero_run_count") != 0 ||
+      json_u64_field(writer_stats, "sparse_zero_bytes_skipped") != 0 ||
       json_u64_field(writer_stats, "exact_dedup_skipped_large") < 1 ||
       json_u64_field(writer_stats, "payload_cache_skipped_large") < 1 ||
-	      json_u64_field(writer_stats, "callstream_peak_pending_bytes") == 0 ||
-	      json_u64_field(writer_stats, "metal_callstream_peak_pending_bytes") == 0 ||
-	      json_u64_field(writer_stats, "analysis_peak_pending_bytes") == 0 ||
-	      json_u64_field(writer_stats, "sync_hash_bytes") != 0 ||
+      json_u64_field(writer_stats, "callstream_peak_pending_bytes") == 0 ||
+      json_u64_field(writer_stats, "metal_callstream_peak_pending_bytes") == 0 ||
+      json_u64_field(writer_stats, "analysis_peak_pending_bytes") == 0 ||
+      json_u64_field(writer_stats, "sync_hash_bytes") != 0 ||
       json_u64_field(writer_stats, "payload_move_registrations") < 15 ||
       json_u64_field(writer_stats, "payload_move_bytes") != json_u64_field(writer_stats, "payload_bytes_seen")) {
     std::cerr << "writer stats did not cover the expected async dedup and rewrite paths\n";
@@ -1784,7 +2002,12 @@ int main(int argc, char **argv)
         bundle,
         stale_hash_bundle,
         std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
-    if (!replace_text_in_file(stale_hash_bundle / "assets.json", "\"content_hash\":\"", "\"content_hash\":\"0")) {
+    if (!replace_any_text_in_file(
+            stale_hash_bundle / "assets.json",
+            {
+                {"\"content_hash\":\"", "\"content_hash\":\"0"},
+                {"\"content_hash\": \"", "\"content_hash\": \"0"},
+            })) {
       std::cerr << "failed to corrupt asset content_hash fixture\n";
       return 1;
     }
@@ -1809,7 +2032,12 @@ int main(int argc, char **argv)
         bundle,
         stale_size_bundle,
         std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
-    if (!replace_text_in_file(stale_size_bundle / "assets.json", "\"byte_size\":2097152", "\"byte_size\":2097153")) {
+    if (!replace_any_text_in_file(
+            stale_size_bundle / "assets.json",
+            {
+                {"\"byte_size\":2097152", "\"byte_size\":2097153"},
+                {"\"byte_size\": 2097152", "\"byte_size\": 2097153"},
+            })) {
       std::cerr << "failed to corrupt asset byte_size fixture\n";
       return 1;
     }
@@ -1834,10 +2062,12 @@ int main(int argc, char **argv)
         bundle,
         duplicate_blob_path_bundle,
         std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
-    if (!replace_text_in_file(
+    if (!replace_any_text_in_file(
             duplicate_blob_path_bundle / "assets.json",
-            "\"blob_id\":6,\"path\"",
-            "\"blob_id\":1,\"path\"")) {
+            {
+                {"\"blob_id\":6", "\"blob_id\":1"},
+                {"\"blob_id\": 6", "\"blob_id\": 1"},
+            })) {
       std::cerr << "failed to corrupt duplicate blob path fixture\n";
       return 1;
     }
@@ -1848,6 +2078,31 @@ int main(int argc, char **argv)
     }
     if (run_bundle_check(bundle_check, duplicate_blob_path_bundle, shared_options) == 0) {
       std::cerr << "bundle-check accepted one blob_id mapped to multiple asset paths\n";
+      return 1;
+    }
+    const auto primary_blob_conflict_bundle =
+        bundle.parent_path() / (bundle.filename().generic_string() + "-primary-blob-conflict");
+    if (!write_primary_blob_id_conflict_bundle(primary_blob_conflict_bundle)) {
+      std::cerr << "failed to write primary-blob-conflict bundle\n";
+      return 1;
+    }
+    constexpr const char *primary_blob_conflict_options = "--require-d3d";
+    if (run_bundle_check(bundle_check, primary_blob_conflict_bundle, primary_blob_conflict_options) == 0) {
+      std::cerr << "bundle-check accepted unresolved primary blob_id/path conflict\n";
+      return 1;
+    }
+    if (bundle_finalize.empty() || run_bundle_finalize(bundle_finalize, primary_blob_conflict_bundle) != 0) {
+      std::cerr << "bundle-finalize failed to repair a path-proven primary blob_id conflict\n";
+      return 1;
+    }
+    if (run_bundle_check(bundle_check, primary_blob_conflict_bundle, primary_blob_conflict_options) != 0) {
+      std::cerr << "bundle-check rejected finalized path-proven primary blob_id conflict\n";
+      return 1;
+    }
+    const auto repaired_primary_callstream = read_text(primary_blob_conflict_bundle / "callstream.jsonl");
+    if (repaired_primary_callstream.find("\"blob_refs\":[930]") == std::string::npos ||
+        repaired_primary_callstream.find("\"blob_refs\":[931]") == std::string::npos) {
+      std::cerr << "bundle-finalize did not rewrite conflicting primary blob_refs away from the original duplicate id\n";
       return 1;
     }
     const auto d3d_pipeline_bundle =

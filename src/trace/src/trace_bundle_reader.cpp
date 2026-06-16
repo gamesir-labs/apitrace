@@ -1034,6 +1034,8 @@ bool parse_asset_index(
     asset.content_hash = entry.value("content_hash", std::string());
     asset.fast_fingerprint = entry.value("fast_fingerprint", std::string());
     asset.byte_size = entry.value("byte_size", 0ull);
+    asset.payload_path = entry.value("payload_path", std::string());
+    asset.payload_offset = entry.value("payload_offset", 0ull);
     asset.binary_payload = entry.value("binary_payload", true);
     if (asset.blob_id == 0 || asset.relative_path.empty()) {
       error = file_label(asset_index_path) + ": asset entry missing blob_id or path";
@@ -1049,7 +1051,8 @@ bool parse_asset_index(
       return false;
     }
     if (entry.value("metal", false)) {
-      metal_assets.push_back(std::move(asset));
+      metal_assets.push_back(asset);
+      assets.push_back(std::move(asset));
     } else {
       assets.push_back(std::move(asset));
     }
@@ -1589,9 +1592,11 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
     return true;
   };
   auto register_referenced_assets = [&](const std::vector<BlobId> &blob_refs) -> bool {
-    if (!impl_->has_asset_index || indexed_blob_paths.empty()) {
-      impl_->last_error = "trace bundle is missing the required asset blob index";
-      return false;
+    if (blob_refs.empty()) {
+      return true;
+    }
+    if (!impl_->has_asset_index) {
+      return true;
     }
     for (const auto blob_id : blob_refs) {
       const auto indexed_path = indexed_blob_paths.find(blob_id);
@@ -1608,13 +1613,39 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
     }
     return true;
   };
+  auto register_payload_asset_paths_from_json = [&](const json &payload) -> bool {
+    std::vector<std::string> paths;
+    collect_asset_paths(payload, paths);
+    for (const auto &path : paths) {
+      const std::filesystem::path relative_path(path);
+      MetalAssetKind metal_kind = MetalAssetKind::Library;
+      const bool metal =
+          detail::is_metal_asset_path(relative_path, &metal_kind);
+      if (!register_asset_path(relative_path, 0, metal)) {
+        return false;
+      }
+    }
+    return true;
+  };
+  auto register_payload_asset_paths = [&](std::string_view payload) -> bool {
+    if (payload.empty() ||
+        (payload.find("_path") == std::string_view::npos &&
+         payload.find("\"path\"") == std::string_view::npos)) {
+      return true;
+    }
+    const auto parsed = json::parse(payload, nullptr, false);
+    if (parsed.is_discarded()) {
+      return true;
+    }
+    return register_payload_asset_paths_from_json(parsed);
+  };
 
-  if (options.load_metal_sideband && has_metal_callstream_file) {
+  if (options.discover_referenced_assets && options.load_metal_sideband && has_metal_callstream_file) {
     std::ifstream metal_input(impl_->layout.metal_callstream_path);
     std::string metal_line;
     std::uint64_t consumed_metal_callstream_bytes = 0;
     while (std::getline(metal_input, metal_line)) {
-      const auto line_bytes = static_cast<std::uint64_t>(metal_line.size() + 1);
+      const auto line_bytes = static_cast<std::uint64_t>(metal_line.size() + (metal_input.eof() ? 0 : 1));
       if (consumed_metal_callstream_bytes + line_bytes > metal_callstream_byte_limit) {
         break;
       }
@@ -1633,6 +1664,10 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
       if (!register_referenced_assets(blob_refs)) {
         return false;
       }
+      if (const auto payload = record.find("payload"); payload != record.end() &&
+          !register_payload_asset_paths_from_json(*payload)) {
+        return false;
+      }
     }
   }
 
@@ -1642,7 +1677,7 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
   std::uint64_t consumed_callstream_bytes = 0;
   std::uint64_t pending_stop_present_frame = std::numeric_limits<std::uint64_t>::max();
   while (std::getline(callstream_input, line)) {
-    const auto line_bytes = static_cast<std::uint64_t>(line.size() + 1);
+    const auto line_bytes = static_cast<std::uint64_t>(line.size() + (callstream_input.eof() ? 0 : 1));
     if (consumed_callstream_bytes + line_bytes > callstream_byte_limit) {
       break;
     }
@@ -1699,7 +1734,10 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
           payload_frame_index(event.payload, std::numeric_limits<std::uint64_t>::max()) ==
               pending_stop_present_frame) {
         impl_->events.push_back(event);
-        if (!register_referenced_assets(event.blob_refs)) {
+        if (options.discover_referenced_assets && !register_referenced_assets(event.blob_refs)) {
+          return false;
+        }
+        if (options.discover_referenced_assets && !register_payload_asset_paths(event.payload)) {
           return false;
         }
         break;
@@ -1709,7 +1747,10 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
 
     impl_->events.push_back(event);
 
-    if (!register_referenced_assets(event.blob_refs)) {
+    if (options.discover_referenced_assets && !register_referenced_assets(event.blob_refs)) {
+      return false;
+    }
+    if (options.discover_referenced_assets && !register_payload_asset_paths(event.payload)) {
       return false;
     }
 
