@@ -911,6 +911,7 @@ private:
   // to the version live at its own sequence, not the latest. The native replayer uses this to build
   // per-version native resources and resolve by sequence. See bugs.md BUG-20260614-004.
   std::vector<ResourceSemanticState> resource_versions_;
+  std::unordered_map<trace::ObjectId, std::size_t> live_resource_version_indices_;
   // Index over resource_versions_ keyed by object_id, each value sorted ascending by create_sequence.
   // Built once (after reconstruction or model load) so GPU-virtual-address resolution can find the
   // version live at a command's sequence in O(log versions-per-id) instead of scanning the whole
@@ -925,6 +926,11 @@ private:
   // covering address A must start within [A - max_width, A].
   std::vector<std::pair<std::uint64_t, const ResourceSemanticState *>> resource_versions_by_va_;
   std::uint64_t max_resource_va_width_ = 0;
+  void register_resource_version(ResourceSemanticState resource);
+  bool append_resource_data_update(
+      trace::ObjectId resource_object_id,
+      ResourceDataUpdate update,
+      std::string &error);
   void build_resource_version_index();
   std::unordered_map<trace::ObjectId, PipelineSemanticState> pipelines_;
   std::unordered_map<trace::ObjectId, RootSignatureSemanticState> root_signatures_;

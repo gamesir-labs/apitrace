@@ -1408,9 +1408,59 @@ private:
         });
 
     resource_update_timeline_.clear();
+    struct ResourceUpdateKey {
+      trace::ObjectId resource_object_id = 0;
+      std::uint64_t sequence = 0;
+      std::uint32_t subresource = 0;
+      std::uint64_t written_begin = 0;
+      std::uint64_t written_end = 0;
+      std::string relative_path;
+
+      bool operator==(const ResourceUpdateKey &other) const noexcept
+      {
+        return resource_object_id == other.resource_object_id &&
+               sequence == other.sequence &&
+               subresource == other.subresource &&
+               written_begin == other.written_begin &&
+               written_end == other.written_end &&
+               relative_path == other.relative_path;
+      }
+    };
+    struct ResourceUpdateKeyHash {
+      std::size_t operator()(const ResourceUpdateKey &key) const noexcept
+      {
+        std::size_t hash = std::hash<trace::ObjectId>{}(key.resource_object_id);
+        hash ^= std::hash<std::uint64_t>{}(key.sequence) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<std::uint32_t>{}(key.subresource) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<std::uint64_t>{}(key.written_begin) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<std::uint64_t>{}(key.written_end) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<std::string>{}(key.relative_path) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+        return hash;
+      }
+    };
+    std::unordered_set<ResourceUpdateKey, ResourceUpdateKeyHash> resource_update_keys;
+    const auto add_resource_update = [&](trace::ObjectId resource_object_id,
+                                         const D3D12ReplayBackend::ResourceDataUpdate &update) {
+      ResourceUpdateKey key;
+      key.resource_object_id = resource_object_id;
+      key.sequence = update.sequence;
+      key.subresource = update.subresource;
+      key.written_begin = update.written_begin;
+      key.written_end = update.written_end;
+      key.relative_path = update.relative_path.generic_string();
+      if (!resource_update_keys.insert(std::move(key)).second) {
+        return;
+      }
+      resource_update_timeline_.push_back(ResourceDataUpdateRef{update.sequence, resource_object_id, &update});
+    };
+    for (const auto &resource : backend_.resource_versions_) {
+      for (const auto &update : resource.data_updates) {
+        add_resource_update(resource.resource_object_id, update);
+      }
+    }
     for (const auto &[resource_object_id, resource] : backend_.resources_) {
       for (const auto &update : resource.data_updates) {
-        resource_update_timeline_.push_back(ResourceDataUpdateRef{update.sequence, resource_object_id, &update});
+        add_resource_update(resource_object_id, update);
       }
     }
     std::stable_sort(

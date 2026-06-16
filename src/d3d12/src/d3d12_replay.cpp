@@ -1330,6 +1330,164 @@ bool d3d12_native_replay_enabled()
   return env_enabled("APITRACE_D3D12_NATIVE_REPLAY", true);
 }
 
+struct DxgiFormatFootprintLayout {
+  std::uint32_t block_width = 1;
+  std::uint32_t block_height = 1;
+  std::uint32_t bytes_per_block = 0;
+};
+
+DxgiFormatFootprintLayout dxgi_format_footprint_layout(std::uint32_t format)
+{
+  // Numeric DXGI_FORMAT values keep this helper usable in non-Windows builds.
+  switch (format) {
+  case 1:  // R32G32B32A32
+  case 2:
+  case 3:
+  case 4:
+    return {1, 1, 16};
+  case 5:  // R32G32B32
+  case 6:
+  case 7:
+  case 8:
+    return {1, 1, 12};
+  case 9:  // 64-bit four/two-channel and packed depth-stencil formats
+  case 10:
+  case 11:
+  case 12:
+  case 13:
+  case 14:
+  case 15:
+  case 16:
+  case 17:
+  case 18:
+  case 19:
+  case 20:
+  case 21:
+  case 22:
+  case 102:  // Y416
+    return {1, 1, 8};
+  case 23:  // 32-bit color/depth formats
+  case 24:
+  case 25:
+  case 26:
+  case 27:
+  case 28:
+  case 29:
+  case 30:
+  case 31:
+  case 32:
+  case 33:
+  case 34:
+  case 35:
+  case 36:
+  case 37:
+  case 38:
+  case 39:
+  case 40:
+  case 41:
+  case 42:
+  case 43:
+  case 44:
+  case 45:
+  case 46:
+  case 47:
+  case 67:
+  case 89:
+  case 100:  // AYUV
+  case 101:  // Y410
+    return {1, 1, 4};
+  case 48:  // 16-bit two/single-channel formats
+  case 49:
+  case 50:
+  case 51:
+  case 52:
+  case 53:
+  case 54:
+  case 55:
+  case 56:
+  case 57:
+  case 58:
+  case 59:
+  case 85:
+  case 86:
+    return {1, 1, 2};
+  case 60:  // 8-bit single-channel formats
+  case 61:
+  case 62:
+  case 63:
+  case 64:
+  case 65:
+    return {1, 1, 1};
+  case 66:  // R1_UNORM
+    return {8, 1, 1};
+  case 68:  // R8G8_B8G8/G8R8_G8B8 packed pairs
+  case 69:
+    return {2, 1, 4};
+  case 70:  // BC1
+  case 71:
+  case 72:
+  case 79:  // BC4
+  case 80:
+  case 81:
+    return {4, 4, 8};
+  case 73:  // BC2
+  case 74:
+  case 75:
+  case 76:  // BC3
+  case 77:
+  case 78:
+  case 82:  // BC5
+  case 83:
+  case 84:
+  case 94:  // BC6H
+  case 95:
+  case 96:
+  case 97:  // BC7
+  case 98:
+  case 99:
+    return {4, 4, 16};
+  case 87:  // B8G8R8A8/B8G8R8X8 families
+  case 88:
+  case 90:
+  case 91:
+  case 92:
+  case 93:
+    return {1, 1, 4};
+  default:
+    return {};
+  }
+}
+
+std::uint64_t placed_footprint_active_bytes(
+    std::uint32_t format,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t depth,
+    std::uint32_t row_pitch)
+{
+  if (width == 0 || height == 0 || depth == 0 || row_pitch == 0) {
+    return 0;
+  }
+
+  const auto layout = dxgi_format_footprint_layout(format);
+  const std::uint64_t rows = layout.bytes_per_block == 0
+                                 ? static_cast<std::uint64_t>(height)
+                                 : (static_cast<std::uint64_t>(height) + layout.block_height - 1) /
+                                       layout.block_height;
+  if (layout.bytes_per_block == 0) {
+    return static_cast<std::uint64_t>(row_pitch) * rows * depth;
+  }
+
+  const std::uint64_t blocks_per_row =
+      (static_cast<std::uint64_t>(width) + layout.block_width - 1) / layout.block_width;
+  const std::uint64_t row_size = blocks_per_row * layout.bytes_per_block;
+  if (row_size > row_pitch) {
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  const std::uint64_t total_rows = rows * static_cast<std::uint64_t>(depth);
+  return total_rows == 0 ? 0 : static_cast<std::uint64_t>(row_pitch) * (total_rows - 1) + row_size;
+}
+
 bool d3d12_retrace_present_frame_capture_enabled()
 {
   return env_enabled("APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES", false);

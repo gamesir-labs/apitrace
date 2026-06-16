@@ -135,8 +135,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
 	      resource.flags = payload_u32(resource_desc, "flags");
 	      if (resource.width == 0 && resource.height == 0 && resource.depth_or_array_size == 0 &&
 	          resource.mip_levels == 0 && resource.sample_count == 0) {
-	        resource_versions_.push_back(resource);
-    resources_[resource.resource_object_id] = std::move(resource);
+	        register_resource_version(std::move(resource));
 	        ++commands_replayed_;
 	        return true;
 	      }
@@ -145,8 +144,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
 	        last_error_ = record_prefix(event) + ": resource_desc has invalid dimensions or sample count";
 	        return false;
 	      }
-	      resource_versions_.push_back(resource);
-    resources_[resource.resource_object_id] = std::move(resource);
+		      register_resource_version(std::move(resource));
 	    }
 	    ++commands_replayed_;
 	    return true;
@@ -157,6 +155,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       objects_.forget(event.object_id);
       command_lists_.erase(event.object_id);
       resources_.erase(event.object_id);
+      live_resource_version_indices_.erase(event.object_id);
       command_signatures_.erase(event.object_id);
       command_queues_.erase(event.object_id);
       command_allocators_.erase(event.object_id);
@@ -1120,8 +1119,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         resource.optimized_clear_stencil = payload_u32(*optimized_clear_value, "stencil");
       }
     }
-    resource_versions_.push_back(resource);
-    resources_[resource.resource_object_id] = std::move(resource);
+    register_resource_version(std::move(resource));
     ++semantic_calls_seen_;
   } else if (function_name == "ID3D12Device::CreateReservedResource") {
     if (!require_payload_key(event, payload, "resource_desc", last_error_) ||
@@ -1214,8 +1212,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         resource.optimized_clear_stencil = payload_u32(*optimized_clear_value, "stencil");
       }
     }
-    resource_versions_.push_back(resource);
-    resources_[resource.resource_object_id] = std::move(resource);
+    register_resource_version(std::move(resource));
     ++semantic_calls_seen_;
   } else if (function_name == "ID3D12Device::CreateHeap" ||
              function_name == "ID3D12Device::OpenExistingHeap" ||
@@ -1344,8 +1341,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         resource.optimized_clear_stencil = payload_u32(*optimized_clear_value, "stencil");
       }
     }
-    resource_versions_.push_back(resource);
-    resources_[resource.resource_object_id] = std::move(resource);
+    register_resource_version(std::move(resource));
     ++semantic_calls_seen_;
 
   } else if (function_name == "ID3D12Device::CreateConstantBufferView" ||
@@ -3355,7 +3351,10 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       update.relative_path = buffer_path;
       update.blob_refs = event.blob_refs;
       update.bytes = std::move(bytes);
-      resource_it->second.data_updates.push_back(std::move(update));
+      if (!append_resource_data_update(event.object_refs.front(), std::move(update), last_error_)) {
+        last_error_ = record_prefix(event) + ": " + last_error_;
+        return false;
+      }
     }
     resource_it->second.mapped = false;
     resource_it->second.map_sequence = 0;
@@ -3410,7 +3409,10 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     update.relative_path = buffer_path;
     update.blob_refs = event.blob_refs;
     update.bytes = std::move(bytes);
-    resource_it->second.data_updates.push_back(std::move(update));
+    if (!append_resource_data_update(dst_buffer_object_id, std::move(update), last_error_)) {
+      last_error_ = record_prefix(event) + ": " + last_error_;
+      return false;
+    }
     ++semantic_calls_seen_;
   } else if (function_name == "ID3D12CommandQueue::ExecuteCommandLists") {
     if (!event.object_refs.empty()) {

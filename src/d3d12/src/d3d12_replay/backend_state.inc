@@ -135,6 +135,36 @@ void D3D12ReplayBackend::build_resource_version_index()
             });
 }
 
+void D3D12ReplayBackend::register_resource_version(ResourceSemanticState resource)
+{
+  const auto resource_object_id = resource.resource_object_id;
+  resource_versions_.push_back(std::move(resource));
+  live_resource_version_indices_[resource_object_id] = resource_versions_.size() - 1;
+  resources_[resource_object_id] = resource_versions_.back();
+}
+
+bool D3D12ReplayBackend::append_resource_data_update(
+    trace::ObjectId resource_object_id,
+    ResourceDataUpdate update,
+    std::string &error)
+{
+  const auto index_it = live_resource_version_indices_.find(resource_object_id);
+  if (index_it != live_resource_version_indices_.end() &&
+      index_it->second < resource_versions_.size()) {
+    auto &version = resource_versions_[index_it->second];
+    version.data_updates.push_back(std::move(update));
+    return true;
+  }
+
+  auto resource_it = resources_.find(resource_object_id);
+  if (resource_it == resources_.end()) {
+    error = "resource data update references an unknown replay resource";
+    return false;
+  }
+  resource_it->second.data_updates.push_back(std::move(update));
+  return true;
+}
+
 bool D3D12ReplayBackend::resolve_gpu_virtual_address_at(
     std::uint64_t gpu_virtual_address,
     std::uint64_t sequence,
@@ -432,6 +462,11 @@ bool D3D12ReplayBackend::initialize(const trace::TraceBundleReader &reader)
   heaps_.clear();
   query_heaps_.clear();
   resources_.clear();
+  resource_versions_.clear();
+  live_resource_version_indices_.clear();
+  resource_versions_by_id_.clear();
+  resource_versions_by_va_.clear();
+  max_resource_va_width_ = 0;
   replay_commands_.clear();
   tile_mapping_updates_.clear();
   blob_paths_.clear();
@@ -1662,22 +1697,12 @@ bool D3D12ReplayBackend::validate_native_replay_readiness()
         return nullptr;
       }
     } else if (location.type == 1) {
-      // Block-compressed formats (BC1-BC7) store one 4x4 texel block per
-      // compressed unit, so a placed footprint occupies ceil(height/4) block
-      // rows rather than one row per texel. Using the texel height here would
-      // overcount the footprint by up to 4x and falsely report the range as
-      // out of bounds against the backing buffer.
-      const auto format = location.footprint_format;
-      const bool block_compressed =
-          (format >= 70 && format <= 84) || (format >= 94 && format <= 99);
-      const std::uint64_t footprint_rows =
-          block_compressed
-              ? (static_cast<std::uint64_t>(location.footprint_height) + 3) / 4
-              : static_cast<std::uint64_t>(location.footprint_height);
-      const auto footprint_bytes =
-          static_cast<std::uint64_t>(location.footprint_row_pitch) *
-          footprint_rows *
-          static_cast<std::uint64_t>(location.footprint_depth);
+      const auto footprint_bytes = placed_footprint_active_bytes(
+          location.footprint_format,
+          location.footprint_width,
+          location.footprint_height,
+          location.footprint_depth,
+          location.footprint_row_pitch);
       if (location.footprint_offset > resource.width ||
           footprint_bytes > resource.width - location.footprint_offset) {
         std::ostringstream message;
