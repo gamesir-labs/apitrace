@@ -50,7 +50,6 @@ constexpr const char *kPipelinesDirectoryName = "pipelines";
 constexpr const char *kSidebandAssetShardFileName = "sideband-assets.json";
 constexpr const char *kAssetSpoolDirectoryName = "spool";
 constexpr const char *kAssetSpoolFileName = "asset-payloads.bin";
-constexpr const char *kAssetJournalStreamName = "asset-journal";
 
 std::uint64_t monotonic_nanoseconds()
 {
@@ -1261,30 +1260,6 @@ std::string asset_index_json(
   }
   output << "  ]\n"
          << "}\n";
-  return output.str();
-}
-
-std::string asset_journal_record_json(const AssetRecord &asset, bool metal)
-{
-  std::ostringstream output;
-  output << "{\"record_type\":\"asset\""
-         << ",\"blob_id\":" << asset.blob_id
-         << ",\"path\":\"" << json_escape(asset.relative_path.generic_string()) << "\""
-         << ",\"kind\":\"" << asset_kind_name(asset.kind) << "\""
-         << ",\"metal\":" << (metal ? "true" : "false")
-         << ",\"binary_payload\":" << (asset.binary_payload ? "true" : "false")
-         << ",\"byte_size\":" << asset.byte_size;
-  if (!asset.debug_name.empty())
-    output << ",\"debug_name\":\"" << json_escape(asset.debug_name) << "\"";
-  if (!asset.content_hash.empty())
-    output << ",\"content_hash\":\"" << json_escape(asset.content_hash) << "\"";
-  if (!asset.fast_fingerprint.empty())
-    output << ",\"fast_fingerprint\":\"" << json_escape(asset.fast_fingerprint) << "\"";
-  if (!asset.payload_path.empty()) {
-    output << ",\"payload_path\":\"" << json_escape(asset.payload_path.generic_string()) << "\""
-           << ",\"payload_offset\":" << asset.payload_offset;
-  }
-  output << "}";
   return output.str();
 }
 
@@ -4535,27 +4510,16 @@ struct TraceBundleWriter::Impl {
 	    return asset;
 	  }
 
-  void append_asset_journal_record(const AssetRecord &asset, bool metal)
-  {
-    if (asset.blob_id == 0 || asset.relative_path.empty() || !open) {
-      return;
-    }
-    append_analysis_line_locked(kAssetJournalStreamName,
-                                asset_journal_record_json(asset, metal));
-  }
-
-		  void publish_queued_asset_for_async_write(AssetRecord asset, bool metal)
-			  {
-			    const auto byte_size = asset.byte_size;
-          AssetRecord published;
-          if (metal) {
-            published = publish_metal_asset(std::move(asset));
-          } else {
-            published = publish_asset(std::move(asset));
-          }
-          append_asset_journal_record(published, metal);
-			    signal_checkpoint_work(0, byte_size);
-				  }
+			  void publish_queued_asset_for_async_write(AssetRecord asset, bool metal)
+				  {
+				    const auto byte_size = asset.byte_size;
+				    if (metal) {
+				      publish_metal_asset(std::move(asset));
+				    } else {
+				      publish_asset(std::move(asset));
+				    }
+				    signal_checkpoint_work(0, byte_size);
+					  }
 
 	  void enqueue_asset_completion(AsyncAssetWriter::Completion completion)
 	  {
