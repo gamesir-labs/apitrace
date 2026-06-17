@@ -729,8 +729,7 @@ void collect_asset_references_from_json(
 
 bool is_canonical_jsonl_asset_path_value(const std::string &path)
 {
-  return path.rfind("buffers/asset-", 0) == 0 ||
-         path.rfind("shaders/asset-", 0) == 0 ||
+  return path.rfind("shaders/asset-", 0) == 0 ||
          path.rfind("pipelines/asset-", 0) == 0 ||
          path.rfind("metal/libraries/asset-", 0) == 0 ||
          path.rfind("metal/pipelines/asset-", 0) == 0;
@@ -2880,7 +2879,9 @@ bool asset_payload_materialized(const AssetEntry &asset)
 
 struct CallstreamPrefixResult {
   bool truncated = false;
+  bool failed = false;
   std::uint64_t kept_frame_count = 0;
+  std::string error;
 };
 
 std::uint64_t json_u64_or_max(const json &node, const char *key)
@@ -2981,6 +2982,60 @@ bool extract_payload(const json &record, json &payload)
   }
   payload = *payload_it;
   return true;
+}
+
+bool line_may_contain_present_progress_marker(const std::string &line)
+{
+  if (line.find("\"frame_index\"") == std::string::npos) {
+    return false;
+  }
+  return line.find("\"boundary\":\"Present\"") != std::string::npos ||
+         line.find("\"boundary\": \"Present\"") != std::string::npos ||
+         line.find("D3D11PresentFrame") != std::string::npos ||
+         line.find("D3D12PresentFrame") != std::string::npos ||
+         line.find("IDXGISwapChain::Present") != std::string::npos ||
+         line.find("IDXGISwapChain1::Present") != std::string::npos;
+}
+
+std::optional<std::uint64_t> frame_index_from_line(const std::string &line)
+{
+  const auto key = line.find("\"frame_index\"");
+  if (key == std::string::npos) {
+    return std::nullopt;
+  }
+  const auto colon = line.find(':', key + 13);
+  if (colon == std::string::npos) {
+    return std::nullopt;
+  }
+  std::size_t value = colon + 1;
+  while (value < line.size() && line[value] == ' ') {
+    ++value;
+  }
+  if (value >= line.size() || line[value] < '0' || line[value] > '9') {
+    return std::nullopt;
+  }
+  std::uint64_t frame_index = 0;
+  while (value < line.size() && line[value] >= '0' && line[value] <= '9') {
+    frame_index = (frame_index * 10) + static_cast<std::uint64_t>(line[value] - '0');
+    ++value;
+  }
+  return frame_index;
+}
+
+bool remaining_callstream_has_later_frame_progress(
+    std::istream &input,
+    std::uint64_t kept_frame_count)
+{
+  std::string line;
+  while (std::getline(input, line)) {
+    const auto frame_index = frame_index_from_line(line);
+    if (frame_index &&
+        *frame_index > kept_frame_count &&
+        line_may_contain_present_progress_marker(line)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 CallstreamPrefixResult truncate_callstream_to_complete_prefix(
@@ -3117,6 +3172,25 @@ CallstreamPrefixResult truncate_callstream_to_complete_prefix(
     return result;
   }
 
+  const auto kept_frame =
+      last_complete_offset != 0 ? last_complete_frame :
+      last_present_boundary_offset != 0 ? last_present_boundary_frame :
+      std::numeric_limits<std::uint64_t>::max();
+  result.kept_frame_count = kept_frame == std::numeric_limits<std::uint64_t>::max() ? 0 : kept_frame + 1;
+
+  if (remaining_callstream_has_later_frame_progress(input, result.kept_frame_count)) {
+    result.failed = true;
+    result.error = "callstream has non-tail inconsistency";
+    if (!inconsistent_reason.empty()) {
+      result.error += ": " + inconsistent_reason;
+    }
+    if (inconsistent_sequence != 0) {
+      result.error += " at sequence " + std::to_string(inconsistent_sequence);
+    }
+    result.error += "; later frames still exist, so this is not a tail truncation";
+    return result;
+  }
+
   const auto target_offset =
       last_complete_offset != 0 ? last_complete_offset :
       last_present_boundary_offset != 0 ? last_present_boundary_offset :
@@ -3127,11 +3201,6 @@ CallstreamPrefixResult truncate_callstream_to_complete_prefix(
     return result;
   }
   result.truncated = true;
-  const auto kept_frame =
-      last_complete_offset != 0 ? last_complete_frame :
-      last_present_boundary_offset != 0 ? last_present_boundary_frame :
-      std::numeric_limits<std::uint64_t>::max();
-  result.kept_frame_count = kept_frame == std::numeric_limits<std::uint64_t>::max() ? 0 : kept_frame + 1;
   stats.truncated_inconsistent_jsonl_bytes += static_cast<std::uint64_t>(old_size - target_offset);
   ++stats.truncated_inconsistent_jsonl_files;
   std::cerr << "warning: truncating callstream.jsonl at " << target_offset
@@ -4712,6 +4781,7 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
   std::unordered_set<std::string> rewritten_paths;
   bool rebuilt_assets_changed = false;
   CallstreamPrefixResult callstream_prefix;
+  bool finalize_failed = false;
   run_stage(options, progress, stage_index, kStageCount, "rewrite_references", [&] {
     const auto callstream = options.bundle_root / apitrace::trace::kCallstreamFileName;
     const auto metal_callstream = options.bundle_root / apitrace::trace::kMetalCallstreamFileName;
@@ -4749,6 +4819,11 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
   run_stage(options, progress, stage_index, kStageCount, "truncate_inconsistent_streams", [&] {
     callstream_prefix =
         truncate_callstream_to_complete_prefix(options.bundle_root, assets, options, stats, rewritten_digests);
+    if (callstream_prefix.failed) {
+      std::cerr << "error: " << callstream_prefix.error << "\n";
+      finalize_failed = true;
+      return;
+    }
     if (!callstream_prefix.truncated) {
       return;
     }
@@ -4766,6 +4841,9 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
         rewritten_digests);
     referenced_paths_after_rewrite.clear();
   });
+  if (finalize_failed) {
+    return 1;
+  }
   run_stage(options, progress, stage_index, kStageCount, "rebuild_semantics", [&] {
     const auto rebuilt_paths =
         rebuild_d3d12_pipeline_semantics(

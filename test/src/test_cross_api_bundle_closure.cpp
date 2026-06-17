@@ -487,7 +487,10 @@ bool write_cross_api_bundle(
       13,
       3,
       "MTLCommandBuffer.presentDrawable",
-      "{\"drawable_id\":300,\"frame_index\":0,\"width\":2,\"height\":2,\"sync_interval\":1,\"flags\":0}"));
+      "{\"drawable_handle\":300,\"present_texture_id\":300,\"frame_index\":0,"
+      "\"width\":2,\"height\":2,\"sync_interval\":1,\"flags\":0}",
+      {},
+      {300}));
   writer.append_metal_event(metal_event(
       MetalCallKind::CommandBufferCommit,
       14,

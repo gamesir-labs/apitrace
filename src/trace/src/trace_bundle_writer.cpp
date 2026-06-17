@@ -1,4 +1,5 @@
 #include "apitrace/trace_bundle_io.hpp"
+#include "apitrace/translation_link_writer.hpp"
 #include "metal_callstream_writer.hpp"
 
 #include <algorithm>
@@ -15,6 +16,8 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -65,6 +68,17 @@ std::uint64_t wall_clock_nanoseconds()
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::system_clock::now().time_since_epoch())
           .count());
+}
+
+std::size_t default_async_asset_worker_count()
+{
+  const auto cores = std::thread::hardware_concurrency();
+  return cores == 0 ? 6 : static_cast<std::size_t>(cores) + 2;
+}
+
+std::uint64_t default_spool_asset_checkpoint_bytes()
+{
+  return 2ull * 1024ull * 1024ull * 1024ull;
 }
 
 template <typename Event>
@@ -901,6 +915,37 @@ std::string normalize_payload(std::string_view payload)
   return std::string(payload);
 }
 
+std::string normalize_valid_json_payload(std::string_view payload)
+{
+  if (payload.empty()) {
+    return "{}";
+  }
+  if (payload == "{}" || payload == "[]") {
+    return std::string(payload);
+  }
+  if (!json::accept(payload)) {
+    return "{}";
+  }
+  return std::string(payload);
+}
+
+std::string translation_link_record_json(
+    const TranslationLinkRecord &record,
+    std::uint64_t metal_sequence_begin,
+    std::uint64_t metal_sequence_end)
+{
+  std::ostringstream output;
+  output << "{\"record_type\":\"" << json_escape(record.record_type)
+         << "\",\"scope_kind\":\"" << json_escape(record.scope_kind)
+         << "\",\"d3d_sequence\":" << record.d3d_sequence
+         << ",\"metal_sequence_begin\":" << metal_sequence_begin
+         << ",\"metal_sequence_end\":" << metal_sequence_end
+         << ",\"frame_id\":" << record.frame_id
+         << ",\"payload\":" << normalize_valid_json_payload(record.payload)
+         << "}";
+  return output.str();
+}
+
 void add_checksum_candidate(
     std::vector<std::filesystem::path> &relative_paths,
     std::unordered_set<std::string> &seen,
@@ -1203,14 +1248,16 @@ void append_asset_index_entries(
     if (const auto digest = known_file_digests.find(relative_path); digest != known_file_digests.end())
       content_hash = digest->second;
     auto byte_size = asset.byte_size;
-    if (const auto known_size = known_file_sizes.find(relative_path); known_size != known_file_sizes.end()) {
-      byte_size = known_size->second;
-    } else {
-      std::error_code stat_error;
-      const auto actual_size = std::filesystem::file_size(bundle_root / relative_path, stat_error);
-      if (!stat_error) {
-        byte_size = actual_size;
-        known_file_sizes.emplace(relative_path, actual_size);
+    if (asset.payload_path.empty()) {
+      if (const auto known_size = known_file_sizes.find(relative_path); known_size != known_file_sizes.end()) {
+        byte_size = known_size->second;
+      } else {
+        std::error_code stat_error;
+        const auto actual_size = std::filesystem::file_size(bundle_root / relative_path, stat_error);
+        if (!stat_error) {
+          byte_size = actual_size;
+          known_file_sizes.emplace(relative_path, actual_size);
+        }
       }
     }
     const auto key = std::to_string(asset.blob_id) + "#" + relative_path + "#" + (metal ? "metal" : "d3d");
@@ -3245,7 +3292,7 @@ private:
   std::size_t max_pending_bytes_ = kDefaultMaxPendingBytes;
   std::size_t hard_max_pending_bytes_ = default_hard_max_pending_bytes();
 	  std::size_t bulk_threshold_ = kDefaultBulkThreshold;
-	  std::size_t worker_count_ = 4;
+	  std::size_t worker_count_ = default_async_asset_worker_count();
 	  bool sparse_write_enabled_ = false;
   bool spool_write_enabled_ = false;
   std::atomic_uint64_t spool_next_offset_{0};
@@ -3981,6 +4028,8 @@ struct TraceBundleWriter::Impl {
   std::unordered_map<std::string, std::uint64_t> known_file_sizes;
   std::unordered_map<std::string, std::string> completed_path_aliases;
   std::unordered_map<std::uint64_t, std::string> reserved_blob_paths;
+  std::unordered_map<std::string, std::vector<std::size_t>> asset_record_indices_by_path;
+  std::unordered_map<std::string, std::vector<std::size_t>> metal_asset_record_indices_by_path;
 		  std::mutex asset_record_mutex;
 	  std::mutex asset_mutex;
 	  AsyncAssetWriter asset_writer;
@@ -3988,6 +4037,9 @@ struct TraceBundleWriter::Impl {
 	  std::condition_variable asset_completion_cv;
 	  std::deque<AsyncAssetWriter::Completion> asset_completion_events;
 	  std::thread asset_completion_thread;
+  std::mutex spool_checkpoint_mutex;
+  std::map<std::uint64_t, std::uint64_t> completed_spool_ranges;
+  std::uint64_t spool_checkpoint_committed_offset = 0;
 	  std::atomic_uint64_t next_asset_id{1};
   std::size_t async_asset_threshold = 1024ull * 1024ull;
   std::size_t exact_dedup_compare_threshold = 1ull * 1024ull * 1024ull;
@@ -4498,7 +4550,9 @@ struct TraceBundleWriter::Impl {
 	  {
 	    TimedWriterLock lock(asset_record_mutex, writer_stats ? &asset_record_lock_stats : nullptr);
 	    asset = reserve_blob_id_locked(std::move(asset));
+    const auto index = assets.size();
 	    assets.push_back(asset);
+    asset_record_indices_by_path[asset.relative_path.generic_string()].push_back(index);
 	    return asset;
 	  }
 
@@ -4506,20 +4560,102 @@ struct TraceBundleWriter::Impl {
   {
     TimedWriterLock lock(asset_record_mutex, writer_stats ? &asset_record_lock_stats : nullptr);
     asset = reserve_blob_id_locked(std::move(asset));
+    const auto index = metal_assets.size();
 	    metal_assets.push_back(asset);
+    metal_asset_record_indices_by_path[asset.relative_path.generic_string()].push_back(index);
 	    return asset;
 	  }
 
 			  void publish_queued_asset_for_async_write(AssetRecord asset, bool metal)
 				  {
-				    const auto byte_size = asset.byte_size;
 				    if (metal) {
 				      publish_metal_asset(std::move(asset));
 				    } else {
 				      publish_asset(std::move(asset));
 				    }
-				    signal_checkpoint_work(0, byte_size);
 					  }
+
+  void mark_spooled_payload_complete(const AssetRecord &asset)
+  {
+    if (asset.payload_path.empty() || asset.byte_size == 0)
+      return;
+
+    auto begin = asset.payload_offset;
+    auto end = begin + asset.byte_size;
+    if (end < begin)
+      return;
+
+    std::lock_guard lock(spool_checkpoint_mutex);
+    if (end <= spool_checkpoint_committed_offset)
+      return;
+
+    auto next = completed_spool_ranges.lower_bound(begin);
+    if (next != completed_spool_ranges.begin()) {
+      auto previous = std::prev(next);
+      if (previous->second >= begin) {
+        begin = std::min(begin, previous->first);
+        end = std::max(end, previous->second);
+        next = completed_spool_ranges.erase(previous);
+      }
+    }
+    while (next != completed_spool_ranges.end() && next->first <= end) {
+      end = std::max(end, next->second);
+      next = completed_spool_ranges.erase(next);
+    }
+    completed_spool_ranges[begin] = end;
+
+    auto head = completed_spool_ranges.begin();
+    while (head != completed_spool_ranges.end() &&
+           head->first <= spool_checkpoint_committed_offset) {
+      if (head->second > spool_checkpoint_committed_offset)
+        spool_checkpoint_committed_offset = head->second;
+      head = completed_spool_ranges.erase(head);
+    }
+  }
+
+  std::uint64_t completed_spool_checkpoint_offset()
+  {
+    std::lock_guard lock(spool_checkpoint_mutex);
+    return spool_checkpoint_committed_offset;
+  }
+
+  bool asset_checkpointable(
+      const AssetRecord &asset,
+      const std::unordered_map<std::string, std::uint64_t> &known_file_sizes_snapshot,
+      std::uint64_t committed_spool_offset) const
+  {
+    if (asset.blob_id == 0 || asset.relative_path.empty())
+      return false;
+
+    if (!asset.payload_path.empty()) {
+      if (asset.payload_path != asset_spool_relative_path)
+        return false;
+      return asset.payload_offset <= committed_spool_offset &&
+             asset.byte_size <= committed_spool_offset - asset.payload_offset;
+    }
+
+    const auto relative_path = asset.relative_path.generic_string();
+    if (known_file_sizes_snapshot.find(relative_path) != known_file_sizes_snapshot.end())
+      return true;
+
+    std::error_code error;
+    return std::filesystem::is_regular_file(layout.root_path / asset.relative_path, error) && !error;
+  }
+
+  void retain_checkpointable_assets(
+      std::vector<AssetRecord> &records,
+      const std::unordered_map<std::string, std::uint64_t> &known_file_sizes_snapshot,
+      std::uint64_t committed_spool_offset) const
+  {
+    records.erase(
+        std::remove_if(
+            records.begin(),
+            records.end(),
+            [&](const AssetRecord &asset) {
+              return !asset_checkpointable(asset, known_file_sizes_snapshot, committed_spool_offset);
+            }),
+        records.end());
+  }
 
 	  void enqueue_asset_completion(AsyncAssetWriter::Completion completion)
 	  {
@@ -4537,12 +4673,11 @@ struct TraceBundleWriter::Impl {
 			    if (!completion.digest.empty())
 			      finalized.content_hash = completion.digest;
 			    finalized.relative_path = completion.final_relative_path;
-          if (!completion.spooled_payload) {
+			    if (!completion.spooled_payload) {
             finalized.payload_path.clear();
             finalized.payload_offset = 0;
           }
 			    finalized.payload_bytes.clear();
-	    std::vector<std::pair<std::uint64_t, std::filesystem::path>> alias_completions;
 	    const bool can_cache_payload =
 	        completion.payload && completion.payload->size() <= exact_dedup_compare_threshold;
 	    const auto cache_payload_hash =
@@ -4648,23 +4783,9 @@ struct TraceBundleWriter::Impl {
 	        content_hash_by_fast_fingerprint[completion.fingerprint_key] = completion.digest;
 	      }
 	    }
-	    {
-	      TimedWriterLock lock(asset_record_mutex, writer_stats ? &asset_record_lock_stats : nullptr);
-	      auto &records = completion.metal ? metal_assets : assets;
-	      for (const auto &record : records) {
-	        if (record.relative_path == completion.asset.relative_path) {
-	          alias_completions.emplace_back(record.blob_id, record.relative_path);
-	        }
-	      }
-	    }
 	    update_published_asset_record(finalized, completion.metal, completion.asset.relative_path);
-	    for (const auto &[blob_id, original_path] : alias_completions) {
-	      if (blob_id == finalized.blob_id)
-	        continue;
-	      auto alias = finalized;
-	      alias.blob_id = blob_id;
-	      update_published_asset_record(alias, completion.metal, original_path);
-	    }
+    if (completion.spooled_payload)
+      mark_spooled_payload_complete(finalized);
 	    signal_checkpoint_work(0, completed_byte_size);
 	  }
 
@@ -4725,16 +4846,28 @@ struct TraceBundleWriter::Impl {
 	    const auto original_key = original_relative_path.generic_string();
 	    TimedWriterLock lock(asset_record_mutex, writer_stats ? &asset_record_lock_stats : nullptr);
 	    auto &records = metal ? metal_assets : assets;
-	    for (auto &record : records) {
-	      if (record.relative_path.generic_string() == original_key) {
+    auto &indices_by_path = metal ? metal_asset_record_indices_by_path : asset_record_indices_by_path;
+    auto update_record = [&](AssetRecord &record) {
 	        const auto published_blob_id = record.blob_id;
 	        const auto published_path = record.relative_path;
 	        record = finalized;
 	        record.blob_id = published_blob_id;
 	        record.relative_path = published_path;
 	        reserved_blob_paths[static_cast<std::uint64_t>(record.blob_id)] = record.relative_path.generic_string();
-	        return;
-	      }
+    };
+
+    if (const auto found = indices_by_path.find(original_key);
+        found != indices_by_path.end()) {
+      for (const auto index : found->second) {
+        if (index < records.size() && records[index].relative_path.generic_string() == original_key)
+          update_record(records[index]);
+      }
+      return;
+    }
+
+	    for (auto &record : records) {
+	      if (record.relative_path.generic_string() == original_key)
+        update_record(record);
 	    }
 	  }
 
@@ -4833,12 +4966,73 @@ struct TraceBundleWriter::Impl {
     std::cerr << "apitrace-writer-stats " << stats_json << "\n";
   }
 
+  void write_lightweight_asset_index_checkpoint()
+  {
+    drain_asset_completion_events();
+
+    std::vector<AssetRecord> asset_snapshot;
+    std::vector<AssetRecord> metal_asset_snapshot;
+    {
+      TimedWriterLock lock(asset_record_mutex, writer_stats ? &asset_record_lock_stats : nullptr);
+      asset_snapshot = assets;
+      metal_asset_snapshot = metal_assets;
+    }
+    if (asset_snapshot.empty() && metal_asset_snapshot.empty()) {
+      checkpoint_signal_events.store(0, std::memory_order_relaxed);
+      checkpoint_signal_asset_bytes.store(0, std::memory_order_relaxed);
+      return;
+    }
+
+    std::unordered_map<std::string, std::string> known_file_digests_snapshot;
+    std::unordered_map<std::string, std::uint64_t> known_file_sizes_snapshot;
+    {
+      TimedWriterLock lock(asset_mutex, writer_stats ? &asset_lock_stats : nullptr);
+      known_file_digests_snapshot = known_file_digests;
+      known_file_sizes_snapshot = known_file_sizes;
+    }
+    const auto committed_spool_offset = completed_spool_checkpoint_offset();
+    retain_checkpointable_assets(
+        asset_snapshot,
+        known_file_sizes_snapshot,
+        committed_spool_offset);
+    retain_checkpointable_assets(
+        metal_asset_snapshot,
+        known_file_sizes_snapshot,
+        committed_spool_offset);
+    if (asset_snapshot.empty() && metal_asset_snapshot.empty()) {
+      checkpoint_signal_events.store(0, std::memory_order_relaxed);
+      checkpoint_signal_asset_bytes.store(0, std::memory_order_relaxed);
+      return;
+    }
+
+    const std::unordered_map<std::string, std::string> async_path_aliases;
+    const auto asset_index = asset_index_json(
+        asset_snapshot,
+        metal_asset_snapshot,
+        layout.root_path,
+        async_path_aliases,
+        known_file_digests_snapshot,
+        known_file_sizes_snapshot);
+
+    if (open_mode == TraceBundleOpenMode::SidebandOnly) {
+      write_text_atomic(layout.analysis_directory_path / kSidebandAssetShardFileName, asset_index);
+    } else if (open_mode == TraceBundleOpenMode::Primary &&
+               should_write_asset_index(layout.asset_index_path, asset_snapshot, metal_asset_snapshot)) {
+      write_text_atomic(layout.asset_index_path, asset_index);
+    }
+
+    checkpoint_signal_events.store(0, std::memory_order_relaxed);
+    checkpoint_signal_asset_bytes.store(0, std::memory_order_relaxed);
+  }
+
   void checkpoint_once(bool full_scan = false)
   {
     if (!open)
       return;
-    if (!full_scan && !sync_checkpoints)
+    if (!full_scan && !sync_checkpoints) {
+      write_lightweight_asset_index_checkpoint();
       return;
+    }
     if (!full_scan &&
         open_mode == TraceBundleOpenMode::Primary &&
         std::filesystem::is_regular_file(layout.root_path / "seal-checkpoint-primary.ready")) {
@@ -5108,7 +5302,15 @@ struct TraceBundleWriter::Impl {
 
 TraceBundleWriter::TraceBundleWriter() : impl_(std::make_unique<Impl>()) {}
 
-TraceBundleWriter::~TraceBundleWriter() = default;
+TraceBundleWriter::~TraceBundleWriter()
+{
+  if (!impl_)
+    return;
+  try {
+    close();
+  } catch (...) {
+  }
+}
 
 bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBundleOpenMode mode)
 {
@@ -5137,7 +5339,8 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
 	  impl_->asset_writer.set_max_pending_bytes(env_size_or_default("APITRACE_ASYNC_ASSET_MAX_PENDING", 2ull * 1024ull * 1024ull * 1024ull));
 	  impl_->asset_writer.set_hard_max_pending_bytes(env_size_or_default("APITRACE_ASYNC_ASSET_HARD_MAX_PENDING", 8ull * 1024ull * 1024ull * 1024ull));
 	  impl_->asset_writer.set_bulk_threshold(env_size_or_default("APITRACE_ASYNC_ASSET_BULK_THRESHOLD", impl_->async_asset_threshold));
-	  impl_->asset_writer.set_worker_count(env_size_or_default("APITRACE_ASYNC_ASSET_WORKERS", 4));
+	  impl_->asset_writer.set_worker_count(
+        env_size_or_default("APITRACE_ASYNC_ASSET_WORKERS", default_async_asset_worker_count()));
 	  impl_->asset_writer.set_sparse_write_enabled(env_flag_enabled("APITRACE_ASSET_SPARSE_WRITE"));
   impl_->asset_writer.set_spool_write_enabled(impl_->asset_spool_write);
 	  if (impl_->writer_stats) {
@@ -5216,8 +5419,10 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
       env_size_or_default("APITRACE_CHECKPOINT_INTERVAL_MS", 0));
   impl_->checkpoint_event_interval =
       env_size_or_default("APITRACE_CHECKPOINT_EVENT_INTERVAL", impl_->checkpoint_event_interval);
+  const auto default_checkpoint_asset_bytes =
+      impl_->asset_spool_write ? default_spool_asset_checkpoint_bytes() : impl_->checkpoint_asset_bytes_interval;
   impl_->checkpoint_asset_bytes_interval =
-      env_size_or_default("APITRACE_CHECKPOINT_ASSET_BYTES", impl_->checkpoint_asset_bytes_interval);
+      env_size_or_default("APITRACE_CHECKPOINT_ASSET_BYTES", default_checkpoint_asset_bytes);
   if (impl_->open)
     impl_->start_checkpoint_thread();
   return impl_->open;
@@ -5298,7 +5503,8 @@ void TraceBundleWriter::append_metal_event(const MetalEventRecord &event)
   }
   {
     TimedWriterPhase phase(impl_->writer_stats ? &impl_->metal_event_phase_asset_ref_scan : nullptr);
-    if (adjusted_event.payload.find("asset-") != std::string::npos ||
+    if (!adjusted_event.blob_refs.empty() ||
+        adjusted_event.payload.find("asset-") != std::string::npos ||
         adjusted_event.function_name.find("asset-") != std::string::npos)
       impl_->metal_callstream_may_reference_asset_alias.store(true, std::memory_order_relaxed);
   }
@@ -5386,11 +5592,13 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
       impl_->asset_payload_move_bytes += payload->size();
     }
   }
-	  if (impl_->inline_finalize) {
+	  const bool foreground_fingerprint =
+	      payload->size() < impl_->foreground_asset_dedup_threshold;
+	  if (impl_->inline_finalize || foreground_fingerprint) {
 	    TimedWriterPhase phase(impl_->writer_stats ? &impl_->asset_register_phase_fingerprint : nullptr);
 	    finalized.fast_fingerprint = effective_fast_fingerprint(finalized, *payload);
 	  }
-	  const auto fingerprint_key = has_effective_fast_fingerprint(finalized, impl_->inline_finalize)
+	  const auto fingerprint_key = has_effective_fast_fingerprint(finalized, impl_->inline_finalize || foreground_fingerprint)
 	      ? asset_fingerprint_key(finalized.kind, finalized.fast_fingerprint)
 	      : std::string();
 	  const bool foreground_dedup =
@@ -5733,10 +5941,12 @@ AssetRecord TraceBundleWriter::register_metal_asset(MetalAssetKind kind, AssetRe
 	    ++impl_->asset_payload_move_registrations;
 	    impl_->asset_payload_move_bytes += payload->size();
 	  }
-	  if (impl_->inline_finalize) {
+	  const bool foreground_fingerprint =
+	      payload->size() < impl_->foreground_asset_dedup_threshold;
+	  if (impl_->inline_finalize || foreground_fingerprint) {
 	    finalized.fast_fingerprint = effective_fast_fingerprint(finalized, *payload);
 	  }
-	  const auto fingerprint_key = has_effective_fast_fingerprint(finalized, impl_->inline_finalize)
+	  const auto fingerprint_key = has_effective_fast_fingerprint(finalized, impl_->inline_finalize || foreground_fingerprint)
 	      ? metal_asset_fingerprint_key(kind, finalized.kind, finalized.fast_fingerprint)
 	      : std::string();
 	  const bool foreground_dedup =
@@ -6039,6 +6249,43 @@ void TraceBundleWriter::append_analysis_line(std::string_view stream_name, std::
   if (line.find("asset-") != std::string::npos)
     impl_->analysis_streams_may_reference_asset_alias.insert(stream_key);
   stream.write_line(line);
+}
+
+void TraceBundleWriter::append_translation_link_record(
+    std::string_view stream_name,
+    const TranslationLinkRecord &record)
+{
+  if (!impl_->open || stream_name.empty()) {
+    return;
+  }
+
+  declare_analysis_stream(stream_name);
+  const auto stream_key = std::string(stream_name);
+  auto &stream = impl_->analysis_stream_files[stream_key];
+  if (!stream.is_open()) {
+    stream.set_max_pending_bytes(impl_->async_line_max_pending_bytes);
+    if (impl_->writer_stats)
+      stream.set_lock_stats(&impl_->analysis_stream_lock_stats);
+    const auto stream_path = analysis_path_for_stream(impl_->layout, stream_key);
+    if (impl_->open_mode == TraceBundleOpenMode::Primary || !std::filesystem::is_regular_file(stream_path)) {
+      stream.open(stream_path, std::ios::trunc);
+    } else {
+      stream.open(stream_path, std::ios::app);
+    }
+  }
+
+  auto metal_sequence_begin = record.metal_sequence_begin;
+  auto metal_sequence_end = record.metal_sequence_end;
+  if (stream_key == "translation-links") {
+    if (metal_sequence_begin != 0)
+      metal_sequence_begin = impl_->lookup_metal_sequence(metal_sequence_begin);
+    if (metal_sequence_end != 0)
+      metal_sequence_end = impl_->lookup_metal_sequence(metal_sequence_end);
+  }
+  auto line = translation_link_record_json(record, metal_sequence_begin, metal_sequence_end);
+  if (line.find("asset-") != std::string::npos)
+    impl_->analysis_streams_may_reference_asset_alias.insert(stream_key);
+  stream.write_line(std::move(line));
 }
 
 void TraceBundleWriter::write_checksum_index(const ChecksumIndex &checksums)

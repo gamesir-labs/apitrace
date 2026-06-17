@@ -17,6 +17,8 @@
 
 namespace apitrace::trace {
 
+struct TranslationLinkRecord;
+
 struct AnalysisRecord {
   std::string stream_name;
   std::string record_type;
@@ -54,6 +56,7 @@ public:
   void declare_analysis_stream(std::string_view stream_name);
   void append_analysis_line(std::string_view stream_name, std::string_view json_line);
   void append_analysis_record(const AnalysisRecord &record);
+  void append_translation_link_record(std::string_view stream_name, const TranslationLinkRecord &record);
   void write_checksum_index(const ChecksumIndex &checksums);
   void flush();
   void checkpoint();

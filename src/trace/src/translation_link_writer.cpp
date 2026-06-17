@@ -1,34 +1,9 @@
 #include "apitrace/translation_link_writer.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <memory>
 #include <utility>
 
 namespace apitrace::trace {
-
-namespace {
-
-using json = nlohmann::json;
-
-std::string translation_link_record_json(const TranslationLinkRecord &record)
-{
-  json encoded = {
-      {"record_type", record.record_type},
-      {"scope_kind", record.scope_kind},
-      {"d3d_sequence", record.d3d_sequence},
-      {"metal_sequence_begin", record.metal_sequence_begin},
-      {"metal_sequence_end", record.metal_sequence_end},
-      {"frame_id", record.frame_id},
-      {"payload", record.payload.empty() ? json::object() : json::parse(record.payload, nullptr, false)},
-  };
-  if (encoded["payload"].is_discarded()) {
-    encoded["payload"] = json::object();
-  }
-  return encoded.dump();
-}
-
-} // namespace
 
 struct TranslationLinkWriter::Impl {
   TraceBundleWriter *bundle_writer = nullptr;
@@ -63,7 +38,7 @@ void TranslationLinkWriter::append_record(const TranslationLinkRecord &record)
     return;
   }
 
-  impl_->bundle_writer->append_analysis_line(impl_->options.stream_name, translation_link_record_json(record));
+  impl_->bundle_writer->append_translation_link_record(impl_->options.stream_name, record);
 
   // TODO: let callers opt into explicit flush boundaries when translated-call linking volume becomes large.
 }

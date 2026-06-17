@@ -1405,6 +1405,35 @@ void flush_diagnostic_batches()
   flush_pending_batches();
 }
 
+// Present-frame textures are the largest per-frame asset captured (full RGBA
+// backbuffer, multiple MB). Hashing them eagerly here forces the synchronous
+// content-addressed dedup path inside register_asset and runs a full SHA256 on
+// the capture (readback) thread for every presented frame -- the single most
+// expensive synchronous computation on the live capture path. Defer it instead:
+// register_asset enqueues the payload to the async asset-writer pool, which both
+// writes and hashes it off the capture thread, and bundle-finalize performs the
+// authoritative content dedup offline. Identical back-to-back frames that arrive
+// before the first async hash lands are deduplicated at finalize time, so the
+// only thing lost is a transient in-flight dedup window -- acceptable under the
+// "keep only required synchronous work on the capture thread" rule.
+// Set APITRACE_D3D12_PRESENT_FRAME_SYNC_HASH=1 to restore the old synchronous
+// behaviour (useful only for A/B comparison or debugging).
+bool present_frame_sync_hash_enabled()
+{
+  static std::atomic<bool> configured{false};
+  static std::atomic<bool> enabled{false};
+  if (!configured.load(std::memory_order_acquire)) {
+    bool parsed = false;
+    if (const char *value = std::getenv("APITRACE_D3D12_PRESENT_FRAME_SYNC_HASH")) {
+      parsed = value[0] == '1' || value[0] == 'y' || value[0] == 'Y' ||
+               value[0] == 't' || value[0] == 'T';
+    }
+    enabled.store(parsed, std::memory_order_release);
+    configured.store(true, std::memory_order_release);
+  }
+  return enabled.load(std::memory_order_acquire);
+}
+
 trace::AssetRecord register_asset_bytes(
     trace::AssetKind kind,
     const char *debug_name,
@@ -1427,7 +1456,8 @@ trace::AssetRecord register_asset_bytes(
 
   const auto *bytes = static_cast<const std::uint8_t *>(data);
   asset.payload_bytes.assign(bytes, bytes + size);
-  if (kind == trace::AssetKind::Texture && asset.debug_name == "d3d12-present-frame") {
+  if (kind == trace::AssetKind::Texture && asset.debug_name == "d3d12-present-frame" &&
+      present_frame_sync_hash_enabled()) {
     asset.content_hash = trace::content_hash_bytes(data, size);
   }
   return session->register_asset(std::move(asset));

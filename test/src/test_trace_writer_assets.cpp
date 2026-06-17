@@ -487,11 +487,83 @@ bool write_checkpoint_tail_bundle(const std::filesystem::path &bundle)
   checkpointed_event.payload = std::string("{\"buffer_path\":\"") + asset.relative_path.generic_string() + "\"}";
   writer.append_call_event(checkpointed_event);
   writer.checkpoint();
+  const auto checkpoint_checksums = read_text(bundle / "checksums.json");
 
   apitrace::trace::EventRecord tail_event = checkpointed_event;
   tail_event.callsite.sequence = 2;
   writer.append_call_event(tail_event);
   writer.append_call_event(tail_event);
+  writer.close();
+  std::ofstream checksum_output(bundle / "checksums.json", std::ios::binary | std::ios::trunc);
+  checksum_output << checkpoint_checksums;
+  checksum_output.close();
+  return true;
+}
+
+bool write_middle_missing_blob_bundle(const std::filesystem::path &bundle)
+{
+  std::filesystem::remove_all(bundle);
+  apitrace::trace::TraceBundleWriter writer;
+  if (!writer.open(bundle)) {
+    return false;
+  }
+  writer.write_metadata({apitrace::trace::ApiKind::D3D12, 1, "middle-missing-blob-test", false});
+
+  apitrace::trace::AssetRecord asset;
+  asset.blob_id = 940;
+  asset.kind = apitrace::trace::AssetKind::Buffer;
+  asset.debug_name = "valid-unmap-buffer";
+  asset.payload_bytes.assign(256, 0x44);
+  asset = writer.register_asset(std::move(asset));
+
+  apitrace::trace::EventRecord valid_unmap;
+  valid_unmap.kind = apitrace::trace::EventKind::Call;
+  valid_unmap.callsite.sequence = 1;
+  valid_unmap.callsite.function_name = "ID3D12Resource::Unmap";
+  valid_unmap.callsite.result_code = 0;
+  valid_unmap.blob_refs = {asset.blob_id};
+  valid_unmap.payload = std::string("{\"buffer_path\":\"") + asset.relative_path.generic_string() + "\"}";
+  writer.append_call_event(valid_unmap);
+
+  apitrace::trace::EventRecord missing_unmap;
+  missing_unmap.kind = apitrace::trace::EventKind::Call;
+  missing_unmap.callsite.sequence = 2;
+  missing_unmap.callsite.function_name = "ID3D12Resource::Unmap";
+  missing_unmap.callsite.result_code = 0;
+  missing_unmap.blob_refs = {941};
+  missing_unmap.payload = "{\"buffer_path\":\"buffers/asset-missing-middle.buffer\"}";
+  writer.append_call_event(missing_unmap);
+
+  apitrace::trace::EventRecord present_call;
+  present_call.kind = apitrace::trace::EventKind::Call;
+  present_call.callsite.sequence = 3;
+  present_call.callsite.function_name = "IDXGISwapChain::Present";
+  present_call.callsite.result_code = 0;
+  present_call.payload = "{\"frame_index\":0,\"sync_interval\":1,\"flags\":0}";
+  writer.append_call_event(present_call);
+
+  apitrace::trace::EventRecord present_boundary;
+  present_boundary.kind = apitrace::trace::EventKind::Boundary;
+  present_boundary.boundary = apitrace::trace::BoundaryKind::Present;
+  present_boundary.callsite.sequence = 4;
+  present_boundary.payload = "{\"frame_index\":0,\"sync_interval\":1,\"flags\":0}";
+  writer.append_call_event(present_boundary);
+
+  apitrace::trace::EventRecord next_present_call;
+  next_present_call.kind = apitrace::trace::EventKind::Call;
+  next_present_call.callsite.sequence = 5;
+  next_present_call.callsite.function_name = "IDXGISwapChain::Present";
+  next_present_call.callsite.result_code = 0;
+  next_present_call.payload = "{\"frame_index\":1,\"sync_interval\":1,\"flags\":0}";
+  writer.append_call_event(next_present_call);
+
+  apitrace::trace::EventRecord next_present_boundary;
+  next_present_boundary.kind = apitrace::trace::EventKind::Boundary;
+  next_present_boundary.boundary = apitrace::trace::BoundaryKind::Present;
+  next_present_boundary.callsite.sequence = 6;
+  next_present_boundary.payload = "{\"frame_index\":1,\"sync_interval\":1,\"flags\":0}";
+  writer.append_call_event(next_present_boundary);
+  writer.close();
   return true;
 }
 
@@ -1437,6 +1509,7 @@ int main(int argc, char **argv)
   std::filesystem::remove_all(spooled_bundle);
   apitrace::trace::AssetRecord spooled_asset;
   std::string spooled_path;
+  constexpr std::uint64_t spooled_byte_size = 512ull * 1024ull;
   {
     apitrace::trace::TraceBundleWriter spooled_writer;
     if (!spooled_writer.open(spooled_bundle)) {
@@ -1444,7 +1517,7 @@ int main(int argc, char **argv)
       return 1;
     }
     spooled_writer.write_metadata({apitrace::trace::ApiKind::D3D12, 1, "spooled-unmap-test", false});
-    std::vector<std::uint8_t> unmap_bytes(512 * 1024);
+    std::vector<std::uint8_t> unmap_bytes(spooled_byte_size);
     for (std::size_t index = 0; index < unmap_bytes.size(); ++index)
       unmap_bytes[index] = static_cast<std::uint8_t>((index * 17u) & 0xff);
     spooled_asset.blob_id = 910;
@@ -1454,9 +1527,10 @@ int main(int argc, char **argv)
     spooled_asset = spooled_writer.register_asset(std::move(spooled_asset));
     spooled_path = spooled_asset.relative_path.generic_string();
     apitrace::trace::EventRecord spooled_event;
-    spooled_event.kind = apitrace::trace::EventKind::ResourceBlob;
+    spooled_event.kind = apitrace::trace::EventKind::Call;
     spooled_event.callsite.sequence = 1;
-    spooled_event.object_debug_name = "d3d12-resource-unmap";
+    spooled_event.callsite.function_name = "ID3D12Resource::Unmap";
+    spooled_event.callsite.result_code = 0;
     spooled_event.blob_refs = {spooled_asset.blob_id};
     spooled_event.payload = std::string("{\"buffer_path\":\"") + spooled_path + "\"}";
     spooled_writer.append_call_event(spooled_event);
@@ -1464,6 +1538,7 @@ int main(int argc, char **argv)
   }
   const auto raw_spooled_assets_json = read_text(spooled_bundle / "assets.json");
   if (raw_spooled_assets_json.find("\"payload_path\"") == std::string::npos ||
+      !contains_json_u64_field(raw_spooled_assets_json, "byte_size", spooled_byte_size) ||
       !std::filesystem::is_regular_file(spooled_bundle / "spool" / "asset-payloads.bin") ||
       std::filesystem::is_regular_file(spooled_bundle / spooled_path)) {
     std::cerr << "d3d12-resource-unmap should use live spool storage before finalize\n";
@@ -1481,6 +1556,121 @@ int main(int argc, char **argv)
       !std::filesystem::is_regular_file(spooled_bundle / finalized_spooled_path)) {
     std::cerr << "bundle-finalize should materialize spooled assets into normal bundle storage\n";
     return 1;
+  }
+  const auto finalized_spooled_callstream = read_text(spooled_bundle / "callstream.jsonl");
+  if (finalized_spooled_callstream.find("ID3D12Resource::Unmap") == std::string::npos ||
+      finalized_spooled_callstream.find("\"blob_refs\":[910]") == std::string::npos ||
+      finalized_spooled_callstream.find(finalized_spooled_path) == std::string::npos) {
+    std::cerr << "bundle-finalize should preserve and rewrite spooled Unmap blob refs\n";
+    return 1;
+  }
+  if (!bundle_check.empty() && run_bundle_check(bundle_check, spooled_bundle, "--require-d3d") != 0) {
+    std::cerr << "bundle-check rejected finalized spooled Unmap payload refs\n";
+    return 1;
+  }
+
+  const auto destructor_close_bundle =
+      bundle.parent_path() / (bundle.filename().generic_string() + "-destructor-close-spool");
+  std::filesystem::remove_all(destructor_close_bundle);
+  {
+    apitrace::trace::TraceBundleWriter destructor_writer;
+    if (!destructor_writer.open(destructor_close_bundle)) {
+      std::cerr << "failed to open destructor-close-spool bundle\n";
+      return 1;
+    }
+    destructor_writer.write_metadata({apitrace::trace::ApiKind::D3D12, 1, "destructor-close-spool-test", false});
+    std::vector<std::uint8_t> destructor_bytes(96 * 1024, 0x5a);
+    apitrace::trace::AssetRecord destructor_asset;
+    destructor_asset.blob_id = 911;
+    destructor_asset.kind = apitrace::trace::AssetKind::Buffer;
+    destructor_asset.debug_name = "d3d12-resource-unmap";
+    destructor_asset.payload_bytes = destructor_bytes;
+    destructor_asset = destructor_writer.register_asset(std::move(destructor_asset));
+
+    apitrace::trace::EventRecord destructor_event;
+    destructor_event.kind = apitrace::trace::EventKind::Call;
+    destructor_event.callsite.sequence = 1;
+    destructor_event.callsite.function_name = "ID3D12Resource::Unmap";
+    destructor_event.callsite.result_code = 0;
+    destructor_event.blob_refs = {destructor_asset.blob_id};
+    destructor_event.payload = std::string("{\"buffer_path\":\"") +
+                               destructor_asset.relative_path.generic_string() + "\"}";
+    destructor_writer.append_call_event(destructor_event);
+  }
+  const auto destructor_assets_json = read_text(destructor_close_bundle / "assets.json");
+  if (destructor_assets_json.find("\"payload_path\"") == std::string::npos ||
+      !contains_json_u64_field(destructor_assets_json, "blob_id", 911) ||
+      !contains_json_u64_field(destructor_assets_json, "byte_size", 96 * 1024) ||
+      !std::filesystem::is_regular_file(destructor_close_bundle / "checksums.json")) {
+    std::cerr << "TraceBundleWriter destructor should close and publish spooled asset indexes\n";
+    return 1;
+  }
+
+  const auto lightweight_checkpoint_bundle =
+      bundle.parent_path() / (bundle.filename().generic_string() + "-lightweight-asset-checkpoint");
+  std::filesystem::remove_all(lightweight_checkpoint_bundle);
+  unset_env_var("APITRACE_SYNC_CHECKPOINTS");
+  set_env_var("APITRACE_CHECKPOINT_ASSET_BYTES", "1");
+  {
+    apitrace::trace::TraceBundleWriter checkpoint_writer;
+    if (!checkpoint_writer.open(lightweight_checkpoint_bundle)) {
+      std::cerr << "failed to open lightweight-asset-checkpoint bundle\n";
+      return 1;
+    }
+    checkpoint_writer.write_metadata({apitrace::trace::ApiKind::D3D12, 1, "lightweight-asset-checkpoint-test", false});
+    std::vector<std::uint8_t> checkpoint_bytes(80 * 1024, 0x31);
+    apitrace::trace::AssetRecord checkpoint_asset;
+    checkpoint_asset.blob_id = 912;
+    checkpoint_asset.kind = apitrace::trace::AssetKind::Buffer;
+    checkpoint_asset.debug_name = "d3d12-resource-unmap";
+    checkpoint_asset.payload_bytes = checkpoint_bytes;
+    checkpoint_asset = checkpoint_writer.register_asset(std::move(checkpoint_asset));
+
+    apitrace::trace::EventRecord checkpoint_event;
+    checkpoint_event.kind = apitrace::trace::EventKind::Call;
+    checkpoint_event.callsite.sequence = 1;
+    checkpoint_event.callsite.function_name = "ID3D12Resource::Unmap";
+    checkpoint_event.callsite.result_code = 0;
+    checkpoint_event.blob_refs = {checkpoint_asset.blob_id};
+    checkpoint_event.payload = std::string("{\"buffer_path\":\"") +
+                               checkpoint_asset.relative_path.generic_string() + "\"}";
+    checkpoint_writer.append_call_event(checkpoint_event);
+
+    for (unsigned attempt = 0; attempt < 100; ++attempt) {
+      const auto assets_json_path = lightweight_checkpoint_bundle / "assets.json";
+      if (std::filesystem::is_regular_file(assets_json_path)) {
+        const auto assets_json = read_text(assets_json_path);
+        if (assets_json.find("\"payload_path\"") != std::string::npos &&
+            contains_json_u64_field(assets_json, "blob_id", 912) &&
+            contains_json_u64_field(assets_json, "byte_size", 80 * 1024)) {
+          break;
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    const auto lightweight_assets_json = read_text(lightweight_checkpoint_bundle / "assets.json");
+    if (lightweight_assets_json.find("\"payload_path\"") == std::string::npos ||
+        !contains_json_u64_field(lightweight_assets_json, "blob_id", 912) ||
+        !contains_json_u64_field(lightweight_assets_json, "byte_size", 80 * 1024) ||
+        std::filesystem::is_regular_file(lightweight_checkpoint_bundle / "checksums.json")) {
+      std::cerr << "non-sync checkpoint should publish only a lightweight spooled asset index\n";
+      return 1;
+    }
+    checkpoint_writer.close();
+  }
+  unset_env_var("APITRACE_CHECKPOINT_ASSET_BYTES");
+
+  if (!bundle_finalize.empty()) {
+    const auto middle_missing_blob_bundle =
+        bundle.parent_path() / (bundle.filename().generic_string() + "-middle-missing-blob");
+    if (!write_middle_missing_blob_bundle(middle_missing_blob_bundle)) {
+      std::cerr << "failed to write middle-missing-blob bundle\n";
+      return 1;
+    }
+    if (run_bundle_finalize(bundle_finalize, middle_missing_blob_bundle) == 0) {
+      std::cerr << "bundle-finalize silently truncated a middle missing blob instead of failing\n";
+      return 1;
+    }
   }
 
   const auto triggered_checkpoint_bundle = bundle.parent_path() / (bundle.filename().generic_string() + "-triggered-checkpoint");
