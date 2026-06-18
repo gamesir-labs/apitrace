@@ -2125,6 +2125,126 @@ private:
     return true;
   }
 
+  // Decode a half-precision (IEEE 754 binary16) bit pattern to float. Diagnostic helper for
+  // probe_texture_values (R16_FLOAT / R16G16B16A16_FLOAT / R11G11B10_FLOAT channels).
+  static float half_bits_to_float(std::uint32_t h, unsigned mant_bits, unsigned exp_bits)
+  {
+    const unsigned exp_mask = (1u << exp_bits) - 1u;
+    const int bias = (1 << (exp_bits - 1)) - 1;
+    const std::uint32_t mant = h & ((1u << mant_bits) - 1u);
+    const std::uint32_t exp = (h >> mant_bits) & exp_mask;
+    if (exp == 0) {
+      return mant == 0 ? 0.0f
+                       : static_cast<float>(mant) / static_cast<float>(1u << mant_bits) *
+                             std::pow(2.0f, static_cast<float>(1 - bias));
+    }
+    if (exp == exp_mask) {
+      return mant == 0 ? std::numeric_limits<float>::infinity()
+                       : std::numeric_limits<float>::quiet_NaN();
+    }
+    return (1.0f + static_cast<float>(mant) / static_cast<float>(1u << mant_bits)) *
+           std::pow(2.0f, static_cast<float>(static_cast<int>(exp) - bias));
+  }
+
+  // Probe an arbitrary small TEXTURE2D (by object_id) and log the ACTUAL decoded float texel
+  // values (not just a nonzero ratio). Diagnostic only: built to read the FH4 auto-exposure
+  // txWorldLum (4x1 R32_FLOAT) average-luminance value L at retrace time, so the H1 "L too low ->
+  // exposure blow-up -> white screen" hypothesis can be settled with a measured number. Supports
+  // R32_FLOAT / R16_FLOAT / R11G11B10_FLOAT / R16G16B16A16_FLOAT / R32G32B32A32_FLOAT. Logs the
+  // first up-to-16 texels (channel floats) plus min/max/mean of channel 0. Offline replay only, so
+  // it is not subject to the in-process per-draw readback crash FH4 hits live.
+  bool probe_texture_values(trace::ObjectId object_id, std::uint64_t frame_index)
+  {
+    std::string ignore;
+    ID3D12Resource *res = resource_for(object_id, ignore);
+    if (!res) {
+      replay_milestone((std::string("probe-val object=") + std::to_string(object_id) +
+                        " UNRESOLVED").c_str());
+      return false;
+    }
+    const D3D12_RESOURCE_DESC desc = res->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+      replay_milestone((std::string("probe-val object=") + std::to_string(object_id) +
+                        " not-tex2d dim=" + std::to_string(static_cast<int>(desc.Dimension))).c_str());
+      return false;
+    }
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    UINT rows = 0; UINT64 row_size = 0, total = 0;
+    device_->GetCopyableFootprints(&desc, 0, 1, 0, &fp, &rows, &row_size, &total);
+    if (total == 0) return false;
+    D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = total;
+    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ScopedD3D12CaptureSuppression suppress;
+    ComPtr<ID3D12Resource> rb;
+    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(rb.put())))) return false;
+    ReadbackCommandObjects cmds;
+    if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(cmds.allocator.put()))) ||
+        FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmds.allocator.get(), nullptr, IID_PPV_ARGS(cmds.list.put())))) return false;
+    // No explicit barrier (same rationale as probe_texture_nonzero): rely on implicit COMMON
+    // promotion / DXMT state tracking; a guessed before-state fought DXMT and faulted.
+    D3D12_TEXTURE_COPY_LOCATION src{}; src.pResource = res; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource = rb.get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = fp;
+    cmds.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    if (FAILED(cmds.list->Close())) return false;
+    ID3D12CommandList *lists[] = {cmds.list.get()};
+    queue_->ExecuteCommandLists(1, lists);
+    wait_for_gpu();
+    void *mapped = nullptr;
+    if (FAILED(rb->Map(0, nullptr, &mapped)) || !mapped) return false;
+    const UINT w = static_cast<UINT>(desc.Width), h = static_cast<UINT>(desc.Height);
+    const auto *base = static_cast<const std::uint8_t *>(mapped) + static_cast<std::size_t>(fp.Offset);
+    const std::uint32_t fmt = static_cast<std::uint32_t>(desc.Format);
+
+    auto decode_ch0 = [&](const std::uint8_t *p) -> float {
+      const std::uint32_t u = static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8) |
+                              (static_cast<std::uint32_t>(p[2]) << 16) | (static_cast<std::uint32_t>(p[3]) << 24);
+      switch (fmt) {
+      case 41:   // R32_FLOAT
+      case 2: {  // R32G32B32A32_FLOAT (channel 0)
+        float f; std::memcpy(&f, &u, 4); return f;
+      }
+      case 54:   // R16_FLOAT
+      case 10:   // R16G16B16A16_FLOAT (channel 0)
+        return half_bits_to_float(u & 0xFFFFu, 10, 5);
+      case 26:   // R11G11B10_FLOAT (channel 0 = R: 6 mantissa, 5 exp, no sign)
+        return half_bits_to_float(u & 0x7FFu, 6, 5);
+      default: {
+        float f; std::memcpy(&f, &u, 4); return f;  // best-effort: treat as float32
+      }
+      }
+    };
+    // bytes per texel for stepping columns
+    UINT bpt = 4;
+    switch (fmt) { case 2: bpt = 16; break; case 10: bpt = 8; break; default: bpt = 4; break; }
+
+    std::string head;  // first up-to-16 ch0 floats
+    float vmin = std::numeric_limits<float>::infinity(), vmax = -std::numeric_limits<float>::infinity();
+    double sum = 0.0; std::uint64_t cnt = 0; UINT printed = 0;
+    for (UINT y = 0; y < h; ++y) {
+      const auto *row = base + static_cast<std::size_t>(y) * fp.Footprint.RowPitch;
+      for (UINT x = 0; x < w; ++x) {
+        const float v = decode_ch0(row + static_cast<std::size_t>(x) * bpt);
+        if (v == v) { vmin = std::min(vmin, v); vmax = std::max(vmax, v); sum += v; ++cnt; }
+        if (printed < 16) {
+          char b[40]; std::snprintf(b, sizeof(b), "%s%.6g", printed ? "," : "", v); head += b; ++printed;
+        }
+      }
+    }
+    D3D12_RANGE none{0, 0};
+    rb->Unmap(0, &none);
+    char stat[160];
+    std::snprintf(stat, sizeof(stat), " min=%.6g max=%.6g mean=%.6g",
+                  cnt ? vmin : 0.0f, cnt ? vmax : 0.0f, cnt ? sum / static_cast<double>(cnt) : 0.0);
+    replay_milestone((std::string("probe-val object=") + std::to_string(object_id) +
+                      " frame=" + std::to_string(frame_index) + " fmt=" + std::to_string(fmt) +
+                      " " + std::to_string(w) + "x" + std::to_string(h) +
+                      " ch0=[" + head + "]" + stat).c_str());
+    return true;
+  }
+
   // Read the first `count` bytes of a DEFAULT/any-heap resource by GPU-copying into a readback
   // buffer. Diagnostic only (BUG-007): tells whether a vertex/index/texture resource that a draw
   // reads actually holds non-zero data, i.e. whether the upload->copy chain populated it.
@@ -2257,6 +2377,24 @@ private:
       // content -> distinguishes "scene render empty" from "back-buffer composite issue".
       if (const std::uint64_t probe_tex = env_u64("APITRACE_D3D12_RETRACE_PROBE_TEXTURE")) {
         probe_texture_nonzero(static_cast<trace::ObjectId>(probe_tex), frame_index);
+      }
+      // Optional: decode ACTUAL float texel values of one or more small textures (comma-separated
+      // object_ids in APITRACE_D3D12_RETRACE_PROBE_TEXTURE_VALUES). Built to read txWorldLum's L and
+      // sample scene-color luminance to settle the auto-exposure white-screen hypothesis.
+      if (const char *tv = std::getenv("APITRACE_D3D12_RETRACE_PROBE_TEXTURE_VALUES")) {
+        std::string_view sv(tv);
+        std::size_t pos = 0;
+        while (pos < sv.size()) {
+          std::size_t comma = sv.find(',', pos);
+          const std::size_t end = (comma == std::string_view::npos) ? sv.size() : comma;
+          const std::string tok(sv.substr(pos, end - pos));
+          const std::uint64_t id = tok.empty() ? 0 : std::strtoull(tok.c_str(), nullptr, 10);
+          if (id != 0) {
+            probe_texture_values(static_cast<trace::ObjectId>(id), frame_index);
+          }
+          if (comma == std::string_view::npos) break;
+          pos = comma + 1;
+        }
       }
     }
     ID3D12Resource *back_buffer = back_buffers_[back_buffer_index].get();
