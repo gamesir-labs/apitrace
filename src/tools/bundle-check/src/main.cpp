@@ -173,6 +173,35 @@ struct CheckOptions {
   std::size_t jobs = default_job_count();
 };
 
+bool has_explicit_validation_scope(const CheckOptions &options)
+{
+  return options.require_asset_index ||
+         options.require_d3d ||
+         options.require_metal ||
+         options.require_translation_links ||
+         options.require_shared_resources ||
+         options.require_d3d_replay_closure ||
+         options.require_d3d_native_readiness ||
+         options.require_metal_replay_closure ||
+         options.require_d3d_present_frames ||
+         options.require_metal_present_frames;
+}
+
+bool requires_metal_sideband(const CheckOptions &options)
+{
+  if (options.require_metal ||
+      options.require_translation_links ||
+      options.require_shared_resources ||
+      options.require_metal_replay_closure ||
+      options.require_metal_present_frames) {
+    return true;
+  }
+
+  // Preserve the historical unscoped bundle-check behavior. Once callers ask for a specific
+  // D3D-only validation set, loading the full Metal sideband is avoidable work.
+  return !has_explicit_validation_scope(options);
+}
+
 void enable_strict_cross_api(CheckOptions &options)
 {
   options.require_asset_index = true;
@@ -5312,8 +5341,10 @@ int apitrace::tools::run_bundle_check(int argc, char **argv)
     options.require_asset_index = true;
   }
 
+  const bool load_metal_sideband = requires_metal_sideband(options);
   apitrace::trace::TraceBundleReader reader;
   apitrace::trace::TraceBundleReader::OpenOptions reader_options;
+  reader_options.load_metal_sideband = load_metal_sideband;
   reader_options.validate_checksum_contents = false;
   reader_options.discover_referenced_assets = false;
   if (!reader.open(bundle, reader_options)) {
@@ -5375,7 +5406,7 @@ int apitrace::tools::run_bundle_check(int argc, char **argv)
     std::cerr << "bundle-check failed: " << reference_error << "\n";
     return 1;
   }
-  if (!verify_translation_links(reader, translation_stats, reference_error)) {
+  if (load_metal_sideband && !verify_translation_links(reader, translation_stats, reference_error)) {
     std::cerr << "bundle-check failed: " << reference_error << "\n";
     return 1;
   }
@@ -5428,6 +5459,7 @@ int apitrace::tools::run_bundle_check(int argc, char **argv)
 
   std::cout << "bundle-check PASS\n";
   std::cout << "events=" << reader.events().size() << "\n";
+  std::cout << "metal_sideband_loaded=" << (load_metal_sideband ? 1 : 0) << "\n";
   std::cout << "metal_events=" << reader.metal_events().size() << "\n";
   std::cout << "assets=" << reader.assets().size() << "\n";
   std::cout << "metal_assets=" << reader.metal_assets().size() << "\n";

@@ -1829,19 +1829,19 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
 
   if (options.load_metal_sideband) {
     for (const auto &entry : impl_->checksums.files) {
-    MetalAssetKind metal_kind = MetalAssetKind::Library;
-    if (!detail::is_metal_asset_path(entry.relative_path, &metal_kind)) {
-      continue;
-    }
+      MetalAssetKind metal_kind = MetalAssetKind::Library;
+      if (!detail::is_metal_asset_path(entry.relative_path, &metal_kind)) {
+        continue;
+      }
 
-    AssetRecord asset;
-    asset.relative_path = entry.relative_path;
-    asset.debug_name = entry.relative_path.filename().generic_string();
-    if (metal_asset_indices_by_path.find(asset.relative_path.generic_string()) == metal_asset_indices_by_path.end()) {
-      metal_asset_indices_by_path.emplace(asset.relative_path.generic_string(), impl_->metal_assets.size());
-      impl_->metal_assets.push_back(std::move(asset));
+      AssetRecord asset;
+      asset.relative_path = entry.relative_path;
+      asset.debug_name = entry.relative_path.filename().generic_string();
+      if (metal_asset_indices_by_path.find(asset.relative_path.generic_string()) == metal_asset_indices_by_path.end()) {
+        metal_asset_indices_by_path.emplace(asset.relative_path.generic_string(), impl_->metal_assets.size());
+        impl_->metal_assets.push_back(std::move(asset));
+      }
     }
-  }
   }
 
   if (options.load_metal_sideband && has_metal_callstream_file &&
@@ -1856,27 +1856,29 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
     return false;
   }
 
-  for (const auto &asset : impl_->metal_assets) {
-    if (prefix_limited && referenced_metal_asset_paths.find(asset.relative_path.generic_string()) == referenced_metal_asset_paths.end()) {
-      continue;
-    }
-    if (!validate_asset_index_record(
-            impl_->layout.root_path,
-            asset,
-            checksum_lookup,
-            validated_asset_file_sizes,
-            impl_->last_error)) {
-      return false;
-    }
-    if (!validate_checksum_entry(
-            impl_->layout.root_path,
-            asset.relative_path,
-            checksum_lookup,
-            impl_->layout.checksums_path,
-            validated_checksum_paths,
-            impl_->last_error,
-            options.validate_checksum_contents)) {
-      return false;
+  if (options.load_metal_sideband) {
+    for (const auto &asset : impl_->metal_assets) {
+      if (prefix_limited && referenced_metal_asset_paths.find(asset.relative_path.generic_string()) == referenced_metal_asset_paths.end()) {
+        continue;
+      }
+      if (!validate_asset_index_record(
+              impl_->layout.root_path,
+              asset,
+              checksum_lookup,
+              validated_asset_file_sizes,
+              impl_->last_error)) {
+        return false;
+      }
+      if (!validate_checksum_entry(
+              impl_->layout.root_path,
+              asset.relative_path,
+              checksum_lookup,
+              impl_->layout.checksums_path,
+              validated_checksum_paths,
+              impl_->last_error,
+              options.validate_checksum_contents)) {
+        return false;
+      }
     }
   }
 
