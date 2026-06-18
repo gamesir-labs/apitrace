@@ -36,3 +36,15 @@ When stderr is an interactive TTY, `bundle-finalize` prints stage progress to
 stderr by default. The final `bundle-finalize:` summary remains on stdout for
 scripts. Use `--no-progress` to suppress interactive progress, or `--progress`
 to force it when stderr is not detected as a TTY.
+
+By default, resumed finalization trusts existing content-addressed canonical
+asset files when their size matches the source asset hash that was just
+computed. This avoids re-hashing duplicate canonical files on large bundles.
+Use `--verify-existing-canonical` to restore strict re-hashing of existing
+canonical files before reuse; use `bundle-check --verify-hashes` for a complete
+post-finalize corruption audit.
+
+By default, JSONL rewrite passes parse only records that may need asset-path or
+blob-id updates after the tail-truncation pass has ensured a complete final
+record. Use `--verify-jsonl-records` when you want `bundle-finalize` to parse
+every JSONL record during reference rewriting as an additional integrity check.
