@@ -501,42 +501,6 @@ std::uint64_t next_present_frame_index()
   return g_present_frame_index++;
 }
 
-std::uint64_t seal_checkpoint_after_present_frame()
-{
-  static std::atomic<bool> configured{false};
-  static std::atomic<std::uint64_t> target{std::numeric_limits<std::uint64_t>::max()};
-
-  if (!configured.load(std::memory_order_acquire)) {
-    auto parsed = std::numeric_limits<std::uint64_t>::max();
-    if (const char *value = std::getenv("APITRACE_D3D12_SEAL_CHECKPOINT_AFTER_FRAME")) {
-      char *end = nullptr;
-      const auto requested = std::strtoull(value, &end, 10);
-      if (end != value && requested > 0) {
-        parsed = static_cast<std::uint64_t>(requested);
-      }
-    }
-    target.store(parsed, std::memory_order_release);
-    configured.store(true, std::memory_order_release);
-  }
-
-  return target.load(std::memory_order_acquire);
-}
-
-void maybe_seal_checkpoint_after_present_frame(std::uint64_t frame_index)
-{
-  static std::atomic<bool> sealed{false};
-  const auto target = seal_checkpoint_after_present_frame();
-  if (target == std::numeric_limits<std::uint64_t>::max() || frame_index + 1 < target) {
-    return;
-  }
-  if (sealed.exchange(true, std::memory_order_acq_rel)) {
-    return;
-  }
-  if (auto *session = session_for(trace::ApiKind::D3D12)) {
-    session->seal_checkpoint();
-  }
-}
-
 bool is_present_test(std::uint32_t flags)
 {
   return (flags & DXGI_PRESENT_TEST) != 0;
@@ -657,6 +621,15 @@ std::vector<trace::ObjectId> collect_object_refs(const void *const *objects, std
     append_object_ref_id(refs, lookup_object_id_locked(objects[index]));
   }
   return refs;
+}
+
+void deduplicate_tail_object_refs(std::vector<trace::ObjectId> &refs, std::size_t first_tail_index)
+{
+  if (first_tail_index >= refs.size()) {
+    return;
+  }
+  std::sort(refs.begin() + static_cast<std::ptrdiff_t>(first_tail_index), refs.end());
+  refs.erase(std::unique(refs.begin() + static_cast<std::ptrdiff_t>(first_tail_index), refs.end()), refs.end());
 }
 
 std::vector<trace::BlobId> collect_blob_refs(const std::uint64_t *blobs, std::uint32_t blob_count)
@@ -1111,8 +1084,10 @@ void record_resource_barrier_batch_event(const void *command_list, const Pending
 {
   std::vector<trace::ObjectId> refs;
   refs.reserve(1 + batch.ops.size() * 3);
+  std::size_t resource_ref_begin = 0;
   if (const auto command_list_id = object_id(command_list)) {
     refs.push_back(command_list_id);
+    resource_ref_begin = 1;
   }
   for (const auto &op : batch.ops) {
     if (op.resource_object_id) {
@@ -1125,8 +1100,7 @@ void record_resource_barrier_batch_event(const void *command_list, const Pending
       refs.push_back(op.resource_after_object_id);
     }
   }
-  std::sort(refs.begin(), refs.end());
-  refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
+  deduplicate_tail_object_refs(refs, resource_ref_begin);
 
   std::ostringstream payload;
   append_resource_barrier_batch_payload(payload, batch);
@@ -1144,8 +1118,10 @@ void record_copy_texture_region_batch_event(const void *command_list, const Pend
 {
   std::vector<trace::ObjectId> refs;
   refs.reserve(1 + batch.ops.size() * 2);
+  std::size_t resource_ref_begin = 0;
   if (const auto command_list_id = object_id(command_list)) {
     refs.push_back(command_list_id);
+    resource_ref_begin = 1;
   }
   for (const auto &op : batch.ops) {
     if (op.dst.resource_object_id) {
@@ -1155,8 +1131,7 @@ void record_copy_texture_region_batch_event(const void *command_list, const Pend
       refs.push_back(op.src.resource_object_id);
     }
   }
-  std::sort(refs.begin(), refs.end());
-  refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
+  deduplicate_tail_object_refs(refs, resource_ref_begin);
 
   std::ostringstream payload;
   append_copy_texture_region_batch_payload(payload, batch);
@@ -2555,13 +2530,6 @@ void D3D12CaptureHooks::install_submission_hooks(runtime::CaptureRuntime &runtim
 
 bool builtin_capture_enabled()
 {
-  if (const char *value = std::getenv("APITRACE_D3D12_BUILTIN_CAPTURE")) {
-    if (std::strcmp(value, "0") == 0 ||
-        std::strcmp(value, "false") == 0 ||
-        std::strcmp(value, "FALSE") == 0) {
-      return false;
-    }
-  }
   return runtime::current_process_trace_session() != nullptr ||
          runtime::ensure_process_trace_session(trace::ApiKind::D3D12) != nullptr;
 }
@@ -3045,7 +3013,6 @@ void record_present_frame(
           << "}";
   const auto blob_id = static_cast<std::uint64_t>(asset.blob_id);
   record_resource_blob("D3D12PresentFrame", &blob_id, 1, payload.str().c_str());
-  maybe_seal_checkpoint_after_present_frame(frame_index);
 }
 
 void record_resource_unmap(

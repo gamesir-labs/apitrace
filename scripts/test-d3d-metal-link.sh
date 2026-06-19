@@ -87,7 +87,6 @@ prepare_wine_env() {
     export APITRACE_DOWNSTREAM_D3D12="$DXMT_RUNTIME_ROOT/x86_64-windows/d3d12.dll"
     export APITRACE_DOWNSTREAM_DXGI="$DXMT_RUNTIME_ROOT/x86_64-windows/dxgi.dll"
     export DXMT_EXPERIMENT_DX12_SUPPORT=1
-    export APITRACE_D3D12_BUILTIN_CAPTURE=0
     export WINEDLLPATH="$DXMT_RUNTIME_ROOT:$WINE_ENV_ROOT/lib/wine"
     export DYLD_FALLBACK_LIBRARY_PATH="$DXMT_UNIX_DIR:$WINE_ENV_ROOT/lib:$WINE_ENV_ROOT/lib/wine/x86_64-unix:/opt/homebrew/lib:/usr/local/lib"
     export APITRACE_D3D12_CAPTURE_PRESENT_FRAMES=1

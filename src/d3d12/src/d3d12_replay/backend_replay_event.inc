@@ -199,10 +199,28 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
   }
 
   const auto &function_name = event.callsite.function_name;
-  const auto command_list_id = event.object_refs.empty() ? trace::ObjectId{} : event.object_refs.front();
+  const auto replay_command_kind = replay_command_kind_for(function_name);
+  const auto resolve_command_list_id = [&]() -> trace::ObjectId {
+    if (event.object_refs.empty()) {
+      return trace::ObjectId{};
+    }
+    if (object_ref_kind_matches(objects_, event.object_refs.front(), trace::ObjectKind::CommandList)) {
+      return event.object_refs.front();
+    }
+    if (replay_command_kind == ReplayCommandKind::Unknown ||
+        replay_command_kind == ReplayCommandKind::BeginCommandList) {
+      return event.object_refs.front();
+    }
+    for (const auto object_id : event.object_refs) {
+      if (object_ref_kind_matches(objects_, object_id, trace::ObjectKind::CommandList)) {
+        return object_id;
+      }
+    }
+    return event.object_refs.front();
+  };
+  const auto command_list_id = resolve_command_list_id();
   auto command_list_it = command_lists_.find(command_list_id);
   auto command_list_state = command_list_it == command_lists_.end() ? nullptr : &command_list_it->second;
-  const auto replay_command_kind = replay_command_kind_for(function_name);
   const bool is_command_list_command =
       command_list_state != nullptr && replay_command_kind != ReplayCommandKind::Unknown;
   if (is_command_list_command && replay_command_kind != ReplayCommandKind::BeginCommandList &&

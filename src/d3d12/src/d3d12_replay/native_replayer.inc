@@ -2771,7 +2771,12 @@ private:
     if (std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG")) {
       static int dbg = 0;
       std::size_t n_setpso = 0, n_draw = 0;
+      const trace::ObjectId dbg_list_id =
+          backend_.replay_commands_[begin_index].command_list_object_id;
       for (std::size_t i = begin_index + 1; i < end_index; ++i) {
+        if (backend_.replay_commands_[i].command_list_object_id != dbg_list_id) {
+          continue;
+        }
         const auto k = backend_.replay_commands_[i].kind;
         if (k == D3D12ReplayBackend::ReplayCommandKind::SetPipelineState) ++n_setpso;
         else if (k == D3D12ReplayBackend::ReplayCommandKind::Draw) ++n_draw;
@@ -2779,7 +2784,7 @@ private:
       if (n_draw > 0 && native.type != D3D12_COMMAND_LIST_TYPE_DIRECT && dbg < 16) {
         ++dbg;
         replay_milestone((std::string("listtypebug list=") +
-                          std::to_string(backend_.replay_commands_[begin_index].command_list_object_id) +
+                          std::to_string(dbg_list_id) +
                           " native_type=" + std::to_string(static_cast<int>(native.type)) +
                           " draws=" + std::to_string(n_draw) + " setpso=" + std::to_string(n_setpso) +
                           " begin=" + std::to_string(begin_index)).c_str());

@@ -1550,6 +1550,67 @@ bool write_copy_texture_source_box_out_of_bounds_bundle(const std::filesystem::p
   return true;
 }
 
+bool write_copy_texture_batch_scrambled_refs_bundle(const std::filesystem::path &bundle)
+{
+  std::filesystem::remove_all(bundle);
+
+  apitrace::trace::TraceBundleWriter writer;
+  if (!writer.open(bundle)) {
+    return false;
+  }
+
+  apitrace::trace::TraceMetadata metadata;
+  metadata.api = apitrace::trace::ApiKind::D3D12;
+  metadata.producer = "test_d3d12_copy_texture_batch_scrambled_refs";
+  writer.write_metadata(metadata);
+
+  std::uint64_t sequence = 1;
+  append(writer, object_create(sequence++, 1, ObjectKind::Device, 0, "ID3D12Device"));
+  append(writer, call(sequence++, "D3D12CreateDevice", {1}, "{\"minimum_feature_level\":45056}"));
+  append(writer, object_create(sequence++, 5, ObjectKind::Resource, 1, "Dst"));
+  append(writer, call(
+      sequence++,
+      "ID3D12Device::CreateCommittedResource",
+      {1, 5},
+      "{\"heap_type\":1,\"heap_flags\":0,\"initial_state\":0,\"gpu_virtual_address\":0,"
+      "\"resource_desc\":" + texture2d_desc_json(64, 64, 1, 28) + ",\"optimized_clear_value\":null}"));
+  append(writer, object_create(sequence++, 6, ObjectKind::Resource, 1, "Src"));
+  append(writer, call(
+      sequence++,
+      "ID3D12Device::CreateCommittedResource",
+      {1, 6},
+      "{\"heap_type\":1,\"heap_flags\":0,\"initial_state\":0,\"gpu_virtual_address\":0,"
+      "\"resource_desc\":" + texture2d_desc_json(64, 64, 1, 28) + ",\"optimized_clear_value\":null}"));
+  append(writer, object_create(sequence++, 13, ObjectKind::CommandQueue, 1, "ID3D12CommandQueue"));
+  append(writer, call(sequence++, "ID3D12Device::CreateCommandQueue", {1, 13}, "{\"type\":0,\"priority\":0,\"flags\":0,\"node_mask\":0}"));
+  append(writer, object_create(sequence++, 14, ObjectKind::CommandAllocator, 1, "ID3D12CommandAllocator"));
+  append(writer, call(sequence++, "ID3D12Device::CreateCommandAllocator", {1, 14}, "{\"type\":0}"));
+  append(writer, object_create(sequence++, 15, ObjectKind::CommandList, 1, "ID3D12GraphicsCommandList"));
+  append(writer, call(
+      sequence++,
+      "ID3D12Device::CreateCommandList",
+      {1, 14, 0, 15},
+      "{\"node_mask\":0,\"type\":0,\"command_allocator_object_id\":14,"
+      "\"initial_pipeline_state_object_id\":0}"));
+  const auto copy_sequence = sequence++;
+  append(writer, call(
+      copy_sequence,
+      "ID3D12GraphicsCommandList::CopyTextureRegionBatch",
+      {6, 15, 5},
+      "{\"schema\":\"copy-texture-region-v2\",\"op_count\":1,"
+      "\"columns\":[\"sequence\",\"dst\",\"dst_x\",\"dst_y\",\"dst_z\",\"src\",\"src_box\"],"
+      "\"location_columns\":[\"resource\",\"type\",\"subresource_index\",\"footprint_offset\","
+      "\"footprint_format\",\"footprint_width\",\"footprint_height\",\"footprint_depth\","
+      "\"footprint_row_pitch\"],"
+      "\"ops\":[[" + std::to_string(copy_sequence) +
+      ",[5,0,0,0,0,0,0,0,0],0,0,0,[6,0,0,0,0,0,0,0,0],null]]}"));
+  append(writer, call(sequence++, "ID3D12GraphicsCommandList::Close", {15}, "{}"));
+  append(writer, call(sequence++, "ID3D12CommandQueue::ExecuteCommandLists", {13, 15}, "{\"command_list_count\":1}"));
+
+  writer.close();
+  return true;
+}
+
 bool write_set_pipeline_state_missing_ref_bundle(const std::filesystem::path &bundle)
 {
   std::filesystem::remove_all(bundle);

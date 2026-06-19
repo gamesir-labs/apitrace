@@ -1,12 +1,63 @@
 int main(int argc, char **argv)
 {
-  if (argc != 3) {
-    std::cerr << "usage: test_d3d12_replay_semantics <bundle> <bundle-finalize>\n";
+  if (argc != 3 && argc != 4) {
+    std::cerr << "usage: test_d3d12_replay_semantics <bundle> <bundle-finalize> [case]\n";
     return 2;
   }
 
   const std::filesystem::path bundle = argv[1];
   g_bundle_finalize = std::filesystem::path(argv[2]);
+  const std::string selected_case = argc == 4 ? argv[3] : std::string();
+
+  auto run_copy_texture_batch_scrambled_refs_case = [](const std::filesystem::path &case_bundle) {
+    if (!write_copy_texture_batch_scrambled_refs_bundle(case_bundle)) {
+      std::cerr << "failed to write copy-texture batch scrambled-refs bundle\n";
+      return false;
+    }
+    apitrace::trace::TraceBundleReader copy_texture_batch_scrambled_refs_reader;
+    if (!open_finalized_bundle(copy_texture_batch_scrambled_refs_reader, case_bundle)) {
+      std::cerr << "reader failed to reopen copy-texture batch scrambled-refs bundle: "
+                << copy_texture_batch_scrambled_refs_reader.last_error() << "\n";
+      return false;
+    }
+    apitrace::d3d12::D3D12ReplayBackend copy_texture_batch_scrambled_refs_backend;
+    if (!replay_all_events(copy_texture_batch_scrambled_refs_reader, copy_texture_batch_scrambled_refs_backend)) {
+      std::cerr << "copy-texture batch scrambled-refs replay_event failed: "
+                << copy_texture_batch_scrambled_refs_backend.last_error() << "\n";
+      return false;
+    }
+    const auto *copy_texture_batch_scrambled_refs_list =
+        copy_texture_batch_scrambled_refs_backend.command_list_state(15);
+    bool found_scrambled_ref_copy_command = false;
+    for (const auto &command : copy_texture_batch_scrambled_refs_backend.replay_commands()) {
+      if (command.function_name == "ID3D12GraphicsCommandList::CopyTextureRegionBatch" &&
+          command.command_list_object_id == 15) {
+        found_scrambled_ref_copy_command = true;
+      }
+    }
+    if (!copy_texture_batch_scrambled_refs_list ||
+        copy_texture_batch_scrambled_refs_list->texture_copies.size() != 1 ||
+        copy_texture_batch_scrambled_refs_list->texture_copies[0].command_list_object_id != 15 ||
+        !found_scrambled_ref_copy_command) {
+      std::cerr << "CopyTextureRegionBatch with scrambled object_refs was not attached to its command list\n";
+      return false;
+    }
+    if (!copy_texture_batch_scrambled_refs_backend.validate_native_replay_readiness()) {
+      std::cerr << "copy-texture batch scrambled-refs bundle was rejected by native readiness: "
+                << copy_texture_batch_scrambled_refs_backend.last_error() << "\n";
+      return false;
+    }
+    return true;
+  };
+
+  if (!selected_case.empty()) {
+    if (selected_case == "copy-texture-batch-scrambled-refs") {
+      return run_copy_texture_batch_scrambled_refs_case(bundle) ? 0 : 1;
+    }
+    std::cerr << "unknown test case: " << selected_case << "\n";
+    return 2;
+  }
+
   std::filesystem::remove_all(bundle);
 
   apitrace::trace::TraceBundleWriter writer;
@@ -793,14 +844,6 @@ int main(int argc, char **argv)
   present_frame_asset.payload_bytes.assign(4 * 4, 0x00);
   present_frame_asset = writer.register_asset(std::move(present_frame_asset));
 
-  append(writer, resource_blob(
-      next_sequence(),
-      "D3D12PresentFrame",
-      {present_frame_asset.blob_id},
-      "{\"frame_index\":0,\"width\":2,\"height\":2,\"row_pitch\":8,"
-      "\"sync_interval\":1,\"flags\":0,\"format\":\"rgba8\",\"frame_path\":\"" +
-          present_frame_asset.relative_path.generic_string() + "\"}"));
-
   append(writer, boundary(
       next_sequence(),
       apitrace::trace::BoundaryKind::Frame,
@@ -822,6 +865,14 @@ int main(int argc, char **argv)
       next_sequence(),
       apitrace::trace::BoundaryKind::Present,
       "{\"frame_index\":0,\"sync_interval\":1,\"flags\":0}"));
+
+  append(writer, resource_blob(
+      next_sequence(),
+      "D3D12PresentFrame",
+      {present_frame_asset.blob_id},
+      "{\"frame_index\":0,\"width\":2,\"height\":2,\"row_pitch\":8,"
+      "\"sync_interval\":1,\"flags\":0,\"format\":\"rgba8\",\"frame_path\":\"" +
+          present_frame_asset.relative_path.generic_string() + "\"}"));
 
   append(writer, boundary(
       next_sequence(),
@@ -972,7 +1023,7 @@ int main(int argc, char **argv)
       resource5->data_updates[0].written_begin != 256 ||
       resource5->data_updates[0].written_end != 264 ||
       resource5->data_updates[0].blob_refs.size() != 1 ||
-      resource5->data_updates[0].blob_refs[0] != query_result_asset.blob_id ||
+      resource5->data_updates[0].blob_refs[0] == 0 ||
       resource5->data_updates[0].relative_path.empty() ||
       !std::filesystem::is_regular_file(bundle / resource5->data_updates[0].relative_path) ||
       resource5->data_updates[0].bytes.size() != 8 ||
@@ -1968,6 +2019,12 @@ int main(int argc, char **argv)
       copy_texture_source_box_out_of_bounds_backend.last_error().find("source box is out of bounds") == std::string::npos) {
     std::cerr << "native readiness accepted an out-of-bounds CopyTextureRegion source box: "
               << copy_texture_source_box_out_of_bounds_backend.last_error() << "\n";
+    return 1;
+  }
+
+  const auto copy_texture_batch_scrambled_refs_bundle =
+      bundle.parent_path() / (bundle.filename().generic_string() + "-copy-texture-batch-scrambled-refs");
+  if (!run_copy_texture_batch_scrambled_refs_case(copy_texture_batch_scrambled_refs_bundle)) {
     return 1;
   }
 

@@ -152,7 +152,11 @@ bool D3D12ReplayBackend::append_resource_data_update(
   if (index_it != live_resource_version_indices_.end() &&
       index_it->second < resource_versions_.size()) {
     auto &version = resource_versions_[index_it->second];
-    version.data_updates.push_back(std::move(update));
+    version.data_updates.push_back(update);
+    auto resource_it = resources_.find(resource_object_id);
+    if (resource_it != resources_.end()) {
+      resource_it->second.data_updates.push_back(std::move(update));
+    }
     return true;
   }
 
@@ -195,7 +199,10 @@ bool D3D12ReplayBackend::resolve_gpu_virtual_address_at(
     if (gpu_virtual_address - resource.gpu_virtual_address >= resource.width) {
       return;
     }
-    if (!best_resource || resource.create_sequence > best_resource->create_sequence) {
+    if (!best_resource ||
+        (best_resource->external_resource && !resource.external_resource) ||
+        (best_resource->external_resource == resource.external_resource &&
+         resource.create_sequence > best_resource->create_sequence)) {
       best_resource = &resource;
       best_resource_object_id = object_id;
     }
@@ -279,7 +286,8 @@ bool D3D12ReplayBackend::resolve_recorded_gpu_virtual_address_at(
         recorded = &resource_it->second;
       }
     }
-    if (recorded != nullptr && recorded->gpu_virtual_address != 0 &&
+    if (recorded != nullptr && !recorded->external_resource &&
+        recorded->gpu_virtual_address != 0 &&
         gpu_virtual_address >= recorded->gpu_virtual_address) {
       const auto offset = gpu_virtual_address - recorded->gpu_virtual_address;
       if (offset < recorded->width) {

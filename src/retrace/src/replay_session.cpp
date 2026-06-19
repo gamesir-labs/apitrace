@@ -2276,7 +2276,7 @@ bool ReplaySession::run()
   trace::TraceBundleReader::OpenOptions reader_options;
   reader_options.load_metal_sideband = impl_->options.enable_metal_retrace;
   reader_options.validate_checksum_contents = false;
-  if (!impl_->options.enable_metal_retrace && impl_->options.backend == BackendKind::NativeD3D12) {
+  if (!impl_->options.enable_metal_retrace) {
     reader_options.stop_after_sequence = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE");
     reader_options.stop_after_present_frame = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME");
     const char *capture_present_frames = std::getenv("APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES");
