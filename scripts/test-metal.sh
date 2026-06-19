@@ -79,14 +79,14 @@ step_trace() {
   done
   grep -F "summary: passed=8 failed=0 skipped=0" "$RUN_LOG" >/dev/null || fail "unexpected metal summary"
   require_file "$TRACE_BUNDLE/callstream.jsonl"
-  "$BUNDLE_CHECK_BIN" --require-metal --require-metal-replay-closure --require-metal-present-frames "$TRACE_BUNDLE" >/dev/null
+  "$BUNDLE_CHECK_BIN" "$TRACE_BUNDLE" >/dev/null
   "$RETRACE_BIN" --metal --validate-only "$TRACE_BUNDLE" >/dev/null
   python3 "$ROOT_DIR/scripts/lib/poison_present_frame.py" \
     --api metal \
     --source "$TRACE_BUNDLE" \
     --output "$POISON_TRACE_BUNDLE" \
     --frame-index 0
-  "$BUNDLE_CHECK_BIN" --require-metal --require-metal-replay-closure --require-metal-present-frames "$POISON_TRACE_BUNDLE" >/dev/null
+  "$BUNDLE_CHECK_BIN" "$POISON_TRACE_BUNDLE" >/dev/null
   "$RETRACE_BIN" --metal --validate-only "$POISON_TRACE_BUNDLE" >/dev/null
 }
 

@@ -190,7 +190,7 @@ step_trace() {
     unset APITRACE_TRACE_BUNDLE
     require_file "$TRACE_BUNDLE/callstream.jsonl"
     if [ -x "$HOST_BUNDLE_CHECK" ]; then
-        "$HOST_BUNDLE_CHECK" --require-d3d --require-d3d-replay-closure --require-d3d-native-readiness --require-d3d-present-frames "$TRACE_BUNDLE" >/dev/null
+        "$HOST_BUNDLE_CHECK" "$TRACE_BUNDLE" >/dev/null
     fi
     if [ -x "$HOST_RETRACE" ]; then
         "$HOST_RETRACE" --validate-only "$TRACE_BUNDLE" >/dev/null
@@ -217,7 +217,7 @@ step_retrace() {
     unset APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES
     require_file "$RETRACE_BUNDLE/callstream.jsonl"
     if [ -x "$HOST_BUNDLE_CHECK" ]; then
-        "$HOST_BUNDLE_CHECK" --require-d3d --require-d3d-replay-closure --require-d3d-native-readiness --require-d3d-present-frames "$RETRACE_BUNDLE" >/dev/null
+        "$HOST_BUNDLE_CHECK" "$RETRACE_BUNDLE" >/dev/null
     fi
 }
 

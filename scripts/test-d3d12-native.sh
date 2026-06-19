@@ -60,14 +60,14 @@ cmake --build "$NATIVE_BUILD_DIR" --target apitrace_bundle_check
 require_file "$RETRACE_BIN"
 require_file "$BUNDLE_CHECK_BIN"
 
-"$BUNDLE_CHECK_BIN" --require-d3d --require-d3d-replay-closure --require-d3d-native-readiness --require-d3d-present-frames "$TRACE_BUNDLE" >/dev/null
+"$BUNDLE_CHECK_BIN" "$TRACE_BUNDLE" >/dev/null
 "$RETRACE_BIN" --validate-only "$TRACE_BUNDLE" >/dev/null
 python3 "$ROOT_DIR/scripts/lib/poison_present_frame.py" \
   --api d3d12 \
   --source "$TRACE_BUNDLE" \
   --output "$POISON_TRACE_BUNDLE" \
   --frame-index 0
-"$BUNDLE_CHECK_BIN" --require-d3d --require-d3d-replay-closure --require-d3d-native-readiness --require-d3d-present-frames "$POISON_TRACE_BUNDLE" >/dev/null
+"$BUNDLE_CHECK_BIN" "$POISON_TRACE_BUNDLE" >/dev/null
 "$RETRACE_BIN" --validate-only "$POISON_TRACE_BUNDLE" >/dev/null
 
 rm -rf "$NATIVE_RETRACE_BUNDLE"

@@ -1,12 +1,11 @@
 int main(int argc, char **argv)
 {
-  if (argc < 2 || argc > 3) {
-    std::cerr << "usage: test_metal_replay_closure <bundle> [bundle-check]\n";
+  if (argc != 2) {
+    std::cerr << "usage: test_metal_replay_closure <bundle>\n";
     return 2;
   }
 
   const std::filesystem::path bundle = argv[1];
-  const std::filesystem::path bundle_check = argc >= 3 ? std::filesystem::path(argv[2]) : std::filesystem::path();
   std::filesystem::remove_all(bundle);
 
   apitrace::trace::TraceBundleWriter writer;
@@ -220,11 +219,6 @@ int main(int argc, char **argv)
     std::cerr << "poisoned MetalPresentFrame should remain diagnostic metadata, not replay input\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, bundle, "--require-metal --require-metal-replay-closure --require-metal-present-frames") != 0) {
-    std::cerr << "bundle-check rejected the valid Metal replay closure fixture\n";
-    return 1;
-  }
 
   const auto sampler_descriptor_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-sampler-descriptor");
@@ -235,11 +229,6 @@ int main(int argc, char **argv)
   if (!validate_metal_bundle(sampler_descriptor_bundle, replay_error)) {
     std::cerr << "sampler-descriptor bundle failed validate-only replay: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, sampler_descriptor_bundle, "--require-metal --require-metal-replay-closure") != 0) {
-    std::cerr << "bundle-check rejected sampler-descriptor bundle\n";
     return 1;
   }
 
@@ -254,11 +243,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, nullable_resource_bind_bundle, "--require-metal --require-metal-replay-closure") != 0) {
-    std::cerr << "bundle-check rejected nullable-resource-binds bundle\n";
-    return 1;
-  }
 
   const auto incomplete_sampler_descriptor_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-incomplete-sampler-descriptor");
@@ -271,11 +255,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "sampler descriptor is missing support_argument_buffers")) {
     std::cerr << "incomplete-sampler-descriptor bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, incomplete_sampler_descriptor_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted incomplete-sampler-descriptor bundle\n";
     return 1;
   }
 
@@ -295,11 +274,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, missing_bind_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted missing-pipeline-bind bundle\n";
-    return 1;
-  }
 
   const auto invalid_viewport_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-invalid-viewport");
@@ -313,11 +287,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, invalid_viewport_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted invalid-viewport bundle\n";
-    return 1;
-  }
 
   const auto missing_color_texture_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-missing-color-texture");
@@ -329,11 +298,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "render pass references an unknown color texture")) {
     std::cerr << "missing-color-texture bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, missing_color_texture_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted missing-color-texture bundle\n";
     return 1;
   }
 
@@ -350,14 +314,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          render_pass_missing_payload_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted render-pass-missing-payload bundle\n";
-    return 1;
-  }
 
   const auto render_pass_missing_subresource_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-render-pass-missing-subresource");
@@ -370,14 +326,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "render pass color attachment is missing level")) {
     std::cerr << "render-pass-missing-subresource bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          render_pass_missing_subresource_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted render-pass-missing-subresource bundle\n";
     return 1;
   }
 
@@ -394,14 +342,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          render_pass_invalid_clear_color_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted render-pass-invalid-clear-color bundle\n";
-    return 1;
-  }
 
   const auto missing_blob_ref_bundle = bundle.parent_path() / (bundle.filename().generic_string() + "-missing-blob-ref");
   if (!write_missing_pipeline_blob_ref_bundle(missing_blob_ref_bundle, "fake-metallib-bytes", pipeline_descriptor)) {
@@ -414,11 +354,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, missing_blob_ref_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted missing-blob-ref bundle\n";
-    return 1;
-  }
 
   const auto wrong_blob_ref_bundle = bundle.parent_path() / (bundle.filename().generic_string() + "-wrong-blob-ref");
   if (!write_wrong_pipeline_blob_ref_bundle(wrong_blob_ref_bundle, "fake-metallib-bytes", pipeline_descriptor)) {
@@ -429,11 +364,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "asset path blob_ref does not match")) {
     std::cerr << "wrong-blob-ref bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, wrong_blob_ref_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted wrong-blob-ref bundle\n";
     return 1;
   }
 
@@ -449,11 +379,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, incomplete_descriptor_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted incomplete-descriptor bundle\n";
-    return 1;
-  }
 
   const auto pipeline_color_missing_payload_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-pipeline-color-missing-payload");
@@ -465,14 +390,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "render pipeline color attachment 0 is missing blending_enabled")) {
     std::cerr << "pipeline-color-missing-payload bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          pipeline_color_missing_payload_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted pipeline-color-missing-payload bundle\n";
     return 1;
   }
 
@@ -488,11 +405,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, wrong_buffer_type_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted wrong-vertex-buffer-type bundle\n";
-    return 1;
-  }
 
   const auto missing_offset_bind_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-missing-vertex-buffer-offset-bind");
@@ -506,11 +418,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, missing_offset_bind_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted missing-vertex-buffer-offset-bind bundle\n";
-    return 1;
-  }
 
   const auto missing_fragment_bytes_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-missing-fragment-bytes");
@@ -522,11 +429,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "setFragmentBytes is missing captured bytes")) {
     std::cerr << "missing-fragment-bytes bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, missing_fragment_bytes_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted missing-fragment-bytes bundle\n";
     return 1;
   }
 
@@ -543,14 +445,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          texture_bind_missing_index_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted texture-bind-missing-index bundle\n";
-    return 1;
-  }
 
   const auto inline_bytes_missing_length_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-inline-bytes-missing-length");
@@ -563,14 +457,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "setFragmentBytes is missing length")) {
     std::cerr << "inline-bytes-missing-length bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          inline_bytes_missing_length_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted inline-bytes-missing-length bundle\n";
     return 1;
   }
 
@@ -587,14 +473,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          buffer_missing_length_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted buffer-missing-length bundle\n";
-    return 1;
-  }
 
   const auto open_encoder_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-open-encoder");
@@ -606,11 +484,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "ended with an open render encoder")) {
     std::cerr << "open-encoder bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, open_encoder_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted open-encoder bundle\n";
     return 1;
   }
 
@@ -626,11 +499,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, uncommitted_command_buffer_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted uncommitted-command-buffer bundle\n";
-    return 1;
-  }
 
   const auto argument_buffer_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-argument-buffer");
@@ -644,11 +512,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, argument_buffer_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted argument-buffer bundle\n";
-    return 1;
-  }
 
   const auto wrong_use_resource_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-wrong-use-resource-type");
@@ -660,11 +523,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "useResource references an unknown replayable resource")) {
     std::cerr << "wrong-use-resource-type bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, wrong_use_resource_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted wrong-use-resource-type bundle\n";
     return 1;
   }
 
@@ -681,14 +539,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          use_resource_missing_payload_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted use-resource-missing-payload bundle\n";
-    return 1;
-  }
 
   const auto use_heap_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-use-heap");
@@ -702,11 +552,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, use_heap_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted use-heap bundle\n";
-    return 1;
-  }
 
   const auto unknown_encoder_state_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-unknown-encoder-state");
@@ -718,11 +563,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "encoder state command references an unknown render encoder")) {
     std::cerr << "unknown-encoder-state bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, unknown_encoder_state_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted unknown-encoder-state bundle\n";
     return 1;
   }
 
@@ -739,11 +579,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, rasterizer_state_missing_field_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted rasterizer-state-missing-field bundle\n";
-    return 1;
-  }
 
   const auto unknown_call_kind_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-unknown-call-kind");
@@ -755,11 +590,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "unknown Metal call kind is not replayable")) {
     std::cerr << "unknown-call-kind bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, unknown_call_kind_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted unknown-call-kind bundle\n";
     return 1;
   }
 
@@ -776,11 +606,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, unknown_depth_stencil_state_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted unknown-depth-stencil-state bundle\n";
-    return 1;
-  }
 
   const auto depth_stencil_state_missing_id_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-depth-stencil-state-missing-id");
@@ -793,14 +618,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "dxmt_set_depth_stencil_state is missing depth_stencil_state_id")) {
     std::cerr << "depth-stencil-state-missing-id bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          depth_stencil_state_missing_id_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted depth-stencil-state-missing-id bundle\n";
     return 1;
   }
 
@@ -816,14 +633,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          texture_view_missing_payload_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted texture-view-missing-payload bundle\n";
-    return 1;
-  }
 
   const auto texture_view_invalid_swizzle_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-texture-view-invalid-swizzle");
@@ -835,14 +644,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "texture view descriptor has invalid swizzle")) {
     std::cerr << "texture-view-invalid-swizzle bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          texture_view_invalid_swizzle_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted texture-view-invalid-swizzle bundle\n";
     return 1;
   }
 
@@ -858,14 +659,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          texture_view_unknown_swizzle_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted texture-view-unknown-swizzle bundle\n";
-    return 1;
-  }
 
   const auto depth_stencil_missing_payload_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-depth-stencil-missing-payload");
@@ -877,14 +670,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "depth stencil descriptor is missing depth_write_enabled")) {
     std::cerr << "depth-stencil-missing-payload bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          depth_stencil_missing_payload_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted depth-stencil-missing-payload bundle\n";
     return 1;
   }
 
@@ -900,14 +685,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          buffer_gpu_address_missing_payload_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted buffer-gpu-address-missing-payload bundle\n";
-    return 1;
-  }
 
   const auto buffer_gpu_address_signpost_missing_payload_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-buffer-gpu-address-signpost-missing-payload");
@@ -919,14 +696,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "dxmt_buffer_gpu_address is missing buffer_id")) {
     std::cerr << "buffer-gpu-address-signpost-missing-payload bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          buffer_gpu_address_signpost_missing_payload_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted buffer-gpu-address-signpost-missing-payload bundle\n";
     return 1;
   }
 
@@ -942,14 +711,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          texture_descriptor_missing_payload_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted texture-descriptor-missing-payload bundle\n";
-    return 1;
-  }
 
   const auto texture_descriptor_invalid_pixel_format_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-texture-descriptor-invalid-pixel-format");
@@ -963,14 +724,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          texture_descriptor_invalid_pixel_format_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted texture-descriptor-invalid-pixel-format bundle\n";
-    return 1;
-  }
 
   const auto texture_gpu_resource_missing_payload_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-texture-gpu-resource-missing-payload");
@@ -982,14 +735,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "dxmt_texture_gpu_resource_id is missing gpu_resource_id")) {
     std::cerr << "texture-gpu-resource-missing-payload bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          texture_gpu_resource_missing_payload_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted texture-gpu-resource-missing-payload bundle\n";
     return 1;
   }
 
@@ -1006,14 +751,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          memory_barrier_missing_payload_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted memory-barrier-missing-payload bundle\n";
-    return 1;
-  }
 
   const auto fence_ops_missing_payload_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-fence-ops-missing-payload");
@@ -1028,14 +765,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          fence_ops_missing_payload_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted fence-ops-missing-payload bundle\n";
-    return 1;
-  }
 
   const auto dispatch_signpost_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-dispatch-signpost-without-pipeline");
@@ -1047,11 +776,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "dispatch signpost occurs before a valid compute pipeline bind")) {
     std::cerr << "dispatch-signpost-without-pipeline bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, dispatch_signpost_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted dispatch-signpost-without-pipeline bundle\n";
     return 1;
   }
 
@@ -1068,14 +792,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          dispatch_signpost_missing_payload_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted dispatch-signpost-missing-payload bundle\n";
-    return 1;
-  }
 
   const auto compute_bytes_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-compute-bytes-without-encoder");
@@ -1087,11 +803,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "setComputeBytes references an unknown compute encoder")) {
     std::cerr << "compute-bytes-without-encoder bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, compute_bytes_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted compute-bytes-without-encoder bundle\n";
     return 1;
   }
 
@@ -1108,11 +819,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, compute_bytes_missing_payload_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted compute-bytes-missing-payload bundle\n";
-    return 1;
-  }
 
   const auto compute_bytes_signpost_missing_payload_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-compute-bytes-signpost-missing-payload");
@@ -1125,14 +831,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "compute bytes signpost is missing captured bytes")) {
     std::cerr << "compute-bytes-signpost-missing-payload bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          compute_bytes_signpost_missing_payload_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted compute-bytes-signpost-missing-payload bundle\n";
     return 1;
   }
 
@@ -1149,11 +847,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, copy_signpost_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted copy-signpost-without-blit-encoder bundle\n";
-    return 1;
-  }
 
   const auto copy_buffer_missing_size_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-copy-buffer-missing-size");
@@ -1168,11 +861,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, copy_buffer_missing_size_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted copy-buffer-missing-size bundle\n";
-    return 1;
-  }
 
   const auto copy_texture_missing_payload_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-copy-texture-missing-payload");
@@ -1184,14 +872,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "copyFromTexture is missing source_slice")) {
     std::cerr << "copy-texture-missing-payload bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          copy_texture_missing_payload_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted copy-texture-missing-payload bundle\n";
     return 1;
   }
 
@@ -1208,14 +888,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          blit_fill_missing_value_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted blit-fill-missing-value bundle\n";
-    return 1;
-  }
 
   const auto blit_batch_missing_ops_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-blit-batch-missing-ops");
@@ -1228,11 +900,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "blitBatch is missing ops")) {
     std::cerr << "blit-batch-missing-ops bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, blit_batch_missing_ops_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted blit-batch-missing-ops bundle\n";
     return 1;
   }
 
@@ -1249,14 +916,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          blit_batch_fence_missing_stages_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted blit-batch-fence-missing-stages bundle\n";
-    return 1;
-  }
 
   const auto draw_missing_vertex_count_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-draw-missing-vertex-count");
@@ -1269,11 +928,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "drawPrimitives is missing vertex_count")) {
     std::cerr << "draw-missing-vertex-count bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, draw_missing_vertex_count_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted draw-missing-vertex-count bundle\n";
     return 1;
   }
 
@@ -1290,11 +944,6 @@ int main(int argc, char **argv)
               << replay_error << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, draw_invalid_primitive_type_bundle, "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted draw-invalid-primitive-type bundle\n";
-    return 1;
-  }
 
   const auto present_missing_payload_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-present-missing-payload");
@@ -1307,14 +956,6 @@ int main(int argc, char **argv)
       !expect_contains(replay_error, "presentDrawable is missing width")) {
     std::cerr << "present-missing-payload bundle did not fail validate-only as expected: "
               << replay_error << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          present_missing_payload_bundle,
-          "--require-metal --require-metal-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted present-missing-payload bundle\n";
     return 1;
   }
 

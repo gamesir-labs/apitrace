@@ -606,52 +606,21 @@ translation link 现在至少使用这些字段：
 - 资产目录提供 shader、纹理、buffer 等真实载荷
 
 默认 retrace 只校验它将要读取的最小闭包，以免大 trace 启动前重复扫描所有资源。
-需要完整检查 bundle 时，使用 `bundle-check <bundle>`；它会读取 `checksums.json`
-中的全部条目，确认文件存在、digest 匹配，并校验 manifest 级 `bundle_hash` 是否与文件列表一致。
-
-双侧 D3D→Metal 调试 bundle 可以打开严格项：
+需要确认经过拷贝、压缩、上传或网络传输后的 bundle 是否损坏时，使用：
 
 ```sh
-bundle-check --strict-cross-api path/to/scene.apitrace
+bundle-check path/to/scene.apitrace
 ```
 
-双侧 bundle 的严格检查必须同时覆盖 D3D 原始语义闭包和 Metal 原生闭包；translation link 只能
-说明两条时间线的对应关系，不能替代 D3D 侧 pipeline、shader、root signature 等原始重放输入。
-当 Metal 侧出现 draw/dispatch workload 时，`draw_to_metal_calls` link 还必须指向 D3D 侧的
-pipeline-dependent API 记录，例如 `SetPipelineState`、`Draw*` 或 `Dispatch*`；不能只链接到
-`ExecuteCommandLists`、frame boundary 或其他调度壳层记录。
+`bundle-check` 只读取 `checksums.json`，对其中列出的每个文件重新计算 SHA-256，
+确认文件存在、digest 匹配，并校验 manifest 级 `bundle_hash` 是否与文件列表一致。
+`--verify-hashes` 是兼容旧脚本的别名；hash 对比现在是 `bundle-check` 的唯一模式。
 
-对 D3D12 原始重放闭包可以增加：
-
-```sh
-bundle-check --require-d3d --require-d3d-replay-closure --require-d3d-native-readiness --require-d3d-present-frames path/to/d3d12.apitrace
-```
-
-这个检查要求 D3D callstream 至少引用独立的 pipeline、shader 和 root signature 资产。它只检查
-D3D 原始语义闭包，不把 Metal 转译产物当作 D3D 侧资产的替代品。
-`--require-d3d-native-readiness` 会把 callstream 喂给 D3D12 replay backend 并执行
-validate-only 语义预检；它不创建图形设备，但会拒绝当前只能由 DXMT 转译后端支持、不能直接
-native replay 的语义。`--require-d3d-present-frames` 还要求 `D3D11PresentFrame` 或
-`D3D12PresentFrame` debug 资产能逐帧匹配 captured Present call 和 Present boundary，用于
-后续 tile compare 输入检查。
-
-对 Metal 原生重放闭包可以增加：
-
-```sh
-bundle-check --require-metal --require-metal-replay-closure --require-metal-present-frames path/to/metal.apitrace
-retrace --metal --validate-only path/to/metal.apitrace
-```
-
-这个检查要求 Metal callstream 引用独立的 metallib 和 pipeline 资产，并包含 pipeline bind 与
-draw/dispatch 调用。`--validate-only` 不创建 `MTLDevice`，用于大 trace 在真实 Metal replay 前的
-闭包预检。`--require-metal-present-frames` 要求 `MetalPresentFrame` debug 资产能按 `frame_index`
-匹配同一 bundle 的 `PresentDrawable` 调用。
-
-严格共享资源检查要求 buffer/texture 存在于 API 无关的 `buffers/` 或 `textures/` 目录，
-并要求 D3D callstream 和 Metal callstream 通过路径引用同一个资源资产。该检查会分别统计
-buffer 和 texture 的跨侧共享路径；如果两侧都引用某类资源，就必须至少有一个同类共享路径。
-PresentFrame debug 资产只用于画面对比，不计入游戏资源共享统计。shader、pipeline 和 Metal
-library 这类 API/后端相关资产仍保持各自目录。
+`bundle-check` 不读取或解释 `callstream.jsonl`、`assets.json`、Metal sideband、
+translation links、D3D/Metal replay model，也不检查 pipeline、shader、root signature、
+PresentFrame 或 replay closure。它不能用于判断 `bundle-finalize` 的语义修复是否正确，
+也不能替代 retrace。需要 replay 语义预检时，应使用 `retrace --validate-only`、
+`retrace --metal --validate-only` 或专门的 D3D/Metal replay 单元测试。
 
 合成双侧 smoke 可用以下脚本固定验证这些条件：
 
@@ -659,8 +628,9 @@ library 这类 API/后端相关资产仍保持各自目录。
 scripts/test-cross-api-smoke.sh
 ```
 
-该脚本会生成同一个 bundle 内的 D3D12 与 Metal 调用流，运行全 strict `bundle-check`、D3D/Metal
-validate-only，并对 D3D12 PresentFrame 与 Metal PresentFrame 执行 `d3d12-to-metal` tile compare。
+该脚本会生成同一个 bundle 内的 D3D12 与 Metal 调用流，运行 checksum-only `bundle-check`、
+D3D/Metal validate-only，并对 D3D12 PresentFrame 与 Metal PresentFrame 执行
+`d3d12-to-metal` tile compare。
 在 Apple Metal 可用环境中，该脚本还会运行 `apitrace_test_metal_native_replay_smoke`：fixture 写入真实
 `metallib`、pipeline、buffer 和离屏 render target 元数据，用非 validate-only `retrace --metal` 执行
 native Metal 命令并捕获 retrace 帧。验收基准来自同一 `metallib` 和几何数据直接执行的原生 Metal

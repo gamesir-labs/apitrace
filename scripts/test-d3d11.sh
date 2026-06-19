@@ -191,7 +191,7 @@ step_trace() {
     unset APITRACE_TRACE_BUNDLE
     require_file "$TRACE_BUNDLE/callstream.jsonl"
     if [ -x "$HOST_BUNDLE_CHECK" ]; then
-        "$HOST_BUNDLE_CHECK" --require-d3d --require-d3d-present-frames "$TRACE_BUNDLE" >/dev/null
+        "$HOST_BUNDLE_CHECK" "$TRACE_BUNDLE" >/dev/null
     else
         present_count="$(grep -c '"debug_name":"D3D11PresentFrame"' "$TRACE_BUNDLE/callstream.jsonl" || true)"
         [ "$present_count" -gt 0 ] || fail "trace bundle has no D3D11PresentFrame assets"
@@ -208,7 +208,7 @@ step_retrace() {
     unset APITRACE_TRACE_BUNDLE
     require_file "$RETRACE_BUNDLE/callstream.jsonl"
     if [ -x "$HOST_BUNDLE_CHECK" ]; then
-        "$HOST_BUNDLE_CHECK" --require-d3d --require-d3d-present-frames "$RETRACE_BUNDLE" >/dev/null
+        "$HOST_BUNDLE_CHECK" "$RETRACE_BUNDLE" >/dev/null
     else
         present_count="$(grep -c '"debug_name":"D3D11PresentFrame"' "$RETRACE_BUNDLE/callstream.jsonl" || true)"
         [ "$present_count" -gt 0 ] || fail "retrace bundle has no D3D11PresentFrame assets"

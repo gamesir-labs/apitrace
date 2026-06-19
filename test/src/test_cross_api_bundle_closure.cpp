@@ -566,30 +566,10 @@ int main(int argc, char **argv)
   if (!bundle_check.empty() &&
       !run_tool(
           bundle_check,
-          "--strict-cross-api",
+          "",
           bundle)) {
-    std::cerr << "bundle-check rejected the cross-api closure fixture\n";
+    std::cerr << "bundle-check rejected checksum-valid cross-api closure fixture\n";
     return 1;
-  }
-
-  if (!bundle_check.empty()) {
-    const auto broken_link_bundle =
-        bundle.parent_path() / (bundle.filename().generic_string() + "-broken-d3d-draw-link");
-    CrossApiBundleOptions broken_options;
-    broken_options.link_draw_to_pipeline_work = false;
-    if (!write_cross_api_bundle(broken_link_bundle, broken_options, error)) {
-      std::cerr << error << "\n";
-      return 1;
-    }
-    if (run_tool(
-            bundle_check,
-            "--require-d3d --require-metal --require-translation-links --require-shared-resources "
-            "--require-d3d-replay-closure --require-d3d-present-frames "
-            "--require-metal-replay-closure --require-metal-present-frames",
-            broken_link_bundle)) {
-      std::cerr << "bundle-check accepted Metal draw work linked to non-pipeline D3D metadata\n";
-      return 1;
-    }
   }
 
   if (!retrace.empty()) {

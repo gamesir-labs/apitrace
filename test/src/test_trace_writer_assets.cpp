@@ -337,7 +337,9 @@ bool refresh_bundle_hash(const std::filesystem::path &bundle)
     if (path != "bundle_hash") {
       const auto encoded = checksums.substr(digest_begin, digest_end - digest_begin);
       const auto size_separator = encoded.find(':');
-      records[path] = size_separator == std::string::npos ? encoded : encoded.substr(0, size_separator);
+      const auto digest = size_separator == std::string::npos ? encoded : encoded.substr(0, size_separator);
+      const auto size_suffix = size_separator == std::string::npos ? std::string() : ("#" + encoded.substr(size_separator + 1));
+      records[path] = digest + size_suffix;
     }
     search_position = digest_end + 1;
   }
@@ -1564,8 +1566,8 @@ int main(int argc, char **argv)
     std::cerr << "bundle-finalize should preserve and rewrite spooled Unmap blob refs\n";
     return 1;
   }
-  if (!bundle_check.empty() && run_bundle_check(bundle_check, spooled_bundle, "--require-d3d") != 0) {
-    std::cerr << "bundle-check rejected finalized spooled Unmap payload refs\n";
+  if (!bundle_check.empty() && run_bundle_check(bundle_check, spooled_bundle, "") != 0) {
+    std::cerr << "bundle-check rejected checksum-valid finalized spooled Unmap payload refs\n";
     return 1;
   }
 
@@ -2108,12 +2110,11 @@ int main(int argc, char **argv)
   }
 
   if (!bundle_check.empty()) {
-    const auto shared_options = "--require-d3d --require-metal --require-translation-links --require-shared-resources";
-    const auto shared_resource_options = "--require-d3d --require-metal --require-shared-resources";
-    if (run_bundle_check(bundle_check, bundle, shared_options) != 0) {
-      std::cerr << "bundle-check rejected the shared generic resource bundle\n";
+    if (run_bundle_check(bundle_check, bundle, "") != 0) {
+      std::cerr << "bundle-check rejected a checksum-valid shared generic resource bundle\n";
       return 1;
     }
+
     const auto stale_unreferenced_checksum_bundle =
         bundle.parent_path() / (bundle.filename().generic_string() + "-stale-unreferenced-checksum");
     std::filesystem::remove_all(stale_unreferenced_checksum_bundle);
@@ -2139,10 +2140,11 @@ int main(int argc, char **argv)
           std::ios::binary | std::ios::trunc);
       output << "{\"record_type\":\"second\"}\n";
     }
-    if (run_bundle_check(bundle_check, stale_unreferenced_checksum_bundle, shared_options) == 0) {
+    if (run_bundle_check(bundle_check, stale_unreferenced_checksum_bundle, "") == 0) {
       std::cerr << "bundle-check accepted stale unreferenced checksum content\n";
       return 1;
     }
+
     const auto missing_asset_index_bundle =
         bundle.parent_path() / (bundle.filename().generic_string() + "-missing-asset-index");
     std::filesystem::remove_all(missing_asset_index_bundle);
@@ -2161,30 +2163,11 @@ int main(int argc, char **argv)
       std::cerr << "reader reported an asset index after assets.json was removed\n";
       return 1;
     }
-    if (run_bundle_check(bundle_check, missing_asset_index_bundle, shared_resource_options) == 0) {
-      std::cerr << "bundle-check accepted strict shared-resource validation without assets.json\n";
+    if (run_bundle_check(bundle_check, missing_asset_index_bundle, "") == 0) {
+      std::cerr << "bundle-check accepted a missing file listed in checksums.json\n";
       return 1;
     }
-    const auto split_texture_resource_bundle =
-        bundle.parent_path() / (bundle.filename().generic_string() + "-split-texture-resource");
-    if (!write_split_texture_resource_bundle(split_texture_resource_bundle)) {
-      std::cerr << "failed to write split-texture-resource bundle\n";
-      return 1;
-    }
-    if (run_bundle_check(bundle_check, split_texture_resource_bundle, shared_resource_options) == 0) {
-      std::cerr << "bundle-check accepted split D3D/Metal texture resource paths\n";
-      return 1;
-    }
-    const auto duplicate_resource_hash_bundle =
-        bundle.parent_path() / (bundle.filename().generic_string() + "-duplicate-cross-api-resource-hash");
-    if (!write_duplicate_cross_api_resource_hash_bundle(duplicate_resource_hash_bundle)) {
-      std::cerr << "failed to write duplicate-cross-api-resource-hash bundle\n";
-      return 1;
-    }
-    if (run_bundle_check(bundle_check, duplicate_resource_hash_bundle, shared_resource_options) == 0) {
-      std::cerr << "bundle-check accepted duplicate D3D/Metal resource content under different paths\n";
-      return 1;
-    }
+
     const auto stale_hash_bundle =
         bundle.parent_path() / (bundle.filename().generic_string() + "-stale-asset-content-hash");
     std::filesystem::remove_all(stale_hash_bundle);
@@ -2206,8 +2189,8 @@ int main(int argc, char **argv)
       std::cerr << "failed to refresh stale content_hash fixture checksum\n";
       return 1;
     }
-    if (run_bundle_check(bundle_check, stale_hash_bundle, shared_options) == 0) {
-      std::cerr << "bundle-check accepted stale asset content_hash metadata\n";
+    if (run_bundle_check(bundle_check, stale_hash_bundle, "") != 0) {
+      std::cerr << "bundle-check rejected checksum-valid stale asset content_hash metadata\n";
       return 1;
     }
     apitrace::trace::TraceBundleReader stale_hash_reader;
@@ -2236,8 +2219,8 @@ int main(int argc, char **argv)
       std::cerr << "failed to refresh stale byte_size fixture checksum\n";
       return 1;
     }
-    if (run_bundle_check(bundle_check, stale_size_bundle, shared_options) == 0) {
-      std::cerr << "bundle-check accepted stale asset byte_size metadata\n";
+    if (run_bundle_check(bundle_check, stale_size_bundle, "") != 0) {
+      std::cerr << "bundle-check rejected checksum-valid stale asset byte_size metadata\n";
       return 1;
     }
     apitrace::trace::TraceBundleReader stale_size_reader;
@@ -2245,48 +2228,19 @@ int main(int argc, char **argv)
       std::cerr << "reader accepted stale asset byte_size metadata\n";
       return 1;
     }
-    const auto duplicate_blob_path_bundle =
-        bundle.parent_path() / (bundle.filename().generic_string() + "-duplicate-blob-path");
-    std::filesystem::remove_all(duplicate_blob_path_bundle);
-    std::filesystem::copy(
-        bundle,
-        duplicate_blob_path_bundle,
-        std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
-    if (!replace_any_text_in_file(
-            duplicate_blob_path_bundle / "assets.json",
-            {
-                {"\"blob_id\":6", "\"blob_id\":1"},
-                {"\"blob_id\": 6", "\"blob_id\": 1"},
-            })) {
-      std::cerr << "failed to corrupt duplicate blob path fixture\n";
-      return 1;
-    }
-    if (!refresh_checksum_entry(duplicate_blob_path_bundle, "assets.json") ||
-        !refresh_bundle_hash(duplicate_blob_path_bundle)) {
-      std::cerr << "failed to refresh duplicate blob path fixture checksum\n";
-      return 1;
-    }
-    if (run_bundle_check(bundle_check, duplicate_blob_path_bundle, shared_options) == 0) {
-      std::cerr << "bundle-check accepted one blob_id mapped to multiple asset paths\n";
-      return 1;
-    }
+
     const auto primary_blob_conflict_bundle =
         bundle.parent_path() / (bundle.filename().generic_string() + "-primary-blob-conflict");
     if (!write_primary_blob_id_conflict_bundle(primary_blob_conflict_bundle)) {
       std::cerr << "failed to write primary-blob-conflict bundle\n";
       return 1;
     }
-    constexpr const char *primary_blob_conflict_options = "--require-d3d";
-    if (run_bundle_check(bundle_check, primary_blob_conflict_bundle, primary_blob_conflict_options) == 0) {
-      std::cerr << "bundle-check accepted unresolved primary blob_id/path conflict\n";
-      return 1;
-    }
     if (bundle_finalize.empty() || run_bundle_finalize(bundle_finalize, primary_blob_conflict_bundle) != 0) {
       std::cerr << "bundle-finalize failed to repair a path-proven primary blob_id conflict\n";
       return 1;
     }
-    if (run_bundle_check(bundle_check, primary_blob_conflict_bundle, primary_blob_conflict_options) != 0) {
-      std::cerr << "bundle-check rejected finalized path-proven primary blob_id conflict\n";
+    if (run_bundle_check(bundle_check, primary_blob_conflict_bundle, "") != 0) {
+      std::cerr << "bundle-check rejected checksum-valid finalized path-proven primary blob_id conflict\n";
       return 1;
     }
     const auto repaired_primary_callstream = read_text(primary_blob_conflict_bundle / "callstream.jsonl");
@@ -2301,8 +2255,8 @@ int main(int argc, char **argv)
       std::cerr << "failed to write d3d-graphics-pipeline bundle\n";
       return 1;
     }
-    if (run_bundle_check(bundle_check, d3d_pipeline_bundle, "--require-d3d --require-d3d-replay-closure") != 0) {
-      std::cerr << "bundle-check rejected D3D graphics pipeline nested shader refs\n";
+    if (run_bundle_check(bundle_check, d3d_pipeline_bundle, "") != 0) {
+      std::cerr << "bundle-check rejected checksum-valid D3D graphics pipeline nested shader refs\n";
       return 1;
     }
     const auto shuffled_d3d_pipeline_bundle =
@@ -2311,65 +2265,8 @@ int main(int argc, char **argv)
       std::cerr << "failed to write shuffled d3d-graphics-pipeline bundle\n";
       return 1;
     }
-    if (run_bundle_check(bundle_check, shuffled_d3d_pipeline_bundle, "--require-d3d --require-d3d-replay-closure") != 0) {
-      std::cerr << "bundle-check rejected D3D graphics pipeline blob_refs whose asset index covers the same paths\n";
-      return 1;
-    }
-    const auto broken_d3d_closure_bundle =
-        bundle.parent_path() / (bundle.filename().generic_string() + "-d3d-replay-closure-missing-submit");
-    std::filesystem::remove_all(broken_d3d_closure_bundle);
-    std::filesystem::copy(
-        d3d_pipeline_bundle,
-        broken_d3d_closure_bundle,
-        std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
-    if (!replace_text_in_file(
-            broken_d3d_closure_bundle / "callstream.jsonl",
-            "ID3D12CommandQueue::ExecuteCommandLists",
-            "ID3D12CommandQueue::ExecuteCommandListsOmitted")) {
-      std::cerr << "failed to corrupt D3D replay closure fixture\n";
-      return 1;
-    }
-    if (!refresh_checksum_entry(broken_d3d_closure_bundle, "callstream.jsonl") ||
-        !refresh_bundle_hash(broken_d3d_closure_bundle)) {
-      std::cerr << "failed to refresh corrupted D3D replay closure checksum\n";
-      return 1;
-    }
-    if (run_bundle_check(bundle_check, broken_d3d_closure_bundle, "--require-d3d --require-d3d-replay-closure") == 0) {
-      std::cerr << "bundle-check accepted D3D replay closure without ExecuteCommandLists\n";
-      return 1;
-    }
-    const auto missing_payload_ref_bundle =
-        bundle.parent_path() / (bundle.filename().generic_string() + "-missing-payload-object-ref");
-    std::filesystem::remove_all(missing_payload_ref_bundle);
-    {
-      apitrace::trace::TraceBundleWriter missing_payload_ref_writer;
-      if (!missing_payload_ref_writer.open(missing_payload_ref_bundle)) {
-        std::cerr << "failed to open missing-payload-object-ref bundle\n";
-        return 1;
-      }
-      apitrace::trace::TraceMetadata missing_payload_ref_metadata;
-      missing_payload_ref_metadata.api = apitrace::trace::ApiKind::D3D12;
-      missing_payload_ref_metadata.producer = "missing-payload-object-ref-test";
-      missing_payload_ref_writer.write_metadata(missing_payload_ref_metadata);
-      missing_payload_ref_writer.write_object_index({
-          {100, apitrace::trace::ObjectKind::Device, 0, "device"},
-          {101, apitrace::trace::ObjectKind::Resource, 100, "cbv-buffer"},
-      });
-      apitrace::trace::EventRecord cbv_event;
-      cbv_event.kind = apitrace::trace::EventKind::Call;
-      cbv_event.callsite.sequence = 1;
-      cbv_event.callsite.function_name = "ID3D12Device::CreateConstantBufferView";
-      cbv_event.callsite.result_code = 0;
-      cbv_event.object_refs = {100};
-      cbv_event.payload =
-          "{\"buffer_location\":268435456,\"size_in_bytes\":256,"
-          "\"gpuva_resolve_status\":\"mapped\",\"resolved_resource_object_id\":101,"
-          "\"resolved_resource_offset\":0,\"resolved_resource_width\":4096}";
-      missing_payload_ref_writer.append_call_event(cbv_event);
-      missing_payload_ref_writer.close();
-    }
-    if (run_bundle_check(bundle_check, missing_payload_ref_bundle, "--require-d3d") == 0) {
-      std::cerr << "bundle-check accepted payload object id missing from object_refs\n";
+    if (run_bundle_check(bundle_check, shuffled_d3d_pipeline_bundle, "") != 0) {
+      std::cerr << "bundle-check rejected checksum-valid D3D graphics pipeline shuffled blob refs\n";
       return 1;
     }
   }
@@ -2477,8 +2374,8 @@ int main(int argc, char **argv)
     frame_writer.append_call_event(present_boundary);
     frame_writer.close();
   }
-  if (!bundle_check.empty() && run_bundle_check(bundle_check, legal_frame_bundle, "--require-d3d") != 0) {
-    std::cerr << "bundle-check rejected a legal D3D present-frame bundle\n";
+  if (!bundle_check.empty() && run_bundle_check(bundle_check, legal_frame_bundle, "") != 0) {
+    std::cerr << "bundle-check rejected checksum-valid legal D3D present-frame bundle\n";
     return 1;
   }
 
@@ -2514,8 +2411,8 @@ int main(int argc, char **argv)
     test_present_writer.append_call_event(real_present_boundary);
     test_present_writer.close();
   }
-  if (!bundle_check.empty() && run_bundle_check(bundle_check, legal_test_present_bundle, "--require-d3d") != 0) {
-    std::cerr << "bundle-check rejected a legal test Present without frame_index\n";
+  if (!bundle_check.empty() && run_bundle_check(bundle_check, legal_test_present_bundle, "") != 0) {
+    std::cerr << "bundle-check rejected checksum-valid legal test Present without frame_index\n";
     return 1;
   }
 

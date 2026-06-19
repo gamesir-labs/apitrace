@@ -145,8 +145,8 @@ D3D11 和 D3D12 trace / retrace 都写 `D3D*PresentFrame` debug 资产。Metal t
 `scripts/test-cross-api-smoke.sh`：
 
 - 生成合成 D3D12 + Metal 双侧 bundle。
-- 用 `bundle-check` 同时要求 D3D、Metal、translation links、共享资源、双侧 replay closure、D3D native readiness 和双侧 PresentFrame。
-- 校验 Metal draw/dispatch 的 `draw_to_metal_calls` 必须链接到 D3D pipeline-dependent 调用，而不是只链接到提交/边界记录。
+- 用 `bundle-check` 只校验 `checksums.json` 列出的文件 hash 和 manifest `bundle_hash`。
+- 由 `apitrace_test_cross_api_bundle_closure`、D3D validate-only 和 Metal validate-only 校验双侧 replay closure 与 translation link 语义。
 - 分别执行 D3D validate-only 与 Metal validate-only。
 - 对同一 bundle 内的 D3D12 PresentFrame 和 Metal PresentFrame 执行 `d3d12-to-metal` tile compare。
 - 构建并运行 `apitrace_test_metal_native_replay_smoke`。该 smoke 使用真实 `metallib`、离屏 render target
@@ -163,8 +163,8 @@ D3D11 和 D3D12 trace / retrace 都写 `D3D*PresentFrame` debug 资产。Metal t
   `d3d12.dll` + `d3dcompiler_47.dll` 生成 DXBC 资产。
 - 生成最小但 pipeline-dependent 的 D3D12 bundle：swapchain back buffer、RTV、root signature、
   graphics PSO、viewport/scissor、OMSetRenderTargets、DrawInstanced、state transition、Present。
-- 用 `bundle-check --require-d3d --require-d3d-replay-closure --require-d3d-native-readiness --require-d3d-present-frames`
-  校验 bundle 闭包，并要求 D3D pipeline / shader / root-signature 资产和 draw 元数据闭合。
+- 用 `bundle-check` 只校验 bundle 文件完整性；D3D pipeline / shader / root-signature 资产和 draw
+  元数据闭包由 native `retrace --validate-only` 和 D3D replay 语义测试负责。
 - 在 DXMT ABI probe 前先运行 ARM64 Metal native probe 并保存诊断日志；该 probe 只用于区分当前
   shell/GUI 环境下的 Metal 可用性，不再作为 x86_64 DXMT native replay 的硬性 gate。
 - 先运行 native DXMT ABI smoke，确认当前进程能枚举 Metal-backed DXGI adapter。

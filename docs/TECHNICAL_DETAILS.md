@@ -100,10 +100,13 @@ retrace --metal path/to/scene.apitrace
 
 ```sh
 bundle-check path/to/scene.apitrace
-bundle-check --require-d3d --require-d3d-replay-closure --require-d3d-native-readiness --require-d3d-present-frames path/to/d3d12.apitrace
-bundle-check --require-metal --require-metal-replay-closure --require-metal-present-frames path/to/metal.apitrace
-bundle-check --strict-cross-api path/to/d3d-metal.apitrace
 ```
+
+`bundle-check` 只用于确认 bundle 在拷贝、压缩、上传或网络传输后是否损坏。它读取
+`checksums.json`，重新计算列出的文件 SHA-256，并校验 manifest 级 `bundle_hash`。
+它不解析 callstream、assets、translation links、D3D/Metal 闭包或 replay model，也不检查
+`bundle-finalize` 的语义结果。需要 replay 语义预检时使用 `retrace --validate-only` 或
+`retrace --metal --validate-only`。
 
 可选参数：
 
@@ -164,26 +167,15 @@ scripts/test-d3d-native-abi.sh
 
 这些脚本会构建需要的 demo / retrace 产物，生成 trace bundle，执行 retrace，并用
 `scripts/lib/present_frame_compare.py` 对 debug PresentFrame 资产做 tile 级对比。
-对真实游戏这类大 bundle，先运行 `bundle-check` 可以在 retrace 前校验 `checksums.json`
-列出的文件闭包、digest 和 manifest 级 `bundle_hash`，并检查 PresentFrame 资产是否能匹配
-D3D Present call / boundary 或 Metal `PresentDrawable`，避免把异步资产写入、路径重写或孤立
-debug 帧误判成 replay 问题。
-对 D3D12 smoke，额外使用 `--require-d3d-replay-closure`、`--require-d3d-native-readiness` 和 `--require-d3d-present-frames`，
-要求 D3D 调用流引用独立的 pipeline、shader 和 root signature 资产，并要求 debug PresentFrame
-资产匹配 captured Present call / boundary。`--require-d3d-native-readiness` 会执行 D3D12
-replay backend 的 validate-only 语义预检，不创建设备，但会拒绝当前不能直接 native replay 的
-DXMT-only 语义，避免只有 Metal 侧资产完整而 D3D 原始重放闭包缺失。
-对 Metal smoke，额外使用 `--require-metal-replay-closure`、`--require-metal-present-frames` 和
-`retrace --metal --validate-only`，要求 Metal 调用流引用独立的 metallib、pipeline 资产，
-包含 pipeline bind 与 draw/dispatch，并要求 debug PresentFrame 资产匹配 `PresentDrawable`。
-双侧 D3D→Metal smoke 使用 `--require-shared-resources` 时，`bundle-check` 会分别统计
-buffer 和 texture 的 D3D 引用、Metal 引用与共享路径；如果两侧都引用某类资源但没有同类共享路径，
-检查会失败。双侧 bundle 还必须打开 D3D replay closure 和 native-readiness 检查，避免只凭
-translation link / Metal 侧闭包误判 D3D 原始调用元数据已经足够重放。PresentFrame debug 资产
-不计入这组资源共享统计，避免画面对比输入掩盖真实游戏资源是否去重。
-如果 Metal 闭包里有 draw/dispatch，`bundle-check` 会进一步要求对应 `draw_to_metal_calls`
-link 指向 D3D 侧 pipeline-dependent 调用；否则说明 D3D 原始 callstream 缺少足以重放该 workload
-的 API 元数据。
+对真实游戏这类大 bundle，`bundle-check` 只回答一个问题：`checksums.json` 中列出的文件
+在传输后是否仍然存在且字节未损坏。它不能判断 `bundle-finalize` 是否修好了引用、frame
+边界、object index、pipeline 资产或 replay closure。
+
+对 D3D12 smoke，需要 D3D replay 闭包或 native readiness 语义预检时，使用
+`retrace --validate-only` 和 D3D replay backend 单元测试。对 Metal smoke，使用
+`retrace --metal --validate-only` 和 Metal replay closure 单元测试。双侧 D3D→Metal smoke
+的 translation link、共享资源、PresentFrame 匹配和 tile compare 仍由对应脚本和专用测试检查，
+不再由 `bundle-check` 承担。
 
 `scripts/test-d3d-native-abi.sh` 是 D3D native retrace 接入 DXMT 的前置 smoke。普通执行时，若当前
 进程拿不到 Metal-backed DXGI adapter，它会报告 `ABI_SMOKE_SKIP` 并以成功状态结束；用于最终验收或

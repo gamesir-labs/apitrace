@@ -1,13 +1,12 @@
 int main(int argc, char **argv)
 {
-  if (argc != 3 && argc != 4) {
-    std::cerr << "usage: test_d3d12_replay_semantics <bundle> <bundle-finalize> [bundle-check]\n";
+  if (argc != 3) {
+    std::cerr << "usage: test_d3d12_replay_semantics <bundle> <bundle-finalize>\n";
     return 2;
   }
 
   const std::filesystem::path bundle = argv[1];
   g_bundle_finalize = std::filesystem::path(argv[2]);
-  const std::filesystem::path bundle_check = argc == 4 ? std::filesystem::path(argv[3]) : std::filesystem::path();
   std::filesystem::remove_all(bundle);
 
   apitrace::trace::TraceBundleWriter writer;
@@ -1114,33 +1113,10 @@ int main(int argc, char **argv)
     std::cerr << "native-ready replay validation failed: " << backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(
-          bundle_check,
-          bundle,
-          "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness --require-d3d-present-frames") != 0) {
-    std::cerr << "bundle-check rejected the native-ready D3D12 replay fixture\n";
-    return 1;
-  }
-  if (!bundle_check.empty()) {
-    if (run_bundle_check(bundle_check, missing_pipeline_shader_ref_bundle, "--require-d3d --require-d3d-replay-closure") == 0) {
-      std::cerr << "bundle-check accepted a pipeline shader path missing from blob_refs\n";
-      return 1;
-    }
-    if (run_bundle_check(bundle_check, incomplete_pipeline_metadata_bundle, "--require-d3d --require-d3d-replay-closure") == 0) {
-      std::cerr << "bundle-check accepted incomplete pipeline shader metadata\n";
-      return 1;
-    }
-  }
   const auto draw_without_pipeline_assets_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-draw-without-pipeline-assets");
   if (!write_draw_without_pipeline_assets_bundle(draw_without_pipeline_assets_bundle)) {
     std::cerr << "failed to write draw-without-pipeline-assets bundle\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, draw_without_pipeline_assets_bundle, "--require-d3d --require-d3d-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted a draw bundle without pipeline assets\n";
     return 1;
   }
   if (!expect_d3d12_replay_failure(missing_pipeline_shader_ref_bundle, "asset path is not covered by blob_refs")) {
@@ -1158,11 +1134,6 @@ int main(int argc, char **argv)
     std::cerr << "failed to write missing-pipeline-sample-desc bundle\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, missing_pipeline_sample_desc_bundle, "--require-d3d --require-d3d-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted a graphics pipeline missing sample_desc\n";
-    return 1;
-  }
   if (!expect_d3d12_replay_failure(
           missing_pipeline_sample_desc_bundle,
           "graphics pipeline asset missing sample_desc")) {
@@ -1176,11 +1147,6 @@ int main(int argc, char **argv)
     std::cerr << "failed to write missing-pipeline-rtv-formats bundle\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, missing_pipeline_rtv_formats_bundle, "--require-d3d --require-d3d-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted a graphics pipeline missing rtv_formats\n";
-    return 1;
-  }
   if (!expect_d3d12_replay_failure(
           missing_pipeline_rtv_formats_bundle,
           "graphics pipeline asset missing rtv_formats")) {
@@ -1192,11 +1158,6 @@ int main(int argc, char **argv)
       bundle.parent_path() / (bundle.filename().generic_string() + "-missing-pipeline-depth-enable");
   if (!write_graphics_pipeline_missing_metadata_bundle(missing_pipeline_depth_enable_bundle, "depth_enable")) {
     std::cerr << "failed to write missing-pipeline-depth-enable bundle\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, missing_pipeline_depth_enable_bundle, "--require-d3d --require-d3d-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted a graphics pipeline missing depth_enable\n";
     return 1;
   }
   if (!expect_d3d12_replay_failure(
@@ -1221,11 +1182,6 @@ int main(int argc, char **argv)
       bundle.parent_path() / (bundle.filename().generic_string() + "-pipeline-unknown-root-signature");
   if (!write_pipeline_unknown_root_signature_bundle(pipeline_unknown_root_signature_bundle)) {
     std::cerr << "failed to write pipeline unknown-root-signature bundle\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, pipeline_unknown_root_signature_bundle, "--require-d3d --require-d3d-replay-closure") == 0) {
-    std::cerr << "bundle-check accepted a pipeline with an unknown root signature object id\n";
     return 1;
   }
   if (!expect_d3d12_replay_failure(
@@ -1260,11 +1216,6 @@ int main(int argc, char **argv)
               << draw_without_bound_pipeline_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, draw_without_bound_pipeline_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted a draw without a bound pipeline as native-ready\n";
-    return 1;
-  }
 
   const auto draw_without_bound_root_signature_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-draw-without-bound-root-signature");
@@ -1289,11 +1240,6 @@ int main(int argc, char **argv)
       draw_without_bound_root_signature_backend.last_error().find("has no bound root signature") == std::string::npos) {
     std::cerr << "native readiness accepted a draw without a bound root signature: "
               << draw_without_bound_root_signature_backend.last_error() << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, draw_without_bound_root_signature_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted a draw without a bound root signature as native-ready\n";
     return 1;
   }
 
@@ -1350,11 +1296,6 @@ int main(int argc, char **argv)
               << dispatch_without_bound_pipeline_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, dispatch_without_bound_pipeline_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted a dispatch without a bound pipeline as native-ready\n";
-    return 1;
-  }
 
   const auto execute_indirect_without_bound_pipeline_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-execute-indirect-without-bound-pipeline");
@@ -1381,11 +1322,6 @@ int main(int argc, char **argv)
               << execute_indirect_without_bound_pipeline_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, execute_indirect_without_bound_pipeline_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted ExecuteIndirect without a bound pipeline as native-ready\n";
-    return 1;
-  }
 
   const auto execute_indirect_argument_buffer_out_of_bounds_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-execute-indirect-argument-buffer-out-of-bounds");
@@ -1410,11 +1346,6 @@ int main(int argc, char **argv)
       execute_indirect_argument_buffer_out_of_bounds_backend.last_error().find("buffer range is out of bounds") == std::string::npos) {
     std::cerr << "native readiness accepted ExecuteIndirect with an out-of-bounds argument buffer: "
               << execute_indirect_argument_buffer_out_of_bounds_backend.last_error() << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, execute_indirect_argument_buffer_out_of_bounds_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted ExecuteIndirect with an out-of-bounds argument buffer as native-ready\n";
     return 1;
   }
 
@@ -1449,11 +1380,6 @@ int main(int argc, char **argv)
                 << ": " << readiness_error << "\n";
       return 1;
     }
-    if (!bundle_check.empty() &&
-        run_bundle_check(bundle_check, execute_indirect_missing_raster_state_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-      std::cerr << "bundle-check accepted " << test_case.suffix << " as native-ready\n";
-      return 1;
-    }
   }
 
   const auto clear_rtv_with_srv_descriptor_bundle =
@@ -1479,11 +1405,6 @@ int main(int argc, char **argv)
       clear_rtv_with_srv_descriptor_backend.last_error().find("expects RenderTargetView") == std::string::npos) {
     std::cerr << "native readiness accepted ClearRenderTargetView with an SRV descriptor: "
               << clear_rtv_with_srv_descriptor_backend.last_error() << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, clear_rtv_with_srv_descriptor_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted ClearRenderTargetView with an SRV descriptor as native-ready\n";
     return 1;
   }
 
@@ -1551,11 +1472,6 @@ int main(int argc, char **argv)
               << clear_rtv_rect_out_of_bounds_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, clear_rtv_rect_out_of_bounds_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted ClearRenderTargetView with an out-of-bounds rect as native-ready\n";
-    return 1;
-  }
 
   const auto query_range_out_of_bounds_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-query-range-out-of-bounds");
@@ -1580,11 +1496,6 @@ int main(int argc, char **argv)
       query_range_out_of_bounds_backend.last_error().find("query range is out of bounds") == std::string::npos) {
     std::cerr << "native readiness accepted an out-of-bounds query range: "
               << query_range_out_of_bounds_backend.last_error() << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, query_range_out_of_bounds_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted an out-of-bounds query range as native-ready\n";
     return 1;
   }
 
@@ -1613,11 +1524,6 @@ int main(int argc, char **argv)
               << clear_state_unknown_pipeline_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, clear_state_unknown_pipeline_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted ClearState with an unknown pipeline state as native-ready\n";
-    return 1;
-  }
 
   const auto predication_range_out_of_bounds_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-predication-range-out-of-bounds");
@@ -1644,11 +1550,6 @@ int main(int argc, char **argv)
               << predication_range_out_of_bounds_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, predication_range_out_of_bounds_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted an out-of-bounds predication buffer range as native-ready\n";
-    return 1;
-  }
 
   const auto fence_signal_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-fence-signal");
@@ -1673,11 +1574,6 @@ int main(int argc, char **argv)
       fence_signal_backend.last_error().find("requires captured fence timeline replay") == std::string::npos) {
     std::cerr << "native readiness accepted a captured fence timeline operation: "
               << fence_signal_backend.last_error() << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, fence_signal_bundle, "--require-d3d --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted a captured fence timeline operation as native-ready\n";
     return 1;
   }
 
@@ -1817,11 +1713,6 @@ int main(int argc, char **argv)
               << draw_with_late_descriptor_table_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, draw_with_late_descriptor_table_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted a draw whose descriptor table was initialized after execution as native-ready\n";
-    return 1;
-  }
 
   const auto incomplete_descriptor_table_range_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-draw-with-incomplete-descriptor-table-range");
@@ -1848,11 +1739,6 @@ int main(int argc, char **argv)
               << incomplete_descriptor_table_range_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, incomplete_descriptor_table_range_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted a draw with an incomplete descriptor-table range as native-ready\n";
-    return 1;
-  }
 
   const auto draw_with_late_render_target_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-draw-with-late-render-target");
@@ -1877,11 +1763,6 @@ int main(int argc, char **argv)
       draw_with_late_render_target_backend.last_error().find("references an uninitialized descriptor") == std::string::npos) {
     std::cerr << "native readiness accepted a draw whose render target was initialized after execution: "
               << draw_with_late_render_target_backend.last_error() << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, draw_with_late_render_target_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted a draw whose render target was initialized after execution as native-ready\n";
     return 1;
   }
 
@@ -1916,11 +1797,6 @@ int main(int argc, char **argv)
                 << ": " << readiness_error << "\n";
       return 1;
     }
-    if (!bundle_check.empty() &&
-        run_bundle_check(bundle_check, draw_missing_raster_state_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-      std::cerr << "bundle-check accepted " << test_case.suffix << " as native-ready\n";
-      return 1;
-    }
   }
 
   const auto render_pass_with_late_render_target_bundle =
@@ -1946,11 +1822,6 @@ int main(int argc, char **argv)
       render_pass_with_late_render_target_backend.last_error().find("references an uninitialized descriptor") == std::string::npos) {
     std::cerr << "native readiness accepted a render pass whose render target was initialized after execution: "
               << render_pass_with_late_render_target_backend.last_error() << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, render_pass_with_late_render_target_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted a render pass whose render target was initialized after execution as native-ready\n";
     return 1;
   }
 
@@ -1992,12 +1863,6 @@ int main(int argc, char **argv)
               << write_buffer_immediate_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty()) {
-    if (run_bundle_check(bundle_check, write_buffer_immediate_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") != 0) {
-      std::cerr << "bundle-check rejected a WriteBufferImmediate bundle as native-ready\n";
-      return 1;
-    }
-  }
 
   const auto write_buffer_immediate_out_of_bounds_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-write-buffer-immediate-out-of-bounds");
@@ -2024,11 +1889,6 @@ int main(int argc, char **argv)
               << write_buffer_immediate_out_of_bounds_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, write_buffer_immediate_out_of_bounds_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted an out-of-bounds WriteBufferImmediate destination as native-ready\n";
-    return 1;
-  }
 
   const auto copy_buffer_range_out_of_bounds_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-copy-buffer-range-out-of-bounds");
@@ -2053,11 +1913,6 @@ int main(int argc, char **argv)
       copy_buffer_range_out_of_bounds_backend.last_error().find("buffer range is out of bounds") == std::string::npos) {
     std::cerr << "native readiness accepted an out-of-bounds CopyBufferRegion range: "
               << copy_buffer_range_out_of_bounds_backend.last_error() << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, copy_buffer_range_out_of_bounds_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted an out-of-bounds CopyBufferRegion range as native-ready\n";
     return 1;
   }
 
@@ -2089,11 +1944,6 @@ int main(int argc, char **argv)
               << execute_bundle_copy_buffer_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, execute_bundle_copy_buffer_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") != 0) {
-    std::cerr << "bundle-check rejected an ExecuteBundle copy-buffer bundle as native-ready\n";
-    return 1;
-  }
 
   const auto copy_texture_source_box_out_of_bounds_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-copy-texture-source-box-out-of-bounds");
@@ -2120,11 +1970,6 @@ int main(int argc, char **argv)
               << copy_texture_source_box_out_of_bounds_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, copy_texture_source_box_out_of_bounds_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted an out-of-bounds CopyTextureRegion source box as native-ready\n";
-    return 1;
-  }
 
   const auto copy_texture_full_copy_out_of_bounds_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-copy-texture-full-copy-out-of-bounds");
@@ -2148,11 +1993,6 @@ int main(int argc, char **argv)
       copy_texture_full_copy_out_of_bounds_backend.last_error().find("destination full-copy region is out of bounds") == std::string::npos) {
     std::cerr << "native readiness accepted an out-of-bounds full CopyTextureRegion: "
               << copy_texture_full_copy_out_of_bounds_backend.last_error() << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, copy_texture_full_copy_out_of_bounds_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted an out-of-bounds full CopyTextureRegion as native-ready\n";
     return 1;
   }
 
@@ -2315,11 +2155,6 @@ int main(int argc, char **argv)
               << discard_resource_rect_out_of_bounds_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, discard_resource_rect_out_of_bounds_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted an out-of-bounds DiscardResource rect as native-ready\n";
-    return 1;
-  }
 
   const auto resolve_subresource_out_of_bounds_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-resolve-subresource-out-of-bounds");
@@ -2344,11 +2179,6 @@ int main(int argc, char **argv)
       resolve_subresource_out_of_bounds_backend.last_error().find("subresource index is out of bounds") == std::string::npos) {
     std::cerr << "native readiness accepted an out-of-bounds ResolveSubresource subresource: "
               << resolve_subresource_out_of_bounds_backend.last_error() << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, resolve_subresource_out_of_bounds_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted an out-of-bounds ResolveSubresource as native-ready\n";
     return 1;
   }
 
@@ -2377,11 +2207,6 @@ int main(int argc, char **argv)
               << resolve_region_rect_out_of_bounds_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, resolve_region_rect_out_of_bounds_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted an out-of-bounds ResolveSubresourceRegion rect as native-ready\n";
-    return 1;
-  }
 
   const auto vertex_buffer_range_out_of_bounds_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-vertex-buffer-range-out-of-bounds");
@@ -2408,11 +2233,6 @@ int main(int argc, char **argv)
               << vertex_buffer_range_out_of_bounds_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, vertex_buffer_range_out_of_bounds_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted an out-of-bounds vertex buffer range as native-ready\n";
-    return 1;
-  }
 
   const auto index_buffer_range_out_of_bounds_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-index-buffer-range-out-of-bounds");
@@ -2437,11 +2257,6 @@ int main(int argc, char **argv)
       index_buffer_range_out_of_bounds_backend.last_error().find("buffer range is out of bounds") == std::string::npos) {
     std::cerr << "native readiness accepted an out-of-bounds index buffer range: "
               << index_buffer_range_out_of_bounds_backend.last_error() << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, index_buffer_range_out_of_bounds_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted an out-of-bounds index buffer range as native-ready\n";
     return 1;
   }
 
@@ -2502,11 +2317,6 @@ int main(int argc, char **argv)
               << copy_resource_mismatched_desc_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, copy_resource_mismatched_desc_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted a CopyResource with mismatched resource descriptions as native-ready\n";
-    return 1;
-  }
 
   const auto resolve_region_requires_list1_bundle =
       bundle.parent_path() / (bundle.filename().generic_string() + "-resolve-region-requires-list1");
@@ -2543,11 +2353,6 @@ int main(int argc, char **argv)
   if (!resolve_region_backend.validate_native_replay_readiness()) {
     std::cerr << "ResolveSubresourceRegion requires-list1 bundle was not accepted by native readiness: "
               << resolve_region_backend.last_error() << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, resolve_region_requires_list1_bundle, "--require-d3d --require-d3d-replay-closure --require-d3d-native-readiness") != 0) {
-    std::cerr << "bundle-check rejected a ResolveSubresourceRegion requires-list1 bundle as native-ready\n";
     return 1;
   }
 
@@ -2587,16 +2392,6 @@ int main(int argc, char **argv)
               << dispatch_rays_backend.last_error() << "\n";
     return 1;
   }
-  if (!bundle_check.empty()) {
-    if (run_bundle_check(bundle_check, dispatch_rays_bundle, "--require-d3d --require-d3d-replay-closure") != 0) {
-      std::cerr << "bundle-check rejected a DispatchRays bundle before native readiness validation\n";
-      return 1;
-    }
-    if (run_bundle_check(bundle_check, dispatch_rays_bundle, "--require-d3d --require-d3d-native-readiness") == 0) {
-      std::cerr << "bundle-check accepted a DispatchRays bundle as native-ready\n";
-      return 1;
-    }
-  }
 
   const auto temporal_bundle = bundle.parent_path() / (bundle.filename().generic_string() + "-temporal-upscale");
   if (!write_temporal_upscale_bundle(temporal_bundle)) {
@@ -2635,11 +2430,6 @@ int main(int argc, char **argv)
       temporal_backend.last_error().find("TemporalUpscale requires a DXMT-backed replay backend") == std::string::npos) {
     std::cerr << "TemporalUpscale bundle was not rejected by native readiness: "
               << temporal_backend.last_error() << "\n";
-    return 1;
-  }
-  if (!bundle_check.empty() &&
-      run_bundle_check(bundle_check, temporal_bundle, "--require-d3d --require-d3d-native-readiness") == 0) {
-    std::cerr << "bundle-check accepted a TemporalUpscale bundle as native-ready\n";
     return 1;
   }
 
@@ -2759,16 +2549,6 @@ int main(int argc, char **argv)
     std::cerr << "mesh stream pipeline was not rejected by native readiness: "
               << mesh_backend.last_error() << "\n";
     return 1;
-  }
-  if (!bundle_check.empty()) {
-    if (run_bundle_check(bundle_check, mesh_bundle, "--require-d3d --require-d3d-replay-closure") != 0) {
-      std::cerr << "bundle-check rejected a mesh bundle before native readiness validation\n";
-      return 1;
-    }
-    if (run_bundle_check(bundle_check, mesh_bundle, "--require-d3d --require-d3d-native-readiness") == 0) {
-      std::cerr << "bundle-check accepted a mesh stream bundle as native-ready\n";
-      return 1;
-    }
   }
 
   const auto mismatch_bundle = bundle.parent_path() / (bundle.filename().generic_string() + "-gpuva-mismatch");

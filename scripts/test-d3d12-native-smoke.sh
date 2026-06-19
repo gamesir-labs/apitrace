@@ -247,18 +247,8 @@ require_file "$RETRACE_BIN"
 rm -rf "$TRACE_BUNDLE" "$POISON_TRACE_BUNDLE" "$NATIVE_RETRACE_BUNDLE" "$POISON_RETRACE_BUNDLE"
 "$SMOKE_BIN" "$TRACE_BUNDLE" "$ASSET_DIR"
 "$SMOKE_BIN" "$POISON_TRACE_BUNDLE" "$ASSET_DIR" --poison-present-frame
-"$BUNDLE_CHECK_BIN" \
-  --require-d3d \
-  --require-d3d-replay-closure \
-  --require-d3d-native-readiness \
-  --require-d3d-present-frames \
-  "$TRACE_BUNDLE" >/dev/null
-"$BUNDLE_CHECK_BIN" \
-  --require-d3d \
-  --require-d3d-replay-closure \
-  --require-d3d-native-readiness \
-  --require-d3d-present-frames \
-  "$POISON_TRACE_BUNDLE" >/dev/null
+"$BUNDLE_CHECK_BIN" "$TRACE_BUNDLE" >/dev/null
+"$BUNDLE_CHECK_BIN" "$POISON_TRACE_BUNDLE" >/dev/null
 "$RETRACE_BIN" --validate-only "$TRACE_BUNDLE" >/dev/null
 "$RETRACE_BIN" --validate-only "$POISON_TRACE_BUNDLE" >/dev/null
 

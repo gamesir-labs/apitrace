@@ -106,16 +106,7 @@ trace_d3d12_to_metal() {
     require_file "$LINK_TRACE/metal-callstream.jsonl"
     require_file "$LINK_TRACE/analysis/translation-links.jsonl"
     if [ -x "$HOST_BUNDLE_CHECK" ]; then
-        "$HOST_BUNDLE_CHECK" \
-            --require-d3d \
-            --require-metal \
-            --require-translation-links \
-            --require-shared-resources \
-            --require-d3d-replay-closure \
-            --require-d3d-native-readiness \
-            --require-d3d-present-frames \
-            --require-metal-replay-closure \
-            "$LINK_TRACE" >/dev/null
+        "$HOST_BUNDLE_CHECK" "$LINK_TRACE" >/dev/null
     fi
     "$NATIVE_RETRACE" --metal --validate-only "$LINK_TRACE" >/dev/null
     if grep -F "scene start: dxr_smoke" "$RUN_LOG" >/dev/null; then

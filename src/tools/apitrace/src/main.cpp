@@ -32,7 +32,7 @@ void print_usage(const char *argv0)
       "\n"
       "commands:\n"
       "  --finalize        Finalize a captured bundle (dedupe, index, persist replay model).\n"
-      "  --bundle-check    Validate a bundle (semantics, closure, --verify-hashes for integrity).\n"
+      "  --bundle-check    Verify bundle checksums after copy/transfer.\n"
       "  --retrace         Replay a bundle.\n"
       "\n"
       "Run `" + name + " <command> --help` for command-specific options.\n");

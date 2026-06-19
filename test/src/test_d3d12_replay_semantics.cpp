@@ -397,19 +397,6 @@ bool error_contains_any(const std::string &error, std::initializer_list<const ch
   return false;
 }
 
-int run_bundle_check(
-    const std::filesystem::path &bundle_check,
-    const std::filesystem::path &bundle,
-    const std::string &options)
-{
-  if (!finalize_bundle(bundle)) {
-    std::cerr << g_open_bundle_error << "\n";
-    return 1;
-  }
-  const auto command = shell_quote_path(bundle_check) + " " + options + " " + shell_quote_path(bundle);
-  return std::system(command.c_str());
-}
-
 bool write_temporal_upscale_bundle(const std::filesystem::path &bundle)
 {
   std::filesystem::remove_all(bundle);

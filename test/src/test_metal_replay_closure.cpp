@@ -7,7 +7,6 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <iterator>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -36,19 +35,6 @@ apitrace::trace::MetalEventRecord metal_event(
 bool expect_contains(const std::string &text, const std::string &needle)
 {
   return text.find(needle) != std::string::npos;
-}
-
-int run_bundle_check(
-    const std::filesystem::path &bundle_check,
-    const std::filesystem::path &bundle,
-    const std::string &options)
-{
-  if (bundle_check.empty()) {
-    return 0;
-  }
-  std::ostringstream command;
-  command << '"' << bundle_check.string() << "\" " << options << " \"" << bundle.string() << '"';
-  return std::system(command.str().c_str());
 }
 
 bool validate_metal_bundle(const std::filesystem::path &bundle, std::string &error)
