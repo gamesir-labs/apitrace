@@ -447,6 +447,7 @@ int main(int argc, char **argv)
   }
 
   std::uint8_t shader_bytes[] = {0x44, 0x58, 0x49, 0x4c};
+  std::uint8_t mesh_shader_bytes[] = {0x44, 0x58, 0x49, 0x4d};
   struct ComputePipelineStream {
     StreamSubobject<void *, PipelineStateSubobjectType::RootSignature> root_signature;
     StreamSubobject<D3D12_SHADER_BYTECODE, PipelineStateSubobjectType::CS> compute_shader;
@@ -470,7 +471,7 @@ int main(int argc, char **argv)
     StreamSubobject<D3D12_SHADER_BYTECODE, PipelineStateSubobjectType::MS> mesh_shader;
   } mesh_stream = {};
   mesh_stream.root_signature.data = compute_stream.root_signature.data;
-  mesh_stream.mesh_shader.data = {shader_bytes, sizeof(shader_bytes)};
+  mesh_stream.mesh_shader.data = {mesh_shader_bytes, sizeof(mesh_shader_bytes)};
   if (apitrace::d3d12::record_create_pipeline_state(
           static_cast<ID3D12Device *>(device),
           &mesh_stream,
@@ -768,6 +769,9 @@ int main(int argc, char **argv)
   const auto barrier_batch_payload = nlohmann::json::parse(barrier_batch_event->payload, nullptr, false);
   if (barrier_batch_payload.is_discarded() ||
       barrier_batch_payload.value("schema", "") != "resource-barrier-v2" ||
+      barrier_batch_event->object_refs.empty() ||
+      barrier_batch_event->object_refs.front() !=
+          static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(command_list)) ||
       barrier_batch_payload.value("barrier_count", 0) != 2 ||
       !barrier_batch_payload.contains("barriers") ||
       barrier_batch_payload["barriers"].size() != 2 ||
@@ -788,6 +792,9 @@ int main(int argc, char **argv)
   const auto copy_texture_batch_payload = nlohmann::json::parse(copy_texture_batch_event->payload, nullptr, false);
   if (copy_texture_batch_payload.is_discarded() ||
       copy_texture_batch_payload.value("schema", "") != "copy-texture-region-v2" ||
+      copy_texture_batch_event->object_refs.empty() ||
+      copy_texture_batch_event->object_refs.front() !=
+          static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(command_list)) ||
       copy_texture_batch_payload.value("op_count", 0) != 1 ||
       !copy_texture_batch_payload.contains("ops") ||
       copy_texture_batch_payload["ops"].size() != 1 ||

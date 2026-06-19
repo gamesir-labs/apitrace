@@ -200,25 +200,16 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
 
   const auto &function_name = event.callsite.function_name;
   const auto replay_command_kind = replay_command_kind_for(function_name);
-  const auto resolve_command_list_id = [&]() -> trace::ObjectId {
-    if (event.object_refs.empty()) {
-      return trace::ObjectId{};
-    }
-    if (object_ref_kind_matches(objects_, event.object_refs.front(), trace::ObjectKind::CommandList)) {
-      return event.object_refs.front();
-    }
-    if (replay_command_kind == ReplayCommandKind::Unknown ||
-        replay_command_kind == ReplayCommandKind::BeginCommandList) {
-      return event.object_refs.front();
-    }
-    for (const auto object_id : event.object_refs) {
-      if (object_ref_kind_matches(objects_, object_id, trace::ObjectKind::CommandList)) {
-        return object_id;
-      }
-    }
-    return event.object_refs.front();
-  };
-  const auto command_list_id = resolve_command_list_id();
+  const auto command_list_id = event.object_refs.empty() ? trace::ObjectId{} : event.object_refs.front();
+  const bool command_list_method = function_name.rfind("ID3D12GraphicsCommandList", 0) == 0;
+  if (command_list_method &&
+      replay_command_kind != ReplayCommandKind::Unknown &&
+      replay_command_kind != ReplayCommandKind::BeginCommandList &&
+      command_list_id != 0 &&
+      !object_ref_kind_matches(objects_, command_list_id, trace::ObjectKind::CommandList)) {
+    last_error_ = record_prefix(event) + ": command-list call object_refs[0] is not a command list";
+    return false;
+  }
   auto command_list_it = command_lists_.find(command_list_id);
   auto command_list_state = command_list_it == command_lists_.end() ? nullptr : &command_list_it->second;
   const bool is_command_list_command =

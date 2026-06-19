@@ -1550,7 +1550,7 @@ bool write_copy_texture_source_box_out_of_bounds_bundle(const std::filesystem::p
   return true;
 }
 
-bool write_copy_texture_batch_scrambled_refs_bundle(const std::filesystem::path &bundle)
+bool write_copy_texture_batch_invalid_refs_bundle(const std::filesystem::path &bundle)
 {
   std::filesystem::remove_all(bundle);
 
@@ -1561,7 +1561,7 @@ bool write_copy_texture_batch_scrambled_refs_bundle(const std::filesystem::path 
 
   apitrace::trace::TraceMetadata metadata;
   metadata.api = apitrace::trace::ApiKind::D3D12;
-  metadata.producer = "test_d3d12_copy_texture_batch_scrambled_refs";
+  metadata.producer = "test_d3d12_copy_texture_batch_invalid_refs";
   writer.write_metadata(metadata);
 
   std::uint64_t sequence = 1;

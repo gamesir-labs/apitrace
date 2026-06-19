@@ -2604,6 +2604,9 @@ void ensure_external_resource_object_with_desc(ID3D12Resource *resource, const c
   if (!resource) {
     return;
   }
+  if (is_known_resource_object(resource)) {
+    return;
+  }
   D3D12_RESOURCE_DESC desc{};
   const bool has_desc = query_resource_desc(resource, desc);
   std::ostringstream payload;

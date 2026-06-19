@@ -9,50 +9,29 @@ int main(int argc, char **argv)
   g_bundle_finalize = std::filesystem::path(argv[2]);
   const std::string selected_case = argc == 4 ? argv[3] : std::string();
 
-  auto run_copy_texture_batch_scrambled_refs_case = [](const std::filesystem::path &case_bundle) {
-    if (!write_copy_texture_batch_scrambled_refs_bundle(case_bundle)) {
-      std::cerr << "failed to write copy-texture batch scrambled-refs bundle\n";
+  auto run_copy_texture_batch_invalid_refs_case = [](const std::filesystem::path &case_bundle) {
+    if (!write_copy_texture_batch_invalid_refs_bundle(case_bundle)) {
+      std::cerr << "failed to write copy-texture batch invalid-refs bundle\n";
       return false;
     }
-    apitrace::trace::TraceBundleReader copy_texture_batch_scrambled_refs_reader;
-    if (!open_finalized_bundle(copy_texture_batch_scrambled_refs_reader, case_bundle)) {
-      std::cerr << "reader failed to reopen copy-texture batch scrambled-refs bundle: "
-                << copy_texture_batch_scrambled_refs_reader.last_error() << "\n";
+    apitrace::trace::TraceBundleReader copy_texture_batch_invalid_refs_reader;
+    if (!open_finalized_bundle(copy_texture_batch_invalid_refs_reader, case_bundle)) {
+      std::cerr << "reader failed to reopen copy-texture batch invalid-refs bundle: "
+                << copy_texture_batch_invalid_refs_reader.last_error() << "\n";
       return false;
     }
-    apitrace::d3d12::D3D12ReplayBackend copy_texture_batch_scrambled_refs_backend;
-    if (!replay_all_events(copy_texture_batch_scrambled_refs_reader, copy_texture_batch_scrambled_refs_backend)) {
-      std::cerr << "copy-texture batch scrambled-refs replay_event failed: "
-                << copy_texture_batch_scrambled_refs_backend.last_error() << "\n";
+    apitrace::d3d12::D3D12ReplayBackend copy_texture_batch_invalid_refs_backend;
+    if (replay_all_events(copy_texture_batch_invalid_refs_reader, copy_texture_batch_invalid_refs_backend)) {
+      std::cerr << "copy-texture batch invalid refs were accepted\n";
       return false;
     }
-    const auto *copy_texture_batch_scrambled_refs_list =
-        copy_texture_batch_scrambled_refs_backend.command_list_state(15);
-    bool found_scrambled_ref_copy_command = false;
-    for (const auto &command : copy_texture_batch_scrambled_refs_backend.replay_commands()) {
-      if (command.function_name == "ID3D12GraphicsCommandList::CopyTextureRegionBatch" &&
-          command.command_list_object_id == 15) {
-        found_scrambled_ref_copy_command = true;
-      }
-    }
-    if (!copy_texture_batch_scrambled_refs_list ||
-        copy_texture_batch_scrambled_refs_list->texture_copies.size() != 1 ||
-        copy_texture_batch_scrambled_refs_list->texture_copies[0].command_list_object_id != 15 ||
-        !found_scrambled_ref_copy_command) {
-      std::cerr << "CopyTextureRegionBatch with scrambled object_refs was not attached to its command list\n";
-      return false;
-    }
-    if (!copy_texture_batch_scrambled_refs_backend.validate_native_replay_readiness()) {
-      std::cerr << "copy-texture batch scrambled-refs bundle was rejected by native readiness: "
-                << copy_texture_batch_scrambled_refs_backend.last_error() << "\n";
-      return false;
-    }
-    return true;
+    return copy_texture_batch_invalid_refs_backend.last_error().find("object_refs[0] is not a command list") !=
+           std::string::npos;
   };
 
   if (!selected_case.empty()) {
-    if (selected_case == "copy-texture-batch-scrambled-refs") {
-      return run_copy_texture_batch_scrambled_refs_case(bundle) ? 0 : 1;
+    if (selected_case == "copy-texture-batch-invalid-refs") {
+      return run_copy_texture_batch_invalid_refs_case(bundle) ? 0 : 1;
     }
     std::cerr << "unknown test case: " << selected_case << "\n";
     return 2;
@@ -2022,9 +2001,9 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  const auto copy_texture_batch_scrambled_refs_bundle =
-      bundle.parent_path() / (bundle.filename().generic_string() + "-copy-texture-batch-scrambled-refs");
-  if (!run_copy_texture_batch_scrambled_refs_case(copy_texture_batch_scrambled_refs_bundle)) {
+  const auto copy_texture_batch_invalid_refs_bundle =
+      bundle.parent_path() / (bundle.filename().generic_string() + "-copy-texture-batch-invalid-refs");
+  if (!run_copy_texture_batch_invalid_refs_case(copy_texture_batch_invalid_refs_bundle)) {
     return 1;
   }
 
