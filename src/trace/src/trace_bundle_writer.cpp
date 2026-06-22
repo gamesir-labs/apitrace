@@ -1492,6 +1492,27 @@ std::uint64_t max_metal_sequence_in_callstream(const std::filesystem::path &path
   return max_sequence;
 }
 
+std::uint64_t max_call_sequence_in_callstream(const std::filesystem::path &path)
+{
+  if (!std::filesystem::is_regular_file(path))
+    return 0;
+
+  std::ifstream input(path, std::ios::binary);
+  if (!input.is_open())
+    return 0;
+
+  std::uint64_t max_sequence = 0;
+  std::string line;
+  while (std::getline(input, line)) {
+    auto record = json::parse(line, nullptr, false);
+    if (record.is_discarded() || !record.is_object())
+      continue;
+    const auto sequence = record.value("sequence", 0ull);
+    max_sequence = std::max(max_sequence, static_cast<std::uint64_t>(sequence));
+  }
+  return max_sequence;
+}
+
 std::unordered_map<std::uint64_t, std::string> asset_paths_by_blob_id(
     const std::vector<AssetRecord> &assets,
     const std::vector<AssetRecord> &metal_assets)
@@ -4134,7 +4155,7 @@ struct TraceBundleWriter::Impl {
   std::unordered_set<std::string> analysis_streams_may_reference_asset_alias;
   bool open = false;
   std::atomic_bool metadata_written{false};
-  bool append_existing_primary_callstream = false;
+  std::uint64_t initial_call_sequence = 0;
   TraceBundleOpenMode open_mode = TraceBundleOpenMode::Primary;
   bool metal_callstream_should_append = false;
   std::uint64_t metal_sequence_offset = 0;
@@ -4844,31 +4865,47 @@ struct TraceBundleWriter::Impl {
 	      const std::filesystem::path &original_relative_path)
 	  {
 	    const auto original_key = original_relative_path.generic_string();
+	    const auto final_key = finalized.relative_path.generic_string();
 	    TimedWriterLock lock(asset_record_mutex, writer_stats ? &asset_record_lock_stats : nullptr);
 	    auto &records = metal ? metal_assets : assets;
     auto &indices_by_path = metal ? metal_asset_record_indices_by_path : asset_record_indices_by_path;
     auto update_record = [&](AssetRecord &record) {
 	        const auto published_blob_id = record.blob_id;
-	        const auto published_path = record.relative_path;
 	        record = finalized;
 	        record.blob_id = published_blob_id;
-	        record.relative_path = published_path;
 	        reserved_blob_paths[static_cast<std::uint64_t>(record.blob_id)] = record.relative_path.generic_string();
     };
+    std::vector<std::size_t> updated_indices;
 
     if (const auto found = indices_by_path.find(original_key);
         found != indices_by_path.end()) {
       for (const auto index : found->second) {
-        if (index < records.size() && records[index].relative_path.generic_string() == original_key)
+        if (index < records.size() && records[index].relative_path.generic_string() == original_key) {
           update_record(records[index]);
+          updated_indices.push_back(index);
+        }
       }
-      return;
+      if (original_key != final_key && !updated_indices.empty()) {
+        auto &final_indices = indices_by_path[final_key];
+        final_indices.insert(final_indices.end(), updated_indices.begin(), updated_indices.end());
+        indices_by_path.erase(original_key);
+      }
+      if (!updated_indices.empty())
+        return;
     }
 
+    std::size_t index = 0;
 	    for (auto &record : records) {
-	      if (record.relative_path.generic_string() == original_key)
+	      if (record.relative_path.generic_string() == original_key) {
         update_record(record);
+        updated_indices.push_back(index);
+      }
+      ++index;
 	    }
+    if (original_key != final_key && !updated_indices.empty()) {
+      auto &final_indices = indices_by_path[final_key];
+      final_indices.insert(final_indices.end(), updated_indices.begin(), updated_indices.end());
+    }
 	  }
 
   void signal_checkpoint_work(std::uint64_t event_count, std::uint64_t asset_bytes)
@@ -5387,6 +5424,9 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
   const bool existing_primary_callstream =
       std::filesystem::is_regular_file(impl_->layout.callstream_path) &&
       std::filesystem::file_size(impl_->layout.callstream_path) > 0;
+  if (mode != TraceBundleOpenMode::Primary && existing_primary_callstream) {
+    impl_->initial_call_sequence = max_call_sequence_in_callstream(impl_->layout.callstream_path);
+  }
   impl_->metal_callstream_should_append =
       mode != TraceBundleOpenMode::Primary &&
       std::filesystem::is_regular_file(impl_->layout.metal_callstream_path);
@@ -5400,12 +5440,9 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
     impl_->metal_sequence_offset = allocator;
   }
   if (mode == TraceBundleOpenMode::Primary) {
-    const auto callstream_mode =
-        existing_primary_callstream ? std::ios::app : std::ios::trunc;
-    impl_->callstream_stream.open(impl_->layout.callstream_path, callstream_mode);
+    impl_->callstream_stream.open(impl_->layout.callstream_path, std::ios::trunc);
     impl_->open = impl_->callstream_stream.is_open();
-    impl_->metadata_written.store(impl_->open && existing_primary_callstream, std::memory_order_relaxed);
-    impl_->append_existing_primary_callstream = impl_->metadata_written.load(std::memory_order_relaxed);
+    impl_->metadata_written.store(false, std::memory_order_relaxed);
   } else {
     impl_->metadata_written.store(existing_primary_callstream, std::memory_order_relaxed);
     impl_->open = true;
@@ -6590,6 +6627,11 @@ void TraceBundleWriter::close()
 bool TraceBundleWriter::is_open() const noexcept
 {
   return impl_ && impl_->open;
+}
+
+std::uint64_t TraceBundleWriter::initial_call_sequence() const noexcept
+{
+  return impl_ ? impl_->initial_call_sequence : 0;
 }
 
 const BundleLayout &TraceBundleWriter::layout() const noexcept

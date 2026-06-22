@@ -192,6 +192,17 @@ int run_bundle_finalize(
   return std::system(command.c_str());
 }
 
+std::size_t count_substrings(const std::string &text, const std::string &needle)
+{
+  std::size_t count = 0;
+  std::size_t position = 0;
+  while ((position = text.find(needle, position)) != std::string::npos) {
+    ++count;
+    position += needle.size();
+  }
+  return count;
+}
+
 bool find_asset_path_by_blob(
     const std::filesystem::path &bundle,
     apitrace::trace::BlobId blob_id,
@@ -208,6 +219,71 @@ bool find_asset_path_by_blob(
     }
   }
   return false;
+}
+
+bool asset_record_matches_file(
+    const std::filesystem::path &bundle,
+    const apitrace::trace::AssetRecord &asset)
+{
+  if (!asset.payload_path.empty())
+    return true;
+
+  const auto path = bundle / asset.relative_path;
+  if (!std::filesystem::is_regular_file(path))
+    return false;
+  return std::filesystem::file_size(path) == asset.byte_size;
+}
+
+bool write_single_event_bundle(
+    const std::filesystem::path &bundle,
+    std::uint64_t blob_id,
+    std::uint8_t byte_value,
+    const char *producer)
+{
+  apitrace::trace::TraceBundleWriter writer;
+  if (!writer.open(bundle))
+    return false;
+  writer.write_metadata({apitrace::trace::ApiKind::D3D12, 1, producer, false});
+  writer.write_object_index({{blob_id, apitrace::trace::ObjectKind::Resource, 0, producer}});
+
+  apitrace::trace::AssetRecord asset;
+  asset.blob_id = blob_id;
+  asset.kind = apitrace::trace::AssetKind::Buffer;
+  asset.debug_name = producer;
+  asset.payload_bytes.assign(64, byte_value);
+  asset = writer.register_asset(std::move(asset));
+
+  apitrace::trace::EventRecord event;
+  event.kind = apitrace::trace::EventKind::ResourceBlob;
+  event.callsite.sequence = 1;
+  event.object_debug_name = producer;
+  event.blob_refs = {asset.blob_id};
+  event.payload = std::string("{\"buffer_path\":\"") + asset.relative_path.generic_string() + "\"}";
+  writer.append_call_event(event);
+  writer.close();
+  return true;
+}
+
+bool primary_open_restarts_bundle(const std::filesystem::path &bundle)
+{
+  std::filesystem::remove_all(bundle);
+  if (!write_single_event_bundle(bundle, 701, 0x71, "primary-restart-first") ||
+      !write_single_event_bundle(bundle, 702, 0x72, "primary-restart-second")) {
+    return false;
+  }
+
+  const auto callstream = read_text(bundle / "callstream.jsonl");
+  if (count_substrings(callstream, "\"record_kind\":\"bundle_header\"") != 1 ||
+      callstream.find("primary-restart-first") != std::string::npos ||
+      callstream.find("primary-restart-second") == std::string::npos) {
+    return false;
+  }
+
+  apitrace::trace::TraceBundleReader reader;
+  if (!reader.open(bundle) || reader.events().size() != 1)
+    return false;
+  return reader.events()[0].blob_refs.size() == 1 &&
+         reader.events()[0].blob_refs[0] == 702;
 }
 
 bool replace_text_in_file(
@@ -966,6 +1042,13 @@ int main(int argc, char **argv)
   set_env_var("APITRACE_ASYNC_ASSET_MAX_PENDING", "1048576");
   set_env_var("APITRACE_ASYNC_ASSET_WORKERS", "1");
   set_env_var("APITRACE_SYNC_CHECKPOINTS", "1");
+  const auto primary_restart_bundle =
+      bundle.parent_path() / (bundle.filename().generic_string() + "-primary-restart");
+  if (!primary_open_restarts_bundle(primary_restart_bundle)) {
+    std::cerr << "primary writer should restart an existing bundle instead of appending a new session\n";
+    return 1;
+  }
+
   apitrace::trace::TraceBundleWriter writer;
   if (!writer.open(bundle)) {
     std::cerr << "failed to open bundle\n";
@@ -1865,9 +1948,15 @@ int main(int argc, char **argv)
   bool found_sparse = false;
   bool found_small_second = false;
   bool found_known_hash_second = false;
+  bool found_second_final_record = false;
   std::filesystem::path sparse_reader_path;
   std::filesystem::path pipeline_reader_path;
   for (const auto &asset : reader.assets()) {
+    if (!asset_record_matches_file(bundle, asset)) {
+      std::cerr << "reader-visible asset metadata did not match the final asset file for blob "
+                << asset.blob_id << "\n";
+      return 1;
+    }
     found_first = found_first || asset.blob_id == first.blob_id;
     found_texture = found_texture || asset.blob_id == generic_texture.blob_id;
     found_collision = found_collision || asset.blob_id == collision.blob_id;
@@ -1881,6 +1970,11 @@ int main(int argc, char **argv)
     found_hash_only_large_second = found_hash_only_large_second || asset.blob_id == hash_only_large_second.blob_id;
     found_small_second = found_small_second || asset.blob_id == small_second.blob_id;
     found_known_hash_second = found_known_hash_second || asset.blob_id == known_hash_second.blob_id;
+    if (asset.blob_id == second.blob_id &&
+        asset.relative_path.generic_string().find("asset-") == std::string::npos &&
+        asset.byte_size == bytes.size()) {
+      found_second_final_record = true;
+    }
 	    if (asset.blob_id == sparse_asset.blob_id) {
 	      found_sparse = true;
 	      sparse_reader_path = asset.relative_path;
@@ -1896,6 +1990,10 @@ int main(int argc, char **argv)
 	    std::cerr << "reader-visible blob ids did not match registered assets\n";
 	    return 1;
 	  }
+  if (!found_second_final_record) {
+    std::cerr << "async alias completion did not publish the final path and size for the second blob id\n";
+    return 1;
+  }
 	  if (pipeline_reader_path.empty()) {
 	    std::cerr << "reader-visible blob ids did not include pipeline asset\n";
 	    return 1;

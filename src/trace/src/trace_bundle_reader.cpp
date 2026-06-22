@@ -1676,6 +1676,35 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
   std::size_t line_number = 0;
   std::uint64_t consumed_callstream_bytes = 0;
   std::uint64_t pending_stop_present_frame = std::numeric_limits<std::uint64_t>::max();
+  ObjectId pending_stop_command_list_submit = 0;
+  auto is_execute_command_lists = [](const EventRecord &event) {
+    return event.kind == EventKind::Call &&
+           event.callsite.function_name == "ID3D12CommandQueue::ExecuteCommandLists";
+  };
+  auto is_graphics_command_list_call = [](const EventRecord &event) {
+    return event.kind == EventKind::Call &&
+           event.callsite.function_name.rfind("ID3D12GraphicsCommandList", 0) == 0;
+  };
+  auto execute_submits_command_list = [&](const EventRecord &event, ObjectId command_list_id) {
+    if (!is_execute_command_lists(event)) {
+      return false;
+    }
+    for (std::size_t index = 1; index < event.object_refs.size(); ++index) {
+      if (event.object_refs[index] == command_list_id) {
+        return true;
+      }
+    }
+    return false;
+  };
+  auto command_list_stop_target = [&](const EventRecord &event) -> ObjectId {
+    if (!options.extend_stop_after_sequence_to_command_list_submit ||
+        !is_graphics_command_list_call(event) ||
+        is_execute_command_lists(event) ||
+        event.object_refs.empty()) {
+      return 0;
+    }
+    return event.object_refs.front();
+  };
   while (std::getline(callstream_input, line)) {
     const auto line_bytes = static_cast<std::uint64_t>(line.size() + (callstream_input.eof() ? 0 : 1));
     if (consumed_callstream_bytes + line_bytes > callstream_byte_limit) {
@@ -1754,8 +1783,19 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
       return false;
     }
 
+    if (pending_stop_command_list_submit != 0) {
+      if (execute_submits_command_list(event, pending_stop_command_list_submit)) {
+        break;
+      }
+      continue;
+    }
+
     if (options.stop_after_sequence != 0 &&
         event.callsite.sequence >= options.stop_after_sequence) {
+      if (const auto command_list_id = command_list_stop_target(event); command_list_id != 0) {
+        pending_stop_command_list_submit = command_list_id;
+        continue;
+      }
       break;
     }
 
@@ -1781,49 +1821,51 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
 
   std::unordered_set<std::string> validated_checksum_paths;
   std::unordered_map<std::string, std::uint64_t> validated_asset_file_sizes;
-  for (const auto &required_relative_path :
-       {std::filesystem::path(kCallstreamFileName),
-        std::filesystem::path(kObjectsDirectoryName) / kObjectIndexFileName,
-        std::filesystem::path(kAssetIndexFileName)}) {
-    if (required_relative_path == kAssetIndexFileName && !std::filesystem::is_regular_file(impl_->layout.asset_index_path)) {
-      continue;
+  if (options.validate_file_references) {
+    for (const auto &required_relative_path :
+         {std::filesystem::path(kCallstreamFileName),
+          std::filesystem::path(kObjectsDirectoryName) / kObjectIndexFileName,
+          std::filesystem::path(kAssetIndexFileName)}) {
+      if (required_relative_path == kAssetIndexFileName && !std::filesystem::is_regular_file(impl_->layout.asset_index_path)) {
+        continue;
+      }
+      if (prefix_limited && required_relative_path == kCallstreamFileName) {
+        continue;
+      }
+      if (!validate_checksum_entry(
+              impl_->layout.root_path,
+              required_relative_path,
+              checksum_lookup,
+              impl_->layout.checksums_path,
+              validated_checksum_paths,
+              impl_->last_error,
+              options.validate_checksum_contents)) {
+        return false;
+      }
     }
-    if (prefix_limited && required_relative_path == kCallstreamFileName) {
-      continue;
-    }
-    if (!validate_checksum_entry(
-            impl_->layout.root_path,
-            required_relative_path,
-            checksum_lookup,
-            impl_->layout.checksums_path,
-            validated_checksum_paths,
-            impl_->last_error,
-            options.validate_checksum_contents)) {
-      return false;
-    }
-  }
 
-  for (const auto &asset : impl_->assets) {
-    if (prefix_limited && referenced_asset_paths.find(asset.relative_path.generic_string()) == referenced_asset_paths.end()) {
-      continue;
-    }
-    if (!validate_asset_index_record(
-            impl_->layout.root_path,
-            asset,
-            checksum_lookup,
-            validated_asset_file_sizes,
-            impl_->last_error)) {
-      return false;
-    }
-    if (!validate_checksum_entry(
-            impl_->layout.root_path,
-            asset.relative_path,
-            checksum_lookup,
-            impl_->layout.checksums_path,
-            validated_checksum_paths,
-            impl_->last_error,
-            options.validate_checksum_contents)) {
-      return false;
+    for (const auto &asset : impl_->assets) {
+      if (prefix_limited && referenced_asset_paths.find(asset.relative_path.generic_string()) == referenced_asset_paths.end()) {
+        continue;
+      }
+      if (!validate_asset_index_record(
+              impl_->layout.root_path,
+              asset,
+              checksum_lookup,
+              validated_asset_file_sizes,
+              impl_->last_error)) {
+        return false;
+      }
+      if (!validate_checksum_entry(
+              impl_->layout.root_path,
+              asset.relative_path,
+              checksum_lookup,
+              impl_->layout.checksums_path,
+              validated_checksum_paths,
+              impl_->last_error,
+              options.validate_checksum_contents)) {
+        return false;
+      }
     }
   }
 
@@ -1844,7 +1886,7 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
     }
   }
 
-  if (options.load_metal_sideband && has_metal_callstream_file &&
+  if (options.validate_file_references && options.load_metal_sideband && has_metal_callstream_file &&
       !validate_checksum_entry(
           impl_->layout.root_path,
           std::filesystem::path(kMetalCallstreamFileName),
@@ -1856,7 +1898,7 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
     return false;
   }
 
-  if (options.load_metal_sideband) {
+  if (options.validate_file_references && options.load_metal_sideband) {
     for (const auto &asset : impl_->metal_assets) {
       if (prefix_limited && referenced_metal_asset_paths.find(asset.relative_path.generic_string()) == referenced_metal_asset_paths.end()) {
         continue;

@@ -24,9 +24,3 @@ EXPORTS
     apitrace_d3d12_record_resource_barrier @210
     apitrace_d3d12_record_runtime_objects @211
     apitrace_d3d12_record_swapchain_back_buffer @212
-    apitrace_d3d12_restore_queue_vtable @213
-    apitrace_d3d12_repatch_queue_vtable @214
-    apitrace_d3d12_suspend_all_queue_vtables @215
-    apitrace_d3d12_resume_all_queue_vtables @216
-    apitrace_d3d12_suspend_all_vtables @217
-    apitrace_d3d12_resume_all_vtables @218

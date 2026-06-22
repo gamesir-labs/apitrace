@@ -175,6 +175,9 @@ void STDMETHODCALLTYPE hook_device_create_constant_buffer_view(
   std::lock_guard<std::mutex> lock(capture_state().mutex);
   std::ostringstream payload;
   const auto resolve = resolve_gpu_virtual_address_locked(desc ? desc->BufferLocation : 0);
+  if (desc && desc->BufferLocation != 0 && desc->SizeInBytes != 0) {
+    capture_mapped_gpuva_range_before_use_locked(resolve, desc->SizeInBytes);
+  }
   payload << "{\"descriptor\":" << descriptor_handle_json(descriptor)
           << ",\"buffer_location\":" << (desc ? desc->BufferLocation : 0)
           << ",\"size_in_bytes\":" << (desc ? desc->SizeInBytes : 0);
@@ -552,6 +555,11 @@ void STDMETHODCALLTYPE hook_queue_execute_command_lists(
     refs.push_back(ref);
   }
 
+  {
+    std::lock_guard<std::mutex> lock(capture_state().mutex);
+    capture_command_lists_mapped_inputs_before_submit_locked(command_list_count, command_lists);
+  }
+
   const auto hook = queue_hook_for(self);
   if (hook.execute_command_lists) {
     const auto referenced_resources = command_list_array_resources_snapshot(command_list_count, command_lists);
@@ -711,6 +719,7 @@ HRESULT STDMETHODCALLTYPE hook_command_list_reset(
   std::lock_guard<std::mutex> lock(capture_state().mutex);
   if (SUCCEEDED(hr)) {
     capture_state().command_list_resources[self].clear();
+    clear_command_list_mapped_uses_locked(self);
   }
   std::ostringstream payload;
   payload << "{\"command_allocator_object_id\":" << object_id_json(lookup_object_id_locked(allocator))
@@ -730,6 +739,7 @@ void STDMETHODCALLTYPE hook_command_list_clear_state(
     hook.clear_state(self, pipeline_state);
   }
   std::lock_guard<std::mutex> lock(capture_state().mutex);
+  clear_command_list_mapped_uses_locked(self);
   std::ostringstream payload;
   payload << "{\"pipeline_state_object_id\":" << object_id_json(lookup_object_id_locked(pipeline_state)) << "}";
   record_call_locked("ID3D12GraphicsCommandList::ClearState", S_OK, {self, pipeline_state}, {}, payload.str());
@@ -797,6 +807,7 @@ void STDMETHODCALLTYPE hook_command_list_set_graphics_root_signature(
     hook.set_graphics_root_signature(self, root_signature);
   }
   std::lock_guard<std::mutex> lock(capture_state().mutex);
+  clear_root_cbv_ranges_locked(self, false);
   std::ostringstream payload;
   payload << "{\"compute\":false,\"root_signature_object_id\":"
           << object_id_json(lookup_object_id_locked(root_signature)) << "}";
@@ -813,6 +824,7 @@ void STDMETHODCALLTYPE hook_command_list_set_compute_root_signature(
     hook.set_compute_root_signature(self, root_signature);
   }
   std::lock_guard<std::mutex> lock(capture_state().mutex);
+  clear_root_cbv_ranges_locked(self, true);
   std::ostringstream payload;
   payload << "{\"compute\":true,\"root_signature_object_id\":"
           << object_id_json(lookup_object_id_locked(root_signature)) << "}";
@@ -976,7 +988,9 @@ void STDMETHODCALLTYPE hook_command_list_set_graphics_root_constant_buffer_view(
     hook.set_graphics_root_constant_buffer_view(self, root_parameter_index, buffer_location);
   }
   std::lock_guard<std::mutex> lock(capture_state().mutex);
+  remember_root_cbv_range_locked(self, false, root_parameter_index, buffer_location);
   const auto resolve = resolve_gpu_virtual_address_locked(buffer_location);
+  capture_mapped_gpuva_range_before_use_chunked_locked(resolve, kRootConstantBufferSnapshotBytes);
   std::ostringstream payload;
   payload << "{\"root_parameter_index\":" << root_parameter_index
           << ",\"buffer_location\":" << gpu_virtual_address_json(buffer_location);
@@ -997,9 +1011,15 @@ void record_root_descriptor_call_locked(
     const char *function_name,
     ID3D12GraphicsCommandList *self,
     UINT root_parameter_index,
-    D3D12_GPU_VIRTUAL_ADDRESS buffer_location)
+    D3D12_GPU_VIRTUAL_ADDRESS buffer_location,
+    std::uint64_t mapped_snapshot_size = 0)
 {
   const auto resolve = resolve_gpu_virtual_address_locked(buffer_location);
+  if (mapped_snapshot_size != 0) {
+    const bool compute = std::strcmp(function_name, "ID3D12GraphicsCommandList::SetComputeRootConstantBufferView") == 0;
+    remember_root_cbv_range_locked(self, compute, root_parameter_index, buffer_location);
+  }
+  capture_mapped_gpuva_range_before_use_chunked_locked(resolve, mapped_snapshot_size);
   std::ostringstream payload;
   payload << "{\"root_parameter_index\":" << root_parameter_index
           << ",\"buffer_location\":" << gpu_virtual_address_json(buffer_location);
@@ -1021,7 +1041,12 @@ void STDMETHODCALLTYPE hook_command_list_set_compute_root_constant_buffer_view(
     hook.set_compute_root_constant_buffer_view(self, root_parameter_index, buffer_location);
   }
   std::lock_guard<std::mutex> lock(capture_state().mutex);
-  record_root_descriptor_call_locked("ID3D12GraphicsCommandList::SetComputeRootConstantBufferView", self, root_parameter_index, buffer_location);
+  record_root_descriptor_call_locked(
+      "ID3D12GraphicsCommandList::SetComputeRootConstantBufferView",
+      self,
+      root_parameter_index,
+      buffer_location,
+      kRootConstantBufferSnapshotBytes);
 }
 
 void STDMETHODCALLTYPE hook_command_list_set_graphics_root_shader_resource_view(
@@ -1409,6 +1434,7 @@ void STDMETHODCALLTYPE hook_command_list_ia_set_vertex_buffers(
   std::vector<apitrace::trace::ObjectId> extra_refs;
   payload << "{\"start_slot\":" << start_slot << ",\"view_count\":" << view_count;
   if (view_count > 0 && views) {
+    remember_vertex_buffer_ranges_locked(self, start_slot, view_count, views);
     payload << ",\"first\":{\"buffer_location\":" << gpu_virtual_address_json(views[0].BufferLocation)
             << ",\"size_in_bytes\":" << views[0].SizeInBytes
             << ",\"stride_in_bytes\":" << views[0].StrideInBytes << "}";
@@ -1418,6 +1444,7 @@ void STDMETHODCALLTYPE hook_command_list_ia_set_vertex_buffers(
         payload << ",";
       }
       const auto resolve = resolve_gpu_virtual_address_locked(views[index].BufferLocation);
+      capture_mapped_gpuva_range_before_use_locked(resolve, views[index].SizeInBytes);
       append_gpuva_object_ref(extra_refs, resolve);
       payload << "{\"buffer_location\":" << gpu_virtual_address_json(views[index].BufferLocation);
       append_gpu_virtual_address_resolve_json(payload, resolve);
@@ -1425,6 +1452,8 @@ void STDMETHODCALLTYPE hook_command_list_ia_set_vertex_buffers(
               << ",\"stride_in_bytes\":" << views[index].StrideInBytes << "}";
     }
     payload << "]";
+  } else {
+    remember_vertex_buffer_ranges_locked(self, start_slot, view_count, views);
   }
   payload << "}";
   record_call_locked("ID3D12GraphicsCommandList::IASetVertexBuffers", S_OK, {self}, {}, payload.str(), extra_refs);
@@ -1443,8 +1472,10 @@ void STDMETHODCALLTYPE hook_command_list_ia_set_index_buffer(
   std::ostringstream payload;
   std::vector<apitrace::trace::ObjectId> extra_refs;
   payload << "{";
+  remember_index_buffer_range_locked(self, view);
   if (view) {
     const auto resolve = resolve_gpu_virtual_address_locked(view->BufferLocation);
+    capture_mapped_gpuva_range_before_use_locked(resolve, view->SizeInBytes);
     append_gpuva_object_ref(extra_refs, resolve);
     payload << "\"buffer_location\":" << gpu_virtual_address_json(view->BufferLocation);
     append_gpu_virtual_address_resolve_json(payload, resolve);
@@ -1557,6 +1588,7 @@ void STDMETHODCALLTYPE hook_command_list_draw_instanced(
   }
   proxy_debug_logf("hook_command_list_draw_instanced self=%p instance_count=%u", self, instance_count);
   std::lock_guard<std::mutex> lock(capture_state().mutex);
+  capture_graphics_mapped_inputs_before_use_locked(self, false);
   std::ostringstream payload;
   payload << "{\"vertex_count_per_instance\":" << vertex_count_per_instance
           << ",\"instance_count\":" << instance_count
@@ -1580,6 +1612,7 @@ void STDMETHODCALLTYPE hook_command_list_draw_indexed_instanced(
   }
   proxy_debug_logf("hook_command_list_draw_indexed_instanced self=%p index_count=%u", self, index_count_per_instance);
   std::lock_guard<std::mutex> lock(capture_state().mutex);
+  capture_graphics_mapped_inputs_before_use_locked(self, true);
   std::ostringstream payload;
   payload << "{\"index_count_per_instance\":" << index_count_per_instance
           << ",\"instance_count\":" << instance_count
@@ -1598,6 +1631,7 @@ void STDMETHODCALLTYPE hook_command_list_dispatch(ID3D12GraphicsCommandList *sel
   }
   proxy_debug_logf("hook_command_list_dispatch self=%p groups=%u,%u,%u", self, x, y, z);
   std::lock_guard<std::mutex> lock(capture_state().mutex);
+  capture_compute_mapped_inputs_before_use_locked(self);
   std::ostringstream payload;
   payload << "{\"thread_group_count_x\":" << x << ",\"thread_group_count_y\":" << y << ",\"thread_group_count_z\":" << z << "}";
   record_call_locked("ID3D12GraphicsCommandList::Dispatch", S_OK, {self}, {}, payload.str());
@@ -1639,6 +1673,8 @@ void STDMETHODCALLTYPE hook_command_list_execute_bundle(
     hook.execute_bundle(self, bundle_command_list);
   }
   std::lock_guard<std::mutex> lock(capture_state().mutex);
+  capture_graphics_mapped_inputs_before_use_locked(bundle_command_list, true);
+  capture_compute_mapped_inputs_before_use_locked(bundle_command_list);
   std::ostringstream payload;
   payload << "{\"bundle_command_list_object_id\":" << object_id_json(lookup_object_id_locked(bundle_command_list)) << "}";
   record_call_locked("ID3D12GraphicsCommandList::ExecuteBundle", S_OK, {self, bundle_command_list}, {}, payload.str());
@@ -1661,6 +1697,7 @@ void STDMETHODCALLTYPE hook_command_list_copy_buffer_region(
   }
   std::lock_guard<std::mutex> lock(capture_state().mutex);
   remember_command_list_resources_locked(self, referenced_resources);
+  capture_mapped_resource_range_before_use_locked(src, src_offset, byte_count);
   std::ostringstream payload;
   payload << "{\"dst_offset\":" << dst_offset
           << ",\"src_offset\":" << src_offset

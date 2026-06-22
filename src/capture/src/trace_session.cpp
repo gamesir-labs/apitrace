@@ -75,6 +75,11 @@ bool TraceSession::active() const noexcept
   return impl_ && impl_->state.active();
 }
 
+std::uint64_t TraceSession::initial_call_sequence() const noexcept
+{
+  return impl_ ? impl_->state.initial_call_sequence() : 0;
+}
+
 const TraceOptions &TraceSession::options() const noexcept
 {
   return impl_->state.options();

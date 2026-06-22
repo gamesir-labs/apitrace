@@ -25,6 +25,7 @@ public:
   void record_object(const trace::ObjectRecord &object);
 
   bool active() const noexcept;
+  std::uint64_t initial_call_sequence() const noexcept;
   const TraceOptions &options() const noexcept;
 
 private:

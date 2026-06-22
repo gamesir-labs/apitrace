@@ -55,6 +55,9 @@ using D3D12CreateVersionedRootSignatureDeserializerFn =
     HRESULT(WINAPI *)(const void *, SIZE_T, REFIID, void **);
 using D3D12EnableExperimentalFeaturesFn = HRESULT(WINAPI *)(UINT, const IID *, void *, UINT *);
 
+constexpr std::uint64_t kRootConstantBufferSnapshotBytes =
+    std::uint64_t{D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT} * 4u * sizeof(std::uint32_t);
+constexpr std::uint64_t kMappedUseSnapshotChunkBytes = 4u * 1024u;
 constexpr GUID kIidIUnknown = {0x00000000, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
 constexpr GUID kIidD3D12Heap = {0x6b3b2502, 0x6e51, 0x45b3, {0x90, 0xee, 0x98, 0x84, 0x26, 0x5e, 0x8d, 0xf3}};
 constexpr GUID kIidD3D12Device = {0x189819f1, 0x1db6, 0x4b57, {0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7}};
@@ -779,9 +782,16 @@ struct ResourceHookState {
   decltype(std::declval<ID3D12ResourceVtbl>().Unmap) unmap = nullptr;
 };
 
+struct CapturedMappedRange {
+  std::uint64_t begin = 0;
+  std::uint64_t end = 0;
+  std::uint64_t hash = 0;
+};
+
 struct MappedResourceState {
   void *data = nullptr;
   UINT subresource = 0;
+  std::vector<CapturedMappedRange> captured_ranges;
 };
 
 struct ResourceGpuVirtualAddressState {
@@ -805,6 +815,19 @@ struct GpuVirtualAddressResolve {
   std::uint64_t offset = 0;
   std::uint64_t width = 0;
   const char *status = "missing";
+};
+
+struct MappedGpuvaUseRange {
+  D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+  std::uint64_t size = 0;
+  bool valid = false;
+};
+
+struct CommandListMappedUseState {
+  std::unordered_map<UINT, MappedGpuvaUseRange> graphics_root_cbvs;
+  std::unordered_map<UINT, MappedGpuvaUseRange> compute_root_cbvs;
+  std::vector<MappedGpuvaUseRange> vertex_buffers;
+  MappedGpuvaUseRange index_buffer;
 };
 
 struct CaptureState {
@@ -841,6 +864,7 @@ struct CaptureState {
   std::unordered_map<ID3D12Resource *, ResourceCaptureInfo> resource_capture_infos;
   std::unordered_map<ID3D12Heap *, UINT> heap_types;
   std::unordered_map<ID3D12GraphicsCommandList *, std::vector<ID3D12Resource *>> command_list_resources;
+  std::unordered_map<ID3D12GraphicsCommandList *, CommandListMappedUseState> command_list_mapped_uses;
   std::vector<const void *> bridge_command_objects;
 };
 
@@ -1990,6 +2014,378 @@ void record_call_locked(
     event.blob_refs = blob_refs;
     event.payload = std::move(payload_json);
     session->append_call_event(event);
+  }
+}
+
+GpuVirtualAddressResolve resolve_gpu_virtual_address_locked(std::uint64_t address);
+
+apitrace::trace::AssetRecord register_asset_bytes_locked(
+    apitrace::trace::AssetKind kind,
+    std::string debug_name,
+    const void *data,
+    std::size_t size);
+
+std::uint64_t fnv1a64_bytes(const void *data, std::size_t size)
+{
+  constexpr std::uint64_t kOffset = 1469598103934665603ull;
+  constexpr std::uint64_t kPrime = 1099511628211ull;
+  std::uint64_t hash = kOffset;
+  const auto *bytes = static_cast<const std::uint8_t *>(data);
+  for (std::size_t index = 0; index < size; ++index) {
+    hash ^= bytes[index];
+    hash *= kPrime;
+  }
+  return hash;
+}
+
+bool mapped_range_captured(const MappedResourceState &mapped, std::uint64_t begin, std::uint64_t end, std::uint64_t hash)
+{
+  for (const auto &range : mapped.captured_ranges) {
+    if (range.begin == begin && range.end == end && range.hash == hash) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void mark_mapped_range_captured(MappedResourceState &mapped, std::uint64_t begin, std::uint64_t end, std::uint64_t hash)
+{
+  if (end <= begin) {
+    return;
+  }
+  auto &ranges = mapped.captured_ranges;
+  for (auto &range : ranges) {
+    if (range.begin == begin && range.end == end) {
+      range.hash = hash;
+      return;
+    }
+  }
+  ranges.push_back(CapturedMappedRange{begin, end, hash});
+}
+
+ID3D12Resource *resource_from_object_id_locked(apitrace::trace::ObjectId object_id)
+{
+  if (object_id == 0) {
+    return nullptr;
+  }
+  for (const auto &[resource, info] : capture_state().resource_capture_infos) {
+    if (info.object_id == object_id) {
+      return resource;
+    }
+  }
+  return nullptr;
+}
+
+void record_mapped_resource_range_update_locked(
+    ID3D12Resource *resource,
+    MappedResourceState &mapped,
+    const ResourceCaptureInfo &info,
+    std::uint64_t begin,
+    std::uint64_t end)
+{
+  if (capture_recording_suppressed() || !resource || !mapped.data || end <= begin) {
+    return;
+  }
+
+  const auto size64 = end - begin;
+  if (size64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    return;
+  }
+
+  const auto size = static_cast<std::size_t>(size64);
+  const auto *bytes = static_cast<const std::uint8_t *>(mapped.data) + static_cast<std::size_t>(begin);
+  const auto hash = fnv1a64_bytes(bytes, size);
+  if (mapped_range_captured(mapped, begin, end, hash)) {
+    return;
+  }
+
+  const auto asset = register_asset_bytes_locked(
+      apitrace::trace::AssetKind::Buffer,
+      "d3d12-mapped-resource-use",
+      bytes,
+      size);
+  if (asset.blob_id == 0 || asset.relative_path.empty()) {
+    return;
+  }
+
+  const auto buffer_path = asset.relative_path.generic_string();
+  std::ostringstream payload;
+  payload << "{\"resource_object_id\":" << object_id_json(info.object_id)
+          << ",\"subresource\":" << mapped.subresource
+          << ",\"written_begin\":" << begin
+          << ",\"written_end\":" << end
+          << ",\"written_size\":" << size64
+          << ",\"buffer_path\":\"" << buffer_path << "\""
+          << ",\"capture_reason\":\"mapped_resource_use\"}";
+  record_call_locked("ID3D12Resource::Unmap", S_OK, {resource}, {asset.blob_id}, payload.str());
+  mark_mapped_range_captured(mapped, begin, end, hash);
+}
+
+void capture_mapped_resource_range_before_use_locked(
+    ID3D12Resource *resource,
+    std::uint64_t begin,
+    std::uint64_t size)
+{
+  if (!resource || size == 0) {
+    return;
+  }
+
+  const auto mapped_it = capture_state().mapped_resources.find(resource);
+  if (mapped_it == capture_state().mapped_resources.end()) {
+    return;
+  }
+
+  const auto info_it = capture_state().resource_capture_infos.find(resource);
+  if (info_it == capture_state().resource_capture_infos.end() || !info_it->second.cpu_writable ||
+      !info_it->second.has_desc || info_it->second.desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+      info_it->second.desc.Width == 0 || begin >= info_it->second.desc.Width) {
+    return;
+  }
+
+  const auto max_size = info_it->second.desc.Width - begin;
+  const auto clamped_size = std::min(size, max_size);
+  if (clamped_size == 0) {
+    return;
+  }
+
+  if (begin > std::numeric_limits<std::uint64_t>::max() - clamped_size) {
+    return;
+  }
+
+  record_mapped_resource_range_update_locked(
+      resource,
+      mapped_it->second,
+      info_it->second,
+      begin,
+      begin + clamped_size);
+}
+
+void capture_mapped_gpuva_range_before_use_locked(
+    const GpuVirtualAddressResolve &resolve,
+    std::uint64_t size)
+{
+  if (!resolve.resolved || resolve.object_id == 0 || size == 0) {
+    return;
+  }
+
+  ID3D12Resource *resource = resource_from_object_id_locked(resolve.object_id);
+  capture_mapped_resource_range_before_use_locked(resource, resolve.offset, size);
+}
+
+void capture_mapped_gpuva_range_before_use_chunked_locked(
+    const GpuVirtualAddressResolve &resolve,
+    std::uint64_t size)
+{
+  if (!resolve.resolved || resolve.object_id == 0 || size == 0) {
+    return;
+  }
+
+  ID3D12Resource *resource = resource_from_object_id_locked(resolve.object_id);
+  if (!resource) {
+    return;
+  }
+  if (resolve.offset > std::numeric_limits<std::uint64_t>::max() - size) {
+    return;
+  }
+  const auto end = resolve.offset + size;
+  const auto chunk_mask = kMappedUseSnapshotChunkBytes - 1u;
+  if (end > std::numeric_limits<std::uint64_t>::max() - chunk_mask) {
+    return;
+  }
+  const auto begin = resolve.offset & ~chunk_mask;
+  const auto aligned_end = (end + chunk_mask) & ~chunk_mask;
+
+  for (std::uint64_t chunk_begin = begin; chunk_begin < aligned_end;
+       chunk_begin += kMappedUseSnapshotChunkBytes) {
+    const auto chunk_size = std::min(kMappedUseSnapshotChunkBytes,
+                                     aligned_end - chunk_begin);
+    capture_mapped_resource_range_before_use_locked(resource, chunk_begin, chunk_size);
+  }
+}
+
+ID3D12GraphicsCommandList *command_list_mapped_use_key_locked(ID3D12GraphicsCommandList *command_list)
+{
+  if (!command_list) {
+    return nullptr;
+  }
+  if (const void *key = registered_object_key_locked(command_list)) {
+    return static_cast<ID3D12GraphicsCommandList *>(const_cast<void *>(key));
+  }
+  return command_list;
+}
+
+ID3D12GraphicsCommandList *command_list_mapped_use_key_locked(ID3D12CommandList *command_list)
+{
+  if (!command_list) {
+    return nullptr;
+  }
+  if (const void *key = registered_command_list_key_locked(command_list)) {
+    return static_cast<ID3D12GraphicsCommandList *>(const_cast<void *>(key));
+  }
+  return reinterpret_cast<ID3D12GraphicsCommandList *>(command_list);
+}
+
+void capture_mapped_gpuva_range_before_use_locked(const MappedGpuvaUseRange &range)
+{
+  if (!range.valid || range.address == 0 || range.size == 0) {
+    return;
+  }
+  const auto resolve = resolve_gpu_virtual_address_locked(range.address);
+  capture_mapped_gpuva_range_before_use_locked(resolve, range.size);
+}
+
+void capture_root_cbv_mapped_gpuva_range_before_use_locked(const MappedGpuvaUseRange &range)
+{
+  if (!range.valid || range.address == 0 || range.size == 0) {
+    return;
+  }
+  const auto resolve = resolve_gpu_virtual_address_locked(range.address);
+  capture_mapped_gpuva_range_before_use_chunked_locked(resolve, range.size);
+}
+
+void remember_root_cbv_range_locked(
+    ID3D12GraphicsCommandList *command_list,
+    bool compute,
+    UINT root_parameter_index,
+    D3D12_GPU_VIRTUAL_ADDRESS buffer_location)
+{
+  auto *key = command_list_mapped_use_key_locked(command_list);
+  if (!key) {
+    return;
+  }
+  auto &state = capture_state().command_list_mapped_uses[key];
+  auto &roots = compute ? state.compute_root_cbvs : state.graphics_root_cbvs;
+  if (buffer_location == 0) {
+    roots.erase(root_parameter_index);
+    return;
+  }
+  roots[root_parameter_index] = MappedGpuvaUseRange{
+      buffer_location,
+      kRootConstantBufferSnapshotBytes,
+      true,
+  };
+}
+
+void clear_root_cbv_ranges_locked(ID3D12GraphicsCommandList *command_list, bool compute)
+{
+  auto *key = command_list_mapped_use_key_locked(command_list);
+  if (!key) {
+    return;
+  }
+  const auto it = capture_state().command_list_mapped_uses.find(key);
+  if (it == capture_state().command_list_mapped_uses.end()) {
+    return;
+  }
+  if (compute) {
+    it->second.compute_root_cbvs.clear();
+  } else {
+    it->second.graphics_root_cbvs.clear();
+  }
+}
+
+void remember_vertex_buffer_ranges_locked(
+    ID3D12GraphicsCommandList *command_list,
+    UINT start_slot,
+    UINT view_count,
+    const D3D12_VERTEX_BUFFER_VIEW *views)
+{
+  if (view_count == 0) {
+    return;
+  }
+  auto *key = command_list_mapped_use_key_locked(command_list);
+  if (!key) {
+    return;
+  }
+  auto &buffers = capture_state().command_list_mapped_uses[key].vertex_buffers;
+  const auto required_size = static_cast<std::size_t>(start_slot) + static_cast<std::size_t>(view_count);
+  if (buffers.size() < required_size) {
+    buffers.resize(required_size);
+  }
+  for (UINT index = 0; index < view_count; ++index) {
+    auto &range = buffers[static_cast<std::size_t>(start_slot) + index];
+    if (!views || views[index].BufferLocation == 0 || views[index].SizeInBytes == 0) {
+      range = {};
+      continue;
+    }
+    range = MappedGpuvaUseRange{views[index].BufferLocation, views[index].SizeInBytes, true};
+  }
+}
+
+void remember_index_buffer_range_locked(ID3D12GraphicsCommandList *command_list, const D3D12_INDEX_BUFFER_VIEW *view)
+{
+  auto *key = command_list_mapped_use_key_locked(command_list);
+  if (!key) {
+    return;
+  }
+  auto &range = capture_state().command_list_mapped_uses[key].index_buffer;
+  if (!view || view->BufferLocation == 0 || view->SizeInBytes == 0) {
+    range = {};
+    return;
+  }
+  range = MappedGpuvaUseRange{view->BufferLocation, view->SizeInBytes, true};
+}
+
+void clear_command_list_mapped_uses_locked(ID3D12GraphicsCommandList *command_list)
+{
+  auto *key = command_list_mapped_use_key_locked(command_list);
+  if (!key) {
+    return;
+  }
+  capture_state().command_list_mapped_uses.erase(key);
+}
+
+void capture_graphics_mapped_inputs_before_use_locked(ID3D12GraphicsCommandList *command_list, bool include_index_buffer)
+{
+  auto *key = command_list_mapped_use_key_locked(command_list);
+  if (!key) {
+    return;
+  }
+  const auto it = capture_state().command_list_mapped_uses.find(key);
+  if (it == capture_state().command_list_mapped_uses.end()) {
+    return;
+  }
+  for (const auto &[root_parameter_index, range] : it->second.graphics_root_cbvs) {
+    (void)root_parameter_index;
+    capture_root_cbv_mapped_gpuva_range_before_use_locked(range);
+  }
+  for (const auto &range : it->second.vertex_buffers) {
+    capture_mapped_gpuva_range_before_use_locked(range);
+  }
+  if (include_index_buffer) {
+    capture_mapped_gpuva_range_before_use_locked(it->second.index_buffer);
+  }
+}
+
+void capture_compute_mapped_inputs_before_use_locked(ID3D12GraphicsCommandList *command_list)
+{
+  auto *key = command_list_mapped_use_key_locked(command_list);
+  if (!key) {
+    return;
+  }
+  const auto it = capture_state().command_list_mapped_uses.find(key);
+  if (it == capture_state().command_list_mapped_uses.end()) {
+    return;
+  }
+  for (const auto &[root_parameter_index, range] : it->second.compute_root_cbvs) {
+    (void)root_parameter_index;
+    capture_root_cbv_mapped_gpuva_range_before_use_locked(range);
+  }
+}
+
+void capture_command_list_mapped_inputs_before_submit_locked(ID3D12CommandList *command_list)
+{
+  auto *graphics_list = command_list_mapped_use_key_locked(command_list);
+  if (!graphics_list) {
+    return;
+  }
+  capture_graphics_mapped_inputs_before_use_locked(graphics_list, true);
+  capture_compute_mapped_inputs_before_use_locked(graphics_list);
+}
+
+void capture_command_lists_mapped_inputs_before_submit_locked(UINT count, ID3D12CommandList *const *command_lists)
+{
+  for (UINT index = 0; command_lists && index < count; ++index) {
+    capture_command_list_mapped_inputs_before_submit_locked(command_lists[index]);
   }
 }
 

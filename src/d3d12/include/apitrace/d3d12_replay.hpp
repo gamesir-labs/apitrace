@@ -32,7 +32,7 @@ public:
   // Persisted replay-model schema. bundle-finalize reconstructs the object model once and
   // serializes it via save_replay_model; retrace loads it via load_replay_model to skip the
   // in-process initialize+replay_event reconstruction. Bump on any wire-format change.
-  static constexpr std::uint32_t kReplayModelSchemaVersion = 2;
+  static constexpr std::uint32_t kReplayModelSchemaVersion = 4;
   bool save_replay_model(
       const std::filesystem::path &json_path,
       const std::filesystem::path &blob_path,
@@ -165,6 +165,7 @@ public:
 
   struct ResourceDataUpdate {
     std::uint64_t sequence = 0;
+    std::uint64_t apply_sequence = 0;
     std::uint32_t subresource = 0;
     std::uint64_t written_begin = 0;
     std::uint64_t written_end = 0;
@@ -915,8 +916,8 @@ private:
   // Index over resource_versions_ keyed by object_id, each value sorted ascending by create_sequence.
   // Built once (after reconstruction or model load) so GPU-virtual-address resolution can find the
   // version live at a command's sequence in O(log versions-per-id) instead of scanning the whole
-  // resource_versions_ vector per binding (which is O(total versions) and dominates replay time on
-  // FH4-scale traces). Pointers reference resource_versions_ entries; rebuild if that vector changes.
+  // resource_versions_ vector per binding. Pointers reference resource_versions_ entries; rebuild if
+  // that vector changes.
   std::unordered_map<trace::ObjectId, std::vector<const ResourceSemanticState *>>
       resource_versions_by_id_;
   // Address-sorted index over resource_versions_ entries that have a non-zero GPU virtual address,
@@ -933,6 +934,17 @@ private:
       std::string &error);
   void build_resource_version_index();
   std::unordered_map<trace::ObjectId, PipelineSemanticState> pipelines_;
+  // Append-only history of every pipeline-state create. pipelines_ keeps only the currently live/latest
+  // entry per object_id while pipeline_versions_ preserves pointer reuse across lifetimes, so replay can
+  // resolve an initial PSO / SetPipelineState to the version live at the command sequence.
+  std::vector<PipelineSemanticState> pipeline_versions_;
+  std::unordered_map<trace::ObjectId, std::vector<const PipelineSemanticState *>>
+      pipeline_versions_by_id_;
+  void register_pipeline_version(PipelineSemanticState pipeline);
+  void build_pipeline_version_index();
+  const PipelineSemanticState *pipeline_at(
+      trace::ObjectId pipeline_state_object_id,
+      std::uint64_t sequence) const;
   std::unordered_map<trace::ObjectId, RootSignatureSemanticState> root_signatures_;
   std::vector<FenceOperationSemanticState> fence_operations_;
   std::vector<ReplayCommandRecord> replay_commands_;

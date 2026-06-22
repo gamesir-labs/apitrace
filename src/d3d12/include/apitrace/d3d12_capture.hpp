@@ -1,6 +1,7 @@
 #pragma once
 
 #include "apitrace/capture_runtime.hpp"
+#include "apitrace/object_types.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -195,12 +196,19 @@ void record_resource_unmap(
     std::uint64_t written_end,
     const void *written_data,
     std::size_t written_size);
+void record_resource_bytes_snapshot(
+    trace::ObjectId resource_object_id,
+    std::uint64_t begin,
+    std::uint64_t end,
+    const void *bytes,
+    std::uint64_t sequence);
 std::uint64_t record_resource_map(
     const void *resource,
     std::uint32_t subresource,
     bool has_read_range,
     std::uint64_t read_begin,
     std::uint64_t read_end,
+    const void *mapped_data,
     bool mapped,
     std::int32_t result_code);
 void record_resolve_query_data_result(

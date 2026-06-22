@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <string_view>
+#include <vector>
 
 #include <d3d12.h>
 
@@ -158,6 +159,141 @@ bool verify_raw_pipeline_capture(const std::filesystem::path &bundle)
   }
   if (stream_pipeline_calls != 2 || !found_compute_stream_pipeline || !found_mesh_stream_pipeline) {
     std::cerr << "raw CreatePipelineState calls did not preserve compute and mesh variants\n";
+    return false;
+  }
+  return true;
+}
+
+bool verify_mapped_root_cbv_capture(const std::filesystem::path &bundle)
+{
+  std::ifstream input(bundle / apitrace::trace::kCallstreamFileName, std::ios::binary);
+  if (!input.is_open()) {
+    std::cerr << "raw callstream was not written\n";
+    return false;
+  }
+
+  bool found_draw = false;
+  bool seen_root_cbv = false;
+  bool found_use_snapshot = false;
+  std::string line;
+  while (std::getline(input, line)) {
+    const auto record = nlohmann::json::parse(line, nullptr, false);
+    if (record.is_discarded() || record.value("record_kind", std::string()) != "call") {
+      continue;
+    }
+    const auto function = record.value("function", std::string());
+    if (function == "ID3D12GraphicsCommandList::SetGraphicsRootConstantBufferView") {
+      seen_root_cbv = true;
+    }
+    if (function == "ID3D12GraphicsCommandList::DrawInstanced") {
+      found_draw = true;
+    }
+    if (function != "ID3D12Resource::Unmap") {
+      continue;
+    }
+    const auto payload = record.value("payload", nlohmann::json::object());
+    if (!payload.is_object() ||
+        payload.value("capture_reason", std::string()) != "mapped_resource_use") {
+      continue;
+    }
+    found_use_snapshot = seen_root_cbv && !found_draw &&
+        payload.value("written_begin", UINT64_MAX) <= 0x200 &&
+        payload.value("written_end", 0ull) >= 0x1000 &&
+        payload.value("written_size", 0ull) >= 0x1000 &&
+        !record.value("blob_refs", nlohmann::json::array()).empty();
+  }
+
+  if (!found_draw || !found_use_snapshot) {
+    std::cerr << "mapped root CBV use was not captured before DrawInstanced\n";
+    return false;
+  }
+  return true;
+}
+
+bool verify_mapped_descriptor_cbv_capture(const std::filesystem::path &bundle)
+{
+  std::ifstream input(bundle / apitrace::trace::kCallstreamFileName, std::ios::binary);
+  if (!input.is_open()) {
+    std::cerr << "raw callstream was not written\n";
+    return false;
+  }
+
+  bool found_use_snapshot = false;
+  bool found_copy_use_snapshot = false;
+  bool found_descriptor_cbv = false;
+  bool found_descriptor_cbv_copy = false;
+  std::string line;
+  while (std::getline(input, line)) {
+    const auto record = nlohmann::json::parse(line, nullptr, false);
+    if (record.is_discarded() || record.value("record_kind", std::string()) != "call") {
+      continue;
+    }
+    const auto function = record.value("function", std::string());
+    if (function == "ID3D12Resource::Unmap") {
+      const auto payload = record.value("payload", nlohmann::json::object());
+      if (payload.is_object() &&
+          payload.value("capture_reason", std::string()) == "mapped_resource_use" &&
+          payload.value("written_begin", UINT64_MAX) == 0x100 &&
+          payload.value("written_end", 0ull) == 0x200 &&
+          payload.value("written_size", 0ull) == 0x100 &&
+          !record.value("blob_refs", nlohmann::json::array()).empty()) {
+        if (!found_descriptor_cbv) {
+          found_use_snapshot = true;
+        } else if (!found_descriptor_cbv_copy) {
+          found_copy_use_snapshot = true;
+        }
+      }
+      continue;
+    }
+    if (function == "ID3D12Device::CopyDescriptorsBatch") {
+      const auto payload = record.value("payload", nlohmann::json::object());
+      if (!payload.is_object() || !payload.contains("ops")) {
+        continue;
+      }
+      for (const auto &op : payload["ops"]) {
+        if (!op.is_array() || op.size() < 6 || !op[5].is_array()) {
+          continue;
+        }
+        for (const auto &range : op[5]) {
+          if (!range.is_array() || range.size() < 3) {
+            continue;
+          }
+          if (range[0].get<std::uint64_t>() == 0x7060 &&
+              range[1].get<std::uint64_t>() == 0x7040 &&
+              range[2].get<std::uint32_t>() == 1) {
+            found_descriptor_cbv_copy = true;
+            if (!found_copy_use_snapshot) {
+              std::cerr << "mapped descriptor CBV copy was not captured before CopyDescriptors\n";
+              return false;
+            }
+          }
+        }
+      }
+      continue;
+    }
+    if (function != "ID3D12Device::CreateDescriptorViewBatch") {
+      continue;
+    }
+    const auto payload = record.value("payload", nlohmann::json::object());
+    if (!payload.is_object() || !payload.contains("ops")) {
+      continue;
+    }
+    for (const auto &op : payload["ops"]) {
+      if (!op.is_array() || op.size() < 3) {
+        continue;
+      }
+      if (op[1].get<int>() == 1 && op[2].get<std::uint64_t>() == 0x7040) {
+        found_descriptor_cbv = true;
+        if (!found_use_snapshot) {
+          std::cerr << "mapped descriptor CBV use was not captured before descriptor creation\n";
+          return false;
+        }
+      }
+    }
+  }
+
+  if (!found_descriptor_cbv || !found_use_snapshot || !found_descriptor_cbv_copy || !found_copy_use_snapshot) {
+    std::cerr << "mapped descriptor CBV use was not captured\n";
     return false;
   }
   return true;
@@ -384,6 +520,34 @@ int main(int argc, char **argv)
     apitrace::runtime::shutdown_process_trace_session();
     return 1;
   }
+  std::uint8_t mapped_constant_data[4096] = {};
+  if (apitrace::d3d12::record_resource_map(
+          constant_buffer_resource,
+          0,
+          false,
+          0,
+          0,
+          mapped_constant_data,
+          true,
+          S_OK) == 0) {
+    std::cerr << "failed to record mapped constant buffer Map call\n";
+    clear_trace_bundle_env();
+    apitrace::runtime::shutdown_process_trace_session();
+    return 1;
+  }
+  for (std::size_t index = 0x300; index < 0x320; ++index) {
+    mapped_constant_data[index] = static_cast<std::uint8_t>(index ^ 0xa5);
+  }
+  apitrace::d3d12::record_resource_unmap(
+      constant_buffer_resource,
+      0,
+      0x300,
+      0x320,
+      mapped_constant_data + 0x300,
+      0x20);
+  for (std::size_t index = 0x100; index < 0x200; ++index) {
+    mapped_constant_data[index] = static_cast<std::uint8_t>(index ^ 0x3c);
+  }
   D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc = {};
   cbv_desc.BufferLocation = 0x100100;
   cbv_desc.SizeInBytes = 256;
@@ -406,6 +570,41 @@ int main(int argc, char **argv)
           0x100,
           4096) == 0) {
     std::cerr << "failed to record null-view descriptor capture api calls\n";
+    clear_trace_bundle_env();
+    apitrace::runtime::shutdown_process_trace_session();
+    return 1;
+  }
+  for (std::size_t index = 0x100; index < 0x200; ++index) {
+    mapped_constant_data[index] = static_cast<std::uint8_t>(index ^ 0xc3);
+  }
+  if (apitrace::d3d12::record_copy_descriptors_simple(
+          static_cast<ID3D12Device *>(device),
+          1,
+          D3D12_CPU_DESCRIPTOR_HANDLE{0x7060},
+          D3D12_CPU_DESCRIPTOR_HANDLE{0x7040},
+          D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+          32) == 0) {
+    std::cerr << "failed to record descriptor CBV copy capture api call\n";
+    clear_trace_bundle_env();
+    apitrace::runtime::shutdown_process_trace_session();
+    return 1;
+  }
+  if (apitrace::d3d12::record_set_root_descriptor(
+          command_list,
+          false,
+          D3D12_ROOT_PARAMETER_TYPE_CBV,
+          1,
+          0x100200) == 0) {
+    std::cerr << "failed to record root CBV binding\n";
+    clear_trace_bundle_env();
+    apitrace::runtime::shutdown_process_trace_session();
+    return 1;
+  }
+  for (std::size_t index = 0x200; index < 0x300; ++index) {
+    mapped_constant_data[index] = static_cast<std::uint8_t>(index ^ 0x5a);
+  }
+  if (apitrace::d3d12::record_draw_instanced(command_list, 3, 1, 0, 0) == 0) {
+    std::cerr << "failed to record DrawInstanced after mapped root CBV update\n";
     clear_trace_bundle_env();
     apitrace::runtime::shutdown_process_trace_session();
     return 1;
@@ -531,6 +730,12 @@ int main(int argc, char **argv)
   clear_trace_bundle_env();
 
   if (!verify_raw_pipeline_capture(bundle)) {
+    return 1;
+  }
+  if (!verify_mapped_descriptor_cbv_capture(bundle)) {
+    return 1;
+  }
+  if (!verify_mapped_root_cbv_capture(bundle)) {
     return 1;
   }
   if (!finalize_bundle(argv[0], bundle)) {
@@ -722,17 +927,60 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  const auto *view_batch_event = find_call(reader, "ID3D12Device::CreateDescriptorViewBatch");
-  const auto view_batch_payload = nlohmann::json::parse(view_batch_event->payload, nullptr, false);
-  if (view_batch_payload.is_discarded() ||
-      view_batch_payload.value("op_count", 0) != 3 ||
-      !view_batch_payload.contains("ops") ||
-      view_batch_payload["ops"].size() != 3 ||
-      view_batch_event->object_refs.size() != 3) {
+  const std::uint64_t descriptor_resource_id =
+      static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(descriptor_resource));
+  const std::uint64_t constant_buffer_resource_id =
+      static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(constant_buffer_resource));
+  const auto has_object_ref = [](const auto &refs, std::uint64_t object_id) {
+    return std::find(refs.begin(), refs.end(), object_id) != refs.end();
+  };
+  nlohmann::json srv_op;
+  nlohmann::json uav_op;
+  nlohmann::json cbv_op;
+  bool srv_refs_ok = false;
+  bool uav_refs_ok = false;
+  bool cbv_refs_ok = false;
+  std::size_t view_op_count = 0;
+  for (const auto &event : reader.events()) {
+    if (event.kind != apitrace::trace::EventKind::Call ||
+        event.callsite.function_name != "ID3D12Device::CreateDescriptorViewBatch") {
+      continue;
+    }
+    const auto view_batch_payload = nlohmann::json::parse(event.payload, nullptr, false);
+    if (view_batch_payload.is_discarded() ||
+        !view_batch_payload.contains("ops") ||
+        !view_batch_payload["ops"].is_array()) {
+      continue;
+    }
+    for (const auto &op : view_batch_payload["ops"]) {
+      ++view_op_count;
+      if (!op.is_array() || op.size() < 3) {
+        continue;
+      }
+      const auto kind = op[1].get<int>();
+      const auto descriptor = op[2].get<std::uint64_t>();
+      if (kind == 2 && descriptor == 0x7000) {
+        srv_op = op;
+        srv_refs_ok = has_object_ref(event.object_refs, descriptor_resource_id);
+      } else if (kind == 3 && descriptor == 0x7020) {
+        uav_op = op;
+        uav_refs_ok = has_object_ref(event.object_refs, descriptor_resource_id);
+      } else if (kind == 1 && descriptor == 0x7040) {
+        cbv_op = op;
+        cbv_refs_ok = has_object_ref(event.object_refs, constant_buffer_resource_id);
+      }
+    }
+  }
+  if (view_op_count < 3 ||
+      srv_op.is_null() ||
+      uav_op.is_null() ||
+      cbv_op.is_null() ||
+      !srv_refs_ok ||
+      !uav_refs_ok ||
+      !cbv_refs_ok) {
     std::cerr << "CreateDescriptorViewBatch did not preserve descriptor view ops\n";
     return 1;
   }
-  const auto &srv_op = view_batch_payload["ops"][0];
   if (srv_op.size() < 16 ||
       srv_op[1].get<int>() != 2 ||
       srv_op[2].get<std::uint64_t>() != 0x7000 ||
@@ -740,7 +988,6 @@ int main(int argc, char **argv)
     std::cerr << "CreateDescriptorViewBatch did not preserve null SRV metadata\n";
     return 1;
   }
-  const auto &uav_op = view_batch_payload["ops"][1];
   if (uav_op.size() < 16 ||
       uav_op[1].get<int>() != 3 ||
       uav_op[2].get<std::uint64_t>() != 0x7020 ||
@@ -749,7 +996,6 @@ int main(int argc, char **argv)
     std::cerr << "CreateDescriptorViewBatch did not preserve null UAV metadata\n";
     return 1;
   }
-  const auto &cbv_op = view_batch_payload["ops"][2];
   if (cbv_op.size() < 16 ||
       cbv_op[1].get<int>() != 1 ||
       cbv_op[2].get<std::uint64_t>() != 0x7040 ||
@@ -757,7 +1003,7 @@ int main(int argc, char **argv)
       cbv_op[10].get<std::uint64_t>() != 256 ||
       cbv_op[11].get<std::string>() != "mapped" ||
       cbv_op[12].get<std::uint64_t>() !=
-          static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(constant_buffer_resource)) ||
+          constant_buffer_resource_id ||
       cbv_op[13].get<std::uint64_t>() != 0x100 ||
       cbv_op[14].get<std::uint64_t>() != 4096 ||
       !cbv_op[15].is_null()) {

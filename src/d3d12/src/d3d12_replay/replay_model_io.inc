@@ -1159,6 +1159,7 @@ template <typename A>
 void serialize_fields(A &a, Backend::ResourceDataUpdate &v)
 {
   a.scalar(v.sequence);
+  a.scalar(v.apply_sequence);
   a.scalar(v.subresource);
   a.scalar(v.written_begin);
   a.scalar(v.written_end);
@@ -1350,6 +1351,7 @@ bool D3D12ReplayBackend::save_replay_model(
   // serializer as resources_' values, including bytes/transitions/data_updates.
   a.vec(self.resource_versions_);
   a.map(self.pipelines_);
+  a.vec(self.pipeline_versions_);
   a.map(self.root_signatures_);
 
   // Ordered vector containers.
@@ -1562,6 +1564,7 @@ bool D3D12ReplayBackend::load_replay_model(
   a.map(resources_);
   a.vec(resource_versions_);
   a.map(pipelines_);
+  a.vec(pipeline_versions_);
   a.map(root_signatures_);
 
   // Ordered vector containers.
@@ -1579,14 +1582,11 @@ bool D3D12ReplayBackend::load_replay_model(
     return false;
   }
 
+  build_resource_version_index();
+  build_pipeline_version_index();
   initialized_ = true;
   return true;
 }
-
-
-
-
-
 
 
 

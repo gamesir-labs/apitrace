@@ -64,6 +64,7 @@ public:
   void close();
 
   bool is_open() const noexcept;
+  std::uint64_t initial_call_sequence() const noexcept;
   const BundleLayout &layout() const noexcept;
 
 private:
@@ -77,6 +78,11 @@ public:
   struct OpenOptions {
     bool load_metal_sideband = true;
     bool validate_checksum_contents = true;
+    // When false, open() still parses bundle metadata, indexes, and callstream events, but skips
+    // validating checksum entries and asset file references. This is for bundle-finalize's
+    // in-process reconstruction after assets.json has been rewritten but before checksums.json is
+    // refreshed; retrace should keep the default validation path.
+    bool validate_file_references = true;
     bool wait_for_present_frame_blob = false;
     // When false, open() parses the bundle header (metadata) and validates assets/checksums but
     // skips parsing the callstream into events(). Used by the retrace replay-model fast path, where
@@ -88,6 +94,10 @@ public:
     // validates blob_refs against assets.json while parsing the streams. Tools that perform their
     // own full reference validation can disable this to avoid a duplicate serial stream pass.
     bool discover_referenced_assets = true;
+    // For D3D12 diagnostic replay, a stop sequence can target an event recorded inside a command
+    // list. The reader still has to include the later ExecuteCommandLists event that submits that
+    // list, while the native replayer performs the actual in-list truncation.
+    bool extend_stop_after_sequence_to_command_list_submit = false;
     std::uint64_t stop_after_sequence = 0;
     std::uint64_t stop_after_present_frame = 0;
   };

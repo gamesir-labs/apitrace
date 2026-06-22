@@ -62,6 +62,7 @@ struct Options {
   bool progress = false;
   bool verify_existing_canonical = false;
   bool verify_jsonl_records = false;
+  bool persist_replay_model_only = false;
 };
 
 struct AssetEntry {
@@ -164,6 +165,9 @@ struct Stats {
   std::uint64_t verified_existing_canonical_bytes = 0;
   std::size_t removed_stale_canonical_files = 0;
   std::uint64_t spooled_asset_bytes = 0;
+  std::size_t recovered_unindexed_asset_aliases = 0;
+  std::uint64_t sequence_regression_segments = 0;
+  std::uint64_t remapped_sequence_records = 0;
 };
 
 std::unordered_map<std::uint64_t, std::string> build_effective_path_by_blob_id(const std::vector<AssetEntry> &assets);
@@ -254,34 +258,6 @@ private:
   std::atomic_uint64_t hits_{0};
   std::atomic_uint64_t misses_{0};
 };
-
-std::string digest_file_range(const fs::path &path, std::uint64_t offset, std::uint64_t byte_size)
-{
-  std::ifstream input(path, std::ios::binary);
-  if (!input.is_open()) {
-    throw std::runtime_error("failed to open payload slice file");
-  }
-  input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-  if (!input.good()) {
-    throw std::runtime_error("failed to seek payload slice");
-  }
-
-  apitrace::trace::ContentHasher hasher;
-  std::vector<std::uint8_t> buffer(1024 * 1024);
-  std::uint64_t remaining = byte_size;
-  while (remaining != 0) {
-    const auto chunk_size = static_cast<std::streamsize>(
-        std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(buffer.size())));
-    input.read(reinterpret_cast<char *>(buffer.data()), chunk_size);
-    const auto read_count = static_cast<std::size_t>(input.gcount());
-    if (read_count == 0) {
-      throw std::runtime_error("short payload slice read");
-    }
-    hasher.update(buffer.data(), read_count);
-    remaining -= read_count;
-  }
-  return hasher.final_hex();
-}
 
 class FileCopyScratch {
 public:
@@ -513,7 +489,9 @@ void print_usage(const char *argv0)
       << "  --verify-existing-canonical\n"
       << "                     Re-hash existing canonical asset files before reusing them.\n"
       << "  --verify-jsonl-records\n"
-      << "                     Parse every JSONL record during reference rewriting.\n";
+      << "                     Parse every JSONL record during reference rewriting.\n"
+      << "  --persist-replay-model-only\n"
+      << "                     Only rebuild the D3D12 replay model and update its checksums.\n";
 }
 
 std::optional<Options> parse_args(int argc, char **argv)
@@ -536,6 +514,8 @@ std::optional<Options> parse_args(int argc, char **argv)
       options.verify_existing_canonical = true;
     } else if (arg == "--verify-jsonl-records") {
       options.verify_jsonl_records = true;
+    } else if (arg == "--persist-replay-model-only") {
+      options.persist_replay_model_only = true;
     } else if (arg == "--jobs") {
       if (i + 1 >= argc) {
         print_usage(argv[0]);
@@ -1488,41 +1468,147 @@ void hash_assets(
     }
   }
 
-  std::atomic<std::size_t> next{0};
+  std::vector<std::size_t> file_group_indices;
+  struct PayloadTask {
+    std::string payload_path;
+    std::vector<std::size_t> group_indices;
+    std::uint64_t byte_size = 0;
+  };
+  std::unordered_map<std::string, std::size_t> payload_task_by_path;
+  std::vector<PayloadTask> payload_tasks;
+  for (std::size_t index = 0; index < groups.size(); ++index) {
+    auto &group = groups[index];
+    if (!group.payload_slice) {
+      file_group_indices.push_back(index);
+      continue;
+    }
+    const auto [it, inserted] = payload_task_by_path.emplace(group.payload_path, payload_tasks.size());
+    if (inserted) {
+      PayloadTask task;
+      task.payload_path = group.payload_path;
+      payload_tasks.push_back(std::move(task));
+    }
+    auto &task = payload_tasks[it->second];
+    task.group_indices.push_back(index);
+    task.byte_size += group.byte_size;
+  }
+  for (auto &task : payload_tasks) {
+    std::sort(task.group_indices.begin(), task.group_indices.end(), [&](std::size_t lhs, std::size_t rhs) {
+      const auto &a = groups[lhs];
+      const auto &b = groups[rhs];
+      if (a.payload_offset != b.payload_offset) {
+        return a.payload_offset < b.payload_offset;
+      }
+      return a.byte_size < b.byte_size;
+    });
+  }
+  std::sort(payload_tasks.begin(), payload_tasks.end(), [](const PayloadTask &lhs, const PayloadTask &rhs) {
+    return lhs.byte_size > rhs.byte_size;
+  });
+
   std::atomic<std::uint64_t> completed_files{0};
   std::atomic<std::uint64_t> completed_bytes{0};
   std::mutex error_mutex;
   std::vector<std::string> errors;
-  const auto worker = [&]() {
+  auto note_completed = [&](const PathGroup &group) {
+    const auto done_files = completed_files.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto done_bytes = completed_bytes.fetch_add(group.byte_size, std::memory_order_relaxed) + group.byte_size;
+    if (progress) {
+      progress->update(done_files, groups.size(), done_bytes, total_bytes);
+    }
+  };
+  auto record_error = [&](const std::string &message) {
+    std::lock_guard<std::mutex> lock(error_mutex);
+    errors.push_back(message);
+  };
+
+  std::atomic<std::size_t> next_file_group{0};
+  const auto file_worker = [&]() {
     for (;;) {
-      const auto cursor = next.fetch_add(1, std::memory_order_relaxed);
-      if (cursor >= groups.size()) {
+      const auto cursor = next_file_group.fetch_add(1, std::memory_order_relaxed);
+      if (cursor >= file_group_indices.size()) {
         return;
       }
-      auto &group = groups[cursor];
+      auto &group = groups[file_group_indices[cursor]];
       try {
-        if (group.payload_slice) {
-          group.digest = digest_file_range(bundle_root / group.payload_path, group.payload_offset, group.byte_size);
-        } else {
-          group.digest = digest_cache.digest_file(bundle_root / group.path);
-        }
+        group.digest = digest_cache.digest_file(bundle_root / group.path);
       } catch (const std::exception &error) {
-        std::lock_guard<std::mutex> lock(error_mutex);
-        errors.push_back(group.path + ": " + error.what());
+        record_error(group.path + ": " + error.what());
       }
-      const auto done_files = completed_files.fetch_add(1, std::memory_order_relaxed) + 1;
-      const auto done_bytes = completed_bytes.fetch_add(group.byte_size, std::memory_order_relaxed) + group.byte_size;
-      if (progress) {
-        progress->update(done_files, groups.size(), done_bytes, total_bytes);
+      note_completed(group);
+    }
+  };
+
+  auto digest_payload_slice = [](
+      std::ifstream &input,
+      std::uint64_t offset,
+      std::uint64_t byte_size,
+      std::vector<std::uint8_t> &buffer) -> std::string {
+    input.clear();
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!input.good()) {
+      throw std::runtime_error("failed to seek payload slice");
+    }
+
+    apitrace::trace::ContentHasher hasher;
+    std::uint64_t remaining = byte_size;
+    while (remaining != 0) {
+      const auto chunk_size = static_cast<std::streamsize>(
+          std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(buffer.size())));
+      input.read(reinterpret_cast<char *>(buffer.data()), chunk_size);
+      const auto read_count = static_cast<std::size_t>(input.gcount());
+      if (read_count == 0) {
+        throw std::runtime_error("short payload slice read");
+      }
+      hasher.update(buffer.data(), read_count);
+      remaining -= read_count;
+    }
+    return hasher.final_hex();
+  };
+
+  std::atomic<std::size_t> next_payload_task{0};
+  const auto payload_worker = [&]() {
+    std::vector<std::uint8_t> buffer(kFileCopyBufferSize);
+    for (;;) {
+      const auto task_index = next_payload_task.fetch_add(1, std::memory_order_relaxed);
+      if (task_index >= payload_tasks.size()) {
+        return;
+      }
+      const auto &task = payload_tasks[task_index];
+      std::ifstream input(bundle_root / task.payload_path, std::ios::binary);
+      if (!input.is_open()) {
+        for (const auto group_index : task.group_indices) {
+          record_error(groups[group_index].path + ": failed to open payload slice file");
+          note_completed(groups[group_index]);
+        }
+        continue;
+      }
+      for (const auto group_index : task.group_indices) {
+        auto &group = groups[group_index];
+        try {
+          group.digest = digest_payload_slice(input, group.payload_offset, group.byte_size, buffer);
+        } catch (const std::exception &error) {
+          record_error(group.path + ": " + error.what());
+        }
+        note_completed(group);
       }
     }
   };
 
   std::vector<std::thread> threads;
-  const auto thread_count = std::max<std::size_t>(1, std::min(jobs, groups.size()));
-  threads.reserve(thread_count);
-  for (std::size_t i = 0; i < thread_count; ++i) {
-    threads.emplace_back(worker);
+  const auto file_thread_count = std::min(jobs, file_group_indices.size());
+  threads.reserve(file_thread_count);
+  for (std::size_t i = 0; i < file_thread_count; ++i) {
+    threads.emplace_back(file_worker);
+  }
+  for (auto &thread : threads) {
+    thread.join();
+  }
+  threads.clear();
+  const auto payload_thread_count = std::min(jobs, payload_tasks.size());
+  threads.reserve(payload_thread_count);
+  for (std::size_t i = 0; i < payload_thread_count; ++i) {
+    threads.emplace_back(payload_worker);
   }
   for (auto &thread : threads) {
     thread.join();
@@ -1858,6 +1944,7 @@ void remove_duplicate_files(
 
 std::vector<fs::path> text_reference_files(const fs::path &bundle_root);
 bool is_typed_asset_file_path(const fs::path &relative);
+std::vector<fs::path> typed_asset_directories();
 
 std::unordered_map<std::string, std::string> build_pipeline_file_aliases(
     const fs::path &bundle_root,
@@ -1886,6 +1973,77 @@ std::unordered_map<std::string, std::string> build_pipeline_file_aliases(
     const auto relative_text = relative.generic_string();
     if (relative_text != canonical) {
       aliases[relative_text] = canonical;
+    }
+  }
+  return aliases;
+}
+
+std::unordered_map<std::string, std::string> build_unindexed_asset_file_aliases(
+    const fs::path &bundle_root,
+    const std::vector<AssetEntry> &assets,
+    FileDigestCache &digest_cache,
+    Stats &stats)
+{
+  std::unordered_map<std::string, std::string> canonical_by_digest;
+  std::unordered_set<std::string> ambiguous_digests;
+  std::unordered_set<std::string> indexed_paths;
+  for (const auto &asset : assets) {
+    if (!asset.path.empty()) {
+      indexed_paths.insert(asset.path);
+    }
+    const auto effective_path = effective_asset_path(asset);
+    if (!effective_path.empty()) {
+      indexed_paths.insert(effective_path);
+    }
+    if (!asset.canonical_path.empty()) {
+      indexed_paths.insert(asset.canonical_path);
+    }
+    if (asset.content_hash.empty()) {
+      continue;
+    }
+    const auto canonical_path = effective_asset_path(asset);
+    if (canonical_path.empty()) {
+      continue;
+    }
+    const auto [it, inserted] = canonical_by_digest.emplace(asset.content_hash, canonical_path);
+    if (!inserted && it->second != canonical_path) {
+      canonical_by_digest.erase(it);
+      ambiguous_digests.insert(asset.content_hash);
+    }
+  }
+
+  std::unordered_map<std::string, std::string> aliases;
+  std::error_code error;
+  for (const auto &relative_directory : typed_asset_directories()) {
+    const auto directory = bundle_root / relative_directory;
+    if (!fs::is_directory(directory, error) || error) {
+      error.clear();
+      continue;
+    }
+    for (fs::recursive_directory_iterator it(directory, error), end; it != end && !error; it.increment(error)) {
+      if (!it->is_regular_file(error) || error) {
+        continue;
+      }
+      const auto relative = fs::relative(it->path(), bundle_root, error);
+      if (error || !safe_relative_path(relative) || !is_typed_asset_file_path(relative)) {
+        error.clear();
+        continue;
+      }
+      const auto relative_text = relative.generic_string();
+      if (indexed_paths.find(relative_text) != indexed_paths.end() ||
+          relative.filename().generic_string().find("asset-") == std::string::npos) {
+        continue;
+      }
+      const auto digest = digest_cache.digest_file(it->path());
+      if (digest.empty() || ambiguous_digests.find(digest) != ambiguous_digests.end()) {
+        continue;
+      }
+      const auto canonical = canonical_by_digest.find(digest);
+      if (canonical == canonical_by_digest.end() || canonical->second == relative_text) {
+        continue;
+      }
+      aliases.emplace(relative_text, canonical->second);
+      ++stats.recovered_unindexed_asset_aliases;
     }
   }
   return aliases;
@@ -2231,34 +2389,6 @@ bool text_may_contain_blob_id_remap(
   return false;
 }
 
-bool number_token_has_json_boundary(std::string_view text, std::size_t begin, std::size_t size)
-{
-  const auto end = begin + size;
-  if (begin > 0 && is_json_digit(text[begin - 1])) {
-    return false;
-  }
-  if (end < text.size() && is_json_digit(text[end])) {
-    return false;
-  }
-  return true;
-}
-
-bool text_may_contain_blob_id_remap_token(
-    std::string_view text,
-    const std::vector<std::string> &blob_id_remap_needles)
-{
-  for (const auto &needle : blob_id_remap_needles) {
-    std::size_t search = 0;
-    while ((search = text.find(needle, search)) != std::string_view::npos) {
-      if (number_token_has_json_boundary(text, search, needle.size())) {
-        return true;
-      }
-      search += needle.size();
-    }
-  }
-  return false;
-}
-
 struct JsonlLineView {
   std::string_view line;
   std::uint64_t offset = 0;
@@ -2354,83 +2484,20 @@ struct JsonlRewriteScanBatch {
   JsonlLineView candidate;
 };
 
-std::uint64_t count_jsonl_lines_in_range(std::string_view text)
-{
-  std::uint64_t lines = 0;
-  for (const auto c : text) {
-    if (c == '\n') {
-      ++lines;
-    }
-  }
-  return lines;
-}
-
 bool line_has_jsonl_rewrite_candidate(
     std::string_view line,
-    const std::vector<std::string> &blob_id_remap_needles)
+    const std::unordered_map<std::uint64_t, std::uint64_t> &blob_id_remap)
 {
   return line.find("asset-") != std::string_view::npos ||
          line.find("\"path\"") != std::string_view::npos ||
          line.find("_path\"") != std::string_view::npos ||
-         text_may_contain_blob_id_remap_token(line, blob_id_remap_needles);
-}
-
-std::vector<std::pair<std::size_t, std::size_t>> find_jsonl_rewrite_candidate_lines(
-    std::string_view text,
-    const std::vector<std::string> &blob_id_remap_needles)
-{
-  std::vector<std::pair<std::size_t, std::size_t>> ranges;
-  auto add_line_for_token = [&](std::size_t token_offset) {
-    const auto line_begin_marker = text.rfind('\n', token_offset);
-    const auto line_begin = line_begin_marker == std::string_view::npos ? 0 : line_begin_marker + 1;
-    const auto line_end = text.find('\n', token_offset);
-    if (line_end == std::string_view::npos) {
-      return;
-    }
-    ranges.emplace_back(line_begin, line_end + 1);
-  };
-  auto find_literal = [&](std::string_view needle) {
-    std::size_t cursor = 0;
-    while ((cursor = text.find(needle, cursor)) != std::string_view::npos) {
-      add_line_for_token(cursor);
-      cursor += needle.size();
-    }
-  };
-
-  find_literal("asset-");
-  find_literal("\"path\"");
-  find_literal("_path\"");
-  for (const auto &needle : blob_id_remap_needles) {
-    std::size_t cursor = 0;
-    while ((cursor = text.find(needle, cursor)) != std::string_view::npos) {
-      if (number_token_has_json_boundary(text, cursor, needle.size())) {
-        add_line_for_token(cursor);
-      }
-      cursor += needle.size();
-    }
-  }
-
-  if (ranges.empty()) {
-    return ranges;
-  }
-  std::sort(ranges.begin(), ranges.end());
-  auto out = ranges.begin();
-  for (auto it = ranges.begin(); it != ranges.end(); ++it) {
-    if (it == ranges.begin() || *it != *out) {
-      if (it != ranges.begin()) {
-        ++out;
-      }
-      *out = *it;
-    }
-  }
-  ranges.erase(++out, ranges.end());
-  return ranges;
+         text_may_contain_blob_id_remap(line, blob_id_remap);
 }
 
 template <typename Callback>
 bool scan_jsonl_file_for_rewrite(
     const fs::path &path,
-    const std::vector<std::string> &blob_id_remap_needles,
+    const std::unordered_map<std::uint64_t, std::uint64_t> &blob_id_remap,
     Callback &&callback)
 {
   constexpr std::uint64_t kMaxChunkSize = 64ull * 1024ull * 1024ull;
@@ -2500,37 +2567,29 @@ bool scan_jsonl_file_for_rewrite(
   };
 
   auto process_complete_text = [&](std::string_view text) -> bool {
-    if (text.empty()) {
-      return true;
-    }
-    const auto candidate_lines = find_jsonl_rewrite_candidate_lines(text, blob_id_remap_needles);
-    if (candidate_lines.empty()) {
-      add_skipped(
-          absolute_offset,
-          static_cast<std::uint64_t>(text.size()),
-          count_jsonl_lines_in_range(text));
-      absolute_offset += static_cast<std::uint64_t>(text.size());
-      return true;
-    }
-
     std::size_t cursor = 0;
-    for (const auto &[begin, end] : candidate_lines) {
-      if (begin > cursor) {
+    while (cursor < text.size()) {
+      const auto newline = text.find('\n', cursor);
+      if (newline == std::string_view::npos) {
+        break;
+      }
+      const auto end = newline + 1;
+      auto line = text.substr(cursor, newline - cursor);
+      if (!line.empty() && line.back() == '\r') {
+        line.remove_suffix(1);
+      }
+      if (!line_has_jsonl_rewrite_candidate(line, blob_id_remap)) {
         add_skipped(
             absolute_offset + static_cast<std::uint64_t>(cursor),
-            static_cast<std::uint64_t>(begin - cursor),
-            count_jsonl_lines_in_range(text.substr(cursor, begin - cursor)));
+            static_cast<std::uint64_t>(end - cursor),
+            1);
+        cursor = end;
+        continue;
       }
-      if (!emit_candidate_line(text, begin, end)) {
+      if (!emit_candidate_line(text, cursor, end)) {
         return false;
       }
       cursor = end;
-    }
-    if (cursor < text.size()) {
-      add_skipped(
-          absolute_offset + static_cast<std::uint64_t>(cursor),
-          static_cast<std::uint64_t>(text.size() - cursor),
-          count_jsonl_lines_in_range(text.substr(cursor)));
     }
     absolute_offset += static_cast<std::uint64_t>(text.size());
     return true;
@@ -2572,7 +2631,7 @@ bool scan_jsonl_file_for_rewrite(
       line.remove_suffix(1);
     }
     const auto byte_size = static_cast<std::uint64_t>(carry.size());
-    const bool candidate = line_has_jsonl_rewrite_candidate(line, blob_id_remap_needles);
+    const bool candidate = line_has_jsonl_rewrite_candidate(line, blob_id_remap);
     if (!candidate) {
       add_skipped(absolute_offset, byte_size, 1);
     } else {
@@ -3537,12 +3596,6 @@ std::unordered_set<std::string> rewrite_text_references(
       }
     }
   }
-  std::vector<std::string> blob_id_remap_needles;
-  blob_id_remap_needles.reserve(blob_id_remap.size());
-  for (const auto &[old_blob_id, _] : blob_id_remap) {
-    blob_id_remap_needles.push_back(std::to_string(old_blob_id));
-  }
-
   const auto reference_files = text_reference_files(bundle_root);
   std::uint64_t file_index = 0;
   std::uint64_t total_bytes = 0;
@@ -3634,9 +3687,7 @@ std::unordered_set<std::string> rewrite_text_references(
         const bool may_rewrite_path_mapped_blob_refs = path_candidates.path_mapped_blob_refs;
         const bool may_rewrite_blob_refs =
             (tokens.blob_refs_key || tokens.blob_id_key) &&
-            (options.verify_jsonl_records
-                 ? text_may_contain_blob_id_remap(line, blob_id_remap)
-                 : text_may_contain_blob_id_remap_token(line, blob_id_remap_needles));
+            text_may_contain_blob_id_remap(line, blob_id_remap);
         if (!may_rewrite_asset_path &&
             !may_rewrite_single_blob_alias &&
             !may_rewrite_path_mapped_blob_refs &&
@@ -3729,7 +3780,7 @@ std::unordered_set<std::string> rewrite_text_references(
         scanned_jsonl =
             scan_jsonl_file_for_rewrite(
                 absolute,
-                blob_id_remap_needles,
+                blob_id_remap,
                 [&](const JsonlRewriteScanBatch &batch) {
                   stats.jsonl_records += batch.line_count;
                   stats.input_bytes += batch.byte_size;
@@ -4367,6 +4418,69 @@ bool validate_record_asset_refs(
   return true;
 }
 
+bool validate_line_blob_refs_fast(
+    std::string_view line,
+    bool has_blob_refs,
+    const std::unordered_map<std::uint64_t, AssetEntry> &asset_by_blob_id,
+    std::string &reason)
+{
+  if (!has_blob_refs) {
+    return true;
+  }
+
+  std::size_t search = 0;
+  while ((search = line.find("\"blob_refs\"", search)) != std::string_view::npos) {
+    const auto colon = line.find(':', search + 11);
+    if (colon == std::string_view::npos) {
+      reason = "malformed blob_refs";
+      return false;
+    }
+    auto cursor = skip_json_whitespace(line, colon + 1);
+    if (cursor >= line.size() || line[cursor] != '[') {
+      reason = "malformed blob_refs";
+      return false;
+    }
+    ++cursor;
+
+    for (;;) {
+      cursor = skip_json_whitespace(line, cursor);
+      if (cursor >= line.size()) {
+        reason = "malformed blob_refs";
+        return false;
+      }
+      if (line[cursor] == ']') {
+        ++cursor;
+        break;
+      }
+      if (line[cursor] == ',') {
+        ++cursor;
+        continue;
+      }
+
+      std::uint64_t blob_id = 0;
+      std::size_t after = cursor;
+      if (!parse_json_unsigned_at(line, cursor, blob_id, after)) {
+        reason = "malformed blob_refs";
+        return false;
+      }
+
+      const auto asset_it = asset_by_blob_id.find(blob_id);
+      if (asset_it == asset_by_blob_id.end()) {
+        reason = "missing blob_id " + std::to_string(blob_id);
+        return false;
+      }
+      if (!asset_payload_materialized(asset_it->second)) {
+        reason = "missing payload for blob_id " + std::to_string(blob_id);
+        return false;
+      }
+      cursor = after;
+    }
+
+    search = cursor;
+  }
+  return true;
+}
+
 bool extract_payload(const json &record, json &payload)
 {
   const auto payload_it = record.find("payload");
@@ -4426,9 +4540,316 @@ json parse_jsonl_line(std::string_view line)
   return json::parse(line.begin(), line.end(), nullptr, false);
 }
 
+std::optional<std::uint64_t> json_u64_value_optional(const json &value)
+{
+  if (value.is_number_unsigned()) {
+    return value.get<std::uint64_t>();
+  }
+  if (value.is_number_integer()) {
+    const auto signed_value = value.get<std::int64_t>();
+    if (signed_value >= 0) {
+      return static_cast<std::uint64_t>(signed_value);
+    }
+  }
+  return std::nullopt;
+}
+
+bool add_u64_checked(std::uint64_t value, std::uint64_t delta, std::uint64_t &out)
+{
+  if (delta > std::numeric_limits<std::uint64_t>::max() - value) {
+    return false;
+  }
+  out = value + delta;
+  return true;
+}
+
+bool remap_json_sequence_value(json &value, std::uint64_t delta)
+{
+  const auto original = json_u64_value_optional(value);
+  if (!original || *original == 0) {
+    return false;
+  }
+  std::uint64_t remapped = 0;
+  if (!add_u64_checked(*original, delta, remapped)) {
+    return false;
+  }
+  if (remapped == *original) {
+    return false;
+  }
+  value = remapped;
+  return true;
+}
+
+bool remap_column_sequences(json &node, std::uint64_t delta)
+{
+  if (!node.is_object()) {
+    return false;
+  }
+  const auto columns_it = node.find("columns");
+  if (columns_it == node.end() || !columns_it->is_array()) {
+    return false;
+  }
+
+  std::vector<std::size_t> sequence_columns;
+  for (std::size_t index = 0; index < columns_it->size(); ++index) {
+    const auto &column = (*columns_it)[index];
+    if (!column.is_string()) {
+      continue;
+    }
+    const auto name = column.get<std::string>();
+    if (name == "sequence" || name == "d3d_sequence") {
+      sequence_columns.push_back(index);
+    }
+  }
+  if (sequence_columns.empty()) {
+    return false;
+  }
+
+  bool changed = false;
+  auto remap_rows = [&](json &rows) {
+    if (!rows.is_array()) {
+      return;
+    }
+    for (auto &row : rows) {
+      if (!row.is_array()) {
+        continue;
+      }
+      for (const auto column_index : sequence_columns) {
+        if (column_index < row.size()) {
+          changed = remap_json_sequence_value(row[column_index], delta) || changed;
+        }
+      }
+    }
+  };
+
+  if (auto rows = node.find("ops"); rows != node.end()) {
+    remap_rows(*rows);
+  }
+  if (auto rows = node.find("barriers"); rows != node.end()) {
+    remap_rows(*rows);
+  }
+  if (auto rows = node.find("records"); rows != node.end()) {
+    remap_rows(*rows);
+  }
+  return changed;
+}
+
+bool remap_embedded_sequence_fields(json &node, std::uint64_t delta, bool is_payload = false)
+{
+  bool changed = false;
+  if (node.is_object()) {
+    changed = remap_column_sequences(node, delta) || changed;
+    for (auto it = node.begin(); it != node.end(); ++it) {
+      if (it.key() == "sequence" || it.key() == "d3d_sequence") {
+        changed = remap_json_sequence_value(it.value(), delta) || changed;
+        continue;
+      }
+      changed = remap_embedded_sequence_fields(it.value(), delta, is_payload || it.key() == "payload") || changed;
+    }
+  } else if (node.is_array() && is_payload) {
+    for (auto &item : node) {
+      changed = remap_embedded_sequence_fields(item, delta, true) || changed;
+    }
+  }
+  return changed;
+}
+
+std::optional<std::uint64_t> line_sequence_fast(std::string_view line)
+{
+  constexpr std::string_view key = "sequence";
+  int depth = 0;
+  bool in_string = false;
+  bool escaped = false;
+  for (std::size_t i = 0; i < line.size(); ++i) {
+    const char c = line[i];
+    if (in_string) {
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        in_string = false;
+      }
+      continue;
+    }
+
+    if (c == '"') {
+      if (depth == 1 &&
+          i + key.size() + 2 <= line.size() &&
+          line.compare(i + 1, key.size(), key) == 0 &&
+          line[i + key.size() + 1] == '"') {
+        const auto colon = skip_json_whitespace(line, i + key.size() + 2);
+        if (colon < line.size() && line[colon] == ':') {
+          std::uint64_t value = 0;
+          std::size_t after = 0;
+          if (parse_json_unsigned_at(line, skip_json_whitespace(line, colon + 1), value, after)) {
+            return value;
+          }
+        }
+      }
+      in_string = true;
+      escaped = false;
+      continue;
+    }
+
+    if (c == '{' || c == '[') {
+      ++depth;
+    } else if ((c == '}' || c == ']') && depth > 0) {
+      --depth;
+    }
+  }
+  return std::nullopt;
+}
+
+std::unordered_set<std::string> repair_callstream_sequence_regressions(
+    const fs::path &bundle_root,
+    const Options &options,
+    Stats &stats,
+    FileDigestCache &digest_cache,
+    std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> &rewritten_digests)
+{
+  std::unordered_set<std::string> rewritten_paths;
+  const auto callstream_path = bundle_root / apitrace::trace::kCallstreamFileName;
+  if (!fs::is_regular_file(callstream_path)) {
+    return rewritten_paths;
+  }
+
+  bool needs_rewrite = false;
+  std::uint64_t last_local_sequence = 0;
+  ++stats.jsonl_passes;
+  const bool detected = scan_jsonl_file(callstream_path, [&](const JsonlLineView &line_view) {
+    ++stats.jsonl_records;
+    stats.input_bytes += line_view.byte_size;
+    const auto sequence = line_sequence_fast(line_view.line);
+    if (!sequence || *sequence == 0) {
+      return true;
+    }
+    if (*sequence < last_local_sequence) {
+      needs_rewrite = true;
+      return false;
+    }
+    last_local_sequence = *sequence;
+    return true;
+  });
+  (void)detected;
+
+  if (!needs_rewrite) {
+    return rewritten_paths;
+  }
+
+  bool rewrite_failed = false;
+  std::uint64_t last_global_sequence = 0;
+  std::uint64_t segment_base = 0;
+  last_local_sequence = 0;
+
+  const auto temporary = temporary_rewrite_path(callstream_path);
+  HashedOutputFile output;
+  if (!options.dry_run) {
+    output.open(temporary);
+    if (!output.is_open()) {
+      std::cerr << "warning: failed to open temporary rewrite file " << temporary << "\n";
+      return rewritten_paths;
+    }
+  }
+
+  ++stats.jsonl_passes;
+  const bool scanned = scan_jsonl_file(callstream_path, [&](const JsonlLineView &line_view) {
+    ++stats.jsonl_records;
+    stats.input_bytes += line_view.byte_size;
+
+    const auto local_sequence = line_sequence_fast(line_view.line);
+    if (!local_sequence || *local_sequence == 0) {
+      if (!options.dry_run) {
+        output.write_line(line_view.line);
+      }
+      note_jsonl_output(stats, line_view.line);
+      return true;
+    }
+
+    if (*local_sequence < last_local_sequence) {
+      segment_base = last_global_sequence;
+      last_local_sequence = 0;
+      ++stats.sequence_regression_segments;
+    }
+
+    std::uint64_t global_sequence = 0;
+    if (!add_u64_checked(*local_sequence, segment_base, global_sequence)) {
+      rewrite_failed = true;
+      std::cerr << "warning: sequence remap overflow in " << callstream_path
+                << " at byte offset " << line_view.offset << "\n";
+      return false;
+    }
+    last_local_sequence = *local_sequence;
+
+    if (global_sequence < last_global_sequence) {
+      rewrite_failed = true;
+      std::cerr << "warning: sequence still regressed after remap in " << callstream_path
+                << " at byte offset " << line_view.offset << "\n";
+      return false;
+    }
+
+    if (global_sequence != *local_sequence) {
+      auto record = parse_jsonl_line(line_view.line);
+      if (record.is_discarded() || !record.is_object()) {
+        rewrite_failed = true;
+        std::cerr << "warning: failed to parse sequence-remap record in " << callstream_path
+                  << " at byte offset " << line_view.offset << "\n";
+        return false;
+      }
+      record["sequence"] = global_sequence;
+      if (auto payload = record.find("payload"); payload != record.end()) {
+        remap_embedded_sequence_fields(*payload, segment_base, true);
+      }
+      const auto rewritten = record.dump();
+      if (!options.dry_run) {
+        output.write_line(rewritten);
+      }
+      note_jsonl_output(stats, rewritten);
+      ++stats.remapped_sequence_records;
+    } else {
+      if (!options.dry_run) {
+        output.write_line(line_view.line);
+      }
+      note_jsonl_output(stats, line_view.line);
+    }
+
+    last_global_sequence = std::max(last_global_sequence, global_sequence);
+    return true;
+  });
+
+  if (!scanned || rewrite_failed) {
+    if (!options.dry_run) {
+      output.close();
+      std::error_code remove_error;
+      fs::remove(temporary, remove_error);
+    }
+    return rewritten_paths;
+  }
+
+  ++stats.rewritten_text_files;
+  rewritten_paths.insert(apitrace::trace::kCallstreamFileName);
+  if (!options.dry_run) {
+    const auto digest_and_size = output.digest_and_size();
+    output.close();
+    if (!replace_with_temporary_file(callstream_path, temporary)) {
+      rewritten_paths.clear();
+    } else {
+      remember_rewritten_digest(
+          bundle_root,
+          fs::path(apitrace::trace::kCallstreamFileName),
+          digest_and_size,
+          digest_cache,
+          rewritten_digests,
+          stats);
+    }
+  }
+  return rewritten_paths;
+}
+
 bool line_may_contain_callstream_prefix_state(std::string_view line, const JsonlLineTokens &tokens)
 {
-  return tokens.blob_refs_key || line_may_contain_present_progress_marker(line);
+  (void)tokens;
+  return line_may_contain_present_progress_marker(line);
 }
 
 CallstreamPrefixResult truncate_callstream_to_complete_prefix(
@@ -4521,6 +4942,11 @@ CallstreamPrefixResult truncate_callstream_to_complete_prefix(
     }
 
     const auto tokens = scan_jsonl_line_tokens(line);
+    if (!options.verify_jsonl_records && tokens.blob_refs_key) {
+      if (!validate_line_blob_refs_fast(line, true, asset_by_blob_id, inconsistent_reason)) {
+        return mark_inconsistent(inconsistent_reason, line_sequence_fast(line).value_or(0));
+      }
+    }
     if (line_number != 1 &&
         !options.verify_jsonl_records &&
         !line_may_contain_callstream_prefix_state(line, tokens)) {
@@ -4536,7 +4962,8 @@ CallstreamPrefixResult truncate_callstream_to_complete_prefix(
     }
 
     bool recoverable_by_rewrite = false;
-    if (!validate_record_asset_refs(
+    if (options.verify_jsonl_records &&
+        !validate_record_asset_refs(
             bundle_root,
             asset_by_blob_id,
             record,
@@ -4955,8 +5382,7 @@ bool resolve_pipeline_shader_paths(
     if (shader->contains(stage_path_key) && (*shader)[stage_path_key].is_string()) {
       const auto stage_path = (*shader)[stage_path_key].get<std::string>();
       const auto path_it = shader_ref_by_path.find(stage_path);
-      if (path_it != shader_ref_by_path.end() &&
-          (bytecode_size == 0 || path_it->second.byte_size == bytecode_size)) {
+      if (path_it != shader_ref_by_path.end() && path_it->second.byte_size == bytecode_size) {
         shader->erase("blob_id");
         shader_blob_refs.push_back(path_it->second.blob_id);
         continue;
@@ -5453,6 +5879,49 @@ bool repair_pipeline_asset_event(
   return true;
 }
 
+bool repair_unmap_asset_event(
+    const fs::path &bundle_root,
+    json &record,
+    std::uint64_t &next_blob_id,
+    std::unordered_map<std::uint64_t, std::string> &path_by_blob_id,
+    std::unordered_map<std::string, AssetEntry> &assets_by_path,
+    std::vector<AssetEntry> &assets)
+{
+  if (record.value("function", std::string()) != "ID3D12Resource::Unmap") {
+    return false;
+  }
+  auto payload_it = record.find("payload");
+  if (payload_it == record.end() || !payload_it->is_object()) {
+    return false;
+  }
+  const auto buffer_path = payload_it->value("buffer_path", std::string());
+  if (buffer_path.empty()) {
+    return false;
+  }
+  const auto asset = ensure_asset_for_path(bundle_root, buffer_path, next_blob_id, assets_by_path, assets);
+  if (!asset || asset->blob_id == 0) {
+    return false;
+  }
+
+  std::unordered_set<std::uint64_t> seen;
+  json blob_refs = json::array();
+  append_unique_blob_ref(blob_refs, seen, asset->blob_id);
+  const auto existing = record.find("blob_refs");
+  if (existing != record.end() && existing->is_array()) {
+    for (const auto &ref : *existing) {
+      if (ref.is_number_unsigned()) {
+        append_unique_blob_ref(blob_refs, seen, ref.get<std::uint64_t>());
+      }
+    }
+  }
+  if (existing != record.end() && blob_ref_sets_equal(*existing, blob_refs)) {
+    return false;
+  }
+  record["blob_refs"] = std::move(blob_refs);
+  path_by_blob_id.emplace(asset->blob_id, effective_asset_path(*asset));
+  return true;
+}
+
 std::unordered_set<std::string> rebuild_d3d12_pipeline_semantics(
     const fs::path &bundle_root,
     std::vector<AssetEntry> &assets,
@@ -5502,7 +5971,8 @@ std::unordered_set<std::string> rebuild_d3d12_pipeline_semantics(
     stats.input_bytes += static_cast<std::uint64_t>(line.size()) + 1;
     if (line.find("CreateGraphicsPipelineState") == std::string::npos &&
         line.find("CreateComputePipelineState") == std::string::npos &&
-        line.find("CreatePipelineState") == std::string::npos) {
+        line.find("CreatePipelineState") == std::string::npos &&
+        line.find("ID3D12Resource::Unmap") == std::string::npos) {
       if (!options.dry_run) {
         output.write_line(line);
       }
@@ -5536,11 +6006,25 @@ std::unordered_set<std::string> rebuild_d3d12_pipeline_semantics(
       note_jsonl_output(stats, rewritten);
       changed = true;
       ++stats.rewritten_records;
-    } else if (legacy_asset_discovery && repair_pipeline_asset_event(
+    } else if (repair_unmap_asset_event(
+                   bundle_root,
+                   record,
+                   next_blob_id,
+                   path_by_blob_id,
+                   assets_by_path,
+                   assets)) {
+      const auto rewritten = record.dump();
+      if (!options.dry_run) {
+        output.write_line(rewritten);
+      }
+      note_jsonl_output(stats, rewritten);
+      changed = true;
+      ++stats.rewritten_records;
+    } else if (repair_pipeline_asset_event(
                    bundle_root,
                    record,
                    options,
-                   legacy_asset_discovery,
+                   true,
                    next_blob_id,
                    path_by_blob_id,
                    asset_by_blob_id,
@@ -6006,7 +6490,8 @@ void add_checksum_candidate(std::vector<fs::path> &candidates, std::unordered_se
 std::vector<fs::path> checksum_candidate_files(
     const fs::path &bundle_root,
     const std::vector<AssetEntry> &assets,
-    const std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> &rewritten_digests)
+    const std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> &rewritten_digests,
+    const std::unordered_set<std::string> &referenced_paths)
 {
   std::vector<fs::path> candidates;
   std::unordered_set<std::string> seen;
@@ -6044,6 +6529,9 @@ std::vector<fs::path> checksum_candidate_files(
   }
 
   for (const auto &[path, _] : rewritten_digests) {
+    add_checksum_candidate(candidates, seen, fs::path(path));
+  }
+  for (const auto &path : referenced_paths) {
     add_checksum_candidate(candidates, seen, fs::path(path));
   }
 
@@ -6099,6 +6587,37 @@ std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> load_prio
   return checksums;
 }
 
+bool write_checksums_from_known(
+    const fs::path &bundle_root,
+    const std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> &known)
+{
+  std::vector<std::pair<std::string, std::pair<std::string, std::uint64_t>>> records;
+  records.reserve(known.size());
+  for (const auto &[path, digest_and_size] : known) {
+    records.push_back({path, digest_and_size});
+  }
+
+  json files = json::object();
+  std::sort(records.begin(), records.end(), [](const auto &lhs, const auto &rhs) {
+    return lhs.first < rhs.first;
+  });
+  for (const auto &[path, digest_and_size] : records) {
+    files[path] = "sha256:" + digest_and_size.first + ":" + std::to_string(digest_and_size.second);
+  }
+
+  json root;
+  root["format_version"] = 1;
+  root["bundle_hash"] = bundle_hash_from_records(records);
+  root["files"] = std::move(files);
+
+  std::ofstream output(bundle_root / apitrace::trace::kChecksumsFileName, std::ios::binary | std::ios::trunc);
+  if (!output.is_open()) {
+    return false;
+  }
+  output << root.dump(2) << "\n";
+  return static_cast<bool>(output);
+}
+
 void write_checksums(
     const fs::path &bundle_root,
     const std::vector<AssetEntry> &assets,
@@ -6106,7 +6625,8 @@ void write_checksums(
     Stats &stats,
     FileDigestCache &digest_cache,
     ProgressReporter *progress,
-    const std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> &rewritten_digests = {})
+    const std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> &rewritten_digests,
+    const std::unordered_set<std::string> &referenced_paths)
 {
   struct ChecksumRecord {
     std::string path;
@@ -6144,7 +6664,7 @@ void write_checksums(
   std::vector<ChecksumRecord> records;
   std::vector<HashTask> hash_tasks;
   std::error_code error;
-  const auto candidates = checksum_candidate_files(bundle_root, assets, rewritten_digests);
+  const auto candidates = checksum_candidate_files(bundle_root, assets, rewritten_digests, referenced_paths);
   for (const auto &relative : candidates) {
     const auto relative_text = relative.generic_string();
     if (relative_text == apitrace::trace::kChecksumsFileName || is_host_metadata_file(relative)) {
@@ -6264,10 +6784,10 @@ void write_checksums(
 // so retrace can load it and skip the in-process initialize+replay_event reconstruction. Runs
 // only for D3D12 bundles; never touches the GPU (no finalize_replay). Best-effort: a failure is
 // reported but does not fail finalize (retrace falls back to in-process reconstruction).
-void persist_d3d12_replay_model(const fs::path &bundle_root, const Options &options, Stats &stats)
+bool persist_d3d12_replay_model(const fs::path &bundle_root, const Options &options, Stats &stats)
 {
   if (options.dry_run) {
-    return;
+    return false;
   }
 
   apitrace::trace::TraceBundleReader reader;
@@ -6280,25 +6800,28 @@ void persist_d3d12_replay_model(const fs::path &bundle_root, const Options &opti
   apitrace::trace::TraceBundleReader::OpenOptions reader_options;
   reader_options.load_metal_sideband = false;
   reader_options.validate_checksum_contents = false;
+  reader_options.validate_file_references = false;
+  reader_options.discover_referenced_assets = false;
   if (!reader.open(bundle_root, reader_options)) {
-    std::cerr << "warning: replay-model persist skipped: failed to reopen bundle\n";
-    return;
+    std::cerr << "warning: replay-model persist skipped: failed to reopen bundle: "
+              << (reader.last_error().empty() ? "unknown error" : reader.last_error()) << "\n";
+    return false;
   }
   if (reader.metadata().api != apitrace::trace::ApiKind::D3D12) {
-    return;
+    return false;
   }
 
   apitrace::d3d12::D3D12ReplayBackend backend;
   if (!backend.initialize(reader)) {
     std::cerr << "warning: replay-model persist skipped: backend initialize failed: "
               << backend.last_error() << "\n";
-    return;
+    return false;
   }
   for (const auto &event : reader.events()) {
     if (!backend.replay_event(event)) {
       std::cerr << "warning: replay-model persist skipped: replay_event failed at sequence "
                 << event.callsite.sequence << ": " << backend.last_error() << "\n";
-      return;
+      return false;
     }
   }
 
@@ -6318,7 +6841,7 @@ void persist_d3d12_replay_model(const fs::path &bundle_root, const Options &opti
   std::string error;
   if (!backend.save_replay_model(json_path, blob_path, source_bundle_hash, error)) {
     std::cerr << "warning: replay-model persist failed: " << error << "\n";
-    return;
+    return false;
   }
 
   std::error_code size_error;
@@ -6327,6 +6850,74 @@ void persist_d3d12_replay_model(const fs::path &bundle_root, const Options &opti
       static_cast<std::uint64_t>(fs::file_size(json_path, size_error));
   stats.d3d12_replay_model_blob_bytes =
       static_cast<std::uint64_t>(fs::file_size(blob_path, size_error));
+  return true;
+}
+
+int run_persist_replay_model_only(const Options &options)
+{
+  const auto started = std::chrono::steady_clock::now();
+  constexpr std::size_t kStageCount = 3;
+  std::size_t stage_index = 0;
+  ProgressReporter progress(options.progress);
+  Stats stats;
+  FileDigestCache digest_cache;
+  bool model_written = false;
+
+  run_stage(options, progress, stage_index, kStageCount, "persist_d3d12_replay_model", [&] {
+    model_written = persist_d3d12_replay_model(options.bundle_root, options, stats);
+  });
+  if (!model_written) {
+    progress.clear_line();
+    return 1;
+  }
+
+  std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> checksums;
+  run_stage(options, progress, stage_index, kStageCount, "load_checksums", [&] {
+    checksums = load_prior_checksums(options.bundle_root);
+  });
+  run_stage(options, progress, stage_index, kStageCount, "update_model_checksums", [&] {
+    for (const auto &relative : {
+             fs::path(apitrace::trace::kD3D12ReplayModelJsonName),
+             fs::path(apitrace::trace::kD3D12ReplayModelBlobName)}) {
+      const auto absolute = options.bundle_root / relative;
+      std::error_code error;
+      const auto size = static_cast<std::uint64_t>(fs::file_size(absolute, error));
+      if (error) {
+        std::cerr << "warning: failed to stat replay-model file " << relative.generic_string() << "\n";
+        continue;
+      }
+      try {
+        checksums[relative.generic_string()] = {digest_cache.digest_file(absolute), size};
+        ++stats.checksum_hashed_files;
+        stats.checksum_hashed_bytes += size;
+      } catch (const std::exception &exception) {
+        std::cerr << "warning: failed to hash replay-model file " << relative.generic_string()
+                  << ": " << exception.what() << "\n";
+      }
+    }
+    stats.checksum_files = checksums.size();
+    if (!options.dry_run && !write_checksums_from_known(options.bundle_root, checksums)) {
+      std::cerr << "error: failed to update " << apitrace::trace::kChecksumsFileName << "\n";
+    }
+  });
+
+  stats.digest_cache_hits = digest_cache.hits();
+  stats.digest_cache_misses = digest_cache.misses();
+  progress.clear_line();
+  const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  std::cout << "bundle-finalize: "
+            << "d3d12_replay_model_written=" << (stats.d3d12_replay_model_written ? "true" : "false")
+            << " d3d12_replay_model_json_bytes=" << stats.d3d12_replay_model_json_bytes
+            << " d3d12_replay_model_blob_bytes=" << stats.d3d12_replay_model_blob_bytes
+            << " checksum_files=" << stats.checksum_files
+            << " checksum_hashed_files=" << stats.checksum_hashed_files
+            << " checksum_hashed_bytes=" << stats.checksum_hashed_bytes
+            << " digest_cache_hits=" << stats.digest_cache_hits
+            << " digest_cache_misses=" << stats.digest_cache_misses
+            << " dry_run=" << (options.dry_run ? "true" : "false")
+            << " persist_replay_model_only=true"
+            << " elapsed_s=" << elapsed << "\n";
+  return 0;
 }
 
 } // namespace
@@ -6347,8 +6938,12 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
     return 2;
   }
 
+  if (options.persist_replay_model_only) {
+    return run_persist_replay_model_only(options);
+  }
+
   const auto started = std::chrono::steady_clock::now();
-  constexpr std::size_t kStageCount = 23;
+  constexpr std::size_t kStageCount = 24;
   std::size_t stage_index = 0;
   ProgressReporter progress(options.progress);
   Stats stats;
@@ -6419,6 +7014,9 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
     aliases = build_aliases(assets);
     ambiguous_aliases.clear();
     merge_unambiguous_aliases(aliases, ambiguous_aliases, canonical_aliases);
+    const auto unindexed_asset_file_aliases =
+        build_unindexed_asset_file_aliases(options.bundle_root, assets, digest_cache, stats);
+    merge_unambiguous_aliases(aliases, ambiguous_aliases, unindexed_asset_file_aliases);
     if (loaded_asset_count == 0 && legacy_asset_discovery) {
       const auto initial_pipeline_file_aliases = build_pipeline_file_aliases(options.bundle_root, digest_cache);
       merge_unambiguous_aliases(aliases, ambiguous_aliases, initial_pipeline_file_aliases);
@@ -6467,6 +7065,16 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
         metal_callstream, blob_id_remap, options, stats, &progress, 2, 3, &digest_cache, &rewritten_digests);
     sanitize_and_rewrite_jsonl_file(
         translation_links, blob_id_remap, options, stats, &progress, 3, 3, &digest_cache, &rewritten_digests);
+  });
+  run_stage(options, progress, stage_index, kStageCount, "repair_callstream_sequences", [&] {
+    const auto sequence_rewrites =
+        repair_callstream_sequence_regressions(
+            options.bundle_root,
+            options,
+            stats,
+            digest_cache,
+            rewritten_digests);
+    rewritten_paths.insert(sequence_rewrites.begin(), sequence_rewrites.end());
   });
   run_stage(options, progress, stage_index, kStageCount, "truncate_inconsistent_streams", [&] {
     callstream_prefix =
@@ -6570,6 +7178,9 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
     aliases = build_aliases(assets);
     ambiguous_aliases.clear();
     merge_unambiguous_aliases(aliases, ambiguous_aliases, canonical_aliases);
+    const auto unindexed_asset_file_aliases =
+        build_unindexed_asset_file_aliases(options.bundle_root, assets, digest_cache, stats);
+    merge_unambiguous_aliases(aliases, ambiguous_aliases, unindexed_asset_file_aliases);
     blob_id_by_effective_path = build_blob_id_by_effective_path(assets);
     effective_path_by_blob_id = build_effective_path_by_blob_id(assets);
     if (aliases.empty()) {
@@ -6676,9 +7287,6 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
         digest_cache,
         rewritten_digests);
   });
-  run_stage(options, progress, stage_index, kStageCount, "persist_d3d12_replay_model", [&] {
-    persist_d3d12_replay_model(options.bundle_root, options, stats);
-  });
   run_stage(options, progress, stage_index, kStageCount, "write_indexes", [&] {
     write_asset_index(
         options.bundle_root,
@@ -6696,8 +7304,19 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
         &rewritten_digests,
         &stats);
   });
+  run_stage(options, progress, stage_index, kStageCount, "persist_d3d12_replay_model", [&] {
+    persist_d3d12_replay_model(options.bundle_root, options, stats);
+  });
   run_stage(options, progress, stage_index, kStageCount, "write_checksums", [&] {
-    write_checksums(options.bundle_root, assets, options, stats, digest_cache, &progress, rewritten_digests);
+    write_checksums(
+        options.bundle_root,
+        assets,
+        options,
+        stats,
+        digest_cache,
+        &progress,
+        rewritten_digests,
+        referenced_paths_after_rewrite);
   });
   stats.digest_cache_hits = digest_cache.hits();
   stats.digest_cache_misses = digest_cache.misses();
@@ -6709,12 +7328,15 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
             << " indexed_assets=" << stats.indexed_assets
             << " hashed_assets=" << stats.hashed_assets
             << " rewritten_assets=" << stats.rewritten_assets
+            << " recovered_unindexed_asset_aliases=" << stats.recovered_unindexed_asset_aliases
             << " duplicate_assets=" << stats.duplicate_assets
             << " duplicate_bytes=" << stats.duplicate_bytes
             << " restored_inline_query_assets=" << stats.restored_inline_query_assets
             << " recovered_spooled_assets=" << stats.recovered_spooled_assets
             << " recovered_spooled_asset_bytes=" << stats.recovered_spooled_asset_bytes
             << " repaired_missing_device_objects=" << stats.repaired_missing_device_objects
+            << " sequence_regression_segments=" << stats.sequence_regression_segments
+            << " remapped_sequence_records=" << stats.remapped_sequence_records
             << " rebuilt_d3d12_pipeline_assets=" << stats.rebuilt_d3d12_pipeline_assets
             << " d3d12_replay_model_written=" << (stats.d3d12_replay_model_written ? "true" : "false")
             << " d3d12_replay_model_json_bytes=" << stats.d3d12_replay_model_json_bytes
@@ -6772,6 +7394,7 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
             << " dry_run=" << (options.dry_run ? "true" : "false")
             << " verify_existing_canonical=" << (options.verify_existing_canonical ? "true" : "false")
             << " verify_jsonl_records=" << (options.verify_jsonl_records ? "true" : "false")
+            << " persist_replay_model_only=false"
             << " elapsed_s=" << elapsed << "\n";
   return 0;
 }

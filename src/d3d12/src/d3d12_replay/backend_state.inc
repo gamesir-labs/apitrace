@@ -143,6 +143,51 @@ void D3D12ReplayBackend::register_resource_version(ResourceSemanticState resourc
   resources_[resource_object_id] = resource_versions_.back();
 }
 
+void D3D12ReplayBackend::register_pipeline_version(PipelineSemanticState pipeline)
+{
+  const auto pipeline_state_object_id = pipeline.pipeline_state_object_id;
+  pipeline_versions_.push_back(std::move(pipeline));
+  pipelines_[pipeline_state_object_id] = pipeline_versions_.back();
+}
+
+void D3D12ReplayBackend::build_pipeline_version_index()
+{
+  pipeline_versions_by_id_.clear();
+  for (const auto &pipeline : pipeline_versions_) {
+    pipeline_versions_by_id_[pipeline.pipeline_state_object_id].push_back(&pipeline);
+  }
+  for (auto &[object_id, versions] : pipeline_versions_by_id_) {
+    (void)object_id;
+    std::sort(versions.begin(), versions.end(),
+              [](const PipelineSemanticState *a, const PipelineSemanticState *b) {
+                return a->create_sequence < b->create_sequence;
+              });
+  }
+}
+
+const D3D12ReplayBackend::PipelineSemanticState *
+D3D12ReplayBackend::pipeline_at(trace::ObjectId pipeline_state_object_id, std::uint64_t sequence) const
+{
+  const auto version_it = pipeline_versions_by_id_.find(pipeline_state_object_id);
+  if (version_it != pipeline_versions_by_id_.end() && !version_it->second.empty()) {
+    const auto &versions = version_it->second;
+    const auto upper = std::upper_bound(
+        versions.begin(),
+        versions.end(),
+        sequence,
+        [](std::uint64_t seq, const PipelineSemanticState *pipeline) {
+          return seq < pipeline->create_sequence;
+        });
+    if (upper != versions.begin()) {
+      return *(upper - 1);
+    }
+    return versions.front();
+  }
+
+  const auto pipeline_it = pipelines_.find(pipeline_state_object_id);
+  return pipeline_it == pipelines_.end() ? nullptr : &pipeline_it->second;
+}
+
 bool D3D12ReplayBackend::append_resource_data_update(
     trace::ObjectId resource_object_id,
     ResourceDataUpdate update,
@@ -187,8 +232,8 @@ bool D3D12ReplayBackend::resolve_gpu_virtual_address_at(
   // width; we keep the largest create_sequence <= sequence among versions whose [va, va+width) covers
   // the address. The address-sorted index (resource_versions_by_va_) makes this a binary search plus
   // a short leftward walk bounded by max_resource_va_width_, instead of an O(total versions) scan per
-  // binding (which stalls heavy anchor batches for minutes). Falls back to the flat map only when no
-  // version history exists (older schema-1 models have an empty resource_versions_).
+  // binding. If the address index has not been built yet, fall back to the append-only version list
+  // or, for an in-progress reconstruction with no versions recorded, the flat live map.
   const ResourceSemanticState *best_resource = nullptr;
   trace::ObjectId best_resource_object_id = 0;
   const auto consider = [&](const ResourceSemanticState &resource, trace::ObjectId object_id) {
@@ -267,9 +312,9 @@ bool D3D12ReplayBackend::resolve_recorded_gpu_virtual_address_at(
   if (recorded_resource_object_id != 0) {
     // Use the version of this object_id live at `sequence` (largest create_sequence <= sequence),
     // not the flat resources_ last-version, so a reused object_id (pointer) resolves to the lifetime
-    // that was actually bound here. The per-object_id index gives O(log versions); falls back to the
-    // flat map when the index is empty (schema-1 models without version history). Falls through to
-    // the address scan if no matching version covers the address.
+    // that was actually bound here. The per-object_id index gives O(log versions); during raw-bundle
+    // reconstruction the index is not built yet, so the flat map represents the current replay state.
+    // Falls through to the address scan if no matching version covers the address.
     const ResourceSemanticState *recorded = nullptr;
     const auto index_it = resource_versions_by_id_.find(recorded_resource_object_id);
     if (index_it != resource_versions_by_id_.end()) {
@@ -475,6 +520,9 @@ bool D3D12ReplayBackend::initialize(const trace::TraceBundleReader &reader)
   resource_versions_by_id_.clear();
   resource_versions_by_va_.clear();
   max_resource_va_width_ = 0;
+  pipelines_.clear();
+  pipeline_versions_.clear();
+  pipeline_versions_by_id_.clear();
   replay_commands_.clear();
   tile_mapping_updates_.clear();
   blob_paths_.clear();
@@ -1155,25 +1203,25 @@ bool D3D12ReplayBackend::validate_native_replay_readiness()
       last_error_ = message.str();
       return nullptr;
     }
-    const auto pipeline_it = pipelines_.find(pipeline_id);
-    if (pipeline_it == pipelines_.end()) {
+    const auto *pipeline = pipeline_at(pipeline_id, sequence);
+    if (!pipeline) {
       std::ostringstream message;
       message << "D3D12 native replay readiness failed: " << label
               << " sequence " << sequence << " references an unknown bound pipeline state";
       last_error_ = message.str();
       return nullptr;
     }
-    if (pipeline_it->second.graphics != graphics) {
+    if (pipeline->graphics != graphics) {
       std::ostringstream message;
       message << "D3D12 native replay readiness failed: " << label
               << " sequence " << sequence << " has a bound "
-              << (pipeline_it->second.graphics ? "graphics" : "compute")
+              << (pipeline->graphics ? "graphics" : "compute")
               << " pipeline where a " << (graphics ? "graphics" : "compute")
               << " pipeline is required";
       last_error_ = message.str();
       return nullptr;
     }
-    return &pipeline_it->second;
+    return pipeline;
   };
 
   const auto require_bound_root_signature = [&](
@@ -1606,7 +1654,7 @@ bool D3D12ReplayBackend::validate_native_replay_readiness()
     }
     if (command.function_name == "ID3D12GraphicsCommandList::ClearState") {
       if (command.object_refs.size() >= 2 && command.object_refs[1] != 0 &&
-          pipelines_.find(command.object_refs[1]) == pipelines_.end()) {
+          !pipeline_at(command.object_refs[1], command.sequence)) {
         std::ostringstream message;
         message << "D3D12 native replay readiness failed: ClearState sequence "
                 << command.sequence << " references an unknown pipeline state";
@@ -2456,13 +2504,15 @@ bool D3D12ReplayBackend::finalize_replay()
     return false;
   }
   // resource_versions_ is fully populated by now (reconstruction or model load). Build the
-  // per-object_id version index once so GPUVA resolution during replay is O(log) per binding.
+  // per-object_id version indexes once so replay resolves reused object ids by command sequence.
   build_resource_version_index();
+  build_pipeline_version_index();
   D3D12NativeReplayer native_replayer(*this);
   return native_replayer.replay(last_error_);
 }
 
 bool D3D12ReplayBackend::validate_only()
 {
+  build_pipeline_version_index();
   return validate_replay_closure();
 }

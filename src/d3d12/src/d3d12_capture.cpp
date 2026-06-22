@@ -19,6 +19,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -84,6 +85,9 @@ std::mutex g_command_batch_mutex;
 std::mutex g_present_mutex;
 std::unordered_map<const void *, trace::ObjectId> g_object_ids;
 std::unordered_map<const void *, trace::ObjectKind> g_object_kinds;
+constexpr std::uint64_t kRootConstantBufferSnapshotBytes =
+    std::uint64_t{D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT} * 4u * sizeof(std::uint32_t);
+constexpr std::uint64_t kMappedUseSnapshotChunkBytes = 4u * 1024u;
 
 struct ResourceGpuVirtualAddressState {
   trace::ObjectId object_id = 0;
@@ -100,6 +104,75 @@ struct GpuVirtualAddressResolve {
 };
 
 std::unordered_map<const void *, ResourceGpuVirtualAddressState> g_resource_gpu_virtual_addresses;
+
+struct CapturedMappedRange {
+  std::uint64_t begin = 0;
+  std::uint64_t end = 0;
+  std::uint64_t hash = 0;
+};
+
+struct MappedResourceState {
+  const void *data = nullptr;
+  std::uint32_t subresource = 0;
+  std::vector<CapturedMappedRange> captured_ranges;
+};
+
+std::unordered_map<const void *, MappedResourceState> g_mapped_resources;
+
+// --- Frame-end re-capture of THIS FRAME's mapped root-CBV ranges (env-gated, bounded) ---
+// Defeats a stale submit-time snapshot of a DYNAMICALLY INDEXED mapped cbuffer (the FH4
+// homepage CG composite reads a per-element transform palette via TEXCOORD-as-index; its
+// palette entry settles after submit relative to the async GPU read, so the submit-time
+// snapshot records zero -> composite off-screen in retrace -> CG never composites). We
+// re-read only the ranges USED THIS FRAME at Present (after writes settle); bounded +
+// deduped + cleared every present so this never degenerates into the unbounded
+// whole-history rehash. Default OFF: zero cost / zero behavior change for normal play.
+inline bool present_recapture_enabled() {
+  static const bool enabled = [] {
+    const char *v = std::getenv("DXMT_APITRACE_PRESENT_RECAPTURE");
+    return v && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+struct PresentRecaptureRange {
+  const void *resource = nullptr;
+  trace::ObjectId object_id = 0;
+  std::uint64_t begin = 0;
+  std::uint64_t end = 0;
+};
+std::vector<PresentRecaptureRange> g_present_recapture_ranges; // guarded by g_object_mutex
+std::unordered_set<std::uint64_t> g_present_recapture_seen;    // guarded by g_object_mutex
+constexpr std::size_t kPresentRecaptureMaxRanges = 2048;
+// caller must hold g_object_mutex
+inline void note_present_recapture_range(const void *resource, trace::ObjectId object_id,
+                                         std::uint64_t begin, std::uint64_t end) {
+  if (!present_recapture_enabled() ||
+      g_present_recapture_ranges.size() >= kPresentRecaptureMaxRanges) {
+    return;
+  }
+  const std::uint64_t key =
+      (reinterpret_cast<std::uintptr_t>(resource) * 0x9e3779b97f4a7c15ull) ^ begin;
+  if (!g_present_recapture_seen.insert(key).second) {
+    return;
+  }
+  g_present_recapture_ranges.push_back({resource, object_id, begin, end});
+}
+
+struct MappedGpuvaUseRange {
+  std::uint64_t address = 0;
+  std::uint64_t size = 0;
+  bool valid = false;
+};
+
+struct CommandListMappedUseState {
+  std::unordered_map<std::uint32_t, MappedGpuvaUseRange> graphics_root_cbvs;
+  std::unordered_map<std::uint32_t, MappedGpuvaUseRange> compute_root_cbvs;
+  std::vector<MappedGpuvaUseRange> vertex_buffers;
+  MappedGpuvaUseRange index_buffer;
+};
+
+std::mutex g_command_list_mapped_use_mutex;
+std::unordered_map<const void *, CommandListMappedUseState> g_command_list_mapped_uses;
 
 struct CopyBufferBatchOp {
   std::uint64_t sequence = 0;
@@ -224,6 +297,17 @@ struct CopyDescriptorRange {
   std::uint32_t count = 0;
 };
 
+struct CapturedCbvDescriptor {
+  std::uint64_t buffer_location = 0;
+  std::uint32_t size_in_bytes = 0;
+};
+
+struct CbvDescriptorCopy {
+  std::uint64_t dst_descriptor = 0;
+  bool has_cbv = false;
+  CapturedCbvDescriptor cbv;
+};
+
 struct CopyDescriptorOp {
   std::uint64_t sequence = 0;
   trace::ObjectId device_object_id = 0;
@@ -263,6 +347,8 @@ std::unordered_map<const void *, PendingCopyBufferBatch> g_copy_buffer_batches;
 std::unordered_map<const void *, PendingResourceBarrierBatch> g_resource_barrier_batches;
 std::unordered_map<const void *, PendingCopyTextureRegionBatch> g_copy_texture_region_batches;
 std::mutex g_diagnostic_batch_mutex;
+std::mutex g_descriptor_metadata_mutex;
+std::unordered_map<std::uint64_t, CapturedCbvDescriptor> g_cbv_descriptors;
 PendingFenceDependencyBatch g_fence_dependency_batch;
 PendingDescriptorViewBatch g_descriptor_view_batch;
 PendingCopyDescriptorBatch g_copy_descriptor_batch;
@@ -487,7 +573,15 @@ trace::ObjectKind to_trace_object_kind(CaptureObjectKind kind)
 
 TraceSession *session_for(trace::ApiKind api)
 {
-  return runtime::ensure_process_trace_session(api);
+  auto *session = runtime::ensure_process_trace_session(api);
+  if (session && api == trace::ApiKind::D3D12) {
+    const auto initial_sequence = session->initial_call_sequence();
+    auto current = g_sequence.load(std::memory_order_relaxed);
+    while (current < initial_sequence &&
+           !g_sequence.compare_exchange_weak(current, initial_sequence, std::memory_order_relaxed)) {
+    }
+  }
+  return session;
 }
 
 std::uint64_t next_present_frame_index()
@@ -585,6 +679,506 @@ void append_gpu_virtual_address_binding_json(std::ostringstream &payload, const 
   std::lock_guard lock(g_object_mutex);
   payload << "\"" << key << "\":" << address;
   append_gpu_virtual_address_resolve_json(payload, resolve_gpu_virtual_address_locked(address));
+}
+
+trace::AssetRecord register_asset_bytes(
+    trace::AssetKind kind,
+    const char *debug_name,
+    const void *data,
+    std::size_t size);
+
+void record_call_event_unbatched(
+    std::uint64_t sequence,
+    const char *opname,
+    const char *payload_json,
+    const void *const *object_refs,
+    std::uint32_t object_ref_count,
+    const std::uint64_t *blob_refs,
+    std::uint32_t blob_ref_count,
+    std::int32_t result_code);
+
+void record_call_event_unbatched_with_object_ids(
+    std::uint64_t sequence,
+    const char *opname,
+    const char *payload_json,
+    std::vector<trace::ObjectId> object_refs,
+    const std::uint64_t *blob_refs,
+    std::uint32_t blob_ref_count,
+    std::int32_t result_code);
+
+void flush_diagnostic_batches();
+void flush_command_list_batches(const void *command_list = nullptr);
+
+std::uint64_t fnv1a64_bytes(const void *data, std::size_t size)
+{
+  constexpr std::uint64_t kOffset = 1469598103934665603ull;
+  constexpr std::uint64_t kPrime = 1099511628211ull;
+  std::uint64_t hash = kOffset;
+  const auto *bytes = static_cast<const std::uint8_t *>(data);
+  for (std::size_t index = 0; index < size; ++index) {
+    hash ^= bytes[index];
+    hash *= kPrime;
+  }
+  return hash;
+}
+
+bool mapped_range_captured(const MappedResourceState &mapped, std::uint64_t begin, std::uint64_t end, std::uint64_t hash)
+{
+  for (const auto &range : mapped.captured_ranges) {
+    if (range.begin == begin && range.end == end && range.hash == hash) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void mark_mapped_range_captured(MappedResourceState &mapped, std::uint64_t begin, std::uint64_t end, std::uint64_t hash)
+{
+  if (end <= begin) {
+    return;
+  }
+  for (auto &range : mapped.captured_ranges) {
+    if (range.begin == begin && range.end == end) {
+      range.hash = hash;
+      return;
+    }
+  }
+  mapped.captured_ranges.push_back(CapturedMappedRange{begin, end, hash});
+}
+
+const void *resource_from_object_id_locked(trace::ObjectId object_id)
+{
+  if (object_id == 0) {
+    return nullptr;
+  }
+  for (const auto &[resource, state] : g_resource_gpu_virtual_addresses) {
+    if (state.object_id == object_id) {
+      return resource;
+    }
+  }
+  return nullptr;
+}
+
+void record_mapped_resource_range_update_unbatched(
+    const void *resource,
+    MappedResourceState &mapped,
+    trace::ObjectId resource_object_id,
+    std::uint64_t begin,
+    std::uint64_t end)
+{
+  if (!resource || !mapped.data || resource_object_id == 0 || end <= begin) {
+    return;
+  }
+
+  const auto size64 = end - begin;
+  if (size64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    return;
+  }
+
+  const auto size = static_cast<std::size_t>(size64);
+  const auto *bytes = static_cast<const std::uint8_t *>(mapped.data) + static_cast<std::size_t>(begin);
+  const auto hash = fnv1a64_bytes(bytes, size);
+  if (mapped_range_captured(mapped, begin, end, hash)) {
+    return;
+  }
+
+  const auto asset = register_asset_bytes(
+      trace::AssetKind::Buffer,
+      "d3d12-mapped-resource-use",
+      bytes,
+      size);
+  if (asset.blob_id == 0 || asset.relative_path.empty()) {
+    return;
+  }
+
+  const auto buffer_path = asset.relative_path.generic_string();
+  std::string payload;
+  payload.reserve(224 + buffer_path.size());
+  payload += "{\"resource_object_id\":";
+  payload += std::to_string(resource_object_id);
+  payload += ",\"subresource\":";
+  payload += std::to_string(mapped.subresource);
+  payload += ",\"written_begin\":";
+  payload += std::to_string(begin);
+  payload += ",\"written_end\":";
+  payload += std::to_string(end);
+  payload += ",\"written_size\":";
+  payload += std::to_string(size64);
+  payload += ",\"buffer_path\":\"";
+  payload += buffer_path;
+  payload += "\",\"capture_reason\":\"mapped_resource_use\"}";
+  const std::uint64_t blob_id = asset.blob_id;
+  record_call_event_unbatched_with_object_ids(
+      g_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+      "ID3D12Resource::Unmap",
+      payload.c_str(),
+      {resource_object_id},
+      &blob_id,
+      1,
+      0);
+  mark_mapped_range_captured(mapped, begin, end, hash);
+}
+
+void record_resource_bytes_snapshot_unbatched(
+    trace::ObjectId resource_object_id,
+    std::uint64_t begin,
+    std::uint64_t end,
+    const void *bytes,
+    std::uint64_t sequence)
+{
+  if (resource_object_id == 0 || !bytes || end <= begin) {
+    return;
+  }
+
+  const auto size64 = end - begin;
+  if (size64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    return;
+  }
+
+  const auto size = static_cast<std::size_t>(size64);
+  const auto asset = register_asset_bytes(
+      trace::AssetKind::Buffer,
+      "d3d12-gpu-cbv-use",
+      bytes,
+      size);
+  if (asset.blob_id == 0 || asset.relative_path.empty()) {
+    return;
+  }
+
+  const auto buffer_path = asset.relative_path.generic_string();
+  std::string payload;
+  payload.reserve(224 + buffer_path.size());
+  payload += "{\"resource_object_id\":";
+  payload += std::to_string(resource_object_id);
+  payload += ",\"subresource\":0";
+  payload += ",\"written_begin\":";
+  payload += std::to_string(begin);
+  payload += ",\"written_end\":";
+  payload += std::to_string(end);
+  payload += ",\"written_size\":";
+  payload += std::to_string(size64);
+  payload += ",\"buffer_path\":\"";
+  payload += buffer_path;
+  payload += "\",\"apply_sequence\":";
+  payload += std::to_string(sequence);
+  payload += ",\"capture_reason\":\"gpu_cbv_use\"}";
+  const std::uint64_t blob_id = asset.blob_id;
+  record_call_event_unbatched_with_object_ids(
+      g_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+      "ID3D12Resource::Unmap",
+      payload.c_str(),
+      {resource_object_id},
+      &blob_id,
+      1,
+      0);
+}
+
+void capture_mapped_resource_range_before_use(const void *resource, std::uint64_t begin, std::uint64_t size)
+{
+  if (!resource || size == 0) {
+    return;
+  }
+
+  std::lock_guard event_lock(g_event_order_mutex);
+  flush_diagnostic_batches();
+  flush_command_list_batches();
+
+  std::lock_guard object_lock(g_object_mutex);
+  auto mapped_it = g_mapped_resources.find(resource);
+  if (mapped_it == g_mapped_resources.end()) {
+    return;
+  }
+
+  auto gpuva_it = g_resource_gpu_virtual_addresses.find(resource);
+  if (gpuva_it == g_resource_gpu_virtual_addresses.end() ||
+      gpuva_it->second.object_id == 0 ||
+      gpuva_it->second.width == 0 ||
+      begin >= gpuva_it->second.width) {
+    return;
+  }
+
+  const auto clamped_size = std::min(size, gpuva_it->second.width - begin);
+  if (clamped_size == 0 || begin > std::numeric_limits<std::uint64_t>::max() - clamped_size) {
+    return;
+  }
+
+  record_mapped_resource_range_update_unbatched(
+      resource,
+      mapped_it->second,
+      gpuva_it->second.object_id,
+      begin,
+      begin + clamped_size);
+}
+
+void capture_mapped_resource_chunks_before_use(
+    const void *resource,
+    std::uint64_t begin,
+    std::uint64_t end)
+{
+  if (!resource || end <= begin) {
+    return;
+  }
+
+  std::lock_guard event_lock(g_event_order_mutex);
+  flush_diagnostic_batches();
+  flush_command_list_batches();
+
+  std::lock_guard object_lock(g_object_mutex);
+  auto mapped_it = g_mapped_resources.find(resource);
+  if (mapped_it == g_mapped_resources.end()) {
+    return;
+  }
+
+  auto gpuva_it = g_resource_gpu_virtual_addresses.find(resource);
+  if (gpuva_it == g_resource_gpu_virtual_addresses.end() ||
+      gpuva_it->second.object_id == 0 ||
+      gpuva_it->second.width == 0 ||
+      begin >= gpuva_it->second.width) {
+    return;
+  }
+
+  const auto resource_width = gpuva_it->second.width;
+  const auto clamped_end = std::min(end, resource_width);
+  for (std::uint64_t chunk_begin = begin; chunk_begin < clamped_end;
+       chunk_begin += kMappedUseSnapshotChunkBytes) {
+    const auto chunk_size = std::min(kMappedUseSnapshotChunkBytes,
+                                     clamped_end - chunk_begin);
+    if (chunk_size == 0 || chunk_begin > std::numeric_limits<std::uint64_t>::max() - chunk_size) {
+      return;
+    }
+    record_mapped_resource_range_update_unbatched(
+        resource,
+        mapped_it->second,
+        gpuva_it->second.object_id,
+        chunk_begin,
+        chunk_begin + chunk_size);
+    // Remember this frame's root-CBV chunk so Present can re-read the settled value
+    // (no-op unless DXMT_APITRACE_PRESENT_RECAPTURE is set).
+    note_present_recapture_range(resource, gpuva_it->second.object_id, chunk_begin,
+                                 chunk_begin + chunk_size);
+  }
+}
+
+// Re-snapshot this frame's root-CBV ranges at Present (after the frame's CPU writes
+// settle), then clear. Bounded by kPresentRecaptureMaxRanges + dedup; gated OFF by
+// default. Caller (record_present) holds g_event_order_mutex; record_mapped_resource_
+// range_update_unbatched is "unbatched" so it requires the caller's event lock, which we
+// hold transitively, and we take g_object_mutex here (same order as the capture paths).
+void maybe_recapture_present_ranges()
+{
+  if (!present_recapture_enabled()) {
+    return;
+  }
+  std::lock_guard object_lock(g_object_mutex);
+  for (const auto &range : g_present_recapture_ranges) {
+    auto mapped_it = g_mapped_resources.find(range.resource);
+    if (mapped_it == g_mapped_resources.end()) {
+      continue;
+    }
+    record_mapped_resource_range_update_unbatched(
+        range.resource, mapped_it->second, range.object_id, range.begin, range.end);
+  }
+  g_present_recapture_ranges.clear();
+  g_present_recapture_seen.clear();
+}
+
+void capture_mapped_gpuva_range_before_use(std::uint64_t gpu_virtual_address, std::uint64_t size)
+{
+  if (gpu_virtual_address == 0 || size == 0) {
+    return;
+  }
+
+  const void *resource = nullptr;
+  std::uint64_t offset = 0;
+  {
+    std::lock_guard lock(g_object_mutex);
+    const auto resolve = resolve_gpu_virtual_address_locked(gpu_virtual_address);
+    if (resolve.object_id == 0) {
+      return;
+    }
+    resource = resource_from_object_id_locked(resolve.object_id);
+    offset = resolve.offset;
+  }
+  capture_mapped_resource_range_before_use(resource, offset, size);
+}
+
+void capture_mapped_gpuva_range_before_use_chunked(std::uint64_t gpu_virtual_address, std::uint64_t size)
+{
+  if (gpu_virtual_address == 0 || size == 0) {
+    return;
+  }
+
+  const void *resource = nullptr;
+  std::uint64_t offset = 0;
+  {
+    std::lock_guard lock(g_object_mutex);
+    const auto resolve = resolve_gpu_virtual_address_locked(gpu_virtual_address);
+    if (resolve.object_id == 0) {
+      return;
+    }
+    resource = resource_from_object_id_locked(resolve.object_id);
+    offset = resolve.offset;
+  }
+  if (!resource) {
+    return;
+  }
+
+  if (offset > std::numeric_limits<std::uint64_t>::max() - size) {
+    return;
+  }
+  const auto end = offset + size;
+  const auto chunk_mask = kMappedUseSnapshotChunkBytes - 1u;
+  if (end > std::numeric_limits<std::uint64_t>::max() - chunk_mask) {
+    return;
+  }
+  const auto begin = offset & ~chunk_mask;
+  const auto aligned_end = (end + chunk_mask) & ~chunk_mask;
+
+  capture_mapped_resource_chunks_before_use(resource, begin, aligned_end);
+}
+
+void capture_root_cbv_mapped_gpuva_range_before_use(const MappedGpuvaUseRange &range)
+{
+  if (!range.valid) {
+    return;
+  }
+  capture_mapped_gpuva_range_before_use_chunked(range.address, range.size);
+}
+
+void remember_root_cbv_range(
+    const void *command_list,
+    bool compute,
+    std::uint32_t root_parameter_index,
+    std::uint64_t gpu_virtual_address)
+{
+  if (!command_list) {
+    return;
+  }
+  std::lock_guard lock(g_command_list_mapped_use_mutex);
+  auto &state = g_command_list_mapped_uses[command_list];
+  auto &roots = compute ? state.compute_root_cbvs : state.graphics_root_cbvs;
+  if (gpu_virtual_address == 0) {
+    roots.erase(root_parameter_index);
+    return;
+  }
+  roots[root_parameter_index] = MappedGpuvaUseRange{
+      gpu_virtual_address,
+      kRootConstantBufferSnapshotBytes,
+      true,
+  };
+}
+
+void clear_root_cbv_ranges(const void *command_list, bool compute)
+{
+  if (!command_list) {
+    return;
+  }
+  std::lock_guard lock(g_command_list_mapped_use_mutex);
+  auto it = g_command_list_mapped_uses.find(command_list);
+  if (it == g_command_list_mapped_uses.end()) {
+    return;
+  }
+  if (compute) {
+    it->second.compute_root_cbvs.clear();
+  } else {
+    it->second.graphics_root_cbvs.clear();
+  }
+}
+
+void remember_vertex_buffer_ranges(
+    const void *command_list,
+    std::uint32_t start_slot,
+    std::uint32_t view_count,
+    const D3D12_VERTEX_BUFFER_VIEW *views)
+{
+  if (!command_list || view_count == 0) {
+    return;
+  }
+  std::lock_guard lock(g_command_list_mapped_use_mutex);
+  auto &buffers = g_command_list_mapped_uses[command_list].vertex_buffers;
+  const auto required_size = static_cast<std::size_t>(start_slot) + static_cast<std::size_t>(view_count);
+  if (buffers.size() < required_size) {
+    buffers.resize(required_size);
+  }
+  for (std::uint32_t index = 0; index < view_count; ++index) {
+    auto &range = buffers[static_cast<std::size_t>(start_slot) + index];
+    if (!views || views[index].BufferLocation == 0 || views[index].SizeInBytes == 0) {
+      range = {};
+      continue;
+    }
+    range = MappedGpuvaUseRange{views[index].BufferLocation, views[index].SizeInBytes, true};
+  }
+}
+
+void remember_index_buffer_range(const void *command_list, const D3D12_INDEX_BUFFER_VIEW *view)
+{
+  if (!command_list) {
+    return;
+  }
+  std::lock_guard lock(g_command_list_mapped_use_mutex);
+  auto &range = g_command_list_mapped_uses[command_list].index_buffer;
+  if (!view || view->BufferLocation == 0 || view->SizeInBytes == 0) {
+    range = {};
+    return;
+  }
+  range = MappedGpuvaUseRange{view->BufferLocation, view->SizeInBytes, true};
+}
+
+void clear_command_list_mapped_uses(const void *command_list)
+{
+  if (!command_list) {
+    return;
+  }
+  std::lock_guard lock(g_command_list_mapped_use_mutex);
+  g_command_list_mapped_uses.erase(command_list);
+}
+
+CommandListMappedUseState command_list_mapped_use_snapshot(const void *command_list)
+{
+  if (!command_list) {
+    return {};
+  }
+  std::lock_guard lock(g_command_list_mapped_use_mutex);
+  const auto it = g_command_list_mapped_uses.find(command_list);
+  return it == g_command_list_mapped_uses.end() ? CommandListMappedUseState{} : it->second;
+}
+
+void capture_mapped_gpuva_range_before_use(const MappedGpuvaUseRange &range)
+{
+  if (!range.valid) {
+    return;
+  }
+  capture_mapped_gpuva_range_before_use(range.address, range.size);
+}
+
+void capture_graphics_mapped_inputs_before_use(const void *command_list, bool include_index_buffer)
+{
+  const auto state = command_list_mapped_use_snapshot(command_list);
+  for (const auto &[root_parameter_index, range] : state.graphics_root_cbvs) {
+    (void)root_parameter_index;
+    capture_root_cbv_mapped_gpuva_range_before_use(range);
+  }
+  for (const auto &range : state.vertex_buffers) {
+    capture_mapped_gpuva_range_before_use(range);
+  }
+  if (include_index_buffer) {
+    capture_mapped_gpuva_range_before_use(state.index_buffer);
+  }
+}
+
+void capture_compute_mapped_inputs_before_use(const void *command_list)
+{
+  const auto state = command_list_mapped_use_snapshot(command_list);
+  for (const auto &[root_parameter_index, range] : state.compute_root_cbvs) {
+    (void)root_parameter_index;
+    capture_root_cbv_mapped_gpuva_range_before_use(range);
+  }
+}
+
+void capture_command_list_mapped_inputs_before_submit(const void *command_list)
+{
+  capture_graphics_mapped_inputs_before_use(command_list, true);
+  capture_compute_mapped_inputs_before_use(command_list);
 }
 
 void append_object_ref_id(std::vector<trace::ObjectId> &refs, trace::ObjectId object_id)
@@ -1220,7 +1814,7 @@ std::vector<CopyTextureRegionBatchFlush> collect_copy_texture_region_batches(con
   return batches;
 }
 
-void flush_copy_buffer_batches(const void *command_list = nullptr)
+void flush_copy_buffer_batches(const void *command_list)
 {
   auto batches = collect_copy_buffer_batches(command_list);
   for (const auto &batch : batches) {
@@ -1228,7 +1822,7 @@ void flush_copy_buffer_batches(const void *command_list = nullptr)
   }
 }
 
-void flush_resource_barrier_batches(const void *command_list = nullptr)
+void flush_resource_barrier_batches(const void *command_list)
 {
   auto batches = collect_resource_barrier_batches(command_list);
   for (const auto &batch : batches) {
@@ -1236,7 +1830,7 @@ void flush_resource_barrier_batches(const void *command_list = nullptr)
   }
 }
 
-void flush_copy_texture_region_batches(const void *command_list = nullptr)
+void flush_copy_texture_region_batches(const void *command_list)
 {
   auto batches = collect_copy_texture_region_batches(command_list);
   for (const auto &batch : batches) {
@@ -1244,7 +1838,7 @@ void flush_copy_texture_region_batches(const void *command_list = nullptr)
   }
 }
 
-void flush_command_list_batches(const void *command_list = nullptr)
+void flush_command_list_batches(const void *command_list)
 {
   flush_copy_buffer_batches(command_list);
   flush_resource_barrier_batches(command_list);
@@ -1391,24 +1985,6 @@ void flush_diagnostic_batches()
 // before the first async hash lands are deduplicated at finalize time, so the
 // only thing lost is a transient in-flight dedup window -- acceptable under the
 // "keep only required synchronous work on the capture thread" rule.
-// Set APITRACE_D3D12_PRESENT_FRAME_SYNC_HASH=1 to restore the old synchronous
-// behaviour (useful only for A/B comparison or debugging).
-bool present_frame_sync_hash_enabled()
-{
-  static std::atomic<bool> configured{false};
-  static std::atomic<bool> enabled{false};
-  if (!configured.load(std::memory_order_acquire)) {
-    bool parsed = false;
-    if (const char *value = std::getenv("APITRACE_D3D12_PRESENT_FRAME_SYNC_HASH")) {
-      parsed = value[0] == '1' || value[0] == 'y' || value[0] == 'Y' ||
-               value[0] == 't' || value[0] == 'T';
-    }
-    enabled.store(parsed, std::memory_order_release);
-    configured.store(true, std::memory_order_release);
-  }
-  return enabled.load(std::memory_order_acquire);
-}
-
 trace::AssetRecord register_asset_bytes(
     trace::AssetKind kind,
     const char *debug_name,
@@ -1431,10 +2007,6 @@ trace::AssetRecord register_asset_bytes(
 
   const auto *bytes = static_cast<const std::uint8_t *>(data);
   asset.payload_bytes.assign(bytes, bytes + size);
-  if (kind == trace::AssetKind::Texture && asset.debug_name == "d3d12-present-frame" &&
-      present_frame_sync_hash_enabled()) {
-    asset.content_hash = trace::content_hash_bytes(data, size);
-  }
   return session->register_asset(std::move(asset));
 }
 
@@ -2348,6 +2920,106 @@ std::vector<CopyDescriptorRange> collect_copy_descriptor_ranges(
   return ranges;
 }
 
+void remember_cbv_descriptor(
+    D3D12_CPU_DESCRIPTOR_HANDLE descriptor,
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc)
+{
+  if (descriptor.ptr == 0) {
+    return;
+  }
+  std::lock_guard lock(g_descriptor_metadata_mutex);
+  if (!desc || desc->BufferLocation == 0 || desc->SizeInBytes == 0) {
+    g_cbv_descriptors.erase(static_cast<std::uint64_t>(descriptor.ptr));
+    return;
+  }
+  g_cbv_descriptors[static_cast<std::uint64_t>(descriptor.ptr)] = {
+      static_cast<std::uint64_t>(desc->BufferLocation),
+      desc->SizeInBytes,
+  };
+}
+
+void forget_cbv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
+{
+  if (descriptor.ptr == 0) {
+    return;
+  }
+  std::lock_guard lock(g_descriptor_metadata_mutex);
+  g_cbv_descriptors.erase(static_cast<std::uint64_t>(descriptor.ptr));
+}
+
+void append_unique_cbv_capture_range(
+    std::vector<MappedGpuvaUseRange> &ranges,
+    const CapturedCbvDescriptor &cbv)
+{
+  if (cbv.buffer_location == 0 || cbv.size_in_bytes == 0) {
+    return;
+  }
+  const auto duplicate = std::find_if(
+      ranges.begin(),
+      ranges.end(),
+      [&cbv](const MappedGpuvaUseRange &range) {
+        return range.valid &&
+               range.address == cbv.buffer_location &&
+               range.size == cbv.size_in_bytes;
+      });
+  if (duplicate == ranges.end()) {
+    ranges.push_back(MappedGpuvaUseRange{cbv.buffer_location, cbv.size_in_bytes, true});
+  }
+}
+
+std::vector<MappedGpuvaUseRange> update_cbv_metadata_for_descriptor_copy(
+    std::uint32_t descriptor_heap_type,
+    std::uint32_t descriptor_size,
+    const std::vector<CopyDescriptorRange> &ranges)
+{
+  std::vector<MappedGpuvaUseRange> capture_ranges;
+  if (descriptor_heap_type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+      descriptor_size == 0 ||
+      ranges.empty()) {
+    return capture_ranges;
+  }
+
+  std::vector<CbvDescriptorCopy> copies;
+  {
+    std::lock_guard lock(g_descriptor_metadata_mutex);
+    for (const auto &range : ranges) {
+      for (std::uint32_t index = 0; index < range.count; ++index) {
+        const auto offset = static_cast<std::uint64_t>(index) * descriptor_size;
+        const auto dst_descriptor = range.dst_descriptor + offset;
+        const auto src_descriptor = range.src_descriptor + offset;
+        CbvDescriptorCopy copy;
+        copy.dst_descriptor = dst_descriptor;
+        if (const auto found = g_cbv_descriptors.find(src_descriptor);
+            found != g_cbv_descriptors.end()) {
+          copy.has_cbv = true;
+          copy.cbv = found->second;
+          append_unique_cbv_capture_range(capture_ranges, copy.cbv);
+        }
+        copies.push_back(copy);
+      }
+    }
+    for (const auto &copy : copies) {
+      if (copy.has_cbv) {
+        g_cbv_descriptors[copy.dst_descriptor] = copy.cbv;
+      } else {
+        g_cbv_descriptors.erase(copy.dst_descriptor);
+      }
+    }
+  }
+  return capture_ranges;
+}
+
+void capture_cbv_descriptor_copy_ranges_before_use(
+    std::uint32_t descriptor_heap_type,
+    std::uint32_t descriptor_size,
+    const std::vector<CopyDescriptorRange> &ranges)
+{
+  for (const auto &range :
+       update_cbv_metadata_for_descriptor_copy(descriptor_heap_type, descriptor_size, ranges)) {
+    capture_mapped_gpuva_range_before_use(range);
+  }
+}
+
 void append_rect_json(std::ostringstream &payload, const D3D12_RECT &rect)
 {
   payload << "{\"left\":" << rect.left
@@ -2834,6 +3506,7 @@ void record_object_destroy(const void *object, CaptureObjectKind kind, const cha
   if (kind == CaptureObjectKind::Resource) {
     std::lock_guard lock(g_object_mutex);
     g_resource_gpu_virtual_addresses.erase(object);
+    g_mapped_resources.erase(object);
     g_object_kinds.erase(object);
   }
 }
@@ -2901,6 +3574,7 @@ std::uint64_t record_execute_command_lists(const void *queue, const void *comman
   if (!queue || !command_list) {
     return 0;
   }
+  capture_command_list_mapped_inputs_before_submit(command_list);
   const void *refs[] = {queue, command_list};
   return record_call("ID3D12CommandQueue::ExecuteCommandLists", "{\"command_list_count\":1}", refs, 2);
 }
@@ -2919,6 +3593,20 @@ std::uint64_t record_present(
   std::lock_guard event_lock(g_event_order_mutex);
   flush_diagnostic_batches();
   flush_command_list_batches();
+
+  // Frame-end re-snapshot of the ranges USED THIS FRAME (BOUNDED + env-gated; default
+  // OFF so normal play is untouched). BUG: the homepage CG composite VS dynamically
+  // indexes a mapped cbuffer (a per-element transform palette via TEXCOORD-as-index);
+  // the submit-time snapshot can record a stale ZERO for that palette entry (the value
+  // settles relative to the async GPU read after submit), so retrace renders the
+  // composite off-screen and the CG never composites. Re-reading the frame's used
+  // ranges here, after the frame's CPU writes settle, captures the value the GPU reads;
+  // the palette is stable across frames so the next frame's composite reconstructs
+  // correctly. NOTE: must stay bounded - g_mapped_resources.captured_ranges accumulates
+  // for the whole session, so we re-snapshot ONLY this frame's ranges (g_present_recapture
+  // _ranges, cleared every present), never the full history.
+  maybe_recapture_present_ranges();
+
   const auto present_test = is_present_test(flags);
   const auto has_frame_index = frame_presented && !present_test && result_code == 0;
   const auto frame_index = has_frame_index ? next_present_frame_index() : UINT64_MAX;
@@ -3029,6 +3717,7 @@ void record_resource_unmap(
   if (!resource || !written_data || written_size == 0 || written_end <= written_begin) {
     return;
   }
+  const auto written_hash = fnv1a64_bytes(written_data, written_size);
 
   const auto asset = register_asset_bytes(
       trace::AssetKind::Buffer,
@@ -3064,6 +3753,27 @@ void record_resource_unmap(
       1,
       &blob_id,
       1);
+  {
+    std::lock_guard lock(g_object_mutex);
+    auto mapped = g_mapped_resources.find(resource);
+    if (mapped != g_mapped_resources.end() && mapped->second.subresource == subresource) {
+      mark_mapped_range_captured(mapped->second, written_begin, written_end, written_hash);
+    }
+  }
+}
+
+void record_resource_bytes_snapshot(
+    trace::ObjectId resource_object_id,
+    std::uint64_t begin,
+    std::uint64_t end,
+    const void *bytes,
+    std::uint64_t sequence)
+{
+  std::lock_guard event_lock(g_event_order_mutex);
+  flush_diagnostic_batches();
+  flush_command_list_batches();
+  record_resource_bytes_snapshot_unbatched(resource_object_id, begin, end, bytes,
+                                          sequence);
 }
 
 std::uint64_t record_resource_map(
@@ -3072,9 +3782,19 @@ std::uint64_t record_resource_map(
     bool has_read_range,
     std::uint64_t read_begin,
     std::uint64_t read_end,
+    const void *mapped_data,
     bool mapped,
     std::int32_t result_code)
 {
+  {
+    std::lock_guard lock(g_object_mutex);
+    if (mapped && mapped_data) {
+      g_mapped_resources[resource] = MappedResourceState{mapped_data, subresource};
+    } else {
+      g_mapped_resources.erase(resource);
+    }
+  }
+
   std::ostringstream payload;
   payload << "{\"subresource\":" << subresource;
   if (has_read_range) {
@@ -3960,6 +4680,7 @@ std::uint64_t record_create_constant_buffer_view(
 {
   const bool has_buffer_location = desc && desc->BufferLocation != 0;
   const bool has_resolved_resource = resolved_resource != nullptr;
+  remember_cbv_descriptor(descriptor, desc);
   if (has_resolved_resource && !is_known_resource_object(resolved_resource)) {
     ensure_external_resource_object_with_desc(static_cast<ID3D12Resource *>(const_cast<void *>(resolved_resource)), "CreateConstantBufferViewGpuVA");
   }
@@ -3977,6 +4698,12 @@ std::uint64_t record_create_constant_buffer_view(
   } else if (desc && desc->SizeInBytes != 0) {
     op.size_in_bytes = desc->SizeInBytes;
   }
+  if (has_buffer_location && has_resolved_resource && desc->SizeInBytes != 0) {
+    capture_mapped_resource_range_before_use(
+        resolved_resource,
+        resolved_resource_offset,
+        desc->SizeInBytes);
+  }
   return record_descriptor_view_batched(
       "ID3D12Device::CreateConstantBufferView",
       object_id(device),
@@ -3991,6 +4718,7 @@ std::uint64_t record_create_shader_resource_view(
     const D3D12_SHADER_RESOURCE_VIEW_DESC *desc,
     D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
 {
+  forget_cbv_descriptor(descriptor);
   ensure_external_resource_object_with_desc(static_cast<ID3D12Resource *>(const_cast<void *>(resource)), "CreateShaderResourceView");
   DescriptorViewOp op;
   op.descriptor = descriptor.ptr;
@@ -4013,6 +4741,7 @@ std::uint64_t record_create_unordered_access_view(
     const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc,
     D3D12_CPU_DESCRIPTOR_HANDLE descriptor)
 {
+  forget_cbv_descriptor(descriptor);
   ensure_external_resource_object_with_desc(static_cast<ID3D12Resource *>(const_cast<void *>(resource)), "CreateUnorderedAccessView");
   ensure_external_resource_object_with_desc(static_cast<ID3D12Resource *>(const_cast<void *>(counter_resource)), "CreateUnorderedAccessViewCounter");
   DescriptorViewOp op;
@@ -4109,14 +4838,7 @@ std::uint64_t record_copy_descriptors(
     std::uint32_t descriptor_heap_type,
     std::uint32_t descriptor_size)
 {
-  std::lock_guard event_lock(g_event_order_mutex);
-  CopyDescriptorOp op;
-  op.device_object_id = object_id(device);
-  op.descriptor_heap_type = descriptor_heap_type;
-  op.descriptor_size = descriptor_size;
-  op.dst_range_count = dst_descriptor_range_count;
-  op.src_range_count = src_descriptor_range_count;
-  op.ranges = collect_copy_descriptor_ranges(
+  auto ranges = collect_copy_descriptor_ranges(
       dst_descriptor_range_count,
       dst_descriptor_range_starts,
       dst_descriptor_range_sizes,
@@ -4124,6 +4846,19 @@ std::uint64_t record_copy_descriptors(
       src_descriptor_range_starts,
       src_descriptor_range_sizes,
       descriptor_size);
+  capture_cbv_descriptor_copy_ranges_before_use(
+      descriptor_heap_type,
+      descriptor_size,
+      ranges);
+
+  std::lock_guard event_lock(g_event_order_mutex);
+  CopyDescriptorOp op;
+  op.device_object_id = object_id(device);
+  op.descriptor_heap_type = descriptor_heap_type;
+  op.descriptor_size = descriptor_size;
+  op.dst_range_count = dst_descriptor_range_count;
+  op.src_range_count = src_descriptor_range_count;
+  op.ranges = std::move(ranges);
 
   const auto sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
   op.sequence = sequence;
@@ -4166,6 +4901,7 @@ std::uint64_t record_draw_instanced(
     std::uint32_t start_vertex_location,
     std::uint32_t start_instance_location)
 {
+  capture_graphics_mapped_inputs_before_use(command_list, false);
   std::ostringstream payload;
   payload << "{\"vertex_count_per_instance\":" << vertex_count_per_instance
           << ",\"instance_count\":" << instance_count
@@ -4184,6 +4920,7 @@ std::uint64_t record_draw_indexed_instanced(
     std::int32_t base_vertex_location,
     std::uint32_t start_instance_location)
 {
+  capture_graphics_mapped_inputs_before_use(command_list, true);
   std::ostringstream payload;
   payload << "{\"index_count_per_instance\":" << index_count_per_instance
           << ",\"instance_count\":" << instance_count
@@ -4197,6 +4934,7 @@ std::uint64_t record_draw_indexed_instanced(
 
 std::uint64_t record_dispatch(const void *command_list, std::uint32_t x, std::uint32_t y, std::uint32_t z)
 {
+  capture_compute_mapped_inputs_before_use(command_list);
   std::ostringstream payload;
   payload << "{\"thread_group_count_x\":" << x
           << ",\"thread_group_count_y\":" << y
@@ -4218,6 +4956,9 @@ std::uint64_t record_reset_command_list(
     const void *initial_pipeline_state,
     std::int32_t result_code)
 {
+  if (result_code >= 0) {
+    clear_command_list_mapped_uses(command_list);
+  }
   std::ostringstream payload;
   payload << "{\"command_allocator_object_id\":" << object_id(command_allocator)
           << ",\"initial_pipeline_state_object_id\":" << object_id(initial_pipeline_state)
@@ -4492,6 +5233,7 @@ std::uint64_t record_set_pipeline_state(const void *command_list, const void *pi
 
 std::uint64_t record_clear_state(const void *command_list, const void *pipeline_state)
 {
+  clear_command_list_mapped_uses(command_list);
   std::ostringstream payload;
   payload << "{\"pipeline_state_object_id\":" << object_id(pipeline_state) << "}";
   const void *refs[] = {command_list, pipeline_state};
@@ -4537,6 +5279,7 @@ std::uint64_t record_set_descriptor_heaps(const void *command_list, std::uint32_
 
 std::uint64_t record_set_root_signature(const void *command_list, bool compute, const void *root_signature)
 {
+  clear_root_cbv_ranges(command_list, compute);
   std::ostringstream payload;
   payload << "{\"compute\":" << (compute ? "true" : "false")
           << ",\"root_signature_object_id\":" << object_id(root_signature)
@@ -4596,6 +5339,11 @@ std::uint64_t record_set_root_descriptor(
     std::uint32_t root_parameter_index,
     std::uint64_t gpu_virtual_address)
 {
+  if (parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) {
+    remember_root_cbv_range(command_list, compute, root_parameter_index, gpu_virtual_address);
+    capture_mapped_gpuva_range_before_use_chunked(gpu_virtual_address, kRootConstantBufferSnapshotBytes);
+  }
+
   const char *name = "ID3D12GraphicsCommandList::SetGraphicsRootConstantBufferView";
   if (compute && parameter_type == D3D12_ROOT_PARAMETER_TYPE_CBV) name = "ID3D12GraphicsCommandList::SetComputeRootConstantBufferView";
   else if (compute && parameter_type == D3D12_ROOT_PARAMETER_TYPE_SRV) name = "ID3D12GraphicsCommandList::SetComputeRootShaderResourceView";
@@ -4619,6 +5367,11 @@ std::uint64_t record_set_root_descriptor(
 
 std::uint64_t record_ia_set_index_buffer(const void *command_list, const D3D12_INDEX_BUFFER_VIEW *view)
 {
+  remember_index_buffer_range(command_list, view);
+  if (view) {
+    capture_mapped_gpuva_range_before_use(view->BufferLocation, view->SizeInBytes);
+  }
+
   std::vector<trace::ObjectId> refs;
   append_object_ref_id(refs, object_id(command_list));
   std::ostringstream payload;
@@ -4641,6 +5394,11 @@ std::uint64_t record_ia_set_vertex_buffers(
     std::uint32_t view_count,
     const D3D12_VERTEX_BUFFER_VIEW *views)
 {
+  remember_vertex_buffer_ranges(command_list, start_slot, view_count, views);
+  for (std::uint32_t index = 0; views && index < view_count; ++index) {
+    capture_mapped_gpuva_range_before_use(views[index].BufferLocation, views[index].SizeInBytes);
+  }
+
   std::vector<trace::ObjectId> refs;
   append_object_ref_id(refs, object_id(command_list));
   std::ostringstream payload;

@@ -2279,6 +2279,8 @@ bool ReplaySession::run()
   if (!impl_->options.enable_metal_retrace) {
     reader_options.stop_after_sequence = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE");
     reader_options.stop_after_present_frame = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME");
+    reader_options.extend_stop_after_sequence_to_command_list_submit =
+        reader_options.stop_after_sequence != 0;
     const char *capture_present_frames = std::getenv("APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES");
     reader_options.wait_for_present_frame_blob =
         capture_present_frames && *capture_present_frames &&

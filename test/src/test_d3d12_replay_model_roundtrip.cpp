@@ -248,8 +248,8 @@ inline bool operator==(const B::FrameSemanticState &a, const B::FrameSemanticSta
 { return F(frame_index) && F(begin_sequence) && F(end_sequence) && F(has_begin) && F(has_present) && F(has_end); }
 
 inline bool operator==(const B::ResourceDataUpdate &a, const B::ResourceDataUpdate &b)
-{ return F(sequence) && F(subresource) && F(written_begin) && F(written_end) && F(relative_path)
-      && F(blob_refs) && F(bytes); }
+{ return F(sequence) && F(apply_sequence) && F(subresource) && F(written_begin) && F(written_end)
+      && F(relative_path) && F(blob_refs) && F(bytes); }
 
 inline bool operator==(const B::ResourceSemanticState &a, const B::ResourceSemanticState &b)
 { return F(resource_object_id) && F(heap_object_id) && F(create_sequence) && F(heap_type) && F(heap_flags)
@@ -1041,6 +1041,7 @@ B::ResourceSemanticState make_resource(Filler &f)
   v.subresource_states[f.u32()] = f.u32();
   B::ResourceDataUpdate update;
   update.sequence = f.u64();
+  update.apply_sequence = f.u64();
   update.subresource = f.u32();
   update.written_begin = f.u64();
   update.written_end = f.u64();
@@ -1411,7 +1412,6 @@ int main()
   std::cout << "d3d12 replay-model round-trip OK\n";
   return 0;
 }
-
 
 
 

@@ -156,6 +156,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       command_lists_.erase(event.object_id);
       resources_.erase(event.object_id);
       live_resource_version_indices_.erase(event.object_id);
+      pipelines_.erase(event.object_id);
       command_signatures_.erase(event.object_id);
       command_queues_.erase(event.object_id);
       command_allocators_.erase(event.object_id);
@@ -836,7 +837,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       last_error_ = record_prefix(event) + ": compute pipeline asset missing root signature object id";
       return false;
     }
-    pipelines_[pipeline.pipeline_state_object_id] = std::move(pipeline);
+    register_pipeline_version(std::move(pipeline));
     ++semantic_calls_seen_;
   } else if (function_name == "ID3D12Device::CreateRootSignature") {
     if (event.callsite.result_code < 0) {
@@ -942,7 +943,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         return false;
       }
       std::string asset_error;
-      if (!read_exact_asset_bytes(
+      if (!read_prefix_asset_bytes(
               absolute_root_signature_path,
               root_signature.bytecode_size,
               root_signature.bytes,
@@ -1706,7 +1707,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         "initial_pipeline_state_object_id",
         event.object_refs.size() >= 4 ? event.object_refs[2] : trace::ObjectId{});
     if (initial_pipeline_state_object_id != 0 &&
-        pipelines_.find(initial_pipeline_state_object_id) == pipelines_.end()) {
+        !pipeline_at(initial_pipeline_state_object_id, event.callsite.sequence)) {
       last_error_ = record_prefix(event) + ": CreateCommandList references an unknown initial pipeline state";
       return false;
     }
@@ -1770,7 +1771,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     }
     const auto initial_pipeline_state_object_id = event.object_refs.size() >= 3 ? event.object_refs[2] : trace::ObjectId{};
     if (initial_pipeline_state_object_id != 0 &&
-        pipelines_.find(initial_pipeline_state_object_id) == pipelines_.end()) {
+        !pipeline_at(initial_pipeline_state_object_id, event.callsite.sequence)) {
       last_error_ = record_prefix(event) + ": Reset references an unknown initial pipeline state";
       return false;
     }
@@ -1792,7 +1793,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       last_error_ = record_prefix(event) + ": SetPipelineState missing pipeline state object id";
       return false;
     }
-    if (pipelines_.find(event.object_refs[1]) == pipelines_.end()) {
+    if (!pipeline_at(event.object_refs[1], event.callsite.sequence)) {
       last_error_ = record_prefix(event) + ": SetPipelineState references an unknown pipeline state";
       return false;
     }
@@ -3354,6 +3355,7 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       }
       ResourceDataUpdate update;
       update.sequence = event.callsite.sequence;
+      update.apply_sequence = payload_u64(payload, "apply_sequence");
       update.subresource = subresource;
       update.written_begin = written_begin;
       update.written_end = written_end;

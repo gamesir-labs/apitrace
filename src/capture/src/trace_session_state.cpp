@@ -164,6 +164,11 @@ bool TraceSessionState::active() const noexcept
   return active_;
 }
 
+std::uint64_t TraceSessionState::initial_call_sequence() const noexcept
+{
+  return bundle_sink_.writer().initial_call_sequence();
+}
+
 const TraceOptions &TraceSessionState::options() const noexcept
 {
   return options_;

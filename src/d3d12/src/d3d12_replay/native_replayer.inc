@@ -176,6 +176,60 @@ private:
     bool swapchain_back_buffer = false;
   };
 
+  struct TargetTextureWatchReadback {
+    std::uint64_t sequence = 0;
+    trace::ObjectId command_list_object_id = 0;
+    D3D12ReplayBackend::ReplayCommandKind kind = D3D12ReplayBackend::ReplayCommandKind::Unknown;
+    std::string function_name;
+    std::string phase;
+    std::string reason;
+    std::vector<trace::ObjectId> object_refs;
+    ComPtr<ID3D12Resource> readback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT x = 0;
+    UINT y = 0;
+    UINT width = 0;
+    UINT height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+  };
+
+  struct TargetTextureWatchRootDescriptor {
+    trace::ObjectId resource_object_id = 0;
+    std::uint64_t offset = 0;
+    std::string kind;
+  };
+
+  struct TargetTextureWatchBufferView {
+    trace::ObjectId resource_object_id = 0;
+    std::uint64_t offset = 0;
+    std::uint32_t size_in_bytes = 0;
+    std::uint32_t stride_in_bytes = 0;
+    std::uint32_t format = 0;
+    bool valid = false;
+  };
+
+  struct TargetTextureWatchOcclusion {
+    std::uint64_t sequence = 0;
+    trace::ObjectId command_list_object_id = 0;
+    std::string function_name;
+    std::string reason;
+    trace::ObjectId pipeline_state_object_id = 0;
+    ComPtr<ID3D12QueryHeap> query_heap;
+    ComPtr<ID3D12Resource> readback;
+  };
+
+  struct TargetTextureWatchBufferReadback {
+    std::uint64_t sequence = 0;
+    trace::ObjectId command_list_object_id = 0;
+    std::string label;
+    trace::ObjectId resource_object_id = 0;
+    std::uint64_t offset = 0;
+    std::uint64_t size = 0;
+    std::uint32_t stride_in_bytes = 0;
+    std::uint32_t format = 0;
+    ComPtr<ID3D12Resource> readback;
+  };
+
   struct NativeCommandList {
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
@@ -187,11 +241,55 @@ private:
     D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     std::uint64_t recorded_until_sequence = 0;
     std::vector<json> pending_render_pass_resolves;
+    std::array<trace::ObjectId, 8> current_render_targets{};
+    UINT current_render_target_count = 0;
+    trace::ObjectId current_pipeline_state_object_id = 0;
+    trace::ObjectId current_graphics_root_signature_object_id = 0;
+    std::array<std::uint64_t, 16> current_graphics_root_tables{};
+    std::array<TargetTextureWatchRootDescriptor, 16> current_graphics_root_descriptors{};
+    D3D12_VIEWPORT current_viewport{};
+    bool has_current_viewport = false;
+    D3D12_RECT current_scissor{};
+    bool has_current_scissor = false;
+    std::uint32_t current_primitive_topology = 0;
+    TargetTextureWatchBufferView current_vertex_buffer0;
+    TargetTextureWatchBufferView current_index_buffer;
+    std::vector<TargetTextureWatchReadback> target_watch_readbacks;
+    std::vector<TargetTextureWatchOcclusion> target_watch_occlusions;
+    std::vector<TargetTextureWatchBufferReadback> target_watch_buffer_readbacks;
   };
 
   struct ReadbackCommandObjects {
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
+  };
+
+  struct ReplaySequenceScope {
+    D3D12NativeReplayer *self = nullptr;
+    std::uint64_t saved = 0;
+
+    ReplaySequenceScope(D3D12NativeReplayer *owner, std::uint64_t sequence)
+        : self(owner), saved(owner ? owner->current_replay_sequence_ : 0)
+    {
+      if (self) {
+        self->current_replay_sequence_ = sequence;
+      }
+    }
+
+    ~ReplaySequenceScope()
+    {
+      if (self) {
+        self->current_replay_sequence_ = saved;
+      }
+    }
+  };
+
+  struct ShaderStageInfo {
+    const char *field = nullptr;
+    const char *path_key = nullptr;
+    D3D12_SHADER_BYTECODE D3D12_GRAPHICS_PIPELINE_STATE_DESC::*desc_member = nullptr;
+    std::uint64_t bytecode_size = 0;
+    std::filesystem::path relative_path;
   };
 
   struct NativeDescriptorHeap {
@@ -204,6 +302,7 @@ private:
 
   struct NativeHeap {
     ComPtr<ID3D12Heap> heap;
+    std::uint64_t replay_size_in_bytes = 0;
   };
 
   bool fail(std::string &error, std::string message) const
@@ -225,6 +324,7 @@ private:
     query_heaps_.clear();
     command_signatures_.clear();
     pipelines_.clear();
+    pipeline_version_natives_.clear();
     root_signatures_.clear();
     descriptor_heaps_.clear();
     heaps_.clear();
@@ -289,6 +389,207 @@ private:
     return nullptr;
   }
 
+  const D3D12ReplayBackend::ResourceSemanticState *recorded_resource_at(
+      trace::ObjectId object_id,
+      std::uint64_t sequence) const
+  {
+    const D3D12ReplayBackend::ResourceSemanticState *best = nullptr;
+    for (const auto &resource : backend_.resource_versions_) {
+      if (resource.resource_object_id != object_id || resource.create_sequence > sequence) {
+        continue;
+      }
+      if (best == nullptr || resource.create_sequence > best->create_sequence) {
+        best = &resource;
+      }
+    }
+    if (best) {
+      return best;
+    }
+    const auto resource_it = backend_.resources_.find(object_id);
+    if (resource_it == backend_.resources_.end()) {
+      return nullptr;
+    }
+    return &resource_it->second;
+  }
+
+  static std::uint32_t dxgi_format_cast_family(DXGI_FORMAT format)
+  {
+    switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R32G32B32A32_UINT:
+    case DXGI_FORMAT_R32G32B32A32_SINT:
+      return 1;
+    case DXGI_FORMAT_R32G32B32_TYPELESS:
+    case DXGI_FORMAT_R32G32B32_FLOAT:
+    case DXGI_FORMAT_R32G32B32_UINT:
+    case DXGI_FORMAT_R32G32B32_SINT:
+      return 2;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R16G16B16A16_SNORM:
+    case DXGI_FORMAT_R16G16B16A16_SINT:
+      return 3;
+    case DXGI_FORMAT_R32G32_TYPELESS:
+    case DXGI_FORMAT_R32G32_FLOAT:
+    case DXGI_FORMAT_R32G32_UINT:
+    case DXGI_FORMAT_R32G32_SINT:
+      return 4;
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+      return 5;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UINT:
+      return 6;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_UINT:
+    case DXGI_FORMAT_R8G8B8A8_SNORM:
+    case DXGI_FORMAT_R8G8B8A8_SINT:
+      return 7;
+    case DXGI_FORMAT_R16G16_TYPELESS:
+    case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R16G16_UNORM:
+    case DXGI_FORMAT_R16G16_UINT:
+    case DXGI_FORMAT_R16G16_SNORM:
+    case DXGI_FORMAT_R16G16_SINT:
+      return 8;
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT:
+    case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_R32_UINT:
+    case DXGI_FORMAT_R32_SINT:
+      return 9;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+    case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+      return 10;
+    case DXGI_FORMAT_R8G8_TYPELESS:
+    case DXGI_FORMAT_R8G8_UNORM:
+    case DXGI_FORMAT_R8G8_UINT:
+    case DXGI_FORMAT_R8G8_SNORM:
+    case DXGI_FORMAT_R8G8_SINT:
+      return 11;
+    case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_R16_FLOAT:
+    case DXGI_FORMAT_D16_UNORM:
+    case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16_UINT:
+    case DXGI_FORMAT_R16_SNORM:
+    case DXGI_FORMAT_R16_SINT:
+      return 12;
+    case DXGI_FORMAT_R8_TYPELESS:
+    case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_R8_UINT:
+    case DXGI_FORMAT_R8_SNORM:
+    case DXGI_FORMAT_R8_SINT:
+      return 13;
+    case DXGI_FORMAT_BC1_TYPELESS:
+    case DXGI_FORMAT_BC1_UNORM:
+    case DXGI_FORMAT_BC1_UNORM_SRGB:
+      return 14;
+    case DXGI_FORMAT_BC2_TYPELESS:
+    case DXGI_FORMAT_BC2_UNORM:
+    case DXGI_FORMAT_BC2_UNORM_SRGB:
+      return 15;
+    case DXGI_FORMAT_BC3_TYPELESS:
+    case DXGI_FORMAT_BC3_UNORM:
+    case DXGI_FORMAT_BC3_UNORM_SRGB:
+      return 16;
+    case DXGI_FORMAT_BC4_TYPELESS:
+    case DXGI_FORMAT_BC4_UNORM:
+    case DXGI_FORMAT_BC4_SNORM:
+      return 17;
+    case DXGI_FORMAT_BC5_TYPELESS:
+    case DXGI_FORMAT_BC5_UNORM:
+    case DXGI_FORMAT_BC5_SNORM:
+      return 18;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+      return 19;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+      return 20;
+    case DXGI_FORMAT_BC6H_TYPELESS:
+    case DXGI_FORMAT_BC6H_UF16:
+    case DXGI_FORMAT_BC6H_SF16:
+      return 21;
+    case DXGI_FORMAT_BC7_TYPELESS:
+    case DXGI_FORMAT_BC7_UNORM:
+    case DXGI_FORMAT_BC7_UNORM_SRGB:
+      return 22;
+    default:
+      return 0;
+    }
+  }
+
+  static bool dxgi_formats_cast_compatible(DXGI_FORMAT lhs, DXGI_FORMAT rhs)
+  {
+    if (lhs == rhs) {
+      return true;
+    }
+    const auto lhs_family = dxgi_format_cast_family(lhs);
+    const auto rhs_family = dxgi_format_cast_family(rhs);
+    return lhs_family != 0 && lhs_family == rhs_family;
+  }
+
+  DXGI_FORMAT effective_swapchain_back_buffer_format() const
+  {
+    const auto *fallback = recorded_back_buffer();
+    if (!fallback) {
+      return DXGI_FORMAT_UNKNOWN;
+    }
+
+    DXGI_FORMAT effective = static_cast<DXGI_FORMAT>(fallback->format);
+    std::uint32_t selected_recorded_format = fallback->format;
+    trace::ObjectId selected_resource_object_id = fallback->resource_object_id;
+    std::uint64_t selected_sequence = std::numeric_limits<std::uint64_t>::max();
+
+    for (const auto &descriptor : backend_.descriptors_) {
+      if (descriptor.kind != "RenderTargetView" ||
+          !descriptor.has_view_desc ||
+          descriptor.resource_object_id == 0 ||
+          descriptor.format == 0) {
+        continue;
+      }
+      const auto *resource = recorded_resource_at(descriptor.resource_object_id, descriptor.create_sequence);
+      if (resource == nullptr ||
+          !resource->swapchain_back_buffer ||
+          resource->format == 0) {
+        continue;
+      }
+      const auto recorded_format = static_cast<DXGI_FORMAT>(resource->format);
+      const auto view_format = static_cast<DXGI_FORMAT>(descriptor.format);
+      if (dxgi_formats_cast_compatible(recorded_format, view_format)) {
+        continue;
+      }
+      if (descriptor.create_sequence < selected_sequence) {
+        effective = view_format;
+        selected_recorded_format = resource->format;
+        selected_resource_object_id = descriptor.resource_object_id;
+        selected_sequence = descriptor.create_sequence;
+      }
+    }
+
+    if (selected_sequence != std::numeric_limits<std::uint64_t>::max()) {
+      replay_milestone((std::string("bb:effective-format resource=") +
+                        std::to_string(selected_resource_object_id) +
+                        " recorded_format=" + std::to_string(selected_recorded_format) +
+                        " effective_format=" + std::to_string(static_cast<std::uint32_t>(effective)) +
+                        " rtv_seq=" + std::to_string(selected_sequence)).c_str());
+    }
+    return effective;
+  }
+
   bool bootstrap(std::string &error)
   {
     UINT width = 0;
@@ -325,9 +626,14 @@ private:
     }
 
     const bool headless = headless_enabled();
+    const DXGI_FORMAT swapchain_format = effective_swapchain_back_buffer_format();
+    if (swapchain_format == DXGI_FORMAT_UNKNOWN) {
+      return fail(error, "trace is missing swapchain back-buffer format semantics");
+    }
     if (headless) {
-      // Offscreen path: create kBufferCount committed render-target textures matching the recorded
-      // back-buffer (true format — e.g. R10G10B10A2 for FH4, NOT the swapchain's hardcoded RGBA8).
+      // Offscreen path: create kBufferCount committed render-target textures matching the effective
+      // back-buffer format. Older bundles may miss ResizeBuffers, so the recorded resource format can
+      // be stale while later RTV creation records the typed format that actually rendered.
       // No window, no swapchain -> no win32u display query -> no deadlock. create_resources() later
       // aliases the trace's swapchain resources onto these exactly as it does for real back-buffers.
       const auto *bb = recorded_back_buffer();
@@ -341,7 +647,7 @@ private:
       desc.Height = bb->height != 0 ? bb->height : height;
       desc.DepthOrArraySize = 1;
       desc.MipLevels = 1;
-      desc.Format = static_cast<DXGI_FORMAT>(bb->format);
+      desc.Format = swapchain_format;
       desc.SampleDesc.Count = 1;
       desc.SampleDesc.Quality = 0;
       desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -412,10 +718,14 @@ private:
     return fail(error, "D3D12 native replay has no window bootstrap for this platform");
 #endif
 
+    // Match the effective back-buffer format so windowed replay uses the same
+    // resource semantics as the headless path. Present-frame export decodes
+    // from the readback byte layout instead of assuming this resource format.
+    const auto *recorded_bb = recorded_back_buffer();
     DXGI_SWAP_CHAIN_DESC1 swap_chain_desc{};
     swap_chain_desc.Width = width;
     swap_chain_desc.Height = height;
-    swap_chain_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    swap_chain_desc.Format = recorded_bb ? swapchain_format : DXGI_FORMAT_R8G8B8A8_UNORM;
     swap_chain_desc.SampleDesc.Count = 1;
     swap_chain_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     swap_chain_desc.BufferCount = kBufferCount;
@@ -479,42 +789,6 @@ private:
     return heap_properties(heap);
   }
 
-  bool create_heaps(std::string &error)
-  {
-    for (const auto &[object_id, heap] : backend_.heaps_) {
-      D3D12_HEAP_DESC desc{};
-      desc.SizeInBytes = heap.size_in_bytes;
-      desc.Properties = heap_properties(heap);
-      desc.Alignment = heap.alignment;
-      // Offline single-device replay never shares heaps across processes or adapters, so the
-      // SHARED / SHARED_CROSS_ADAPTER flags are no-ops here. Strip them: a CUSTOM heap with
-      // SHARED_CROSS_ADAPTER + a CPU-visible page property is invalid per the D3D12 spec (DXMT
-      // rejects it as "custom-cross-adapter-cpu-visible"), and we render into the heap identically
-      // without sharing. The matching resource ALLOW_CROSS_ADAPTER flag is stripped in resource_desc.
-      auto heap_flags = static_cast<D3D12_HEAP_FLAGS>(heap.flags);
-      heap_flags = static_cast<D3D12_HEAP_FLAGS>(
-          heap_flags & ~(D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER));
-      desc.Flags = heap_flags;
-      NativeHeap native;
-      HRESULT hr = device_->CreateHeap(&desc, IID_PPV_ARGS(native.heap.put()));
-      if (FAILED(hr)) {
-        std::ostringstream detail;
-        detail << "CreateHeap(object_id=" << object_id
-               << " size=" << desc.SizeInBytes
-               << " alignment=" << desc.Alignment
-               << " heap_type=" << static_cast<unsigned>(desc.Properties.Type)
-               << " cpu_page=" << static_cast<unsigned>(desc.Properties.CPUPageProperty)
-               << " mem_pool=" << static_cast<unsigned>(desc.Properties.MemoryPoolPreference)
-               << " flags=0x" << std::hex << static_cast<unsigned>(desc.Flags) << std::dec
-               << ")";
-        error = hresult_error(detail.str(), hr);
-        return false;
-      }
-      heaps_.emplace(object_id, std::move(native));
-    }
-    return true;
-  }
-
   static D3D12_RESOURCE_DESC resource_desc(const D3D12ReplayBackend::ResourceSemanticState &resource)
   {
     D3D12_RESOURCE_DESC desc{};
@@ -534,6 +808,117 @@ private:
     desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
         resource.flags & ~D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
     return desc;
+  }
+
+  static std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment)
+  {
+    if (alignment <= 1) {
+      return value;
+    }
+    const std::uint64_t remainder = value % alignment;
+    if (!remainder) {
+      return value;
+    }
+    const std::uint64_t add = alignment - remainder;
+    if (value > std::numeric_limits<std::uint64_t>::max() - add) {
+      return 0;
+    }
+    return value + add;
+  }
+
+  bool current_device_heap_requirement(
+      trace::ObjectId heap_object_id,
+      std::uint64_t &required_size,
+      std::string &error) const
+  {
+    required_size = 0;
+    for (const auto &resource : backend_.resource_versions_) {
+      if (resource.heap_object_id != heap_object_id) {
+        continue;
+      }
+      const auto desc = resource_desc(resource);
+      const auto allocation_info = device_->GetResourceAllocationInfo(1, 1, &desc);
+      if (allocation_info.SizeInBytes == 0) {
+        std::ostringstream detail;
+        detail << "GetResourceAllocationInfo returned zero for placed resource object="
+               << resource.resource_object_id << " create_seq=" << resource.create_sequence;
+        error = detail.str();
+        return false;
+      }
+      if (resource.heap_offset >
+          std::numeric_limits<std::uint64_t>::max() - allocation_info.SizeInBytes) {
+        std::ostringstream detail;
+        detail << "placed resource range overflow object=" << resource.resource_object_id
+               << " create_seq=" << resource.create_sequence;
+        error = detail.str();
+        return false;
+      }
+      required_size = std::max<std::uint64_t>(
+          required_size, resource.heap_offset + allocation_info.SizeInBytes);
+    }
+    return true;
+  }
+
+  bool create_heaps(std::string &error)
+  {
+    for (const auto &[object_id, heap] : backend_.heaps_) {
+      D3D12_HEAP_DESC desc{};
+      desc.SizeInBytes = heap.size_in_bytes;
+      desc.Properties = heap_properties(heap);
+      desc.Alignment = heap.alignment;
+      // Offline single-device replay never shares heaps across processes or adapters, so the
+      // SHARED / SHARED_CROSS_ADAPTER flags are no-ops here. Strip them: a CUSTOM heap with
+      // SHARED_CROSS_ADAPTER + a CPU-visible page property is invalid per the D3D12 spec (DXMT
+      // rejects it as "custom-cross-adapter-cpu-visible"), and we render into the heap identically
+      // without sharing. The matching resource ALLOW_CROSS_ADAPTER flag is stripped in resource_desc.
+      auto heap_flags = static_cast<D3D12_HEAP_FLAGS>(heap.flags);
+      heap_flags = static_cast<D3D12_HEAP_FLAGS>(
+          heap_flags & ~(D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER));
+      desc.Flags = heap_flags;
+      std::uint64_t required_size = 0;
+      if (!current_device_heap_requirement(object_id, required_size, error)) {
+        return false;
+      }
+      if (required_size > desc.SizeInBytes) {
+        const std::uint64_t heap_alignment = desc.Alignment ? desc.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        const std::uint64_t replay_size = align_up(required_size, heap_alignment);
+        if (replay_size == 0) {
+          std::ostringstream detail;
+          detail << "CreateHeap replay-size overflow object_id=" << object_id
+                 << " recorded_size=" << desc.SizeInBytes
+                 << " required_size=" << required_size
+                 << " alignment=" << heap_alignment;
+          error = detail.str();
+          return false;
+        }
+        std::ostringstream detail;
+        detail << "heap:resize-for-replay object=" << object_id
+               << " recorded_size=" << desc.SizeInBytes
+               << " replay_size=" << replay_size
+               << " required_size=" << required_size
+               << " alignment=" << heap_alignment;
+        replay_milestone(detail.str().c_str());
+        desc.SizeInBytes = replay_size;
+      }
+      NativeHeap native;
+      native.replay_size_in_bytes = desc.SizeInBytes;
+      HRESULT hr = device_->CreateHeap(&desc, IID_PPV_ARGS(native.heap.put()));
+      if (FAILED(hr)) {
+        std::ostringstream detail;
+        detail << "CreateHeap(object_id=" << object_id
+               << " size=" << desc.SizeInBytes
+               << " alignment=" << desc.Alignment
+               << " heap_type=" << static_cast<unsigned>(desc.Properties.Type)
+               << " cpu_page=" << static_cast<unsigned>(desc.Properties.CPUPageProperty)
+               << " mem_pool=" << static_cast<unsigned>(desc.Properties.MemoryPoolPreference)
+               << " flags=0x" << std::hex << static_cast<unsigned>(desc.Flags) << std::dec
+               << ")";
+        error = hresult_error(detail.str(), hr);
+        return false;
+      }
+      heaps_.emplace(object_id, std::move(native));
+    }
+    return true;
   }
 
   static D3D12_CLEAR_VALUE clear_value(const D3D12ReplayBackend::ResourceSemanticState &resource)
@@ -568,12 +953,41 @@ private:
     const auto desc = resource_desc(resource);
     const auto optimized_clear = resource.has_optimized_clear_value ? clear_value(resource) : D3D12_CLEAR_VALUE{};
     HRESULT hr = S_OK;
+    const auto log_create_failure = [&](const char *call_name, HRESULT failed_hr) {
+      D3D12_RESOURCE_ALLOCATION_INFO allocation_info =
+          device_->GetResourceAllocationInfo(1, 1, &desc);
+      std::ostringstream detail;
+      detail << "resource:create-fail call=" << call_name
+             << " hr=0x" << std::hex << static_cast<std::uint32_t>(failed_hr) << std::dec
+             << " object=" << resource.resource_object_id
+             << " create_seq=" << resource.create_sequence
+             << " dim=" << resource.dimension
+             << " fmt=" << resource.format
+             << " width=" << resource.width
+             << " height=" << resource.height
+             << " depth_or_array=" << resource.depth_or_array_size
+             << " mips=" << resource.mip_levels
+             << " sample_count=" << resource.sample_count
+             << " layout=" << resource.layout
+             << " flags=0x" << std::hex << resource.flags << std::dec
+             << " heap_object=" << resource.heap_object_id
+             << " heap_type=" << resource.heap_type
+             << " heap_flags=0x" << std::hex << resource.heap_flags << std::dec
+             << " heap_offset=" << resource.heap_offset
+             << " alloc_size=" << allocation_info.SizeInBytes
+             << " alloc_alignment=" << allocation_info.Alignment
+             << " initial_state=0x" << std::hex << resource.initial_state << std::dec
+             << " reserved=" << (resource.reserved_resource ? "1" : "0")
+             << " optimized_clear=" << (resource.has_optimized_clear_value ? "1" : "0");
+      replay_milestone(detail.str().c_str());
+    };
     if (resource.reserved_resource) {
       hr = device_->CreateReservedResource(
           &desc, static_cast<D3D12_RESOURCE_STATES>(resource.initial_state),
           resource.has_optimized_clear_value ? &optimized_clear : nullptr,
           IID_PPV_ARGS(native.resource.put()));
       if (FAILED(hr)) {
+        log_create_failure("CreateReservedResource", hr);
         error = hresult_error("CreateReservedResource", hr);
         return false;
       }
@@ -588,6 +1002,7 @@ private:
           resource.has_optimized_clear_value ? &optimized_clear : nullptr,
           IID_PPV_ARGS(native.resource.put()));
       if (FAILED(hr)) {
+        log_create_failure("CreatePlacedResource", hr);
         error = hresult_error("CreatePlacedResource", hr);
         return false;
       }
@@ -599,6 +1014,7 @@ private:
           resource.has_optimized_clear_value ? &optimized_clear : nullptr,
           IID_PPV_ARGS(native.resource.put()));
       if (FAILED(hr)) {
+        log_create_failure("CreateCommittedResource", hr);
         error = hresult_error("CreateCommittedResource", hr);
         return false;
       }
@@ -722,6 +1138,16 @@ private:
           root_signature.bytes.size(),
           IID_PPV_ARGS(native.put()));
       if (FAILED(hr)) {
+        std::ostringstream detail;
+        detail << "rootsig:create-fail hr=0x"
+               << std::hex << static_cast<std::uint32_t>(hr) << std::dec
+               << " object=" << object_id
+               << " create_seq=" << root_signature.create_sequence
+               << " node_mask=" << root_signature.node_mask
+               << " bytecode_size=" << root_signature.bytecode_size
+               << " bytes=" << root_signature.bytes.size()
+               << " path=" << root_signature.relative_path.generic_string();
+        replay_milestone(detail.str().c_str());
         error = hresult_error("CreateRootSignature", hr);
         return false;
       }
@@ -746,7 +1172,280 @@ private:
     if (size == 0 || relative_path.empty()) {
       return fail(error, std::string("pipeline shader field is incomplete: ") + field);
     }
-    return read_exact_asset_bytes(backend_.bundle_root_ / relative_path, size, bytes, error);
+    return read_prefix_asset_bytes(backend_.bundle_root_ / relative_path, size, bytes, error);
+  }
+
+  bool shader_stage_info(const json &pipeline_asset, const char *field, const char *path_key, ShaderStageInfo &info) const
+  {
+    const auto shader = pipeline_asset.find(field);
+    if (shader == pipeline_asset.end() || shader->is_null() || !shader->is_object()) {
+      return false;
+    }
+    const auto size = payload_u64(*shader, "bytecode_size");
+    const auto relative_path = payload_string(*shader, path_key);
+    if (size == 0 || relative_path.empty()) {
+      return false;
+    }
+    info.field = field;
+    info.path_key = path_key;
+    info.bytecode_size = size;
+    info.relative_path = relative_path;
+    return true;
+  }
+
+  static std::uint32_t read_le_u32(const std::uint8_t *bytes)
+  {
+    return static_cast<std::uint32_t>(bytes[0]) |
+           (static_cast<std::uint32_t>(bytes[1]) << 8) |
+           (static_cast<std::uint32_t>(bytes[2]) << 16) |
+           (static_cast<std::uint32_t>(bytes[3]) << 24);
+  }
+
+  std::uint64_t dxbc_declared_size(const std::filesystem::path &absolute_path) const
+  {
+    std::ifstream input(absolute_path, std::ios::binary);
+    if (!input) {
+      return 0;
+    }
+    std::array<std::uint8_t, 28> header{};
+    input.read(reinterpret_cast<char *>(header.data()), static_cast<std::streamsize>(header.size()));
+    if (input.gcount() != static_cast<std::streamsize>(header.size())) {
+      return 0;
+    }
+    if (std::memcmp(header.data(), "DXBC", 4) != 0) {
+      return 0;
+    }
+    return read_le_u32(header.data() + 24);
+  }
+
+  void build_shader_candidate_index() const
+  {
+    if (shader_candidate_index_built_) {
+      return;
+    }
+    shader_candidate_index_built_ = true;
+    const auto shader_dir = backend_.bundle_root_ / "shaders";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(shader_dir, ec)) {
+      return;
+    }
+    for (std::filesystem::directory_iterator it(shader_dir, ec), end; !ec && it != end; it.increment(ec)) {
+      if (!it->is_regular_file(ec)) {
+        continue;
+      }
+      const auto relative_path = std::filesystem::path("shaders") / it->path().filename();
+      if (!is_shader_asset_path(relative_path)) {
+        continue;
+      }
+      const auto file_size = it->file_size(ec);
+      if (ec) {
+        ec.clear();
+        continue;
+      }
+      const auto declared_size = dxbc_declared_size(it->path());
+      if (declared_size == 0 || declared_size != file_size) {
+        continue;
+      }
+      shader_candidate_paths_by_size_[declared_size].push_back(relative_path);
+    }
+    for (auto &[size, paths] : shader_candidate_paths_by_size_) {
+      (void)size;
+      std::sort(paths.begin(), paths.end());
+    }
+  }
+
+  const std::vector<std::filesystem::path> &shader_candidates_for_size(std::uint64_t size) const
+  {
+    static const std::vector<std::filesystem::path> empty;
+    build_shader_candidate_index();
+    const auto it = shader_candidate_paths_by_size_.find(size);
+    return it == shader_candidate_paths_by_size_.end() ? empty : it->second;
+  }
+
+  struct ShaderStageCandidateSet {
+    ShaderStageInfo stage;
+    std::vector<std::filesystem::path> candidates;
+  };
+
+  template <typename CreateFn>
+  bool try_graphics_pso_candidate_combination(
+      const D3D12ReplayBackend::PipelineSemanticState &pipeline,
+      const std::vector<ShaderStageCandidateSet> &sets,
+      std::size_t index,
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc,
+      std::vector<std::vector<std::uint8_t>> &candidate_bytes,
+      std::vector<std::filesystem::path> &chosen_paths,
+      CreateFn &&create,
+      ComPtr<ID3D12PipelineState> &native) const
+  {
+    if (index == sets.size()) {
+      ComPtr<ID3D12PipelineState> retry_native;
+      if (FAILED(create(desc, retry_native))) {
+        return false;
+      }
+      std::string message = "pso:shader-candidates object=" +
+                            std::to_string(pipeline.pipeline_state_object_id) +
+                            " create_sequence=" + std::to_string(pipeline.create_sequence);
+      for (std::size_t i = 0; i < sets.size(); ++i) {
+        message += " stage=";
+        message += sets[i].stage.field;
+        message += " from=";
+        message += sets[i].stage.relative_path.generic_string();
+        message += " to=";
+        message += chosen_paths[i].generic_string();
+      }
+      replay_milestone(message.c_str());
+      native = std::move(retry_native);
+      return true;
+    }
+
+    const auto &set = sets[index];
+    const auto previous = desc.*(set.stage.desc_member);
+    for (const auto &candidate : set.candidates) {
+      std::string candidate_error;
+      if (!read_exact_asset_bytes(
+              backend_.bundle_root_ / candidate,
+              set.stage.bytecode_size,
+              candidate_bytes[index],
+              candidate_error)) {
+        continue;
+      }
+      desc.*(set.stage.desc_member) =
+          D3D12_SHADER_BYTECODE{candidate_bytes[index].data(), candidate_bytes[index].size()};
+      chosen_paths[index] = candidate;
+      if (try_graphics_pso_candidate_combination(
+              pipeline,
+              sets,
+              index + 1,
+              desc,
+              candidate_bytes,
+              chosen_paths,
+              create,
+              native)) {
+        return true;
+      }
+    }
+    desc.*(set.stage.desc_member) = previous;
+    candidate_bytes[index].clear();
+    return false;
+  }
+
+  template <typename CreateFn>
+  bool retry_graphics_pso_shader_candidates(
+      const D3D12ReplayBackend::PipelineSemanticState &pipeline,
+      const json &pipeline_asset,
+      const D3D12_GRAPHICS_PIPELINE_STATE_DESC &base_desc,
+      CreateFn &&create,
+      ComPtr<ID3D12PipelineState> &native) const
+  {
+    std::array<ShaderStageInfo, 5> stages{};
+    stages[0].desc_member = &D3D12_GRAPHICS_PIPELINE_STATE_DESC::VS;
+    stages[1].desc_member = &D3D12_GRAPHICS_PIPELINE_STATE_DESC::PS;
+    stages[2].desc_member = &D3D12_GRAPHICS_PIPELINE_STATE_DESC::DS;
+    stages[3].desc_member = &D3D12_GRAPHICS_PIPELINE_STATE_DESC::HS;
+    stages[4].desc_member = &D3D12_GRAPHICS_PIPELINE_STATE_DESC::GS;
+    const std::array<std::pair<const char *, const char *>, 5> names{{
+        {"vs", "vs_path"},
+        {"ps", "ps_path"},
+        {"ds", "ds_path"},
+        {"hs", "hs_path"},
+        {"gs", "gs_path"},
+    }};
+    std::vector<ShaderStageCandidateSet> candidate_sets;
+    for (std::size_t index = 0; index < stages.size(); ++index) {
+      auto &stage = stages[index];
+      if (!shader_stage_info(pipeline_asset, names[index].first, names[index].second, stage)) {
+        continue;
+      }
+      const auto declared_size = dxbc_declared_size(backend_.bundle_root_ / stage.relative_path);
+      if (declared_size == 0 || declared_size == stage.bytecode_size) {
+        continue;
+      }
+      ShaderStageCandidateSet set;
+      set.stage = stage;
+      const auto &candidates = shader_candidates_for_size(stage.bytecode_size);
+      constexpr std::size_t kMaxCandidatesPerStage = 32;
+      for (const auto &candidate : candidates) {
+        if (candidate == stage.relative_path) {
+          continue;
+        }
+        set.candidates.push_back(candidate);
+        if (set.candidates.size() >= kMaxCandidatesPerStage) {
+          break;
+        }
+      }
+      if (!set.candidates.empty()) {
+        candidate_sets.push_back(std::move(set));
+      }
+    }
+    if (candidate_sets.empty()) {
+      return false;
+    }
+
+    auto desc = base_desc;
+    std::vector<std::vector<std::uint8_t>> candidate_bytes(candidate_sets.size());
+    std::vector<std::filesystem::path> chosen_paths(candidate_sets.size());
+    return try_graphics_pso_candidate_combination(
+        pipeline,
+        candidate_sets,
+        0,
+        desc,
+        candidate_bytes,
+        chosen_paths,
+        create,
+        native);
+  }
+
+  template <typename CreateFn>
+  bool retry_compute_pso_shader_candidates(
+      const D3D12ReplayBackend::PipelineSemanticState &pipeline,
+      const json &pipeline_asset,
+      const D3D12_COMPUTE_PIPELINE_STATE_DESC &base_desc,
+      CreateFn &&create,
+      ComPtr<ID3D12PipelineState> &native) const
+  {
+    ShaderStageInfo stage;
+    if (!shader_stage_info(pipeline_asset, "cs", "cs_path", stage)) {
+      return false;
+    }
+    const auto declared_size = dxbc_declared_size(backend_.bundle_root_ / stage.relative_path);
+    if (declared_size == 0 || declared_size == stage.bytecode_size) {
+      return false;
+    }
+    const auto &candidates = shader_candidates_for_size(stage.bytecode_size);
+    constexpr std::size_t kMaxCandidates = 32;
+    std::size_t tried = 0;
+    for (const auto &candidate : candidates) {
+      if (candidate == stage.relative_path) {
+        continue;
+      }
+      if (tried++ >= kMaxCandidates) {
+        break;
+      }
+      std::vector<std::uint8_t> candidate_bytes;
+      std::string candidate_error;
+      if (!read_exact_asset_bytes(
+              backend_.bundle_root_ / candidate,
+              stage.bytecode_size,
+              candidate_bytes,
+              candidate_error)) {
+        continue;
+      }
+      D3D12_COMPUTE_PIPELINE_STATE_DESC retry_desc = base_desc;
+      retry_desc.CS = D3D12_SHADER_BYTECODE{candidate_bytes.data(), candidate_bytes.size()};
+      ComPtr<ID3D12PipelineState> retry_native;
+      if (FAILED(create(retry_desc, retry_native))) {
+        continue;
+      }
+      replay_milestone((std::string("pso:shader-candidates object=") +
+                        std::to_string(pipeline.pipeline_state_object_id) +
+                        " create_sequence=" + std::to_string(pipeline.create_sequence) +
+                        " stage=cs from=" + stage.relative_path.generic_string() +
+                        " to=" + candidate.generic_string()).c_str());
+      native = std::move(retry_native);
+      return true;
+    }
+    return false;
   }
 
   static D3D12_INPUT_LAYOUT_DESC input_layout_desc(
@@ -863,7 +1562,9 @@ private:
 
   bool create_pipelines(std::string &error)
   {
-    for (const auto &[object_id, pipeline] : backend_.pipelines_) {
+    const auto make_native_pipeline = [&](const D3D12ReplayBackend::PipelineSemanticState &pipeline,
+                                          ComPtr<ID3D12PipelineState> &native,
+                                          std::string &error) -> bool {
       ID3D12RootSignature *root_signature = nullptr;
       if (!pipeline.uses_embedded_root_signature) {
         const auto root_it = root_signatures_.find(pipeline.root_signature_object_id);
@@ -889,14 +1590,25 @@ private:
         desc.CS = D3D12_SHADER_BYTECODE{cs.data(), cs.size()};
         desc.NodeMask = pipeline.node_mask;
         desc.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(pipeline.flags);
-        ComPtr<ID3D12PipelineState> native;
-        HRESULT hr = device_->CreateComputePipelineState(&desc, IID_PPV_ARGS(native.put()));
+        const auto create_compute_pipeline =
+            [&](const D3D12_COMPUTE_PIPELINE_STATE_DESC &pipeline_desc,
+                ComPtr<ID3D12PipelineState> &pipeline_state) -> HRESULT {
+          return device_->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(pipeline_state.put()));
+        };
+        HRESULT hr = create_compute_pipeline(desc, native);
         if (FAILED(hr)) {
-          error = hresult_error("CreateComputePipelineState", hr);
+          if (retry_compute_pso_shader_candidates(pipeline, pipeline_asset, desc, create_compute_pipeline, native)) {
+            return true;
+          }
+          error = hresult_error("CreateComputePipelineState", hr) +
+                  " path=" + pipeline.relative_path.generic_string() +
+                  " object=" + std::to_string(pipeline.pipeline_state_object_id) +
+                  " create_sequence=" + std::to_string(pipeline.create_sequence) +
+                  " root=" + std::to_string(pipeline.root_signature_object_id) +
+                  " cs_bytes=" + std::to_string(cs.size());
           return false;
         }
-        pipelines_.emplace(object_id, std::move(native));
-        continue;
+        return true;
       }
       if (!require_object(pipeline_asset, "blend_state", blend, error) ||
           !require_object(pipeline_asset, "rasterizer_state", rasterizer, error) ||
@@ -940,13 +1652,62 @@ private:
       desc.NodeMask = pipeline.node_mask;
       desc.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(pipeline.flags);
       desc.IBStripCutValue = static_cast<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>(pipeline.ib_strip_cut_value);
-      ComPtr<ID3D12PipelineState> native;
-      HRESULT hr = device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(native.put()));
+      const auto create_graphics_pipeline =
+          [&](const D3D12_GRAPHICS_PIPELINE_STATE_DESC &pipeline_desc,
+              ComPtr<ID3D12PipelineState> &pipeline_state) -> HRESULT {
+        return device_->CreateGraphicsPipelineState(&pipeline_desc, IID_PPV_ARGS(pipeline_state.put()));
+      };
+      HRESULT hr = create_graphics_pipeline(desc, native);
       if (FAILED(hr)) {
-        error = hresult_error("CreateGraphicsPipelineState", hr);
+        if (retry_graphics_pso_shader_candidates(pipeline, pipeline_asset, desc, create_graphics_pipeline, native)) {
+          return true;
+        }
+        error = hresult_error("CreateGraphicsPipelineState", hr) +
+                " path=" + pipeline.relative_path.generic_string() +
+                " object=" + std::to_string(pipeline.pipeline_state_object_id) +
+                " create_sequence=" + std::to_string(pipeline.create_sequence) +
+                " root=" + std::to_string(pipeline.root_signature_object_id) +
+                " rts=" + std::to_string(pipeline.num_render_targets) +
+                " dsv=" + std::to_string(pipeline.dsv_format) +
+                " sample=" + std::to_string(pipeline.sample_count) + "x" +
+                std::to_string(pipeline.sample_quality) +
+                " vs_bytes=" + std::to_string(vs.size()) +
+                " ps_bytes=" + std::to_string(ps.size()) +
+                " ds_bytes=" + std::to_string(ds.size()) +
+                " hs_bytes=" + std::to_string(hs.size()) +
+                " gs_bytes=" + std::to_string(gs.size());
+        return false;
+      }
+      return true;
+    };
+
+    for (const auto &[object_id, pipeline] : backend_.pipelines_) {
+      ComPtr<ID3D12PipelineState> native;
+      if (!make_native_pipeline(pipeline, native, error)) {
         return false;
       }
       pipelines_.emplace(object_id, std::move(native));
+    }
+
+    std::unordered_map<trace::ObjectId, std::size_t> version_counts;
+    for (const auto &pipeline : backend_.pipeline_versions_) {
+      ++version_counts[pipeline.pipeline_state_object_id];
+    }
+    for (const auto &pipeline : backend_.pipeline_versions_) {
+      if (version_counts[pipeline.pipeline_state_object_id] < 2) {
+        continue;  // single version: pipelines_ already holds it
+      }
+      ComPtr<ID3D12PipelineState> native;
+      if (!make_native_pipeline(pipeline, native, error)) {
+        return false;
+      }
+      pipeline_version_natives_[pipeline.pipeline_state_object_id].emplace_back(
+          pipeline.create_sequence, std::move(native));
+    }
+    for (auto &[object_id, versions] : pipeline_version_natives_) {
+      (void)object_id;
+      std::stable_sort(versions.begin(), versions.end(),
+                       [](const auto &a, const auto &b) { return a.first < b.first; });
     }
     return true;
   }
@@ -975,6 +1736,39 @@ private:
     return handle;
   }
 
+  bool allocate_cpu_descriptor_scratch(
+      D3D12_DESCRIPTOR_HEAP_TYPE type,
+      D3D12_CPU_DESCRIPTOR_HANDLE &handle,
+      std::string &error)
+  {
+    handle = {};
+    const auto index = static_cast<std::size_t>(type);
+    if (index >= cpu_descriptor_scratch_.size()) {
+      return fail(error, "CPU descriptor scratch heap type is out of range");
+    }
+    auto &scratch = cpu_descriptor_scratch_[index];
+    if (scratch.descriptor_size == 0) {
+      scratch.descriptor_size = device_->GetDescriptorHandleIncrementSize(type);
+    }
+    if (scratch.heaps.empty() || scratch.next >= scratch.capacity) {
+      D3D12_DESCRIPTOR_HEAP_DESC desc{};
+      desc.Type = type;
+      desc.NumDescriptors = scratch.capacity;
+      desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+      ComPtr<ID3D12DescriptorHeap> heap;
+      const HRESULT hr = device_->CreateDescriptorHeap(&desc, IID_PPV_ARGS(heap.put()));
+      if (FAILED(hr)) {
+        return fail(error, hresult_error("CreateDescriptorHeap(cpu scratch)", hr));
+      }
+      scratch.current_start = heap->GetCPUDescriptorHandleForHeapStart();
+      scratch.heaps.push_back(std::move(heap));
+      scratch.next = 0;
+    }
+    handle.ptr = scratch.current_start.ptr +
+                 static_cast<SIZE_T>(scratch.next++) * scratch.descriptor_size;
+    return true;
+  }
+
   // BUG-007 diagnostic: log when a clear/set-render-target binding targets a known back-buffer RTV
   // slot, so we can tell whether the back-buffer is bound as a DRAW target vs only cleared.
   void note_back_buffer_rtv_use(const D3D12ReplayBackend::DescriptorBinding &binding,
@@ -1001,10 +1795,34 @@ private:
     if (dst.ptr == 0) {
       return fail(error, "descriptor destination cannot be relocated");
     }
+    return create_descriptor_view(semantic, dst, true, error);
+  }
+
+  bool create_descriptor_view(
+      const D3D12ReplayBackend::DescriptorSemanticState &semantic,
+      D3D12_CPU_DESCRIPTOR_HANDLE dst,
+      bool track_back_buffer_rtv,
+      std::string &error)
+  {
+    if (dst.ptr == 0) {
+      return fail(error, "descriptor destination cannot be zero");
+    }
+    struct SequenceRestore {
+      D3D12NativeReplayer *self = nullptr;
+      std::uint64_t saved = 0;
+      ~SequenceRestore()
+      {
+        if (self) {
+          self->current_replay_sequence_ = saved;
+        }
+      }
+    } restore{this, current_replay_sequence_};
+    const auto saved_sequence = current_replay_sequence_;
     // Resolve resource references to the version live when this descriptor was created.
     current_replay_sequence_ = semantic.create_sequence;
     ID3D12Resource *resource = semantic.resource_object_id == 0 ? nullptr : resource_for(semantic.resource_object_id, error);
     if (semantic.resource_object_id != 0 && !resource) {
+      current_replay_sequence_ = saved_sequence;
       return false;
     }
     // Diagnostic: a view format incompatible with the recorded resource format (e.g. RG11B10F view
@@ -1075,7 +1893,7 @@ private:
       // Diagnostic (BUG-007): record which descriptor slots hold an RTV that points at a swapchain
       // back-buffer, so the clear/set-render-target paths can report whether the back-buffer is ever
       // bound as a DRAW target (OMSetRenderTargets) vs only cleared.
-      if (std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG") && resource != nullptr) {
+      if (track_back_buffer_rtv && std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG") && resource != nullptr) {
         for (UINT bi = 0; bi < kBufferCount; ++bi) {
           if (back_buffers_[bi] && back_buffers_[bi].get() == resource) {
             back_buffer_rtv_slots_.insert(
@@ -1131,12 +1949,15 @@ private:
       if (semantic.buffer.resource_object_id == 0) {
         return fail(error, "CBV source GPUVA cannot be relocated");
       }
-      const auto native_it = resources_.find(semantic.buffer.resource_object_id);
-      if (native_it == resources_.end()) {
-        return fail(error, "CBV source resource is missing");
+      ID3D12Resource *buffer = resource_for(semantic.buffer.resource_object_id, error);
+      if (!buffer) {
+        if (error.empty()) {
+          error = "CBV source resource is missing";
+        }
+        return false;
       }
       D3D12_CONSTANT_BUFFER_VIEW_DESC desc{};
-      desc.BufferLocation = native_it->second.resource->GetGPUVirtualAddress() + semantic.buffer.offset;
+      desc.BufferLocation = buffer->GetGPUVirtualAddress() + semantic.buffer.offset;
       desc.SizeInBytes = semantic.size_in_bytes;
       device_->CreateConstantBufferView(&desc, dst);
     } else if (semantic.kind == "ShaderResourceView") {
@@ -1238,9 +2059,62 @@ private:
       }
       device_->CreateUnorderedAccessView(resource, counter_resource, &desc, dst);
     } else {
+      current_replay_sequence_ = saved_sequence;
       return fail(error, "descriptor kind is not covered: " + semantic.kind);
     }
+    current_replay_sequence_ = saved_sequence;
     return true;
+  }
+
+  const D3D12ReplayBackend::DescriptorSemanticState *descriptor_semantic_at(
+      std::uint64_t descriptor,
+      std::uint64_t sequence) const
+  {
+    const auto history_it = descriptor_slot_history_.find(descriptor);
+    if (history_it == descriptor_slot_history_.end() || history_it->second.empty()) {
+      return nullptr;
+    }
+    const auto &history = history_it->second;
+    const auto upper = std::upper_bound(
+        history.begin(),
+        history.end(),
+        sequence,
+        [](std::uint64_t value, const DescriptorSlotHistoryEntry &entry) {
+          return value < entry.sequence;
+        });
+    if (upper == history.begin()) {
+      return nullptr;
+    }
+    return (upper - 1)->descriptor;
+  }
+
+  bool materialize_cpu_descriptor_at(
+      std::uint64_t descriptor,
+      std::uint64_t sequence,
+      D3D12_CPU_DESCRIPTOR_HANDLE &handle,
+      D3D12ReplayBackend::DescriptorBinding *binding_out,
+      std::string &error)
+  {
+    handle = {};
+    D3D12ReplayBackend::DescriptorBinding binding;
+    if (!backend_.resolve_descriptor_binding_at(descriptor, false, sequence, binding, error)) {
+      return false;
+    }
+    if (binding_out) {
+      *binding_out = binding;
+    }
+    if (binding.heap_object_id == 0) {
+      return true;
+    }
+    const auto *semantic = descriptor_semantic_at(descriptor, sequence);
+    if (semantic == nullptr) {
+      return fail(error, "CPU descriptor has no recorded contents at command sequence");
+    }
+    const auto heap_type = static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(binding.heap_type);
+    if (!allocate_cpu_descriptor_scratch(heap_type, handle, error)) {
+      return false;
+    }
+    return create_descriptor_view(*semantic, handle, false, error);
   }
 
   bool apply_sampler(
@@ -1348,6 +2222,7 @@ private:
 
   bool sync_resource_data_until(std::uint64_t sequence, std::string &error)
   {
+    const ReplaySequenceScope sync_scope(this, sequence);
     while (next_resource_update_index_ < resource_update_timeline_.size() &&
            resource_update_timeline_[next_resource_update_index_].sequence <= sequence) {
       const auto &entry = resource_update_timeline_[next_resource_update_index_];
@@ -1356,7 +2231,7 @@ private:
       // ring/pool upload buffer, e.g. one seen reused 192x), the flat map points at the final native
       // while reads resolve the sequence-correct native -> the read version never gets the data ->
       // textures/constants read empty -> draws render black (BUG-007 layer 2).
-      current_replay_sequence_ = entry.sequence;
+      const ReplaySequenceScope update_scope(this, entry.sequence);
       ID3D12Resource *target = resource_for(entry.resource_object_id, error);
       if (!target) {
         return false;
@@ -1408,6 +2283,7 @@ private:
         });
 
     resource_update_timeline_.clear();
+    descriptor_slot_history_.clear();
     struct ResourceUpdateKey {
       trace::ObjectId resource_object_id = 0;
       std::uint64_t sequence = 0;
@@ -1441,9 +2317,10 @@ private:
     std::unordered_set<ResourceUpdateKey, ResourceUpdateKeyHash> resource_update_keys;
     const auto add_resource_update = [&](trace::ObjectId resource_object_id,
                                          const D3D12ReplayBackend::ResourceDataUpdate &update) {
+      const auto effective_sequence = update.apply_sequence != 0 ? update.apply_sequence : update.sequence;
       ResourceUpdateKey key;
       key.resource_object_id = resource_object_id;
-      key.sequence = update.sequence;
+      key.sequence = effective_sequence;
       key.subresource = update.subresource;
       key.written_begin = update.written_begin;
       key.written_end = update.written_end;
@@ -1451,7 +2328,7 @@ private:
       if (!resource_update_keys.insert(std::move(key)).second) {
         return;
       }
-      resource_update_timeline_.push_back(ResourceDataUpdateRef{update.sequence, resource_object_id, &update});
+      resource_update_timeline_.push_back(ResourceDataUpdateRef{effective_sequence, resource_object_id, &update});
     };
     for (const auto &resource : backend_.resource_versions_) {
       for (const auto &update : resource.data_updates) {
@@ -1469,6 +2346,40 @@ private:
         [](const auto &lhs, const auto &rhs) {
           return lhs.sequence < rhs.sequence;
         });
+
+    struct DescriptorHistoryEvent {
+      std::uint64_t sequence = 0;
+      const D3D12ReplayBackend::DescriptorSemanticState *descriptor = nullptr;
+      const D3D12ReplayBackend::CopyDescriptorSemanticState *copy = nullptr;
+    };
+    std::vector<DescriptorHistoryEvent> descriptor_history_events;
+    descriptor_history_events.reserve(descriptor_timeline_.size() + descriptor_copy_timeline_.size());
+    for (const auto *descriptor : descriptor_timeline_) {
+      descriptor_history_events.push_back(DescriptorHistoryEvent{descriptor->create_sequence, descriptor, nullptr});
+    }
+    for (const auto *copy : descriptor_copy_timeline_) {
+      descriptor_history_events.push_back(DescriptorHistoryEvent{copy->create_sequence, nullptr, copy});
+    }
+    std::stable_sort(
+        descriptor_history_events.begin(),
+        descriptor_history_events.end(),
+        [](const auto &lhs, const auto &rhs) {
+          return lhs.sequence < rhs.sequence;
+        });
+    for (const auto &event : descriptor_history_events) {
+      if (event.descriptor != nullptr) {
+        descriptor_slot_history_[event.descriptor->descriptor].push_back(
+            DescriptorSlotHistoryEntry{event.sequence, event.descriptor});
+        continue;
+      }
+      for (const auto &pair : event.copy->descriptors) {
+        const auto *source = descriptor_semantic_at(pair.src_descriptor, event.sequence);
+        if (source != nullptr) {
+          descriptor_slot_history_[pair.dst_descriptor].push_back(
+              DescriptorSlotHistoryEntry{event.sequence, source});
+        }
+      }
+    }
 
     next_descriptor_index_ = 0;
     next_sampler_index_ = 0;
@@ -1634,13 +2545,13 @@ private:
       return nullptr;
     }
     const auto &intervals = it->second;  // ascending by end_sequence
-    auto upper = std::upper_bound(
+    auto lower = std::lower_bound(
         intervals.begin(), intervals.end(), limit_sequence,
-        [](std::uint64_t seq, const CommandListInterval &iv) { return seq <= iv.end_sequence; });
-    if (upper == intervals.begin()) {
+        [](const CommandListInterval &iv, std::uint64_t seq) { return iv.end_sequence < seq; });
+    if (lower == intervals.begin()) {
       return nullptr;
     }
-    return &*(upper - 1);
+    return &*(lower - 1);
   }
 
   bool find_submitted_interval(
@@ -1688,7 +2599,24 @@ private:
       const auto batch_begin = std::chrono::steady_clock::now();
       std::size_t batch_command_count = 0;
       std::vector<ID3D12CommandList *> native_lists;
+      std::vector<NativeCommandList *> recorded_native_lists;
       native_lists.reserve(batch.command_list_ids.size());
+      recorded_native_lists.reserve(batch.command_list_ids.size());
+      // D3D12 command lists capture GPU virtual addresses, GPU descriptor handles, and commands;
+      // upload buffer and shader-visible descriptor heap contents are still read by the GPU when
+      // ExecuteCommandLists runs. Translation layers such as DXMT may encode backend commands while
+      // the command list is being replay-recorded, so preload execution-time resource data and
+      // shader-visible descriptors before recording the lists. CPU descriptors used by commands
+      // such as OMSetRenderTargets are still materialized at their command sequence below.
+      if (!sync_resource_data_until(batch.execute_sequence, error) ||
+          !sync_descriptors_until(batch.execute_sequence, error)) {
+        if (error.empty()) {
+          error = "batch pre-record sync failed (batch=" +
+                  std::to_string(replay_batch_index_) +
+                  " seq=" + std::to_string(batch.execute_sequence) + ")";
+        }
+        return false;
+      }
       for (const auto command_list_id : batch.command_list_ids) {
         auto native_it = command_lists_.find(command_list_id);
         if (native_it == command_lists_.end()) {
@@ -1712,6 +2640,7 @@ private:
           return false;
         }
         native_lists.push_back(native_it->second.list.get());
+        recorded_native_lists.push_back(&native_it->second);
       }
       if (!sync_resource_data_until(batch.execute_sequence, error) ||
           !sync_descriptors_until(batch.execute_sequence, error) ||
@@ -1752,6 +2681,14 @@ private:
           replay_milestone((std::string("submit:waited batch=") +
                             std::to_string(replay_batch_index_)).c_str());
         }
+        if (!flush_target_texture_watch(recorded_native_lists, error)) {
+          if (error.empty()) {
+            error = "target texture watch failed (batch=" +
+                    std::to_string(replay_batch_index_) +
+                    " seq=" + std::to_string(batch.execute_sequence) + ")";
+          }
+          return false;
+        }
         // Detect an asynchronous GPU fault from this batch's submission. wait_for_gpu() cannot tell
         // a completed fence from a removed device, so check explicitly and stop at the offending
         // batch with the actual reason instead of failing opaquely much later.
@@ -1777,7 +2714,16 @@ private:
         }
       }
       ++replay_batch_index_;
-      if (replay_stop_after_sequence_ != 0 && batch.execute_sequence >= replay_stop_after_sequence_) {
+      const bool stop_targets_recorded_list = replay_stop_command_list_id() != 0;
+      if (replay_stop_after_sequence_ != 0 &&
+          (replay_stop_sequence_reached_ ||
+           (!stop_targets_recorded_list && batch.execute_sequence >= replay_stop_after_sequence_))) {
+        if (std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG")) {
+          replay_milestone((std::string("probe:context label=stop-sequence index=") +
+                            std::to_string(replay_stop_after_sequence_) +
+                            " batch_seq=" + std::to_string(batch.execute_sequence)).c_str());
+          probe_configured_resources(replay_stop_after_sequence_);
+        }
         break;
       }
       if (batch.presented) {
@@ -2107,22 +3053,209 @@ private:
     const UINT w = static_cast<UINT>(desc.Width), h = static_cast<UINT>(desc.Height);
     const auto *base = static_cast<const std::uint8_t *>(mapped) + static_cast<std::size_t>(fp.Offset);
     std::uint64_t nz = 0, cnt = 0;
+    std::uint64_t sum[4] = {};
+    std::uint32_t minv[4] = {255u, 255u, 255u, 255u};
+    std::uint32_t maxv[4] = {};
+    bool rgba_stats_supported = true;
     for (UINT y = 0; y < h; y += 8) {
       const auto *row = base + static_cast<std::size_t>(y) * fp.Footprint.RowPitch;
       for (UINT x = 0; x < w; x += 8) {
-        const auto *p = row + static_cast<std::size_t>(x) * 4u;
-        if (p[0] || p[1] || p[2] || p[3]) ++nz;
+        const auto fmt = static_cast<DXGI_FORMAT>(desc.Format);
+        const UINT bytes_per_pixel = fmt == DXGI_FORMAT_R8_UNORM ? 1u : 4u;
+        const auto *p = row + static_cast<std::size_t>(x) * bytes_per_pixel;
+        std::uint32_t rgba[4] = {};
+        switch (fmt) {
+        case DXGI_FORMAT_R10G10B10A2_UNORM: {
+          const std::uint32_t px =
+              static_cast<std::uint32_t>(p[0]) |
+              (static_cast<std::uint32_t>(p[1]) << 8) |
+              (static_cast<std::uint32_t>(p[2]) << 16) |
+              (static_cast<std::uint32_t>(p[3]) << 24);
+          rgba[0] = ((px & 0x3FFu) * 255u + 511u) / 1023u;
+          rgba[1] = (((px >> 10) & 0x3FFu) * 255u + 511u) / 1023u;
+          rgba[2] = (((px >> 20) & 0x3FFu) * 255u + 511u) / 1023u;
+          rgba[3] = (((px >> 30) & 0x3u) * 255u + 1u) / 3u;
+          break;
+        }
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+          rgba[0] = p[0];
+          rgba[1] = p[1];
+          rgba[2] = p[2];
+          rgba[3] = p[3];
+          break;
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8X8_UNORM:
+          rgba[0] = p[2];
+          rgba[1] = p[1];
+          rgba[2] = p[0];
+          rgba[3] = fmt == DXGI_FORMAT_B8G8R8X8_UNORM ? 255u : p[3];
+          break;
+        case DXGI_FORMAT_R8_UNORM:
+          rgba[0] = rgba[1] = rgba[2] = p[0];
+          rgba[3] = 255u;
+          break;
+        default:
+          rgba_stats_supported = false;
+          break;
+        }
+        if (rgba[0] || rgba[1] || rgba[2] || rgba[3]) ++nz;
+        if (rgba_stats_supported) {
+          for (UINT c = 0; c < 4; ++c) {
+            sum[c] += rgba[c];
+            minv[c] = std::min(minv[c], rgba[c]);
+            maxv[c] = std::max(maxv[c], rgba[c]);
+          }
+        }
         ++cnt;
       }
     }
+    write_probe_texture_ppm(object_id, frame_index, desc, fp, base);
     D3D12_RANGE none{0, 0};
     rb->Unmap(0, &none);
-    replay_milestone((std::string("probe-tex object=") + std::to_string(object_id) +
-                      " frame=" + std::to_string(frame_index) + " fmt=" +
-                      std::to_string(static_cast<int>(desc.Format)) + " " +
-                      std::to_string(w) + "x" + std::to_string(h) +
-                      " nonzero_permille=" + std::to_string(cnt ? nz * 1000 / cnt : 0)).c_str());
+    std::string message = std::string("probe-tex object=") + std::to_string(object_id) +
+                          " frame=" + std::to_string(frame_index) + " fmt=" +
+                          std::to_string(static_cast<int>(desc.Format)) + " " +
+                          std::to_string(w) + "x" + std::to_string(h) +
+                          " nonzero_permille=" + std::to_string(cnt ? nz * 1000 / cnt : 0);
+    if (rgba_stats_supported && cnt) {
+      auto append_channel = [&](const char *name, UINT c) {
+        char stats[128];
+        std::snprintf(stats, sizeof(stats), " %s[min=%u max=%u mean=%.2f]",
+                      name, minv[c], maxv[c], static_cast<double>(sum[c]) / static_cast<double>(cnt));
+        message += stats;
+      };
+      append_channel("r", 0);
+      append_channel("g", 1);
+      append_channel("b", 2);
+      append_channel("a", 3);
+    }
+    replay_milestone(message.c_str());
     return true;
+  }
+
+  void write_probe_texture_ppm(
+      trace::ObjectId object_id,
+      std::uint64_t frame_index,
+      const D3D12_RESOURCE_DESC &desc,
+      const D3D12_PLACED_SUBRESOURCE_FOOTPRINT &fp,
+      const std::uint8_t *base)
+  {
+#ifdef _WIN32
+    const char *sink_dir = std::getenv("APITRACE_D3D12_RETRACE_PRESENT_FRAME_DIR");
+    if (sink_dir == nullptr || *sink_dir == '\0') {
+      return;
+    }
+    const UINT w = static_cast<UINT>(desc.Width);
+    const UINT h = static_cast<UINT>(desc.Height);
+    if (w == 0 || h == 0) {
+      return;
+    }
+    const auto fmt = static_cast<DXGI_FORMAT>(desc.Format);
+    switch (fmt) {
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_R8_UNORM:
+      break;
+    default:
+      replay_milestone((std::string("probe-tex-dump object=") + std::to_string(object_id) +
+                        " frame=" + std::to_string(frame_index) +
+                        " skipped fmt=" + std::to_string(static_cast<int>(desc.Format))).c_str());
+      return;
+    }
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(fs::path(sink_dir), ec);
+    if (ec) {
+      replay_milestone((std::string("probe-tex-dump object=") + std::to_string(object_id) +
+                        " frame=" + std::to_string(frame_index) +
+                        " mkdir-failed " + ec.message()).c_str());
+      return;
+    }
+
+    char stem[128];
+    std::snprintf(stem, sizeof(stem), "probe-texture-object-%llu-frame-%llu",
+                  static_cast<unsigned long long>(object_id),
+                  static_cast<unsigned long long>(frame_index));
+    const fs::path ppm_path = fs::path(sink_dir) / (std::string(stem) + ".ppm");
+    std::ofstream ppm(ppm_path, std::ios::binary | std::ios::trunc);
+    if (!ppm) {
+      replay_milestone((std::string("probe-tex-dump object=") + std::to_string(object_id) +
+                        " frame=" + std::to_string(frame_index) +
+                        " open-failed " + ppm_path.string()).c_str());
+      return;
+    }
+
+    ppm << "P6\n" << w << ' ' << h << "\n255\n";
+    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(w) * 3u);
+    for (UINT y = 0; y < h; ++y) {
+      const auto *src_row = base + static_cast<std::size_t>(y) * fp.Footprint.RowPitch;
+      for (UINT x = 0; x < w; ++x) {
+        auto *dst = rgb.data() + static_cast<std::size_t>(x) * 3u;
+        switch (fmt) {
+        case DXGI_FORMAT_R10G10B10A2_UNORM: {
+          const auto *src = src_row + static_cast<std::size_t>(x) * 4u;
+          const std::uint32_t px =
+              static_cast<std::uint32_t>(src[0]) |
+              (static_cast<std::uint32_t>(src[1]) << 8) |
+              (static_cast<std::uint32_t>(src[2]) << 16) |
+              (static_cast<std::uint32_t>(src[3]) << 24);
+          const std::uint32_t r10 = px & 0x3FFu;
+          const std::uint32_t g10 = (px >> 10) & 0x3FFu;
+          const std::uint32_t b10 = (px >> 20) & 0x3FFu;
+          dst[0] = static_cast<std::uint8_t>((r10 * 255u + 511u) / 1023u);
+          dst[1] = static_cast<std::uint8_t>((g10 * 255u + 511u) / 1023u);
+          dst[2] = static_cast<std::uint8_t>((b10 * 255u + 511u) / 1023u);
+          break;
+        }
+        case DXGI_FORMAT_R8G8B8A8_UNORM: {
+          const auto *src = src_row + static_cast<std::size_t>(x) * 4u;
+          dst[0] = src[0];
+          dst[1] = src[1];
+          dst[2] = src[2];
+          break;
+        }
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8X8_UNORM: {
+          const auto *src = src_row + static_cast<std::size_t>(x) * 4u;
+          dst[0] = src[2];
+          dst[1] = src[1];
+          dst[2] = src[0];
+          break;
+        }
+        case DXGI_FORMAT_R8_UNORM: {
+          const std::uint8_t v = src_row[x];
+          dst[0] = v;
+          dst[1] = v;
+          dst[2] = v;
+          break;
+        }
+        default:
+          dst[0] = dst[1] = dst[2] = 0;
+          break;
+        }
+      }
+      ppm.write(reinterpret_cast<const char *>(rgb.data()),
+                static_cast<std::streamsize>(rgb.size()));
+    }
+    if (!ppm) {
+      replay_milestone((std::string("probe-tex-dump object=") + std::to_string(object_id) +
+                        " frame=" + std::to_string(frame_index) +
+                        " write-failed " + ppm_path.string()).c_str());
+      return;
+    }
+    replay_milestone((std::string("probe-tex-dump object=") + std::to_string(object_id) +
+                      " frame=" + std::to_string(frame_index) +
+                      " path=" + ppm_path.string()).c_str());
+#else
+    (void)object_id;
+    (void)frame_index;
+    (void)desc;
+    (void)fp;
+    (void)base;
+#endif
   }
 
   // Decode a half-precision (IEEE 754 binary16) bit pattern to float. Diagnostic helper for
@@ -2146,13 +3279,9 @@ private:
            std::pow(2.0f, static_cast<float>(static_cast<int>(exp) - bias));
   }
 
-  // Probe an arbitrary small TEXTURE2D (by object_id) and log the ACTUAL decoded float texel
-  // values (not just a nonzero ratio). Diagnostic only: built to read the FH4 auto-exposure
-  // txWorldLum (4x1 R32_FLOAT) average-luminance value L at retrace time, so the H1 "L too low ->
-  // exposure blow-up -> white screen" hypothesis can be settled with a measured number. Supports
+  // Probe an arbitrary small TEXTURE2D (by object_id) and log decoded float texel values. Supports
   // R32_FLOAT / R16_FLOAT / R11G11B10_FLOAT / R16G16B16A16_FLOAT / R32G32B32A32_FLOAT. Logs the
-  // first up-to-16 texels (channel floats) plus min/max/mean of channel 0. Offline replay only, so
-  // it is not subject to the in-process per-draw readback crash FH4 hits live.
+  // first up-to-16 texels plus min/max/mean of channel 0.
   bool probe_texture_values(trace::ObjectId object_id, std::uint64_t frame_index)
   {
     std::string ignore;
@@ -2243,6 +3372,36 @@ private:
                       " " + std::to_string(w) + "x" + std::to_string(h) +
                       " ch0=[" + head + "]" + stat).c_str());
     return true;
+  }
+
+  void probe_configured_resources(std::uint64_t frame_index)
+  {
+    // Reuse the existing retrace probe controls for both present-time and stop-sequence diagnostics.
+    if (const std::uint64_t probe_obj = env_u64("APITRACE_D3D12_RETRACE_PROBE_RESOURCE")) {
+      std::string probe_err;
+      if (!probe_resource_head(static_cast<trace::ObjectId>(probe_obj), 64, probe_err)) {
+        replay_milestone((std::string("probe-res frame=") + std::to_string(frame_index) +
+                          " FAILED: " + probe_err).c_str());
+      }
+    }
+    if (const std::uint64_t probe_tex = env_u64("APITRACE_D3D12_RETRACE_PROBE_TEXTURE")) {
+      probe_texture_nonzero(static_cast<trace::ObjectId>(probe_tex), frame_index);
+    }
+    if (const char *tv = std::getenv("APITRACE_D3D12_RETRACE_PROBE_TEXTURE_VALUES")) {
+      std::string_view sv(tv);
+      std::size_t pos = 0;
+      while (pos < sv.size()) {
+        std::size_t comma = sv.find(',', pos);
+        const std::size_t end = (comma == std::string_view::npos) ? sv.size() : comma;
+        const std::string tok(sv.substr(pos, end - pos));
+        const std::uint64_t id = tok.empty() ? 0 : std::strtoull(tok.c_str(), nullptr, 10);
+        if (id != 0) {
+          probe_texture_values(static_cast<trace::ObjectId>(id), frame_index);
+        }
+        if (comma == std::string_view::npos) break;
+        pos = comma + 1;
+      }
+    }
   }
 
   // Read the first `count` bytes of a DEFAULT/any-heap resource by GPU-copying into a readback
@@ -2366,44 +3525,10 @@ private:
       }
       // Optional: probe a specific resource's head bytes (APITRACE_D3D12_RETRACE_PROBE_RESOURCE) to
       // see whether a vertex/index/texture buffer a draw reads is actually populated.
-      if (const std::uint64_t probe_obj = env_u64("APITRACE_D3D12_RETRACE_PROBE_RESOURCE")) {
-        std::string probe_err;
-        if (!probe_resource_head(static_cast<trace::ObjectId>(probe_obj), 64, probe_err)) {
-          replay_milestone((std::string("probe-res frame=") + std::to_string(frame_index) +
-                            " FAILED: " + probe_err).c_str());
-        }
-      }
-      // Optional: probe an offscreen TEXTURE2D (APITRACE_D3D12_RETRACE_PROBE_TEXTURE) for non-zero
-      // content -> distinguishes "scene render empty" from "back-buffer composite issue".
-      if (const std::uint64_t probe_tex = env_u64("APITRACE_D3D12_RETRACE_PROBE_TEXTURE")) {
-        probe_texture_nonzero(static_cast<trace::ObjectId>(probe_tex), frame_index);
-      }
-      // Optional: decode ACTUAL float texel values of one or more small textures (comma-separated
-      // object_ids in APITRACE_D3D12_RETRACE_PROBE_TEXTURE_VALUES). Built to read txWorldLum's L and
-      // sample scene-color luminance to settle the auto-exposure white-screen hypothesis.
-      if (const char *tv = std::getenv("APITRACE_D3D12_RETRACE_PROBE_TEXTURE_VALUES")) {
-        std::string_view sv(tv);
-        std::size_t pos = 0;
-        while (pos < sv.size()) {
-          std::size_t comma = sv.find(',', pos);
-          const std::size_t end = (comma == std::string_view::npos) ? sv.size() : comma;
-          const std::string tok(sv.substr(pos, end - pos));
-          const std::uint64_t id = tok.empty() ? 0 : std::strtoull(tok.c_str(), nullptr, 10);
-          if (id != 0) {
-            probe_texture_values(static_cast<trace::ObjectId>(id), frame_index);
-          }
-          if (comma == std::string_view::npos) break;
-          pos = comma + 1;
-        }
-      }
+      probe_configured_resources(frame_index);
     }
     ID3D12Resource *back_buffer = back_buffers_[back_buffer_index].get();
     const D3D12_RESOURCE_DESC desc = back_buffer->GetDesc();
-    // Present-frame capture always emits RGBA8 bytes downstream (the recorder
-    // tags the asset "format":"rgba8" and the readback copy assumes 4 bytes
-    // per pixel). Accept only source formats we can correctly decode into
-    // RGBA8; anything else would be byte-copied and misinterpreted, producing
-    // wrong colors rather than an error.
     switch (desc.Format) {
     case DXGI_FORMAT_R8G8B8A8_UNORM:
     case DXGI_FORMAT_R10G10B10A2_UNORM:
@@ -2422,6 +3547,14 @@ private:
     UINT64 row_size = 0;
     UINT64 readback_size = 0;
     device_->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &num_rows, &row_size, &readback_size);
+    DXGI_FORMAT readback_decode_format = footprint.Footprint.Format;
+    switch (readback_decode_format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+      break;
+    default:
+      return fail(error, "present-frame capture produced an unsupported readback format");
+    }
     if (num_rows == 0 || readback_size == 0 || footprint.Footprint.RowPitch < desc.Width * 4u) {
       return fail(error, "present-frame capture produced an invalid readback layout");
     }
@@ -2513,36 +3646,36 @@ private:
         return false;
       }
 
-      for (UINT row = 0; row < height; ++row) {
-        const auto *src_row = static_cast<const std::uint8_t *>(mapped) +
-                              static_cast<std::size_t>(footprint.Offset) +
-                              static_cast<std::size_t>(row) * footprint.Footprint.RowPitch;
-        auto *dst_row = rgba.data() + static_cast<std::size_t>(row) * row_pitch;
-        if (desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) {
-          // Source is 32-bit little-endian packed: R[0:10] G[10:20] B[20:30]
-          // A[30:32]. Unpack each channel to 8-bit UNORM (rounded) so the
-          // downstream RGBA8 assumption holds and colors stay correct.
-          for (UINT col = 0; col < width; ++col) {
-            const auto *src_px = src_row + static_cast<std::size_t>(col) * 4u;
-            const std::uint32_t px =
-                static_cast<std::uint32_t>(src_px[0]) |
-                (static_cast<std::uint32_t>(src_px[1]) << 8) |
-                (static_cast<std::uint32_t>(src_px[2]) << 16) |
-                (static_cast<std::uint32_t>(src_px[3]) << 24);
-            const std::uint32_t r10 = px & 0x3FFu;
-            const std::uint32_t g10 = (px >> 10) & 0x3FFu;
-            const std::uint32_t b10 = (px >> 20) & 0x3FFu;
-            const std::uint32_t a2 = (px >> 30) & 0x3u;
-            auto *dst_px = dst_row + static_cast<std::size_t>(col) * 4u;
-            dst_px[0] = static_cast<std::uint8_t>((r10 * 255u + 511u) / 1023u);
-            dst_px[1] = static_cast<std::uint8_t>((g10 * 255u + 511u) / 1023u);
-            dst_px[2] = static_cast<std::uint8_t>((b10 * 255u + 511u) / 1023u);
-            dst_px[3] = static_cast<std::uint8_t>(a2 * 85u);
+      auto decode_rows = [&](DXGI_FORMAT decode_format) {
+        for (UINT row = 0; row < height; ++row) {
+          const auto *src_row = static_cast<const std::uint8_t *>(mapped) +
+                                static_cast<std::size_t>(footprint.Offset) +
+                                static_cast<std::size_t>(row) * footprint.Footprint.RowPitch;
+          auto *dst_row = rgba.data() + static_cast<std::size_t>(row) * row_pitch;
+          if (decode_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+            for (UINT col = 0; col < width; ++col) {
+              const auto *src_px = src_row + static_cast<std::size_t>(col) * 4u;
+              const std::uint32_t px =
+                  static_cast<std::uint32_t>(src_px[0]) |
+                  (static_cast<std::uint32_t>(src_px[1]) << 8) |
+                  (static_cast<std::uint32_t>(src_px[2]) << 16) |
+                  (static_cast<std::uint32_t>(src_px[3]) << 24);
+              const std::uint32_t r10 = px & 0x3FFu;
+              const std::uint32_t g10 = (px >> 10) & 0x3FFu;
+              const std::uint32_t b10 = (px >> 20) & 0x3FFu;
+              const std::uint32_t a2 = (px >> 30) & 0x3u;
+              auto *dst_px = dst_row + static_cast<std::size_t>(col) * 4u;
+              dst_px[0] = static_cast<std::uint8_t>((r10 * 255u + 511u) / 1023u);
+              dst_px[1] = static_cast<std::uint8_t>((g10 * 255u + 511u) / 1023u);
+              dst_px[2] = static_cast<std::uint8_t>((b10 * 255u + 511u) / 1023u);
+              dst_px[3] = static_cast<std::uint8_t>(a2 * 85u);
+            }
+          } else {
+            std::memcpy(dst_row, src_row, row_pitch);
           }
-        } else {
-          std::memcpy(dst_row, src_row, row_pitch);
         }
-      }
+      };
+      decode_rows(readback_decode_format);
       D3D12_RANGE written_range{0, 0};
       readback->Unmap(0, &written_range);
     }
@@ -2601,27 +3734,38 @@ private:
     }
     raw.close();
 
-    // Viewable PPM (P6 = binary RGB); drop the alpha channel.
-    const fs::path ppm_path = fs::path(dir) / (std::string(stem) + ".ppm");
-    std::ofstream ppm(ppm_path, std::ios::binary | std::ios::trunc);
-    if (!ppm) {
-      return fail(error, "failed to open present-frame ppm file: " + ppm_path.string());
-    }
-    ppm << "P6\n" << width << ' ' << height << "\n255\n";
-    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(width) * 3u);
-    for (UINT row = 0; row < height; ++row) {
-      const auto *src_row = bytes + static_cast<std::size_t>(row) * row_pitch;
-      for (UINT col = 0; col < width; ++col) {
-        const auto *px = src_row + static_cast<std::size_t>(col) * 4u;
-        rgb[col * 3u + 0] = px[0];
-        rgb[col * 3u + 1] = px[1];
-        rgb[col * 3u + 2] = px[2];
+    auto write_ppm = [&](const fs::path &ppm_path,
+                         const std::uint8_t *ppm_bytes,
+                         SIZE_T ppm_size) -> bool {
+      if (!ppm_bytes || ppm_size == 0) {
+        return true;
       }
-      ppm.write(reinterpret_cast<const char *>(rgb.data()),
-                static_cast<std::streamsize>(rgb.size()));
-    }
-    if (!ppm) {
-      return fail(error, "failed to write present-frame ppm file: " + ppm_path.string());
+      std::ofstream ppm(ppm_path, std::ios::binary | std::ios::trunc);
+      if (!ppm) {
+        return fail(error, "failed to open present-frame ppm file: " + ppm_path.string());
+      }
+      ppm << "P6\n" << width << ' ' << height << "\n255\n";
+      std::vector<std::uint8_t> rgb(static_cast<std::size_t>(width) * 3u);
+      for (UINT row = 0; row < height; ++row) {
+        const auto *src_row = ppm_bytes + static_cast<std::size_t>(row) * row_pitch;
+        for (UINT col = 0; col < width; ++col) {
+          const auto *px = src_row + static_cast<std::size_t>(col) * 4u;
+          rgb[col * 3u + 0] = px[0];
+          rgb[col * 3u + 1] = px[1];
+          rgb[col * 3u + 2] = px[2];
+        }
+        ppm.write(reinterpret_cast<const char *>(rgb.data()),
+                  static_cast<std::streamsize>(rgb.size()));
+      }
+      if (!ppm) {
+        return fail(error, "failed to write present-frame ppm file: " + ppm_path.string());
+      }
+      return true;
+    };
+
+    const fs::path ppm_path = fs::path(dir) / (std::string(stem) + ".ppm");
+    if (!write_ppm(ppm_path, bytes, rgba_size)) {
+      return false;
     }
     return true;
   }
@@ -2726,6 +3870,1042 @@ private:
   }
 #endif
 
+  trace::ObjectId resource_object_id_for_cpu_descriptor(
+      std::uint64_t descriptor,
+      std::uint64_t sequence,
+      std::string &error) const
+  {
+    D3D12ReplayBackend::DescriptorBinding binding;
+    if (!backend_.resolve_descriptor_binding_at(descriptor, false, sequence, binding, error)) {
+      return 0;
+    }
+    if (binding.heap_object_id == 0) {
+      return 0;
+    }
+    const auto *semantic = descriptor_semantic_at(descriptor, sequence);
+    if (!semantic || semantic->kind != "RenderTargetView") {
+      return 0;
+    }
+    return semantic->resource_object_id;
+  }
+
+  trace::ObjectId target_texture_watch_object_id() const
+  {
+    return static_cast<trace::ObjectId>(env_u64("APITRACE_D3D12_RETRACE_PROBE_TEXTURE"));
+  }
+
+  bool target_texture_watch_enabled() const
+  {
+    return target_texture_watch_object_id() != 0;
+  }
+
+  bool target_texture_watch_near_stop_sequence(std::uint64_t sequence) const
+  {
+    return replay_stop_after_sequence_ != 0 &&
+           sequence + 4096 >= replay_stop_after_sequence_ &&
+           sequence <= replay_stop_after_sequence_;
+  }
+
+  bool target_texture_watch_focused_stop_sequence(std::uint64_t sequence) const
+  {
+    return replay_stop_after_sequence_ != 0 &&
+           sequence + 160 >= replay_stop_after_sequence_ &&
+           sequence <= replay_stop_after_sequence_;
+  }
+
+  static bool target_texture_watch_is_draw_command(
+      const D3D12ReplayBackend::ReplayCommandRecord &command)
+  {
+    return command.kind == D3D12ReplayBackend::ReplayCommandKind::Draw;
+  }
+
+  std::string target_texture_watch_descriptor_summary(
+      std::uint64_t descriptor,
+      std::uint64_t sequence) const
+  {
+    if (descriptor == 0) {
+      return "0";
+    }
+    std::ostringstream out;
+    out << descriptor;
+    const auto *semantic = descriptor_semantic_at(descriptor, sequence);
+    if (!semantic) {
+      out << ":none";
+      return out.str();
+    }
+    out << ":" << semantic->kind
+        << ":res=" << semantic->resource_object_id
+        << ":fmt=" << semantic->format
+        << ":dim=" << semantic->view_dimension;
+    if (semantic->has_view_desc) {
+      out << ":mip=" << semantic->most_detailed_mip
+          << ":plane=" << semantic->plane_slice
+          << ":slice=" << semantic->first_array_slice;
+    }
+    return out.str();
+  }
+
+  static std::string target_texture_watch_root_descriptor_summary(
+      const TargetTextureWatchRootDescriptor &descriptor)
+  {
+    if (descriptor.resource_object_id == 0 && descriptor.kind.empty()) {
+      return "0";
+    }
+    std::ostringstream out;
+    out << (descriptor.kind.empty() ? "RootDescriptor" : descriptor.kind)
+        << ":res=" << descriptor.resource_object_id
+        << ":off=" << descriptor.offset;
+    return out.str();
+  }
+
+  static std::string target_texture_watch_buffer_view_summary(
+      const TargetTextureWatchBufferView &view)
+  {
+    if (!view.valid) {
+      return "none";
+    }
+    std::ostringstream out;
+    out << "res=" << view.resource_object_id
+        << ":off=" << view.offset
+        << ":size=" << view.size_in_bytes;
+    if (view.stride_in_bytes != 0) {
+      out << ":stride=" << view.stride_in_bytes;
+    }
+    if (view.format != 0) {
+      out << ":fmt=" << view.format;
+    }
+    return out.str();
+  }
+
+  static std::string target_texture_watch_hex_bytes(
+      const std::uint8_t *bytes,
+      std::size_t count)
+  {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(count * 2);
+    for (std::size_t i = 0; i < count; ++i) {
+      out.push_back(kHex[(bytes[i] >> 4) & 0xf]);
+      out.push_back(kHex[bytes[i] & 0xf]);
+    }
+    return out;
+  }
+
+  static float target_texture_watch_float32(const std::uint8_t *bytes)
+  {
+    float value = 0.0f;
+    std::memcpy(&value, bytes, sizeof(value));
+    return value;
+  }
+
+  static std::uint16_t target_texture_watch_u16(const std::uint8_t *bytes)
+  {
+    return static_cast<std::uint16_t>(bytes[0]) |
+           static_cast<std::uint16_t>(bytes[1] << 8);
+  }
+
+  void log_target_texture_watch_draw_state(
+      const NativeCommandList &native,
+      const D3D12ReplayBackend::ReplayCommandRecord &command,
+      const json &payload,
+      const std::string &reason) const
+  {
+    if (!std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG")) {
+      return;
+    }
+
+    std::string rtvs;
+    for (UINT i = 0; i < native.current_render_target_count &&
+                     i < native.current_render_targets.size(); ++i) {
+      rtvs += i ? "," : "";
+      rtvs += std::to_string(native.current_render_targets[i]);
+    }
+
+    std::ostringstream out;
+    out << "target-draw-state"
+        << " object=" << target_texture_watch_object_id()
+        << " seq=" << command.sequence
+        << " list=" << command.command_list_object_id
+        << " fn=" << command.function_name
+        << " reason=" << reason
+        << " pso=" << native.current_pipeline_state_object_id
+        << " root_sig=" << native.current_graphics_root_signature_object_id
+        << " topo=" << native.current_primitive_topology
+        << " rtvs=" << rtvs
+        << " vb0=" << target_texture_watch_buffer_view_summary(native.current_vertex_buffer0)
+        << " ib=" << target_texture_watch_buffer_view_summary(native.current_index_buffer)
+        << " draw_index_count=" << payload_u32(payload, "index_count_per_instance")
+        << " draw_instance_count=" << payload_u32(payload, "instance_count")
+        << " draw_start_index=" << payload_u32(payload, "start_index_location")
+        << " draw_base_vertex=" << payload_i32(payload, "base_vertex_location");
+    if (native.has_current_viewport) {
+      out << " vp=" << native.current_viewport.TopLeftX << "," << native.current_viewport.TopLeftY
+          << "," << native.current_viewport.Width << "," << native.current_viewport.Height
+          << "," << native.current_viewport.MinDepth << "," << native.current_viewport.MaxDepth;
+    } else {
+      out << " vp=none";
+    }
+    if (native.has_current_scissor) {
+      out << " sc=" << native.current_scissor.left << "," << native.current_scissor.top
+          << "," << native.current_scissor.right << "," << native.current_scissor.bottom;
+    } else {
+      out << " sc=none";
+    }
+    for (UINT root : {5u, 6u, 7u, 8u, 12u}) {
+      out << " rootTable" << root << "="
+          << target_texture_watch_descriptor_summary(
+                 native.current_graphics_root_tables[root], command.sequence);
+    }
+    for (UINT root : {0u, 1u, 2u, 3u, 4u, 9u, 10u, 11u, 13u, 14u, 15u}) {
+      const auto &descriptor = native.current_graphics_root_descriptors[root];
+      if (descriptor.resource_object_id != 0 || !descriptor.kind.empty()) {
+        out << " rootDesc" << root << "="
+            << target_texture_watch_root_descriptor_summary(descriptor);
+      }
+    }
+    replay_milestone(out.str().c_str());
+  }
+
+  static bool target_texture_watch_is_blue(DXGI_FORMAT format, const std::uint8_t *px,
+                                           UINT &r, UINT &g, UINT &b, UINT &a,
+                                           std::uint32_t &u32)
+  {
+    r = g = b = 0;
+    a = 255;
+    u32 = static_cast<std::uint32_t>(px[0]) |
+          (static_cast<std::uint32_t>(px[1]) << 8) |
+          (static_cast<std::uint32_t>(px[2]) << 16) |
+          (static_cast<std::uint32_t>(px[3]) << 24);
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+      r = px[0];
+      g = px[1];
+      b = px[2];
+      a = px[3];
+      break;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+      r = px[2];
+      g = px[1];
+      b = px[0];
+      a = format == DXGI_FORMAT_B8G8R8X8_UNORM ? 255u : px[3];
+      break;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+      r = ((u32 & 0x3FFu) * 255u + 511u) / 1023u;
+      g = (((u32 >> 10) & 0x3FFu) * 255u + 511u) / 1023u;
+      b = (((u32 >> 20) & 0x3FFu) * 255u + 511u) / 1023u;
+      a = (((u32 >> 30) & 0x3u) * 255u + 1u) / 3u;
+      break;
+    default:
+      return false;
+    }
+    return r <= 4 && g <= 4 && b >= 240;
+  }
+
+  bool append_target_texture_watch_readback(
+      NativeCommandList &native,
+      const D3D12ReplayBackend::ReplayCommandRecord &command,
+      const char *phase,
+      const char *reason,
+      std::string &error)
+  {
+    const trace::ObjectId target_object_id = target_texture_watch_object_id();
+    if (target_object_id == 0) {
+      return true;
+    }
+    ID3D12Resource *res = resource_for(target_object_id, error);
+    if (!res) {
+      return false;
+    }
+    const D3D12_RESOURCE_DESC desc = res->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        desc.Width == 0 || desc.Height == 0 || desc.SampleDesc.Count != 1) {
+      return true;
+    }
+    switch (static_cast<DXGI_FORMAT>(desc.Format)) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+      break;
+    default:
+      return true;
+    }
+    const UINT x = static_cast<UINT>(desc.Width / 2);
+    const UINT y = desc.Height / 2;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    fp.Offset = 0;
+    fp.Footprint.Format = static_cast<DXGI_FORMAT>(desc.Format);
+    fp.Footprint.Width = 1;
+    fp.Footprint.Height = 1;
+    fp.Footprint.Depth = 1;
+    fp.Footprint.RowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    const UINT64 total = fp.Footprint.RowPitch;
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = total;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ScopedD3D12CaptureSuppression suppress;
+    TargetTextureWatchReadback readback{};
+    if (FAILED(device_->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr, IID_PPV_ARGS(readback.readback.put())))) {
+      return fail(error, "target texture watch readback allocation failed");
+    }
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = res;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = readback.readback.get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = fp;
+    D3D12_BOX box{};
+    box.left = x;
+    box.top = y;
+    box.front = 0;
+    box.right = x + 1;
+    box.bottom = y + 1;
+    box.back = 1;
+    native.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    readback.sequence = command.sequence;
+    readback.command_list_object_id = command.command_list_object_id;
+    readback.kind = command.kind;
+    readback.function_name = command.function_name;
+    readback.phase = phase ? phase : "";
+    readback.reason = reason ? reason : "";
+    readback.object_refs = command.object_refs;
+    readback.footprint = fp;
+    readback.x = x;
+    readback.y = y;
+    readback.width = static_cast<UINT>(desc.Width);
+    readback.height = desc.Height;
+    readback.format = static_cast<DXGI_FORMAT>(desc.Format);
+    native.target_watch_readbacks.push_back(std::move(readback));
+    return true;
+  }
+
+  bool begin_target_texture_watch_occlusion(
+      NativeCommandList &native,
+      const D3D12ReplayBackend::ReplayCommandRecord &command,
+      const std::string &reason,
+      std::string &error)
+  {
+    ScopedD3D12CaptureSuppression suppress;
+    TargetTextureWatchOcclusion occlusion{};
+    D3D12_QUERY_HEAP_DESC query_desc{};
+    query_desc.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+    query_desc.Count = 1;
+    HRESULT hr = device_->CreateQueryHeap(
+        &query_desc, IID_PPV_ARGS(occlusion.query_heap.put()));
+    if (FAILED(hr)) {
+      error = hresult_error("CreateQueryHeap(target watch occlusion)", hr);
+      return false;
+    }
+
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = sizeof(std::uint64_t);
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    hr = device_->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr, IID_PPV_ARGS(occlusion.readback.put()));
+    if (FAILED(hr)) {
+      error = hresult_error("CreateCommittedResource(target watch occlusion)", hr);
+      return false;
+    }
+
+    native.list->BeginQuery(
+        occlusion.query_heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+    occlusion.sequence = command.sequence;
+    occlusion.command_list_object_id = command.command_list_object_id;
+    occlusion.function_name = command.function_name;
+    occlusion.reason = reason;
+    occlusion.pipeline_state_object_id = native.current_pipeline_state_object_id;
+    native.target_watch_occlusions.push_back(std::move(occlusion));
+    return true;
+  }
+
+  bool end_target_texture_watch_occlusion(NativeCommandList &native, std::string &error)
+  {
+    if (native.target_watch_occlusions.empty()) {
+      return true;
+    }
+    auto &occlusion = native.target_watch_occlusions.back();
+    native.list->EndQuery(
+        occlusion.query_heap.get(), D3D12_QUERY_TYPE_OCCLUSION, 0);
+    native.list->ResolveQueryData(
+        occlusion.query_heap.get(), D3D12_QUERY_TYPE_OCCLUSION,
+        0, 1, occlusion.readback.get(), 0);
+    (void)error;
+    return true;
+  }
+
+  bool append_target_texture_watch_buffer_readback(
+      NativeCommandList &native,
+      const D3D12ReplayBackend::ReplayCommandRecord &command,
+      std::string_view label,
+      trace::ObjectId resource_object_id,
+      std::uint64_t offset,
+      std::uint64_t requested_size,
+      std::uint32_t stride_in_bytes,
+      std::uint32_t format,
+      std::string &error)
+  {
+    if (resource_object_id == 0 || requested_size == 0) {
+      return true;
+    }
+    ID3D12Resource *res = resource_for(resource_object_id, error);
+    if (!res) {
+      return false;
+    }
+    const D3D12_RESOURCE_DESC desc = res->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || offset >= desc.Width) {
+      return true;
+    }
+    const std::uint64_t size = std::min<std::uint64_t>(
+        requested_size, static_cast<std::uint64_t>(desc.Width) - offset);
+    if (size == 0) {
+      return true;
+    }
+
+    TargetTextureWatchBufferReadback readback{};
+    readback.sequence = command.sequence;
+    readback.command_list_object_id = command.command_list_object_id;
+    readback.label = std::string(label);
+    readback.resource_object_id = resource_object_id;
+    readback.offset = offset;
+    readback.size = size;
+    readback.stride_in_bytes = stride_in_bytes;
+    readback.format = format;
+    native.target_watch_buffer_readbacks.push_back(std::move(readback));
+    return true;
+  }
+
+  bool populate_target_texture_watch_buffer_readback(
+      TargetTextureWatchBufferReadback &readback,
+      std::string &error)
+  {
+    if (readback.readback) {
+      return true;
+    }
+    ID3D12Resource *res = resource_for(readback.resource_object_id, error);
+    if (!res) {
+      return false;
+    }
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = readback.size;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ScopedD3D12CaptureSuppression suppress;
+    HRESULT hr = device_->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr, IID_PPV_ARGS(readback.readback.put()));
+    if (FAILED(hr)) {
+      error = hresult_error("CreateCommittedResource(target watch buffer)", hr);
+      return false;
+    }
+    ReadbackCommandObjects cmds;
+    if (FAILED(device_->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(cmds.allocator.put()))) ||
+        FAILED(device_->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmds.allocator.get(), nullptr,
+            IID_PPV_ARGS(cmds.list.put())))) {
+      return fail(error, "target watch buffer command allocation failed");
+    }
+    cmds.list->CopyBufferRegion(
+        readback.readback.get(), 0, res, readback.offset, readback.size);
+    if (FAILED(cmds.list->Close())) {
+      return fail(error, "target watch buffer command close failed");
+    }
+    ID3D12CommandList *lists[] = {cmds.list.get()};
+    queue_->ExecuteCommandLists(1, lists);
+    wait_for_gpu();
+    return true;
+  }
+
+  bool append_target_texture_watch_draw_buffer_readbacks(
+      NativeCommandList &native,
+      const D3D12ReplayBackend::ReplayCommandRecord &command,
+      std::string &error)
+  {
+    if (native.current_vertex_buffer0.valid) {
+      const std::uint64_t vb_size =
+          std::min<std::uint64_t>(native.current_vertex_buffer0.size_in_bytes, 512);
+      if (!append_target_texture_watch_buffer_readback(
+              native, command, "vb0",
+              native.current_vertex_buffer0.resource_object_id,
+              native.current_vertex_buffer0.offset,
+              vb_size,
+              native.current_vertex_buffer0.stride_in_bytes,
+              0,
+              error)) {
+        return false;
+      }
+    }
+    if (native.current_index_buffer.valid) {
+      const std::uint64_t ib_size =
+          std::min<std::uint64_t>(native.current_index_buffer.size_in_bytes, 256);
+      if (!append_target_texture_watch_buffer_readback(
+              native, command, "ib",
+              native.current_index_buffer.resource_object_id,
+              native.current_index_buffer.offset,
+              ib_size,
+              0,
+              native.current_index_buffer.format,
+              error)) {
+        return false;
+      }
+    }
+    for (UINT root : {0u, 1u, 2u, 3u, 4u}) {
+      const auto &descriptor = native.current_graphics_root_descriptors[root];
+      if (descriptor.resource_object_id == 0 || descriptor.kind != "RootCBV") {
+        continue;
+      }
+      const std::string label = std::string("rootCBV") + std::to_string(root);
+      if (!append_target_texture_watch_buffer_readback(
+              native, command, label,
+              descriptor.resource_object_id,
+              descriptor.offset,
+              256,
+              0,
+              0,
+              error)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool target_command_may_write_watched_texture(
+      const NativeCommandList &native,
+      const D3D12ReplayBackend::ReplayCommandRecord &command,
+      const json &payload,
+      std::string &reason,
+      std::string &error) const
+  {
+    const trace::ObjectId target_object_id = target_texture_watch_object_id();
+    if (target_object_id == 0) {
+      return false;
+    }
+
+    switch (command.kind) {
+    case D3D12ReplayBackend::ReplayCommandKind::SetRenderTargets:
+    case D3D12ReplayBackend::ReplayCommandKind::SetDynamicState:
+    case D3D12ReplayBackend::ReplayCommandKind::SetPipelineState:
+    case D3D12ReplayBackend::ReplayCommandKind::SetRootSignature:
+    case D3D12ReplayBackend::ReplayCommandKind::SetDescriptorHeaps:
+    case D3D12ReplayBackend::ReplayCommandKind::SetRootDescriptorTable:
+    case D3D12ReplayBackend::ReplayCommandKind::SetRootConstants:
+    case D3D12ReplayBackend::ReplayCommandKind::SetRootConstantBufferView:
+    case D3D12ReplayBackend::ReplayCommandKind::SetViewports:
+    case D3D12ReplayBackend::ReplayCommandKind::SetScissorRects:
+    case D3D12ReplayBackend::ReplayCommandKind::SetPrimitiveTopology:
+    case D3D12ReplayBackend::ReplayCommandKind::SetVertexBuffers:
+    case D3D12ReplayBackend::ReplayCommandKind::SetIndexBuffer:
+    case D3D12ReplayBackend::ReplayCommandKind::ResourceBarrier:
+    case D3D12ReplayBackend::ReplayCommandKind::BeginCommandList:
+    case D3D12ReplayBackend::ReplayCommandKind::EndCommandList:
+    case D3D12ReplayBackend::ReplayCommandKind::MapResource:
+    case D3D12ReplayBackend::ReplayCommandKind::UnmapResource:
+      return false;
+    default:
+      break;
+    }
+
+    if (command.kind == D3D12ReplayBackend::ReplayCommandKind::Draw ||
+        command.kind == D3D12ReplayBackend::ReplayCommandKind::ExecuteIndirect ||
+        command.kind == D3D12ReplayBackend::ReplayCommandKind::ExecuteBundle ||
+        command.kind == D3D12ReplayBackend::ReplayCommandKind::RenderPass) {
+      for (UINT i = 0; i < native.current_render_target_count &&
+                       i < native.current_render_targets.size(); ++i) {
+        if (native.current_render_targets[i] == target_object_id) {
+          reason = "bound-rtv";
+          return true;
+        }
+      }
+      return false;
+    }
+
+    if (command.kind == D3D12ReplayBackend::ReplayCommandKind::ClearRenderTarget) {
+      const auto descriptor = payload_u64(payload, "descriptor");
+      if (descriptor != 0 &&
+          resource_object_id_for_cpu_descriptor(descriptor, command.sequence, error) == target_object_id) {
+        reason = "clear-rtv";
+        return true;
+      }
+      return false;
+    }
+
+    if (command.kind == D3D12ReplayBackend::ReplayCommandKind::ClearUnorderedAccess ||
+        command.kind == D3D12ReplayBackend::ReplayCommandKind::DiscardResource) {
+      if (command.object_refs.size() >= 2 && command.object_refs[1] == target_object_id) {
+        reason = command.kind == D3D12ReplayBackend::ReplayCommandKind::ClearUnorderedAccess
+                     ? "clear-uav"
+                     : "discard";
+        return true;
+      }
+      return false;
+    }
+
+    if (command.kind == D3D12ReplayBackend::ReplayCommandKind::Copy) {
+      if (command.function_name == "ID3D12GraphicsCommandList::CopyResource") {
+        if (command.object_refs.size() >= 2 && command.object_refs[1] == target_object_id) {
+          reason = "copy-resource-dst";
+          return true;
+        }
+        return false;
+      }
+      if (command.function_name == "ID3D12GraphicsCommandList::CopyTextureRegion") {
+        const auto dst = payload.find("dst");
+        if (dst != payload.end() && dst->is_object() &&
+            json_object_id((*dst)["resource_object_id"]) == target_object_id) {
+          reason = "copy-texture-dst";
+          return true;
+        }
+        return false;
+      }
+      if (command.function_name == "ID3D12GraphicsCommandList::CopyTextureRegionBatch") {
+        const auto ops = payload.find("ops");
+        if (ops != payload.end() && ops->is_array()) {
+          for (const auto &op : *ops) {
+            if (op.is_array() && op.size() > 1 && op[1].is_array() && !op[1].empty() &&
+                json_object_id(op[1][0]) == target_object_id) {
+              reason = "copy-texture-batch-dst";
+              return true;
+            }
+          }
+        }
+        return false;
+      }
+      return false;
+    }
+
+    if (command.kind == D3D12ReplayBackend::ReplayCommandKind::Resolve) {
+      if (command.object_refs.size() >= 2 && command.object_refs[1] == target_object_id) {
+        reason = "resolve-dst";
+        return true;
+      }
+      return false;
+    }
+
+    if (command.kind == D3D12ReplayBackend::ReplayCommandKind::Dispatch ||
+        command.kind == D3D12ReplayBackend::ReplayCommandKind::TemporalUpscale ||
+        command.kind == D3D12ReplayBackend::ReplayCommandKind::WriteBufferImmediate ||
+        command.kind == D3D12ReplayBackend::ReplayCommandKind::Predication ||
+        command.kind == D3D12ReplayBackend::ReplayCommandKind::Query) {
+      return false;
+    }
+
+    return false;
+  }
+
+  bool update_target_texture_watch_render_targets(
+      NativeCommandList &native,
+      const D3D12ReplayBackend::ReplayCommandRecord &command,
+      const json &payload,
+      std::string &error)
+  {
+    if (command.kind != D3D12ReplayBackend::ReplayCommandKind::SetRenderTargets) {
+      return true;
+    }
+    native.current_render_targets = {};
+    native.current_render_target_count = 0;
+    const auto render_target_count = payload_u32(payload, "render_target_count");
+    const auto render_targets = payload.find("render_targets");
+    const bool has_render_target_array = render_targets != payload.end() && render_targets->is_array();
+    const bool single_range =
+        has_render_target_array &&
+        (payload_bool(payload, "single_handle_to_descriptor_range") ||
+         payload_bool(payload, "single_descriptor_handle")) &&
+        render_targets->size() == 1 &&
+        render_target_count > 1;
+
+    D3D12ReplayBackend::DescriptorBinding first_binding;
+    UINT descriptor_size = 0;
+    if (single_range) {
+      if (!backend_.resolve_descriptor_binding_at(json_u64((*render_targets)[0]), false,
+                                                  command.sequence, first_binding, error)) {
+        return false;
+      }
+      const auto heap_it = descriptor_heaps_.find(first_binding.heap_object_id);
+      if (heap_it == descriptor_heaps_.end() || heap_it->second.descriptor_size == 0) {
+        return true;
+      }
+      descriptor_size = heap_it->second.descriptor_size;
+    }
+
+    const UINT count = std::min<UINT>(
+        render_target_count, static_cast<UINT>(native.current_render_targets.size()));
+    for (UINT index = 0; index < count; ++index) {
+      std::uint64_t descriptor = 0;
+      if (single_range) {
+        descriptor = first_binding.descriptor + static_cast<std::uint64_t>(index) * descriptor_size;
+      } else if (has_render_target_array && index < render_targets->size()) {
+        descriptor = json_u64((*render_targets)[index]);
+      } else if (!has_render_target_array && render_target_count == 1) {
+        descriptor = payload_u64(payload, "first_rtv");
+      }
+      if (descriptor == 0) {
+        continue;
+      }
+      native.current_render_targets[index] =
+          resource_object_id_for_cpu_descriptor(descriptor, command.sequence, error);
+    }
+    native.current_render_target_count = count;
+    return true;
+  }
+
+  void update_target_texture_watch_state(
+      NativeCommandList &native,
+      const D3D12ReplayBackend::ReplayCommandRecord &command,
+      const json &payload)
+  {
+    switch (command.kind) {
+    case D3D12ReplayBackend::ReplayCommandKind::SetPipelineState:
+      native.current_pipeline_state_object_id =
+          command.object_refs.size() >= 2 ? command.object_refs[1] : 0;
+      break;
+    case D3D12ReplayBackend::ReplayCommandKind::SetRootSignature:
+      if (command.function_name.find("Compute") == std::string::npos) {
+        native.current_graphics_root_signature_object_id =
+            command.object_refs.size() >= 2 ? command.object_refs[1] : 0;
+      }
+      break;
+    case D3D12ReplayBackend::ReplayCommandKind::SetRootDescriptorTable:
+      if (command.function_name.find("Compute") == std::string::npos) {
+        const UINT root = payload_u32(payload, "root_parameter_index");
+        if (root < native.current_graphics_root_tables.size()) {
+          native.current_graphics_root_tables[root] =
+              payload_u64(payload, "base_descriptor");
+        }
+      }
+      break;
+    case D3D12ReplayBackend::ReplayCommandKind::SetRootConstantBufferView:
+      if (command.function_name.find("Compute") == std::string::npos) {
+        const UINT root = payload_u32(payload, "root_parameter_index");
+        if (root < native.current_graphics_root_descriptors.size()) {
+          auto &descriptor = native.current_graphics_root_descriptors[root];
+          descriptor.resource_object_id =
+              static_cast<trace::ObjectId>(payload_u64(payload, "resolved_resource_object_id"));
+          descriptor.offset = payload_u64(payload, "resolved_resource_offset");
+          descriptor.kind = command.function_name.find("ShaderResourceView") != std::string::npos
+                                ? "RootSRV"
+                                : command.function_name.find("UnorderedAccessView") != std::string::npos
+                                      ? "RootUAV"
+                                      : "RootCBV";
+        }
+      }
+      break;
+    case D3D12ReplayBackend::ReplayCommandKind::SetViewports: {
+      const auto viewports_json = payload.find("viewports");
+      const json *first = nullptr;
+      if (viewports_json != payload.end() && viewports_json->is_array() &&
+          !viewports_json->empty() && (*viewports_json)[0].is_object()) {
+        first = &(*viewports_json)[0];
+      } else {
+        const auto first_it = payload.find("first");
+        if (first_it != payload.end() && first_it->is_object()) {
+          first = &(*first_it);
+        }
+      }
+      if (first) {
+        native.current_viewport.TopLeftX = payload_float(*first, "x");
+        native.current_viewport.TopLeftY = payload_float(*first, "y");
+        native.current_viewport.Width = payload_float(*first, "width");
+        native.current_viewport.Height = payload_float(*first, "height");
+        native.current_viewport.MinDepth = payload_float(*first, "min_depth");
+        native.current_viewport.MaxDepth = payload_float(*first, "max_depth");
+        native.has_current_viewport = true;
+      } else if (payload_u32(payload, "viewport_count") == 0) {
+        native.has_current_viewport = false;
+      }
+      break;
+    }
+    case D3D12ReplayBackend::ReplayCommandKind::SetScissorRects: {
+      const auto rects_json = payload.find("rects");
+      const json *first = nullptr;
+      if (rects_json != payload.end() && rects_json->is_array() &&
+          !rects_json->empty() && (*rects_json)[0].is_object()) {
+        first = &(*rects_json)[0];
+      } else {
+        const auto first_it = payload.find("first");
+        if (first_it != payload.end() && first_it->is_object()) {
+          first = &(*first_it);
+        }
+      }
+      if (first) {
+        native.current_scissor.left = payload_i32(*first, "left");
+        native.current_scissor.top = payload_i32(*first, "top");
+        native.current_scissor.right = payload_i32(*first, "right");
+        native.current_scissor.bottom = payload_i32(*first, "bottom");
+        native.has_current_scissor = true;
+      } else if (payload_u32(payload, "rect_count") == 0) {
+        native.has_current_scissor = false;
+      }
+      break;
+    }
+    case D3D12ReplayBackend::ReplayCommandKind::SetPrimitiveTopology:
+      native.current_primitive_topology = payload_u32(payload, "primitive_topology");
+      break;
+    case D3D12ReplayBackend::ReplayCommandKind::SetVertexBuffers: {
+      const auto start_slot = payload_u32(payload, "start_slot");
+      if (start_slot != 0) {
+        break;
+      }
+      const auto view_count = payload_u64(payload, "view_count");
+      const json *first = nullptr;
+      const auto views_json = payload.find("views");
+      if (views_json != payload.end() && views_json->is_array() &&
+          !views_json->empty() && (*views_json)[0].is_object()) {
+        first = &(*views_json)[0];
+      } else {
+        const auto first_it = payload.find("first");
+        if (first_it != payload.end() && first_it->is_object()) {
+          first = &(*first_it);
+        }
+      }
+      if (view_count == 0 || !first || payload_u64(*first, "buffer_location") == 0) {
+        native.current_vertex_buffer0 = {};
+        break;
+      }
+      native.current_vertex_buffer0.resource_object_id =
+          static_cast<trace::ObjectId>(payload_u64(*first, "resolved_resource_object_id"));
+      native.current_vertex_buffer0.offset = payload_u64(*first, "resolved_resource_offset");
+      native.current_vertex_buffer0.size_in_bytes = payload_u32(*first, "size_in_bytes");
+      native.current_vertex_buffer0.stride_in_bytes = payload_u32(*first, "stride_in_bytes");
+      native.current_vertex_buffer0.format = 0;
+      native.current_vertex_buffer0.valid = true;
+      break;
+    }
+    case D3D12ReplayBackend::ReplayCommandKind::SetIndexBuffer:
+      if (payload.empty() || payload_u64(payload, "buffer_location") == 0) {
+        native.current_index_buffer = {};
+        break;
+      }
+      native.current_index_buffer.resource_object_id =
+          static_cast<trace::ObjectId>(payload_u64(payload, "resolved_resource_object_id"));
+      native.current_index_buffer.offset = payload_u64(payload, "resolved_resource_offset");
+      native.current_index_buffer.size_in_bytes = payload_u32(payload, "size_in_bytes");
+      native.current_index_buffer.stride_in_bytes = 0;
+      native.current_index_buffer.format = payload_u32(payload, "format");
+      native.current_index_buffer.valid = true;
+      break;
+    default:
+      break;
+    }
+  }
+
+  bool flush_target_texture_watch(
+      const std::vector<NativeCommandList *> &recorded_lists,
+      std::string &error)
+  {
+    const trace::ObjectId target_object_id = target_texture_watch_object_id();
+    if (target_object_id == 0) {
+      return true;
+    }
+    const auto flush_buffer_readbacks = [&](NativeCommandList &native) -> bool {
+      for (auto &readback : native.target_watch_buffer_readbacks) {
+        if (!populate_target_texture_watch_buffer_readback(readback, error)) {
+          return false;
+        }
+        void *mapped = nullptr;
+        if (FAILED(readback.readback->Map(0, nullptr, &mapped)) || !mapped) {
+          return fail(error, "target texture watch buffer map failed");
+        }
+        const auto *bytes = static_cast<const std::uint8_t *>(mapped);
+        std::size_t nonzero = 0;
+        for (std::uint64_t i = 0; i < readback.size; ++i) {
+          if (bytes[i] != 0) {
+            ++nonzero;
+          }
+        }
+
+        std::ostringstream out;
+        out << "target-buffer"
+            << " object=" << target_object_id
+            << " seq=" << readback.sequence
+            << " list=" << readback.command_list_object_id
+            << " label=" << readback.label
+            << " res=" << readback.resource_object_id
+            << " off=" << readback.offset
+            << " size=" << readback.size
+            << " nonzero=" << nonzero
+            << " hex=" << target_texture_watch_hex_bytes(
+                              bytes, static_cast<std::size_t>(
+                                         std::min<std::uint64_t>(readback.size, 64)));
+        if (readback.label == "vb0" && readback.stride_in_bytes >= 40) {
+          const std::uint64_t vertex_count =
+              std::min<std::uint64_t>(readback.size / readback.stride_in_bytes, 8);
+          out << " vertices=";
+          for (std::uint64_t vertex = 0; vertex < vertex_count; ++vertex) {
+            const auto *v = bytes + vertex * readback.stride_in_bytes;
+            if (vertex != 0) {
+              out << ";";
+            }
+            out << target_texture_watch_float32(v + 0) << ","
+                << target_texture_watch_float32(v + 4) << ","
+                << target_texture_watch_float32(v + 8) << ","
+                << target_texture_watch_float32(v + 12)
+                << "|uv=" << target_texture_watch_float32(v + 32) << ","
+                << target_texture_watch_float32(v + 36);
+          }
+        } else if (readback.label == "ib" && readback.format == DXGI_FORMAT_R16_UINT) {
+          const std::uint64_t index_count =
+              std::min<std::uint64_t>(readback.size / sizeof(std::uint16_t), 32);
+          out << " indices=";
+          for (std::uint64_t index = 0; index < index_count; ++index) {
+            if (index != 0) {
+              out << ",";
+            }
+            out << target_texture_watch_u16(bytes + index * sizeof(std::uint16_t));
+          }
+        } else if (readback.label.rfind("rootCBV", 0) == 0) {
+          const std::uint64_t float_count =
+              std::min<std::uint64_t>(readback.size / sizeof(float), 16);
+          out << " floats=";
+          for (std::uint64_t index = 0; index < float_count; ++index) {
+            if (index != 0) {
+              out << ",";
+            }
+            out << target_texture_watch_float32(bytes + index * sizeof(float));
+          }
+        }
+        D3D12_RANGE none{0, 0};
+        readback.readback->Unmap(0, &none);
+        replay_milestone(out.str().c_str());
+      }
+      native.target_watch_buffer_readbacks.clear();
+      return true;
+    };
+
+    for (auto *native : recorded_lists) {
+      if (!native || native->target_watch_readbacks.empty()) {
+        if (native && !native->target_watch_occlusions.empty()) {
+          for (auto &occlusion : native->target_watch_occlusions) {
+            void *mapped = nullptr;
+            if (FAILED(occlusion.readback->Map(0, nullptr, &mapped)) || !mapped) {
+              return fail(error, "target texture watch occlusion map failed");
+            }
+            const auto samples = *static_cast<const std::uint64_t *>(mapped);
+            D3D12_RANGE none{0, 0};
+            occlusion.readback->Unmap(0, &none);
+            replay_milestone(
+                (std::string("target-draw-occlusion object=") +
+                 std::to_string(target_object_id) +
+                 " seq=" + std::to_string(occlusion.sequence) +
+                 " list=" + std::to_string(occlusion.command_list_object_id) +
+                 " fn=" + occlusion.function_name +
+                 " reason=" + occlusion.reason +
+                 " pso=" + std::to_string(occlusion.pipeline_state_object_id) +
+                 " samples=" + std::to_string(samples))
+                    .c_str());
+          }
+          native->target_watch_occlusions.clear();
+        }
+        if (native && !flush_buffer_readbacks(*native)) {
+          return false;
+        }
+        continue;
+      }
+      bool was_blue = false;
+      bool initialized = false;
+      for (auto &watch : native->target_watch_readbacks) {
+        void *mapped = nullptr;
+        if (FAILED(watch.readback->Map(0, nullptr, &mapped)) || !mapped) {
+          return fail(error, "target texture watch map failed");
+        }
+        const auto *base = static_cast<const std::uint8_t *>(mapped) +
+                           static_cast<std::size_t>(watch.footprint.Offset);
+        const auto *px = base;
+        UINT r = 0;
+        UINT g = 0;
+        UINT b = 0;
+        UINT a = 0;
+        std::uint32_t u32 = 0;
+        const bool is_blue =
+            target_texture_watch_is_blue(watch.format, px, r, g, b, a, u32);
+        D3D12_RANGE none{0, 0};
+        watch.readback->Unmap(0, &none);
+
+        const bool transition_to_blue = initialized && !was_blue && is_blue;
+        const bool first_sample_blue = !initialized && is_blue;
+        const bool near_stop_sequence =
+            target_texture_watch_near_stop_sequence(watch.sequence);
+        if (transition_to_blue || first_sample_blue || near_stop_sequence) {
+          std::string refs;
+          for (std::size_t i = 0; i < watch.object_refs.size(); ++i) {
+            refs += i ? "," : "";
+            refs += std::to_string(watch.object_refs[i]);
+          }
+          const char *kind =
+              transition_to_blue ? "transition" : first_sample_blue ? "already-blue" : "sample";
+          replay_milestone(
+              (std::string("target-blue ") +
+               kind +
+               " object=" + std::to_string(target_object_id) +
+               " seq=" + std::to_string(watch.sequence) +
+               " list=" + std::to_string(watch.command_list_object_id) +
+               " kind=" + std::to_string(static_cast<int>(watch.kind)) +
+               " fn=" + watch.function_name +
+               " phase=" + watch.phase +
+               " reason=" + watch.reason +
+               " xy=" + std::to_string(watch.x) + "," + std::to_string(watch.y) +
+               " rgba=" + std::to_string(r) + "," + std::to_string(g) + "," +
+               std::to_string(b) + "," + std::to_string(a) +
+               " u32=" + std::to_string(u32) +
+               " refs=" + refs)
+                  .c_str());
+        }
+        initialized = true;
+        was_blue = is_blue;
+      }
+      native->target_watch_readbacks.clear();
+      for (auto &occlusion : native->target_watch_occlusions) {
+        void *mapped = nullptr;
+        if (FAILED(occlusion.readback->Map(0, nullptr, &mapped)) || !mapped) {
+          return fail(error, "target texture watch occlusion map failed");
+        }
+        const auto samples = *static_cast<const std::uint64_t *>(mapped);
+        D3D12_RANGE none{0, 0};
+        occlusion.readback->Unmap(0, &none);
+        replay_milestone(
+            (std::string("target-draw-occlusion object=") +
+             std::to_string(target_object_id) +
+             " seq=" + std::to_string(occlusion.sequence) +
+             " list=" + std::to_string(occlusion.command_list_object_id) +
+             " fn=" + occlusion.function_name +
+             " reason=" + occlusion.reason +
+             " pso=" + std::to_string(occlusion.pipeline_state_object_id) +
+             " samples=" + std::to_string(samples))
+                .c_str());
+      }
+      native->target_watch_occlusions.clear();
+      if (!flush_buffer_readbacks(*native)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   // Resolve the initial pipeline state recorded on the BeginCommandList marker at `begin_index`
   // (CreateCommandList/Reset initial_pipeline_state_object_id). Returns nullptr if none / unresolved.
   ID3D12PipelineState *initial_pipeline_state_for(std::size_t begin_index)
@@ -2745,8 +4925,7 @@ private:
     if (pso_id == 0) {
       return nullptr;
     }
-    const auto it = pipelines_.find(static_cast<trace::ObjectId>(pso_id));
-    return it == pipelines_.end() ? nullptr : it->second.get();
+    return pipeline_for(static_cast<trace::ObjectId>(pso_id), begin_cmd.sequence);
   }
 
   bool record_command_list(
@@ -2760,11 +4939,9 @@ private:
       error = hresult_error("ID3D12CommandAllocator::Reset", hr);
       return false;
     }
-    // Reset with the RECORDED initial pipeline state, not nullptr. FH4 binds its graphics PSO via
-    // the Reset/CreateCommandList initial-PSO parameter (initial_pipeline_state_object_id) and then
-    // draws WITHOUT a separate SetPipelineState. Passing nullptr here left the list with no PSO, so
-    // DXMT skipped every such draw ("draw skipped without graphics pipeline state") -> blank frames
-    // (BUG-007). The BeginCommandList marker at begin_index carries that initial PSO id.
+    // Reset with the recorded initial pipeline state, not nullptr. Some applications bind graphics
+    // PSO through Reset/CreateCommandList and then draw without a separate SetPipelineState.
+    // Passing nullptr leaves the list with no PSO and drops those draws.
     ID3D12PipelineState *initial_pso = initial_pipeline_state_for(begin_index);
     // Diagnostic (BUG-007): a native list whose TYPE is not DIRECT but whose recorded interval has
     // Draw commands is the mismatch (graphics PSO/draw on a COPY/COMPUTE list -> DXMT drops them).
@@ -2795,6 +4972,22 @@ private:
       error = hresult_error("ID3D12GraphicsCommandList::Reset", hr);
       return false;
     }
+    native.current_render_targets = {};
+    native.current_render_target_count = 0;
+    native.current_pipeline_state_object_id = 0;
+    native.current_graphics_root_signature_object_id = 0;
+    native.current_graphics_root_tables = {};
+    native.current_graphics_root_descriptors = {};
+    native.current_viewport = {};
+    native.has_current_viewport = false;
+    native.current_scissor = {};
+    native.has_current_scissor = false;
+    native.current_primitive_topology = 0;
+    native.current_vertex_buffer0 = {};
+    native.current_index_buffer = {};
+    native.target_watch_readbacks.clear();
+    native.target_watch_occlusions.clear();
+    native.target_watch_buffer_readbacks.clear();
     const auto record_begin = std::chrono::steady_clock::now();
     bool grind_warned = false;
     // replay_commands_ is a GLOBAL sequence-ordered stream; when the app records multiple command
@@ -2803,10 +4996,22 @@ private:
     // draws into a COPY/COMPUTE native list and DXMT would drop them (BUG-007).
     const trace::ObjectId this_list_id =
         backend_.replay_commands_[begin_index].command_list_object_id;
+    const trace::ObjectId stop_command_list_id = replay_stop_command_list_id();
+    const bool stop_this_list =
+        replay_stop_after_sequence_ != 0 &&
+        (stop_command_list_id == 0 || stop_command_list_id == this_list_id);
+    const bool watch_this_list =
+        target_texture_watch_enabled() &&
+        (native.type == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+         native.type == D3D12_COMMAND_LIST_TYPE_COPY);
     for (std::size_t index = begin_index + 1; index < end_index; ++index) {
       const auto &cmd_ref = backend_.replay_commands_[index];
       if (cmd_ref.command_list_object_id != this_list_id) {
         continue;  // interleaved command from another concurrently-recorded list
+      }
+      if (stop_this_list && cmd_ref.sequence > replay_stop_after_sequence_) {
+        replay_stop_sequence_reached_ = true;
+        break;
       }
       // Mid-grind watchdog: if a single command list is taking pathologically long to record, dump
       // the cumulative per-kind breakdown WHILE still inside the loop (the per-batch batch:slow log
@@ -2827,9 +5032,50 @@ private:
                   .c_str());
         }
       }
+      const json &payload = cached_payload(index, cmd_ref.payload);
+      std::string target_watch_reason;
+      const bool target_watch_command =
+          watch_this_list &&
+          target_command_may_write_watched_texture(
+              native, cmd_ref, payload, target_watch_reason, error);
+      const bool target_watch_focused_sample =
+          watch_this_list &&
+          !target_watch_command &&
+          target_texture_watch_focused_stop_sequence(cmd_ref.sequence);
+      const char *target_watch_before_phase =
+          target_watch_command ? "before" : "scan-before";
+      const char *target_watch_after_phase =
+          target_watch_command ? "after" : "scan-after";
+      const char *target_watch_reason_cstr =
+          target_watch_command ? target_watch_reason.c_str() : "near-stop-scan";
+      const bool target_watch_draw =
+          target_watch_command &&
+          native.type == D3D12_COMMAND_LIST_TYPE_DIRECT &&
+          target_texture_watch_is_draw_command(cmd_ref) &&
+          target_texture_watch_near_stop_sequence(cmd_ref.sequence);
+      if (!error.empty()) {
+        return false;
+      }
+      if ((target_watch_command || target_watch_focused_sample) &&
+          !append_target_texture_watch_readback(
+              native, cmd_ref, target_watch_before_phase, target_watch_reason_cstr, error)) {
+        return false;
+      }
+      if (target_watch_draw) {
+        log_target_texture_watch_draw_state(native, cmd_ref, payload, target_watch_reason);
+        if (!append_target_texture_watch_draw_buffer_readbacks(native, cmd_ref, error)) {
+          return false;
+        }
+        if (!begin_target_texture_watch_occlusion(native, cmd_ref, target_watch_reason, error)) {
+          return false;
+        }
+      }
       const auto cmd_begin = std::chrono::steady_clock::now();
-      const bool ok = record_command(native.list.get(), cmd_ref,
-                                     cached_payload(index, cmd_ref.payload), error);
+      const bool ok = record_command(native.list.get(), cmd_ref, payload, error);
+      if (target_watch_draw &&
+          !end_target_texture_watch_occlusion(native, error)) {
+        return false;
+      }
       const auto kind_idx = static_cast<std::size_t>(cmd_ref.kind);
       if (kind_idx < kCommandKindCount) {
         command_kind_micros_[kind_idx] += static_cast<std::uint64_t>(
@@ -2845,6 +5091,19 @@ private:
                   " seq=" + std::to_string(cmd_ref.sequence) + ")";
         }
         return false;
+      }
+      if (!update_target_texture_watch_render_targets(native, cmd_ref, payload, error)) {
+        return false;
+      }
+      update_target_texture_watch_state(native, cmd_ref, payload);
+      if ((target_watch_command || target_watch_focused_sample) &&
+          !append_target_texture_watch_readback(
+              native, cmd_ref, target_watch_after_phase, target_watch_reason_cstr, error)) {
+        return false;
+      }
+      if (stop_this_list && cmd_ref.sequence >= replay_stop_after_sequence_) {
+        replay_stop_sequence_reached_ = true;
+        break;
       }
     }
     hr = native.list->Close();
@@ -2878,6 +5137,25 @@ private:
     }
     native_it->second.recorded_until_sequence = sequence_limit;
     return true;
+  }
+
+  trace::ObjectId replay_stop_command_list_id()
+  {
+    if (replay_stop_command_list_id_initialized_) {
+      return replay_stop_command_list_id_;
+    }
+    replay_stop_command_list_id_initialized_ = true;
+    if (replay_stop_after_sequence_ == 0) {
+      return 0;
+    }
+    for (const auto &command : backend_.replay_commands_) {
+      if (command.sequence != replay_stop_after_sequence_) {
+        continue;
+      }
+      replay_stop_command_list_id_ = command.command_list_object_id;
+      break;
+    }
+    return replay_stop_command_list_id_;
   }
 
   bool descriptor_handle(
@@ -2944,6 +5222,28 @@ private:
       return nullptr;
     }
     return resource_it->second.resource.get();
+  }
+
+  ID3D12PipelineState *pipeline_for(trace::ObjectId object_id, std::uint64_t sequence) const
+  {
+    const auto version_it = pipeline_version_natives_.find(object_id);
+    if (version_it != pipeline_version_natives_.end() && !version_it->second.empty()) {
+      const auto &versions = version_it->second;
+      const ComPtr<ID3D12PipelineState> *chosen = nullptr;
+      for (const auto &[create_seq, native] : versions) {
+        if (create_seq <= sequence) {
+          chosen = &native;
+        } else {
+          break;
+        }
+      }
+      if (chosen == nullptr) {
+        chosen = &versions.front().second;
+      }
+      return chosen->get();
+    }
+    const auto pipeline_it = pipelines_.find(object_id);
+    return pipeline_it == pipelines_.end() ? nullptr : pipeline_it->second.get();
   }
 
   NativeCommandList *native_command_list_for(
@@ -3014,11 +5314,14 @@ private:
           << current_replay_sequence_;
       return fail(error, out.str());
     }
-    const auto resource_it = resources_.find(binding.resource_object_id);
-    if (resource_it == resources_.end()) {
-      return fail(error, "GPUVA source resource cannot be relocated");
+    ID3D12Resource *resource = resource_for(binding.resource_object_id, error);
+    if (!resource) {
+      if (error.empty()) {
+        error = "GPUVA source resource cannot be relocated";
+      }
+      return false;
     }
-    relocated = resource_it->second.resource->GetGPUVirtualAddress() + binding.offset;
+    relocated = resource->GetGPUVirtualAddress() + binding.offset;
     return true;
   }
 
@@ -3032,7 +5335,7 @@ private:
       return fail(error, "command payload is not JSON");
     }
     // Resolve resource references to the version live when this command was recorded.
-    current_replay_sequence_ = command.sequence;
+    const ReplaySequenceScope command_scope(this, command.sequence);
     if (!sync_resource_data_until(command.sequence, error) ||
         !sync_descriptors_until(command.sequence, error)) {
       return false;
@@ -3259,11 +5562,11 @@ private:
     if (command.object_refs.size() < 2) {
       return fail(error, "SetPipelineState missing PSO object");
     }
-    const auto pipeline_it = pipelines_.find(command.object_refs[1]);
-    if (pipeline_it == pipelines_.end()) {
+    ID3D12PipelineState *pipeline = pipeline_for(command.object_refs[1], command.sequence);
+    if (!pipeline) {
       return fail(error, "SetPipelineState references an unknown PSO");
     }
-    list->SetPipelineState(pipeline_it->second.get());
+    list->SetPipelineState(pipeline);
     ++dbg_setpso_calls_;
     return true;
   }
@@ -3523,7 +5826,7 @@ private:
       }
       note_back_buffer_rtv_use(binding, "OMSetRenderTargets", command.sequence);
       D3D12_CPU_DESCRIPTOR_HANDLE handle{};
-      if (!descriptor_handle(binding, handle, error)) {
+      if (!materialize_cpu_descriptor_at(descriptor, command.sequence, handle, nullptr, error)) {
         return false;
       }
       handles.push_back(handle);
@@ -3536,7 +5839,7 @@ private:
       if (!backend_.resolve_descriptor_binding_at(dsv_descriptor, false, command.sequence, dsv_binding, error)) {
         return false;
       }
-      if (!descriptor_handle(dsv_binding, dsv_handle, error)) {
+      if (!materialize_cpu_descriptor_at(dsv_descriptor, command.sequence, dsv_handle, nullptr, error)) {
         return false;
       }
       dsv_ptr = &dsv_handle;
@@ -3570,7 +5873,7 @@ private:
       }
     }
     D3D12_CPU_DESCRIPTOR_HANDLE handle{};
-    if (!descriptor_handle(binding, handle, error)) {
+    if (!materialize_cpu_descriptor_at(payload_u64(payload, "descriptor"), command.sequence, handle, nullptr, error)) {
       return false;
     }
     const auto color_json = payload.find("color");
@@ -3602,7 +5905,7 @@ private:
       return false;
     }
     D3D12_CPU_DESCRIPTOR_HANDLE handle{};
-    if (!descriptor_handle(binding, handle, error)) {
+    if (!materialize_cpu_descriptor_at(payload_u64(payload, "descriptor"), command.sequence, handle, nullptr, error)) {
       return false;
     }
     const auto rects = d3d12_rects_from_payload(payload);
@@ -3628,7 +5931,7 @@ private:
       return false;
     }
     D3D12_CPU_DESCRIPTOR_HANDLE handle{};
-    if (!descriptor_handle(binding, handle, error)) {
+    if (!materialize_cpu_descriptor_at(descriptor, sequence, handle, nullptr, error)) {
       return false;
     }
     const auto color_json = clear.find("color");
@@ -3657,7 +5960,7 @@ private:
       return false;
     }
     D3D12_CPU_DESCRIPTOR_HANDLE handle{};
-    if (!descriptor_handle(binding, handle, error)) {
+    if (!materialize_cpu_descriptor_at(descriptor, sequence, handle, nullptr, error)) {
       return false;
     }
     list->ClearDepthStencilView(
@@ -3689,7 +5992,7 @@ private:
       return false;
     }
     D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle{};
-    if (!descriptor_handle(cpu_binding, cpu_handle, error)) {
+    if (!materialize_cpu_descriptor_at(payload_u64(payload, "cpu_descriptor"), command.sequence, cpu_handle, nullptr, error)) {
       return false;
     }
     if (command.object_refs.size() < 2 || command.object_refs[1] == 0) {
@@ -3882,11 +6185,10 @@ private:
     if (command.function_name == "ID3D12GraphicsCommandList::ClearState") {
       ID3D12PipelineState *pipeline = nullptr;
       if (command.object_refs.size() >= 2 && command.object_refs[1] != 0) {
-        const auto pipeline_it = pipelines_.find(command.object_refs[1]);
-        if (pipeline_it == pipelines_.end()) {
+        pipeline = pipeline_for(command.object_refs[1], command.sequence);
+        if (!pipeline) {
           return fail(error, "ClearState references an unknown PSO");
         }
-        pipeline = pipeline_it->second.get();
       }
       list->ClearState(pipeline);
       return true;
@@ -4087,7 +6389,8 @@ private:
           return false;
         }
         D3D12_CPU_DESCRIPTOR_HANDLE handle{};
-        if (!descriptor_handle(binding, handle, error)) {
+        if (descriptor != 0 &&
+            !materialize_cpu_descriptor_at(descriptor, command.sequence, handle, nullptr, error)) {
           return false;
         }
         render_target_handles.push_back(handle);
@@ -4108,7 +6411,12 @@ private:
               error)) {
         return false;
       }
-      if (!descriptor_handle(binding, depth_stencil_handle, error)) {
+      if (!materialize_cpu_descriptor_at(
+              payload_u64(*depth_stencil, "cpu_descriptor"),
+              command.sequence,
+              depth_stencil_handle,
+              nullptr,
+              error)) {
         return false;
       }
       depth_stencil_ptr = &depth_stencil_handle;
@@ -4674,11 +6982,27 @@ private:
     const D3D12ReplayBackend::ResourceDataUpdate *update = nullptr;
   };
 
+  struct DescriptorSlotHistoryEntry {
+    std::uint64_t sequence = 0;
+    const D3D12ReplayBackend::DescriptorSemanticState *descriptor = nullptr;
+  };
+
+  struct CpuDescriptorScratch {
+    std::vector<ComPtr<ID3D12DescriptorHeap>> heaps;
+    D3D12_CPU_DESCRIPTOR_HANDLE current_start{};
+    UINT descriptor_size = 0;
+    UINT next = 0;
+    UINT capacity = 4096;
+  };
+
   const D3D12ReplayBackend &backend_;
   HWND hwnd_ = nullptr;
   UINT present_delay_ms_ = static_cast<UINT>(env_u32("APITRACE_D3D12_RETRACE_PRESENT_DELAY_MS"));
   std::uint64_t replay_stop_after_present_frame_ = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME");
   std::uint64_t replay_stop_after_sequence_ = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE");
+  bool replay_stop_sequence_reached_ = false;
+  bool replay_stop_command_list_id_initialized_ = false;
+  trace::ObjectId replay_stop_command_list_id_ = 0;
   UINT64 fence_value_ = 0;
   std::uint64_t replay_batch_index_ = 0;
   // Per-command-kind cumulative record time (microseconds) + invocation counts, to attribute a slow
@@ -4708,9 +7032,15 @@ private:
   std::unordered_map<trace::ObjectId, NativeDescriptorHeap> descriptor_heaps_;
   std::unordered_map<trace::ObjectId, ComPtr<ID3D12RootSignature>> root_signatures_;
   std::unordered_map<trace::ObjectId, ComPtr<ID3D12PipelineState>> pipelines_;
+  std::unordered_map<trace::ObjectId, std::vector<std::pair<std::uint64_t, ComPtr<ID3D12PipelineState>>>>
+      pipeline_version_natives_;
   std::unordered_map<trace::ObjectId, ComPtr<ID3D12CommandSignature>> command_signatures_;
   std::unordered_map<trace::ObjectId, NativeHeap> heaps_;
   std::unordered_map<trace::ObjectId, ComPtr<ID3D12QueryHeap>> query_heaps_;
+  std::array<CpuDescriptorScratch, D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES> cpu_descriptor_scratch_;
+  std::unordered_map<std::uint64_t, std::vector<DescriptorSlotHistoryEntry>> descriptor_slot_history_;
+  mutable bool shader_candidate_index_built_ = false;
+  mutable std::unordered_map<std::uint64_t, std::vector<std::filesystem::path>> shader_candidate_paths_by_size_;
   std::unordered_map<trace::ObjectId, NativeResource> resources_;
   // Per-version native resources for object_ids reused across lifetimes (BUG-20260614-004). Built
   // from backend_.resource_versions_ when more than one version exists for an id. Each entry is a

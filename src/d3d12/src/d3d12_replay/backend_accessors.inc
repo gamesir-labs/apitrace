@@ -17,7 +17,14 @@ void D3D12ReplayBackend::shutdown()
   heaps_.clear();
   query_heaps_.clear();
   resources_.clear();
+  resource_versions_.clear();
+  live_resource_version_indices_.clear();
+  resource_versions_by_id_.clear();
+  resource_versions_by_va_.clear();
+  max_resource_va_width_ = 0;
   pipelines_.clear();
+  pipeline_versions_.clear();
+  pipeline_versions_by_id_.clear();
   root_signatures_.clear();
   fence_operations_.clear();
   replay_commands_.clear();
