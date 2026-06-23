@@ -19,6 +19,7 @@ struct ReplayStatistics {
   std::uint64_t backend_init_ms = 0;
   std::uint64_t event_replay_ms = 0;
   std::uint64_t finalize_ms = 0;
+  std::string d3d12_event_ordered_counters;
   std::string backend_name;
 };
 

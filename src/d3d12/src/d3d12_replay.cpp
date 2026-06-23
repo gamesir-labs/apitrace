@@ -163,6 +163,62 @@ bool pump_messages()
 }
 #endif
 
+class ScopedFenceEvent {
+public:
+  enum class WaitResult {
+    Signaled,
+    Timeout,
+    Failed,
+  };
+
+#ifdef _WIN32
+  ScopedFenceEvent() : handle_(CreateEventA(nullptr, FALSE, FALSE, nullptr)) {}
+  ~ScopedFenceEvent()
+  {
+    if (handle_) {
+      CloseHandle(handle_);
+    }
+  }
+
+  bool valid() const noexcept { return handle_ != nullptr; }
+  HANDLE get() const noexcept { return handle_; }
+
+  WaitResult wait(std::uint32_t timeout_ms) const
+  {
+    const DWORD result = WaitForSingleObject(handle_, timeout_ms);
+    if (result == WAIT_OBJECT_0) {
+      return WaitResult::Signaled;
+    }
+    if (result == WAIT_TIMEOUT) {
+      return WaitResult::Timeout;
+    }
+    return WaitResult::Failed;
+  }
+
+private:
+  HANDLE handle_ = nullptr;
+#else
+  ScopedFenceEvent() = default;
+  bool valid() const noexcept { return true; }
+  HANDLE get() const noexcept { return nullptr; }
+
+  WaitResult wait_until(ID3D12Fence *fence, std::uint64_t value, std::uint32_t timeout_ms) const
+  {
+    if (!fence) {
+      return WaitResult::Failed;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (fence->GetCompletedValue() < value) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return WaitResult::Timeout;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return WaitResult::Signaled;
+  }
+#endif
+};
+
 D3D12_RESOURCE_BARRIER transition_barrier(
     ID3D12Resource *resource,
     D3D12_RESOURCE_STATES before,

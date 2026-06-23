@@ -17,6 +17,12 @@
     event_ordered_lists_closed_ = 0;
     event_ordered_resource_updates_applied_ = 0;
     event_ordered_copy_descriptors_applied_ = 0;
+    event_ordered_command_lists_submitted_ = 0;
+    event_ordered_queue_signals_ = 0;
+    event_ordered_queue_waits_ = 0;
+    event_ordered_fence_signals_ = 0;
+    event_ordered_cpu_waits_ = 0;
+    event_ordered_cpu_wait_timeouts_ = 0;
     resource_update_timeline_.clear();
     descriptor_copy_timeline_.clear();
     next_resource_update_index_ = 0;
@@ -67,11 +73,14 @@
       dispatch_live(event);
     }
 
-    wait_for_gpu();
+    if (!event_ordered_final_drain_queues(error)) {
+      return false;
+    }
     const std::string summary = "[event-ordered] iterated " + std::to_string(event_count) +
                                 " events, categories_hit=" + event_ordered_categories_summary();
     event_ordered_log(summary);
-    event_ordered_log(event_ordered_counters_summary());
+    backend_.event_ordered_counters_ = event_ordered_counters_summary();
+    event_ordered_log(backend_.event_ordered_counters_);
     replay_milestone("[event-ordered] replay:done");
     return true;
   }
@@ -361,7 +370,13 @@ private:
            " lists_reset=" + std::to_string(event_ordered_lists_reset_) +
            " lists_closed=" + std::to_string(event_ordered_lists_closed_) +
            " resource_updates_applied=" + std::to_string(event_ordered_resource_updates_applied_) +
-           " copy_descriptors_applied=" + std::to_string(event_ordered_copy_descriptors_applied_);
+           " copy_descriptors_applied=" + std::to_string(event_ordered_copy_descriptors_applied_) +
+           " command_lists_submitted=" + std::to_string(event_ordered_command_lists_submitted_) +
+           " queue_signals=" + std::to_string(event_ordered_queue_signals_) +
+           " queue_waits=" + std::to_string(event_ordered_queue_waits_) +
+           " fence_signals=" + std::to_string(event_ordered_fence_signals_) +
+           " cpu_waits=" + std::to_string(event_ordered_cpu_waits_) +
+           " cpu_wait_timeouts=" + std::to_string(event_ordered_cpu_wait_timeouts_);
   }
 
   void event_ordered_log_stub_once(const std::string &category, const trace::EventRecord &event)
@@ -379,6 +394,7 @@ private:
 #include "eo_create_command_objects.inc"
 #include "eo_content.inc"
 #include "eo_record.inc"
+#include "eo_submit.inc"
 
   void dispatch_live(const trace::EventRecord &event)
   {
@@ -428,14 +444,33 @@ private:
       event_ordered_apply_copy_descriptors(event);
       return;
     }
+    if (function_name == "ID3D12CommandQueue::ExecuteCommandLists") {
+      event_ordered_handle_execute_command_lists(event);
+      return;
+    }
     if (function_name == "ID3D12CommandQueue::UpdateTileMappings") {
       event_ordered_log_stub_once("UpdateTileMappings(P4)", event);
+      return;
+    }
+    if (function_name == "ID3D12CommandQueue::Signal") {
+      event_ordered_handle_queue_signal(event);
+      return;
+    }
+    if (function_name == "ID3D12CommandQueue::Wait") {
+      event_ordered_handle_queue_wait(event);
+      return;
+    }
+    if (function_name == "ID3D12Fence::Signal") {
+      event_ordered_handle_fence_signal(event);
+      return;
+    }
+    if (function_name == "ID3D12Fence::SetEventOnCompletion") {
+      event_ordered_handle_fence_set_event_on_completion(event);
       return;
     }
 
     event_ordered_log_stub_once(event_ordered_category(event), event);
 
-    // TODO(event-ordered): materialize remaining live operations for record,
-    // ExecuteCommandLists, QueueSignal, QueueWait, FenceSignal,
-    // FenceSetEventOnCompletion, Map, Unmap, Present, ReleaseDestroy, and Default.
+    // TODO(event-ordered): materialize remaining live operations for Map,
+    // Unmap, Present, ReleaseDestroy, and Default.
   }

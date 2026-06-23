@@ -2946,11 +2946,17 @@ private:
     return true;
   }
 
-  bool sync_tile_mapping_updates_until(std::uint64_t sequence, std::string &error)
+  bool sync_tile_mapping_updates_until(
+      std::uint64_t sequence,
+      std::string &error,
+      ID3D12CommandQueue *queue_override = nullptr)
   {
     while (next_tile_mapping_update_index_ < backend_.tile_mapping_updates_.size() &&
            backend_.tile_mapping_updates_[next_tile_mapping_update_index_].sequence <= sequence) {
-      if (!apply_tile_mapping_update(backend_.tile_mapping_updates_[next_tile_mapping_update_index_], error)) {
+      if (!apply_tile_mapping_update(
+              backend_.tile_mapping_updates_[next_tile_mapping_update_index_],
+              error,
+              queue_override)) {
         return false;
       }
       ++next_tile_mapping_update_index_;
@@ -2960,8 +2966,13 @@ private:
 
   bool apply_tile_mapping_update(
       const D3D12ReplayBackend::TileMappingUpdateRecord &update,
-      std::string &error)
+      std::string &error,
+      ID3D12CommandQueue *queue_override = nullptr)
   {
+    ID3D12CommandQueue *queue = queue_override ? queue_override : queue_.get();
+    if (!queue) {
+      return fail(error, "UpdateTileMappings requires a native command queue");
+    }
     const auto resource_it = resources_.find(update.resource_object_id);
     if (resource_it == resources_.end()) {
       return fail(error, "UpdateTileMappings references an unknown resource");
@@ -3047,7 +3058,7 @@ private:
     // System (mingw) d3d12.h declares the standard 10-argument signature with
     // the pHeap parameter. This build is capture-only and never replays, but
     // it must compile.
-    queue_->UpdateTileMappings(
+    queue->UpdateTileMappings(
         resource_it->second.resource.get(),
         region_count,
         regions.data(),
@@ -3062,7 +3073,7 @@ private:
     // The vendored third_party/d3d-headers d3d12.h used by the native retrace
     // build (matching DXMT's d3d12.dll vtable ABI) omits the pHeap parameter.
     (void)native_heap;
-    queue_->UpdateTileMappings(
+    queue->UpdateTileMappings(
         resource_it->second.resource.get(),
         region_count,
         regions.data(),
@@ -7410,6 +7421,12 @@ private:
   std::uint64_t event_ordered_lists_closed_ = 0;
   std::uint64_t event_ordered_resource_updates_applied_ = 0;
   std::uint64_t event_ordered_copy_descriptors_applied_ = 0;
+  std::uint64_t event_ordered_command_lists_submitted_ = 0;
+  std::uint64_t event_ordered_queue_signals_ = 0;
+  std::uint64_t event_ordered_queue_waits_ = 0;
+  std::uint64_t event_ordered_fence_signals_ = 0;
+  std::uint64_t event_ordered_cpu_waits_ = 0;
+  std::uint64_t event_ordered_cpu_wait_timeouts_ = 0;
   std::unordered_set<std::string> event_ordered_resource_updates_applied_keys_;
   std::unordered_set<std::string> event_ordered_copy_descriptors_applied_keys_;
 #if !defined(_WIN32)

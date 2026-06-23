@@ -29,6 +29,7 @@ public:
   bool finalize_replay();
   bool validate_only();
   void shutdown();
+  const std::string &event_ordered_counters() const noexcept;
 
   // Persisted replay-model schema. bundle-finalize reconstructs the object model once and
   // serializes it via save_replay_model; retrace loads it via load_replay_model to skip the
@@ -112,6 +113,7 @@ public:
   std::uint64_t draw_calls_seen_ = 0;
   std::uint64_t dispatch_calls_seen_ = 0;
   std::uint64_t last_sequence_ = 0;
+  std::string event_ordered_counters_;
   std::unordered_map<trace::BlobId, std::filesystem::path> blob_paths_;
   D3D12ObjectRegistry objects_;
   D3D12SubmissionTracker submissions_;

@@ -83,7 +83,11 @@ std::string format_statistics(const apitrace::replay::ReplayStatistics &statisti
       "open_ms: " + std::to_string(statistics.open_ms) + "\n" +
       "backend_init_ms: " + std::to_string(statistics.backend_init_ms) + "\n" +
       "event_replay_ms: " + std::to_string(statistics.event_replay_ms) + "\n" +
-      "finalize_ms: " + std::to_string(statistics.finalize_ms) + "\n";
+      "finalize_ms: " + std::to_string(statistics.finalize_ms) + "\n" +
+      (statistics.d3d12_event_ordered_counters.empty()
+           ? std::string()
+           : "d3d12_event_ordered_counters: " +
+                 statistics.d3d12_event_ordered_counters + "\n");
 }
 
 std::string shell_quote(const std::string &value)

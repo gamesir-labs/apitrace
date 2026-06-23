@@ -30,6 +30,7 @@ void D3D12ReplayBackend::shutdown()
   replay_commands_.clear();
   tile_mapping_updates_.clear();
   bundle_root_.clear();
+  event_ordered_counters_.clear();
   initialized_ = false;
   commands_replayed_ = 0;
   frames_seen_ = 0;
@@ -44,6 +45,11 @@ void D3D12ReplayBackend::shutdown()
 const std::string &D3D12ReplayBackend::last_error() const noexcept
 {
   return last_error_;
+}
+
+const std::string &D3D12ReplayBackend::event_ordered_counters() const noexcept
+{
+  return event_ordered_counters_;
 }
 
 const std::vector<D3D12ReplayBackend::DescriptorSemanticState> &
