@@ -12,6 +12,19 @@
     replay_milestone("[event-ordered] replay:begin");
     event_ordered_categories_hit_.clear();
     event_ordered_categories_hit_order_.clear();
+    struct EventOrderedRecordingScope {
+      D3D12NativeReplayer *self = nullptr;
+      bool saved = false;
+      explicit EventOrderedRecordingScope(D3D12NativeReplayer *owner)
+          : self(owner), saved(owner->event_ordered_recording_)
+      {
+        self->event_ordered_recording_ = true;
+      }
+      ~EventOrderedRecordingScope()
+      {
+        self->event_ordered_recording_ = saved;
+      }
+    } event_ordered_recording_scope(this);
 
     if (!log_stage("event_ordered_bootstrap_device", [&] { return bootstrap_device(error); })) {
       return false;
@@ -182,6 +195,24 @@ private:
            event_ordered_starts_with(method, "Dispatch");
   }
 
+  bool event_ordered_is_record_call(const trace::EventRecord &event) const
+  {
+    const std::string_view function_name(event.callsite.function_name);
+    if (function_name == "ID3D12CommandAllocator::Reset" ||
+        function_name == "ID3D12GraphicsCommandList::Reset" ||
+        function_name == "ID3D12GraphicsCommandList::Close") {
+      return true;
+    }
+    if (backend_.replay_commands_.empty()) {
+      return false;
+    }
+    const auto &record = backend_.replay_commands_.back();
+    return record.sequence == event.callsite.sequence &&
+           record.function_name == event.callsite.function_name &&
+           record.command_list_object_id != 0 &&
+           record.kind != D3D12ReplayBackend::ReplayCommandKind::Unknown;
+  }
+
   static std::string event_ordered_category(const trace::EventRecord &event)
   {
     const std::string_view function_name(event.callsite.function_name);
@@ -317,6 +348,7 @@ private:
 #include "eo_create_descriptors.inc"
 #include "eo_create_pipelines.inc"
 #include "eo_create_command_objects.inc"
+#include "eo_record.inc"
 
   void dispatch_live(const trace::EventRecord &event)
   {
@@ -356,6 +388,10 @@ private:
         event_ordered_contains(function_name, "CreateCommandList") ||
         event_ordered_contains(function_name, "CreateFence")) {
       materialize_create_command_objects(event);
+      return;
+    }
+    if (event_ordered_is_record_call(event)) {
+      handle_record_event(event);
       return;
     }
 

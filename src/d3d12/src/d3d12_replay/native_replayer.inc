@@ -5236,7 +5236,7 @@ private:
         }
       }
       const auto cmd_begin = std::chrono::steady_clock::now();
-      const bool ok = record_command(native.list.get(), cmd_ref, payload, error);
+      const bool ok = record_command(native, cmd_ref, payload, error);
       if (target_watch_draw &&
           !end_target_texture_watch_occlusion(native, error)) {
         return false;
@@ -5553,94 +5553,160 @@ private:
   }
 
   bool record_command(
-      ID3D12GraphicsCommandList *list,
+      NativeCommandList &native,
       const D3D12ReplayBackend::ReplayCommandRecord &command,
       const json &payload,
       std::string &error)
   {
+    const json *saved_payload_override = record_one_payload_override_;
+    record_one_payload_override_ = &payload;
+    record_one(native, command);
+    record_one_payload_override_ = saved_payload_override;
+    if (!record_one_ok_) {
+      error = record_one_error_;
+      return false;
+    }
+    return true;
+  }
+
+  void record_one(
+      NativeCommandList &native,
+      const D3D12ReplayBackend::ReplayCommandRecord &command)
+  {
+    std::string error;
+    auto finish = [&](bool ok) {
+      record_one_ok_ = ok;
+      record_one_error_ = ok ? std::string() : std::move(error);
+    };
+
+    json parsed_payload;
+    const json *payload_ptr = record_one_payload_override_;
+    if (!payload_ptr) {
+      parsed_payload = json::parse(command.payload, nullptr, false);
+      payload_ptr = &parsed_payload;
+    }
+    const json &payload = *payload_ptr;
     if (payload.is_discarded() || !payload.is_object()) {
-      return fail(error, "command payload is not JSON");
+      finish(fail(error, "command payload is not JSON"));
+      return;
     }
     // Resolve resource references to the version live when this command was recorded.
     const ReplaySequenceScope command_scope(this, command.sequence);
-    if (!sync_resource_data_until(command.sequence, error) ||
-        !sync_descriptors_until(command.sequence, error)) {
-      return false;
+    if (!event_ordered_recording_) {
+      if (!sync_resource_data_until(command.sequence, error) ||
+          !sync_descriptors_until(command.sequence, error)) {
+        finish(false);
+        return;
+      }
     }
 
+    ID3D12GraphicsCommandList *list = native.list.get();
     switch (command.kind) {
     case D3D12ReplayBackend::ReplayCommandKind::SetPipelineState:
-      return record_set_pipeline_state(list, command, error);
+      finish(record_set_pipeline_state(list, command, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::SetRootSignature:
-      return record_set_root_signature(list, command, error);
+      finish(record_set_root_signature(list, command, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::SetDescriptorHeaps:
-      return record_set_descriptor_heaps(list, command, error);
+      finish(record_set_descriptor_heaps(list, command, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::SetRootDescriptorTable:
-      return record_set_root_descriptor_table(list, command, payload, error);
+      finish(record_set_root_descriptor_table(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::SetRootConstants:
-      return record_set_root_constants(list, command, payload, error);
+      finish(record_set_root_constants(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::SetRootConstantBufferView:
-      return record_set_root_descriptor(list, command, payload, error);
+      finish(record_set_root_descriptor(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::SetViewports:
-      return record_set_viewports(list, payload, error);
+      finish(record_set_viewports(list, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::SetScissorRects:
-      return record_set_scissors(list, payload, error);
+      finish(record_set_scissors(list, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::SetRenderTargets:
-      return record_set_render_targets(list, command, payload, error);
+      finish(record_set_render_targets(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::ClearRenderTarget:
-      return record_clear_render_target(list, command, payload, error);
+      finish(record_clear_render_target(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::ClearDepthStencil:
-      return record_clear_depth_stencil(list, command, payload, error);
+      finish(record_clear_depth_stencil(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::ClearUnorderedAccess:
-      return record_clear_unordered_access(list, command, payload, error);
+      finish(record_clear_unordered_access(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::DiscardResource:
-      return record_discard_resource(list, command, payload, error);
+      finish(record_discard_resource(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::ResourceBarrier:
-      return record_resource_barriers(list, payload, error);
+      finish(record_resource_barriers(list, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::SetDynamicState:
-      return record_dynamic_state(list, command, payload, error);
+      finish(record_dynamic_state(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::RenderPass:
-      return record_render_pass(list, command, payload, error);
+      finish(record_render_pass(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::Query:
-      return record_query(list, command, payload, error);
+      finish(record_query(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::Predication:
-      return record_predication(list, command, payload, error);
+      finish(record_predication(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::WriteBufferImmediate:
-      return record_write_buffer_immediate(list, command, payload, error);
+      finish(record_write_buffer_immediate(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::TemporalUpscale:
-      return fail(error, "TemporalUpscale requires a DXMT-backed replay backend");
+      finish(fail(error, "TemporalUpscale requires a DXMT-backed replay backend"));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::UnsupportedNative:
-      return fail(error, "D3D12 native command replay incomplete: unsupported command " + command.function_name);
+      finish(fail(error, "D3D12 native command replay incomplete: unsupported command " + command.function_name));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::SetPrimitiveTopology:
       list->IASetPrimitiveTopology(static_cast<D3D12_PRIMITIVE_TOPOLOGY>(payload_u32(payload, "primitive_topology")));
-      return true;
+      finish(true);
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::SetVertexBuffers:
-      return record_set_vertex_buffers(list, command, payload, error);
+      finish(record_set_vertex_buffers(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::SetIndexBuffer:
-      return record_set_index_buffer(list, command, payload, error);
+      finish(record_set_index_buffer(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::Draw:
-      return record_draw(list, command, payload, error);
+      finish(record_draw(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::ExecuteIndirect:
-      return record_execute_indirect(list, command, payload, error);
+      finish(record_execute_indirect(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::ExecuteBundle:
-      return record_execute_bundle(list, command, error);
+      finish(record_execute_bundle(list, command, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::Copy:
-      return record_copy(list, command, payload, error);
+      finish(record_copy(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::Resolve:
-      return record_resolve(list, command, payload, error);
+      finish(record_resolve(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::Dispatch:
-      return record_dispatch(list, command, payload, error);
+      finish(record_dispatch(list, command, payload, error));
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::MapResource:
     case D3D12ReplayBackend::ReplayCommandKind::UnmapResource:
-      return true;
+      finish(true);
+      return;
     case D3D12ReplayBackend::ReplayCommandKind::BeginCommandList:
     case D3D12ReplayBackend::ReplayCommandKind::EndCommandList:
       // Recording-lifetime markers (CreateCommandList / Reset / Close). The replayer drives list
       // open/close itself in record_command_list via its own Reset()/Close(); an interior marker
       // (e.g. a list created then Reset to re-record) is a no-op here, not a real GPU command.
-      return true;
+      finish(true);
+      return;
     default:
-      return fail(error, "unsupported command " + command.function_name);
+      finish(fail(error, "unsupported command " + command.function_name));
+      return;
     }
   }
 
@@ -5660,7 +5726,8 @@ private:
     if (bundle_it->second.type != D3D12_COMMAND_LIST_TYPE_BUNDLE) {
       return fail(error, "ExecuteBundle references a non-bundle command list");
     }
-    if (!ensure_command_list_recorded(bundle_object_id, command.sequence, error)) {
+    if (!event_ordered_recording_ &&
+        !ensure_command_list_recorded(bundle_object_id, command.sequence, error)) {
       return false;
     }
     list->ExecuteBundle(bundle_it->second.list.get());
@@ -7315,6 +7382,10 @@ private:
   std::size_t next_descriptor_copy_index_ = 0;
   std::size_t next_resource_update_index_ = 0;
   std::size_t next_tile_mapping_update_index_ = 0;
+  const json *record_one_payload_override_ = nullptr;
+  bool record_one_ok_ = true;
+  std::string record_one_error_;
+  bool event_ordered_recording_ = false;
 #if !defined(_WIN32)
   std::unique_ptr<trace::TraceBundleWriter> capture_writer_;
   std::uint64_t capture_sequence_ = 0;
