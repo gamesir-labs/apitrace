@@ -2451,6 +2451,7 @@ bool ReplaySession::run()
       impl_->statistics.backend_name += "-event-ordered";
       milestone_log("model:skipped — APITRACE_D3D12_RETRACE_EVENT_ORDERED set");
       backend.set_event_ordered_timing_enabled(true);
+      backend.set_event_ordered_init(true);
       const auto backend_init_begin = std::chrono::steady_clock::now();
       if (!backend.initialize(impl_->reader)) {
         impl_->statistics.backend_init_ms = elapsed_ms(backend_init_begin);

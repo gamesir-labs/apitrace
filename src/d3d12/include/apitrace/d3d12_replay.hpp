@@ -49,6 +49,7 @@ public:
 
   bool initialize(const trace::TraceBundleReader &reader);
   void set_event_ordered_timing_enabled(bool enabled) noexcept;
+  void set_event_ordered_init(bool enabled) noexcept;
   bool replay_event(const trace::EventRecord &event);
   bool replay_event_ordered(const trace::TraceBundleReader &reader);
   bool finalize_replay();
@@ -146,6 +147,7 @@ public:
   EventOrderedInitTiming event_ordered_init_timing_;
   EventOrderedReplayTiming event_ordered_replay_timing_;
   bool event_ordered_timing_enabled_ = false;
+  bool event_ordered_init_ = false;
   std::unordered_map<trace::BlobId, std::filesystem::path> blob_paths_;
   D3D12ObjectRegistry objects_;
   D3D12SubmissionTracker submissions_;

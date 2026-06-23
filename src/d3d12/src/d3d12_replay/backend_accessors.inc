@@ -35,6 +35,7 @@ void D3D12ReplayBackend::shutdown()
   event_ordered_init_timing_ = {};
   event_ordered_replay_timing_ = {};
   event_ordered_timing_enabled_ = false;
+  event_ordered_init_ = false;
   initialized_ = false;
   commands_replayed_ = 0;
   frames_seen_ = 0;
@@ -50,6 +51,11 @@ void D3D12ReplayBackend::shutdown()
 void D3D12ReplayBackend::set_event_ordered_timing_enabled(bool enabled) noexcept
 {
   event_ordered_timing_enabled_ = enabled;
+}
+
+void D3D12ReplayBackend::set_event_ordered_init(bool enabled) noexcept
+{
+  event_ordered_init_ = enabled;
 }
 
 const std::string &D3D12ReplayBackend::last_error() const noexcept

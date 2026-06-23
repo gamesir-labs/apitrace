@@ -570,6 +570,9 @@ bool D3D12ReplayBackend::initialize(const trace::TraceBundleReader &reader)
       if (asset.blob_id != 0 && !asset.relative_path.empty()) {
         blob_paths_[asset.blob_id] = asset.relative_path;
       }
+      if (event_ordered_init_) {
+        continue;
+      }
       if (!is_pipeline_asset_path(asset.relative_path)) {
         continue;
       }
@@ -589,7 +592,7 @@ bool D3D12ReplayBackend::initialize(const trace::TraceBundleReader &reader)
     ScopedDurationAccumulator timer(
         presch_index_present_duration,
         event_ordered_timing_enabled_);
-    if (!index_present_frames(reader)) {
+    if (!event_ordered_init_ && !index_present_frames(reader)) {
       return false;
     }
   }
@@ -613,7 +616,7 @@ bool D3D12ReplayBackend::initialize(const trace::TraceBundleReader &reader)
     ScopedDurationAccumulator timer(
         presch_validate_frame_duration,
         event_ordered_timing_enabled_);
-    if (!validate_frame_boundaries(reader)) {
+    if (!event_ordered_init_ && !validate_frame_boundaries(reader)) {
       return false;
     }
   }
