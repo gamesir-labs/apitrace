@@ -500,6 +500,10 @@ bool D3D12ReplayBackend::initialize(const trace::TraceBundleReader &reader)
   dispatch_calls_seen_ = 0;
   last_sequence_ = 0;
   event_ordered_metal_calls_replayed_ = 0;
+  event_ordered_counters_.clear();
+  event_ordered_perf_breakdown_.clear();
+  event_ordered_init_timing_ = {};
+  event_ordered_replay_timing_ = {};
   bundle_root_ = reader.layout().root_path;
   present_frames_.clear();
   present_semantics_.clear();
@@ -533,42 +537,99 @@ bool D3D12ReplayBackend::initialize(const trace::TraceBundleReader &reader)
     return false;
   }
 
-  for (const auto &object : reader.objects()) {
-    D3D12TrackedObject tracked;
-    tracked.object_id = object.object_id;
-    tracked.kind = object.kind;
-    tracked.parent_object_id = object.parent_object_id;
-    tracked.debug_name = object.debug_name;
-    objects_.track(tracked);
-    if (object.kind == trace::ObjectKind::CommandList) {
-      command_lists_.emplace(object.object_id, CommandListSemanticState{});
+  std::chrono::steady_clock::duration object_import_duration{};
+  std::chrono::steady_clock::duration asset_scan_total_duration{};
+  std::chrono::steady_clock::duration pipeline_preload_duration{};
+  std::chrono::steady_clock::duration presch_index_present_duration{};
+  std::chrono::steady_clock::duration presch_index_semantics_duration{};
+  std::chrono::steady_clock::duration presch_validate_present_duration{};
+  std::chrono::steady_clock::duration presch_validate_frame_duration{};
+
+  {
+    ScopedDurationAccumulator timer(
+        object_import_duration,
+        event_ordered_timing_enabled_);
+    for (const auto &object : reader.objects()) {
+      D3D12TrackedObject tracked;
+      tracked.object_id = object.object_id;
+      tracked.kind = object.kind;
+      tracked.parent_object_id = object.parent_object_id;
+      tracked.debug_name = object.debug_name;
+      objects_.track(tracked);
+      if (object.kind == trace::ObjectKind::CommandList) {
+        command_lists_.emplace(object.object_id, CommandListSemanticState{});
+      }
     }
   }
 
-  for (const auto &asset : reader.assets()) {
-    if (asset.blob_id != 0 && !asset.relative_path.empty()) {
-      blob_paths_[asset.blob_id] = asset.relative_path;
+  {
+    ScopedDurationAccumulator timer(
+        asset_scan_total_duration,
+        event_ordered_timing_enabled_);
+    for (const auto &asset : reader.assets()) {
+      if (asset.blob_id != 0 && !asset.relative_path.empty()) {
+        blob_paths_[asset.blob_id] = asset.relative_path;
+      }
+      if (!is_pipeline_asset_path(asset.relative_path)) {
+        continue;
+      }
+      {
+        ScopedDurationAccumulator timer(
+            pipeline_preload_duration,
+            event_ordered_timing_enabled_);
+        if (!read_pipeline_asset_json(reader.layout().root_path, asset.relative_path, last_error_)) {
+          return false;
+        }
+      }
+      ++pipeline_assets_read_;
     }
-    if (!is_pipeline_asset_path(asset.relative_path)) {
-      continue;
-    }
-    if (!read_pipeline_asset_json(reader.layout().root_path, asset.relative_path, last_error_)) {
+  }
+
+  {
+    ScopedDurationAccumulator timer(
+        presch_index_present_duration,
+        event_ordered_timing_enabled_);
+    if (!index_present_frames(reader)) {
       return false;
     }
-    ++pipeline_assets_read_;
+  }
+  {
+    ScopedDurationAccumulator timer(
+        presch_index_semantics_duration,
+        event_ordered_timing_enabled_);
+    if (!index_present_semantics(reader)) {
+      return false;
+    }
+  }
+  {
+    ScopedDurationAccumulator timer(
+        presch_validate_present_duration,
+        event_ordered_timing_enabled_);
+    if (!validate_present_boundaries(reader)) {
+      return false;
+    }
+  }
+  {
+    ScopedDurationAccumulator timer(
+        presch_validate_frame_duration,
+        event_ordered_timing_enabled_);
+    if (!validate_frame_boundaries(reader)) {
+      return false;
+    }
   }
 
-  if (!index_present_frames(reader)) {
-    return false;
-  }
-  if (!index_present_semantics(reader)) {
-    return false;
-  }
-  if (!validate_present_boundaries(reader)) {
-    return false;
-  }
-  if (!validate_frame_boundaries(reader)) {
-    return false;
+  if (event_ordered_timing_enabled_) {
+    const auto asset_scan_duration =
+        asset_scan_total_duration > pipeline_preload_duration
+            ? asset_scan_total_duration - pipeline_preload_duration
+            : std::chrono::steady_clock::duration{};
+    event_ordered_init_timing_.object_import_ms = duration_ms(object_import_duration);
+    event_ordered_init_timing_.asset_scan_ms = duration_ms(asset_scan_duration);
+    event_ordered_init_timing_.pipeline_preload_ms = duration_ms(pipeline_preload_duration);
+    event_ordered_init_timing_.presch_index_present_ms = duration_ms(presch_index_present_duration);
+    event_ordered_init_timing_.presch_index_semantics_ms = duration_ms(presch_index_semantics_duration);
+    event_ordered_init_timing_.presch_validate_present_ms = duration_ms(presch_validate_present_duration);
+    event_ordered_init_timing_.presch_validate_frame_ms = duration_ms(presch_validate_frame_duration);
   }
 
   initialized_ = true;

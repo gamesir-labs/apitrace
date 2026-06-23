@@ -40,6 +40,92 @@ namespace {
 
 using json = nlohmann::json;
 
+std::uint64_t elapsed_ms(std::chrono::steady_clock::time_point begin)
+{
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - begin)
+          .count());
+}
+
+std::uint64_t duration_ms(std::chrono::steady_clock::duration duration)
+{
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(duration).count());
+}
+
+class ScopedMsAccumulator {
+public:
+  explicit ScopedMsAccumulator(std::uint64_t &target, bool enabled = true)
+      : target_(target), enabled_(enabled)
+  {
+    if (enabled_) {
+      begin_ = std::chrono::steady_clock::now();
+    }
+  }
+
+  ~ScopedMsAccumulator()
+  {
+    stop();
+  }
+
+  void stop()
+  {
+    if (!active_ || !enabled_) {
+      return;
+    }
+    target_ += elapsed_ms(begin_);
+    active_ = false;
+  }
+
+private:
+  std::uint64_t &target_;
+  std::chrono::steady_clock::time_point begin_;
+  bool enabled_ = true;
+  bool active_ = true;
+};
+
+class ScopedDurationAccumulator {
+public:
+  explicit ScopedDurationAccumulator(
+      std::chrono::steady_clock::duration &target,
+      bool enabled = true,
+      std::chrono::steady_clock::duration *secondary_target = nullptr)
+      : target_(target),
+        secondary_target_(secondary_target),
+        enabled_(enabled)
+  {
+    if (enabled_) {
+      begin_ = std::chrono::steady_clock::now();
+    }
+  }
+
+  ~ScopedDurationAccumulator()
+  {
+    stop();
+  }
+
+  void stop()
+  {
+    if (!active_ || !enabled_) {
+      return;
+    }
+    const auto duration = std::chrono::steady_clock::now() - begin_;
+    target_ += duration;
+    if (secondary_target_) {
+      *secondary_target_ += duration;
+    }
+    active_ = false;
+  }
+
+private:
+  std::chrono::steady_clock::duration &target_;
+  std::chrono::steady_clock::duration *secondary_target_ = nullptr;
+  std::chrono::steady_clock::time_point begin_;
+  bool enabled_ = true;
+  bool active_ = true;
+};
+
 bool env_enabled(const char *name, bool fallback)
 {
   const char *value = std::getenv(name);

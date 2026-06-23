@@ -75,6 +75,12 @@ private:
 
 class TraceBundleReader {
 public:
+  struct OpenTiming {
+    std::uint64_t parse_assets_index_ms = 0;
+    std::uint64_t parse_callstream_ms = 0;
+    std::uint64_t register_blob_refs_ms = 0;
+  };
+
   struct OpenOptions {
     bool load_metal_sideband = true;
     bool validate_checksum_contents = true;
@@ -94,6 +100,7 @@ public:
     // validates blob_refs against assets.json while parsing the streams. Tools that perform their
     // own full reference validation can disable this to avoid a duplicate serial stream pass.
     bool discover_referenced_assets = true;
+    bool collect_open_timing = false;
     // For D3D12 diagnostic replay, a stop sequence can target an event recorded inside a command
     // list. The reader still has to include the later ExecuteCommandLists event that submits that
     // list, while the native replayer performs the actual in-list truncation.
@@ -121,6 +128,7 @@ public:
   const std::unordered_set<std::string> &validated_checksum_paths() const noexcept;
   bool has_asset_index() const noexcept;
   bool prefix_limited() const noexcept;
+  const OpenTiming &open_timing() const noexcept;
   const std::string &last_error() const noexcept;
 
 private:

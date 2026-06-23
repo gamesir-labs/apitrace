@@ -252,6 +252,37 @@ private:
     frame_timing_active_ = false;
   }
 
+  void begin_event_ordered_present_timing()
+  {
+    event_ordered_present_timing_active_ = true;
+    event_ordered_present_timing_begin_ = std::chrono::steady_clock::now();
+    event_ordered_last_present_timing_ = event_ordered_present_timing_begin_;
+    event_ordered_first_present_seen_ = false;
+    event_ordered_steady_present_total_ms_ = 0.0;
+    event_ordered_steady_present_intervals_ = 0;
+  }
+
+  void note_event_ordered_present_timing()
+  {
+    if (!event_ordered_present_timing_active_) {
+      return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!event_ordered_first_present_seen_) {
+      backend_.event_ordered_replay_timing_.first_present_ms = elapsed_ms(event_ordered_present_timing_begin_);
+      event_ordered_first_present_seen_ = true;
+    } else {
+      event_ordered_steady_present_total_ms_ +=
+          std::chrono::duration<double, std::milli>(now - event_ordered_last_present_timing_).count();
+      ++event_ordered_steady_present_intervals_;
+      backend_.event_ordered_replay_timing_.steady_per_frame_ms =
+          static_cast<std::uint64_t>(
+              event_ordered_steady_present_total_ms_ /
+              static_cast<double>(event_ordered_steady_present_intervals_));
+    }
+    event_ordered_last_present_timing_ = now;
+  }
+
   struct NativeResource {
     ComPtr<ID3D12Resource> resource;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
@@ -7348,6 +7379,12 @@ private:
   double frame_timing_frame_waited_ms_ = 0.0;
   double frame_timing_total_waited_ms_ = 0.0;
   std::uint64_t frame_timing_total_frames_ = 0;
+  bool event_ordered_present_timing_active_ = false;
+  bool event_ordered_first_present_seen_ = false;
+  std::chrono::steady_clock::time_point event_ordered_present_timing_begin_{};
+  std::chrono::steady_clock::time_point event_ordered_last_present_timing_{};
+  double event_ordered_steady_present_total_ms_ = 0.0;
+  std::uint64_t event_ordered_steady_present_intervals_ = 0;
   UINT64 fence_value_ = 0;
   std::uint64_t replay_batch_index_ = 0;
   // Per-command-kind cumulative record time (microseconds) + invocation counts, to attribute a slow
@@ -7406,6 +7443,9 @@ private:
   std::vector<const D3D12ReplayBackend::CopyDescriptorSemanticState *> descriptor_copy_timeline_;
   std::vector<ResourceDataUpdateRef> resource_update_timeline_;
   std::deque<D3D12ReplayBackend::ResourceDataUpdate> event_ordered_resource_update_storage_;
+  std::unordered_set<std::string> event_ordered_ingested_update_keys_;
+  std::vector<std::size_t> event_ordered_resource_version_update_cursors_;
+  std::unordered_map<trace::ObjectId, std::size_t> event_ordered_resource_update_cursors_;
   std::deque<D3D12ReplayBackend::DescriptorSemanticState> event_ordered_copied_descriptor_storage_;
   std::size_t next_descriptor_index_ = 0;
   std::size_t next_sampler_index_ = 0;

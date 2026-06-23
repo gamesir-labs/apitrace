@@ -98,6 +98,28 @@ bool env_enabled(const char *name)
   return text != "0" && text != "false" && text != "FALSE";
 }
 
+std::string event_ordered_perf_breakdown(
+    const trace::TraceBundleReader::OpenTiming &open_timing,
+    const d3d12::D3D12ReplayBackend::EventOrderedInitTiming &init_timing,
+    std::string replay_timing)
+{
+  std::ostringstream out;
+  out << "parse_assets_index_ms=" << open_timing.parse_assets_index_ms
+      << " parse_callstream_ms=" << open_timing.parse_callstream_ms
+      << " register_blob_refs_ms=" << open_timing.register_blob_refs_ms
+      << " object_import_ms=" << init_timing.object_import_ms
+      << " asset_scan_ms=" << init_timing.asset_scan_ms
+      << " pipeline_preload_ms=" << init_timing.pipeline_preload_ms
+      << " presch_index_present_ms=" << init_timing.presch_index_present_ms
+      << " presch_index_semantics_ms=" << init_timing.presch_index_semantics_ms
+      << " presch_validate_present_ms=" << init_timing.presch_validate_present_ms
+      << " presch_validate_frame_ms=" << init_timing.presch_validate_frame_ms;
+  if (!replay_timing.empty()) {
+    out << ' ' << replay_timing;
+  }
+  return out.str();
+}
+
 // Append a line to the replay milestone log (APITRACE_D3D12_REPLAY_MILESTONE_LOG) if it is set.
 // This is the one diagnostic channel that survives Wine, where stderr is swallowed. We use it here
 // to record the model fast-path decision (loaded vs fell back, with reason) so a silent fallback to
@@ -2312,6 +2334,7 @@ bool ReplaySession::run()
   }
   if (d3d12_event_ordered_replay) {
     reader_options.parse_callstream_events = true;
+    reader_options.collect_open_timing = true;
   }
   const auto open_begin = std::chrono::steady_clock::now();
   if (!impl_->reader.open(impl_->options.bundle_root, reader_options)) {
@@ -2427,9 +2450,15 @@ bool ReplaySession::run()
     if (d3d12_event_ordered_replay) {
       impl_->statistics.backend_name += "-event-ordered";
       milestone_log("model:skipped — APITRACE_D3D12_RETRACE_EVENT_ORDERED set");
+      backend.set_event_ordered_timing_enabled(true);
       const auto backend_init_begin = std::chrono::steady_clock::now();
       if (!backend.initialize(impl_->reader)) {
         impl_->statistics.backend_init_ms = elapsed_ms(backend_init_begin);
+        impl_->statistics.d3d12_event_ordered_perf_breakdown =
+            event_ordered_perf_breakdown(
+                impl_->reader.open_timing(),
+                backend.event_ordered_init_timing(),
+                backend.event_ordered_perf_breakdown());
         impl_->last_error = backend.last_error().empty()
                                 ? "failed to initialize D3D12 replay backend"
                                 : backend.last_error();
@@ -2440,6 +2469,11 @@ bool ReplaySession::run()
       const auto event_replay_begin = std::chrono::steady_clock::now();
       if (!backend.replay_event_ordered(impl_->reader)) {
         impl_->statistics.event_replay_ms = elapsed_ms(event_replay_begin);
+        impl_->statistics.d3d12_event_ordered_perf_breakdown =
+            event_ordered_perf_breakdown(
+                impl_->reader.open_timing(),
+                backend.event_ordered_init_timing(),
+                backend.event_ordered_perf_breakdown());
         impl_->last_error = backend.last_error().empty()
                                 ? "D3D12 event-ordered replay failed"
                                 : backend.last_error();
@@ -2451,6 +2485,11 @@ bool ReplaySession::run()
       impl_->statistics.presents_seen = backend.presents_seen_;
       impl_->statistics.metal_calls_replayed = backend.event_ordered_metal_calls_replayed_;
       impl_->statistics.d3d12_event_ordered_counters = backend.event_ordered_counters();
+      impl_->statistics.d3d12_event_ordered_perf_breakdown =
+          event_ordered_perf_breakdown(
+              impl_->reader.open_timing(),
+              backend.event_ordered_init_timing(),
+              backend.event_ordered_perf_breakdown());
       backend.shutdown();
       return true;
     }

@@ -31,6 +31,10 @@ void D3D12ReplayBackend::shutdown()
   tile_mapping_updates_.clear();
   bundle_root_.clear();
   event_ordered_counters_.clear();
+  event_ordered_perf_breakdown_.clear();
+  event_ordered_init_timing_ = {};
+  event_ordered_replay_timing_ = {};
+  event_ordered_timing_enabled_ = false;
   initialized_ = false;
   commands_replayed_ = 0;
   frames_seen_ = 0;
@@ -43,6 +47,11 @@ void D3D12ReplayBackend::shutdown()
   event_ordered_metal_calls_replayed_ = 0;
 }
 
+void D3D12ReplayBackend::set_event_ordered_timing_enabled(bool enabled) noexcept
+{
+  event_ordered_timing_enabled_ = enabled;
+}
+
 const std::string &D3D12ReplayBackend::last_error() const noexcept
 {
   return last_error_;
@@ -51,6 +60,17 @@ const std::string &D3D12ReplayBackend::last_error() const noexcept
 const std::string &D3D12ReplayBackend::event_ordered_counters() const noexcept
 {
   return event_ordered_counters_;
+}
+
+const std::string &D3D12ReplayBackend::event_ordered_perf_breakdown() const noexcept
+{
+  return event_ordered_perf_breakdown_;
+}
+
+const D3D12ReplayBackend::EventOrderedInitTiming &
+D3D12ReplayBackend::event_ordered_init_timing() const noexcept
+{
+  return event_ordered_init_timing_;
 }
 
 const std::vector<D3D12ReplayBackend::DescriptorSemanticState> &

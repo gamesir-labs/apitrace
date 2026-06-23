@@ -37,40 +37,20 @@
     return lhs.update->blob_refs < rhs.update->blob_refs;
   }
 
-  bool event_ordered_resource_update_seen(
-      trace::ObjectId resource_object_id,
-      const D3D12ReplayBackend::ResourceDataUpdate &update) const
-  {
-    const std::uint64_t effective_sequence =
-        event_ordered_effective_resource_update_sequence(update);
-    for (const auto &entry : resource_update_timeline_) {
-      if (entry.sequence == effective_sequence &&
-          entry.resource_object_id == resource_object_id &&
-          entry.update != nullptr &&
-          entry.update->subresource == update.subresource &&
-          entry.update->written_begin == update.written_begin &&
-          entry.update->written_end == update.written_end &&
-          entry.update->relative_path.generic_string() == update.relative_path.generic_string() &&
-          entry.update->bytes.size() == update.bytes.size() &&
-          entry.update->blob_refs == update.blob_refs) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   void event_ordered_note_resource_update(
       trace::ObjectId resource_object_id,
       const D3D12ReplayBackend::ResourceDataUpdate &update)
   {
-    if (event_ordered_resource_update_seen(resource_object_id, update)) {
+    ResourceDataUpdateRef entry;
+    entry.sequence = event_ordered_effective_resource_update_sequence(update);
+    entry.resource_object_id = resource_object_id;
+    entry.update = &update;
+    std::string update_key = event_ordered_resource_update_key(entry);
+    if (event_ordered_ingested_update_keys_.find(update_key) != event_ordered_ingested_update_keys_.end()) {
       return;
     }
     event_ordered_resource_update_storage_.push_back(update);
     const auto &stable_update = event_ordered_resource_update_storage_.back();
-    ResourceDataUpdateRef entry;
-    entry.sequence = event_ordered_effective_resource_update_sequence(stable_update);
-    entry.resource_object_id = resource_object_id;
     entry.update = &stable_update;
     auto insert_at = std::upper_bound(
         resource_update_timeline_.begin(),
@@ -85,19 +65,33 @@
     if (inserted_index < next_resource_update_index_) {
       next_resource_update_index_ = inserted_index;
     }
+    event_ordered_ingested_update_keys_.insert(std::move(update_key));
   }
 
   void event_ordered_ingest_resource_updates()
   {
-    for (const auto &resource : backend_.resource_versions_) {
-      for (const auto &update : resource.data_updates) {
+    if (event_ordered_resource_version_update_cursors_.size() < backend_.resource_versions_.size()) {
+      event_ordered_resource_version_update_cursors_.resize(backend_.resource_versions_.size());
+    }
+    for (std::size_t index = 0; index < backend_.resource_versions_.size(); ++index) {
+      const auto &resource = backend_.resource_versions_[index];
+      auto &cursor = event_ordered_resource_version_update_cursors_[index];
+      for (std::size_t update_index = cursor; update_index < resource.data_updates.size(); ++update_index) {
+        const auto &update = resource.data_updates[update_index];
         event_ordered_note_resource_update(resource.resource_object_id, update);
       }
+      cursor = resource.data_updates.size();
     }
     for (const auto &[resource_object_id, resource] : backend_.resources_) {
-      for (const auto &update : resource.data_updates) {
+      auto &cursor = event_ordered_resource_update_cursors_[resource_object_id];
+      if (cursor > resource.data_updates.size()) {
+        cursor = 0;
+      }
+      for (std::size_t update_index = cursor; update_index < resource.data_updates.size(); ++update_index) {
+        const auto &update = resource.data_updates[update_index];
         event_ordered_note_resource_update(resource_object_id, update);
       }
+      cursor = resource.data_updates.size();
     }
   }
 

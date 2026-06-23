@@ -120,9 +120,12 @@
 
     ComPtr<ID3D12PipelineState> native;
     std::string error;
-    if (!create_native_pipeline(pipeline_it->second, native, error)) {
-      event_ordered_record_materialize_error(event, std::move(error));
-      return;
+    {
+      ScopedMsAccumulator timer(backend_.event_ordered_replay_timing_.pso_create_ms);
+      if (!create_native_pipeline(pipeline_it->second, native, error)) {
+        event_ordered_record_materialize_error(event, std::move(error));
+        return;
+      }
     }
     if (!native) {
       event_ordered_record_materialize_error(

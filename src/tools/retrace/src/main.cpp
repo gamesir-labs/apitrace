@@ -87,7 +87,11 @@ std::string format_statistics(const apitrace::replay::ReplayStatistics &statisti
       (statistics.d3d12_event_ordered_counters.empty()
            ? std::string()
            : "d3d12_event_ordered_counters: " +
-                 statistics.d3d12_event_ordered_counters + "\n");
+                 statistics.d3d12_event_ordered_counters + "\n") +
+      (statistics.d3d12_event_ordered_perf_breakdown.empty()
+           ? std::string()
+           : "eo_perf_breakdown: " +
+                 statistics.d3d12_event_ordered_perf_breakdown + "\n");
 }
 
 std::string shell_quote(const std::string &value)

@@ -6,6 +6,7 @@
 #include "apitrace/trace_bundle_io.hpp"
 
 #include <filesystem>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -20,16 +21,42 @@ class D3D12ReplayBackend {
 public:
   struct DescriptorSemanticState;
 
+  struct EventOrderedInitTiming {
+    std::uint64_t object_import_ms = 0;
+    std::uint64_t asset_scan_ms = 0;
+    std::uint64_t pipeline_preload_ms = 0;
+    std::uint64_t presch_index_present_ms = 0;
+    std::uint64_t presch_index_semantics_ms = 0;
+    std::uint64_t presch_validate_present_ms = 0;
+    std::uint64_t presch_validate_frame_ms = 0;
+  };
+
+  struct EventOrderedReplayTiming {
+    std::uint64_t bootstrap_ms = 0;
+    std::uint64_t semantic_replay_event_ms = 0;
+    std::uint64_t content_sync_ms = 0;
+    std::uint64_t dispatch_create_ms = 0;
+    std::uint64_t dispatch_record_ms = 0;
+    std::uint64_t dispatch_submit_present_ms = 0;
+    std::uint64_t pso_create_ms = 0;
+    std::uint64_t final_drain_ms = 0;
+    std::uint64_t first_present_ms = 0;
+    std::uint64_t steady_per_frame_ms = 0;
+  };
+
   D3D12ReplayBackend();
   ~D3D12ReplayBackend();
 
   bool initialize(const trace::TraceBundleReader &reader);
+  void set_event_ordered_timing_enabled(bool enabled) noexcept;
   bool replay_event(const trace::EventRecord &event);
   bool replay_event_ordered(const trace::TraceBundleReader &reader);
   bool finalize_replay();
   bool validate_only();
   void shutdown();
   const std::string &event_ordered_counters() const noexcept;
+  const std::string &event_ordered_perf_breakdown() const noexcept;
+  const EventOrderedInitTiming &event_ordered_init_timing() const noexcept;
 
   // Persisted replay-model schema. bundle-finalize reconstructs the object model once and
   // serializes it via save_replay_model; retrace loads it via load_replay_model to skip the
@@ -115,6 +142,10 @@ public:
   std::uint64_t last_sequence_ = 0;
   std::uint64_t event_ordered_metal_calls_replayed_ = 0;
   std::string event_ordered_counters_;
+  std::string event_ordered_perf_breakdown_;
+  EventOrderedInitTiming event_ordered_init_timing_;
+  EventOrderedReplayTiming event_ordered_replay_timing_;
+  bool event_ordered_timing_enabled_ = false;
   std::unordered_map<trace::BlobId, std::filesystem::path> blob_paths_;
   D3D12ObjectRegistry objects_;
   D3D12SubmissionTracker submissions_;

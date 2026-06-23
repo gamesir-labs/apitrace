@@ -34,9 +34,15 @@
     next_resource_update_index_ = 0;
     next_descriptor_copy_index_ = 0;
     event_ordered_resource_update_storage_.clear();
+    event_ordered_ingested_update_keys_.clear();
+    event_ordered_resource_version_update_cursors_.clear();
+    event_ordered_resource_update_cursors_.clear();
     event_ordered_copied_descriptor_storage_.clear();
     event_ordered_resource_updates_applied_keys_.clear();
     event_ordered_copy_descriptors_applied_keys_.clear();
+    backend_.event_ordered_perf_breakdown_.clear();
+    backend_.event_ordered_replay_timing_ = {};
+    begin_event_ordered_present_timing();
     struct EventOrderedRecordingScope {
       D3D12NativeReplayer *self = nullptr;
       bool saved = false;
@@ -51,8 +57,11 @@
       }
     } event_ordered_recording_scope(this);
 
-    if (!log_stage("event_ordered_bootstrap_device", [&] { return bootstrap_device(error); })) {
-      return false;
+    {
+      ScopedMsAccumulator timer(backend_.event_ordered_replay_timing_.bootstrap_ms);
+      if (!log_stage("event_ordered_bootstrap_device", [&] { return bootstrap_device(error); })) {
+        return false;
+      }
     }
 
     begin_frame_timing();
@@ -70,36 +79,50 @@
     std::uint64_t event_count = 0;
     for (const auto &event : reader.events()) {
       const std::uint64_t event_sequence = event.callsite.sequence;
-      if (!backend_.replay_event(event)) {
-        if (!backend_.last_error().empty()) {
-          error = "sequence " + std::to_string(event_sequence) + " " +
-                  event_ordered_event_name(event) + ": " + backend_.last_error();
-        } else {
-          error = "sequence " + std::to_string(event_sequence) + " " +
-                  event_ordered_event_name(event) + ": D3D12 event-ordered replay failed";
+      {
+        ScopedMsAccumulator timer(backend_.event_ordered_replay_timing_.semantic_replay_event_ms);
+        if (!backend_.replay_event(event)) {
+          if (!backend_.last_error().empty()) {
+            error = "sequence " + std::to_string(event_sequence) + " " +
+                    event_ordered_event_name(event) + ": " + backend_.last_error();
+          } else {
+            error = "sequence " + std::to_string(event_sequence) + " " +
+                    event_ordered_event_name(event) + ": D3D12 event-ordered replay failed";
+          }
+          return false;
         }
-        return false;
       }
 
       ++event_count;
-      event_ordered_sync_resource_content_before_consumer(event);
+      {
+        ScopedMsAccumulator timer(backend_.event_ordered_replay_timing_.content_sync_ms);
+        event_ordered_sync_resource_content_before_consumer(event);
+      }
       if (!event_ordered_maybe_bootstrap_swapchain(event, swapchain_ready, error)) {
         return false;
       }
 
-      dispatch_live(event);
+      const auto dispatch_category = event_ordered_dispatch_category(event);
+      {
+        ScopedMsAccumulator timer(event_ordered_dispatch_timing_bucket(dispatch_category));
+        dispatch_live(event);
+      }
       if (event_ordered_stop_requested_) {
         break;
       }
     }
 
-    if (!event_ordered_final_drain_queues(error)) {
-      return false;
+    {
+      ScopedMsAccumulator timer(backend_.event_ordered_replay_timing_.final_drain_ms);
+      if (!event_ordered_final_drain_queues(error)) {
+        return false;
+      }
     }
     const std::string summary = "[event-ordered] iterated " + std::to_string(event_count) +
                                 " events, categories_hit=" + event_ordered_categories_summary();
     event_ordered_log(summary);
     backend_.event_ordered_counters_ = event_ordered_counters_summary();
+    backend_.event_ordered_perf_breakdown_ = event_ordered_perf_breakdown_summary();
     event_ordered_log(backend_.event_ordered_counters_);
     replay_milestone("[event-ordered] replay:done");
     return true;
@@ -170,8 +193,11 @@ private:
       return true;
     }
 
-    if (!log_stage("event_ordered_bootstrap_swapchain", [&] { return bootstrap_swapchain(error); })) {
-      return false;
+    {
+      ScopedMsAccumulator timer(backend_.event_ordered_replay_timing_.bootstrap_ms);
+      if (!log_stage("event_ordered_bootstrap_swapchain", [&] { return bootstrap_swapchain(error); })) {
+        return false;
+      }
     }
     swapchain_ready = true;
     return true;
@@ -256,6 +282,46 @@ private:
            record.function_name == event.callsite.function_name &&
            record.command_list_object_id != 0 &&
            record.kind != D3D12ReplayBackend::ReplayCommandKind::Unknown;
+  }
+
+  enum class EventOrderedDispatchCategory {
+    Create,
+    Record,
+    SubmitPresent,
+  };
+
+  EventOrderedDispatchCategory event_ordered_dispatch_category(const trace::EventRecord &event) const
+  {
+    const std::string_view function_name(event.callsite.function_name);
+    if (event.kind == trace::EventKind::Boundary &&
+        event.boundary == trace::BoundaryKind::Present) {
+      return EventOrderedDispatchCategory::SubmitPresent;
+    }
+    if (function_name == "IDXGISwapChain::Present" ||
+        function_name == "ID3D12CommandQueue::ExecuteCommandLists" ||
+        function_name == "ID3D12CommandQueue::Signal" ||
+        function_name == "ID3D12CommandQueue::Wait" ||
+        function_name == "ID3D12Fence::Signal" ||
+        function_name == "ID3D12Fence::SetEventOnCompletion") {
+      return EventOrderedDispatchCategory::SubmitPresent;
+    }
+    if (event_ordered_is_record_call(event)) {
+      return EventOrderedDispatchCategory::Record;
+    }
+    return EventOrderedDispatchCategory::Create;
+  }
+
+  std::uint64_t &event_ordered_dispatch_timing_bucket(EventOrderedDispatchCategory category)
+  {
+    switch (category) {
+    case EventOrderedDispatchCategory::Create:
+      return backend_.event_ordered_replay_timing_.dispatch_create_ms;
+    case EventOrderedDispatchCategory::Record:
+      return backend_.event_ordered_replay_timing_.dispatch_record_ms;
+    case EventOrderedDispatchCategory::SubmitPresent:
+      return backend_.event_ordered_replay_timing_.dispatch_submit_present_ms;
+    }
+    return backend_.event_ordered_replay_timing_.dispatch_create_ms;
   }
 
   static std::string event_ordered_category(const trace::EventRecord &event)
@@ -401,6 +467,21 @@ private:
            " fence_signals=" + std::to_string(event_ordered_fence_signals_) +
            " cpu_waits=" + std::to_string(event_ordered_cpu_waits_) +
            " cpu_wait_timeouts=" + std::to_string(event_ordered_cpu_wait_timeouts_);
+  }
+
+  std::string event_ordered_perf_breakdown_summary() const
+  {
+    const auto &timing = backend_.event_ordered_replay_timing_;
+    return "bootstrap_ms=" + std::to_string(timing.bootstrap_ms) +
+           " semantic_replay_event_ms=" + std::to_string(timing.semantic_replay_event_ms) +
+           " content_sync_ms=" + std::to_string(timing.content_sync_ms) +
+           " dispatch_create_ms=" + std::to_string(timing.dispatch_create_ms) +
+           " dispatch_record_ms=" + std::to_string(timing.dispatch_record_ms) +
+           " dispatch_submit_present_ms=" + std::to_string(timing.dispatch_submit_present_ms) +
+           " pso_create_ms=" + std::to_string(timing.pso_create_ms) +
+           " final_drain_ms=" + std::to_string(timing.final_drain_ms) +
+           " first_present_ms=" + std::to_string(timing.first_present_ms) +
+           " steady_per_frame_ms=" + std::to_string(timing.steady_per_frame_ms);
   }
 
   void event_ordered_log_stub_once(const std::string &category, const trace::EventRecord &event)
@@ -553,6 +634,7 @@ private:
     }
 
     ++event_ordered_presents_executed_;
+    note_event_ordered_present_timing();
     log_frame_timing(present.frame_index);
     if (present_delay_ms_ != 0) {
 #ifdef _WIN32

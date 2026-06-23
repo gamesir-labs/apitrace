@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -26,6 +27,53 @@ namespace apitrace::trace {
 namespace {
 
 using json = nlohmann::json;
+
+std::uint64_t duration_ms(std::chrono::steady_clock::duration duration)
+{
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(duration).count());
+}
+
+class ScopedDurationAccumulator {
+public:
+  explicit ScopedDurationAccumulator(
+      std::chrono::steady_clock::duration &target,
+      bool enabled = true,
+      std::chrono::steady_clock::duration *secondary_target = nullptr)
+      : target_(target),
+        secondary_target_(secondary_target),
+        enabled_(enabled)
+  {
+    if (enabled_) {
+      begin_ = std::chrono::steady_clock::now();
+    }
+  }
+
+  ~ScopedDurationAccumulator()
+  {
+    stop();
+  }
+
+  void stop()
+  {
+    if (!active_ || !enabled_) {
+      return;
+    }
+    const auto duration = std::chrono::steady_clock::now() - begin_;
+    target_ += duration;
+    if (secondary_target_) {
+      *secondary_target_ += duration;
+    }
+    active_ = false;
+  }
+
+private:
+  std::chrono::steady_clock::duration &target_;
+  std::chrono::steady_clock::duration *secondary_target_ = nullptr;
+  std::chrono::steady_clock::time_point begin_;
+  bool enabled_ = true;
+  bool active_ = true;
+};
 
 constexpr const char *kObjectsDirectoryName = "objects";
 constexpr const char *kObjectIndexFileName = "objects.json";
@@ -1432,6 +1480,7 @@ struct TraceBundleReader::Impl {
   std::vector<ObjectRecord> objects;
   ChecksumIndex checksums;
   std::unordered_set<std::string> validated_checksum_paths;
+  OpenTiming open_timing;
   std::string last_error;
   bool has_asset_index = false;
   bool prefix_limited = false;
@@ -1472,6 +1521,12 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
   impl_->layout.metal_buffers_directory_path = impl_->layout.metal_directory_path / kMetalBuffersDirectoryName;
   impl_->layout.metal_textures_directory_path = impl_->layout.metal_directory_path / kMetalTexturesDirectoryName;
 
+  std::chrono::steady_clock::duration parse_assets_index_duration{};
+  std::chrono::steady_clock::duration parse_callstream_total_duration{};
+  std::chrono::steady_clock::duration callstream_register_blob_refs_duration{};
+  std::chrono::steady_clock::duration register_blob_refs_duration{};
+  std::chrono::steady_clock::duration *register_blob_refs_secondary_target = nullptr;
+
   for (const auto &required_path : {impl_->layout.callstream_path, impl_->layout.checksums_path, impl_->layout.object_index_path}) {
     if (!std::filesystem::is_regular_file(required_path)) {
       impl_->last_error = "missing required file: " + file_label(required_path);
@@ -1489,13 +1544,18 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
   }
 
   std::unordered_map<BlobId, std::filesystem::path> indexed_blob_paths;
-  if (!parse_asset_index(
-          impl_->layout.asset_index_path,
-          impl_->assets,
-          impl_->metal_assets,
-          indexed_blob_paths,
-          impl_->last_error)) {
-    return false;
+  {
+    ScopedDurationAccumulator assets_index_timer(
+        parse_assets_index_duration,
+        options.collect_open_timing);
+    if (!parse_asset_index(
+            impl_->layout.asset_index_path,
+            impl_->assets,
+            impl_->metal_assets,
+            indexed_blob_paths,
+            impl_->last_error)) {
+      return false;
+    }
   }
   impl_->has_asset_index = std::filesystem::is_regular_file(impl_->layout.asset_index_path);
 
@@ -1591,7 +1651,7 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
     }
     return true;
   };
-  auto register_referenced_assets = [&](const std::vector<BlobId> &blob_refs) -> bool {
+  auto register_referenced_assets_impl = [&](const std::vector<BlobId> &blob_refs) -> bool {
     if (blob_refs.empty()) {
       return true;
     }
@@ -1613,7 +1673,17 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
     }
     return true;
   };
-  auto register_payload_asset_paths_from_json = [&](const json &payload) -> bool {
+  auto register_referenced_assets = [&](const std::vector<BlobId> &blob_refs) -> bool {
+    if (blob_refs.empty() || !impl_->has_asset_index) {
+      return true;
+    }
+    ScopedDurationAccumulator timer(
+        register_blob_refs_duration,
+        options.collect_open_timing,
+        register_blob_refs_secondary_target);
+    return register_referenced_assets_impl(blob_refs);
+  };
+  auto register_payload_asset_paths_from_json_impl = [&](const json &payload) -> bool {
     std::vector<std::string> paths;
     collect_asset_paths(payload, paths);
     for (const auto &path : paths) {
@@ -1627,17 +1697,28 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
     }
     return true;
   };
+  auto register_payload_asset_paths_from_json = [&](const json &payload) -> bool {
+    ScopedDurationAccumulator timer(
+        register_blob_refs_duration,
+        options.collect_open_timing,
+        register_blob_refs_secondary_target);
+    return register_payload_asset_paths_from_json_impl(payload);
+  };
   auto register_payload_asset_paths = [&](std::string_view payload) -> bool {
     if (payload.empty() ||
         (payload.find("_path") == std::string_view::npos &&
          payload.find("\"path\"") == std::string_view::npos)) {
       return true;
     }
+    ScopedDurationAccumulator timer(
+        register_blob_refs_duration,
+        options.collect_open_timing,
+        register_blob_refs_secondary_target);
     const auto parsed = json::parse(payload, nullptr, false);
     if (parsed.is_discarded()) {
       return true;
     }
-    return register_payload_asset_paths_from_json(parsed);
+    return register_payload_asset_paths_from_json_impl(parsed);
   };
 
   if (options.discover_referenced_assets && options.load_metal_sideband && has_metal_callstream_file) {
@@ -1705,6 +1786,10 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
     }
     return event.object_refs.front();
   };
+  register_blob_refs_secondary_target = &callstream_register_blob_refs_duration;
+  ScopedDurationAccumulator callstream_parse_timer(
+      parse_callstream_total_duration,
+      options.collect_open_timing);
   while (std::getline(callstream_input, line)) {
     const auto line_bytes = static_cast<std::uint64_t>(line.size() + (callstream_input.eof() ? 0 : 1));
     if (consumed_callstream_bytes + line_bytes > callstream_byte_limit) {
@@ -1810,6 +1895,8 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
       pending_stop_present_frame = payload_frame_index(event.payload, std::numeric_limits<std::uint64_t>::max());
     }
   }
+  callstream_parse_timer.stop();
+  register_blob_refs_secondary_target = nullptr;
 
   if (!header_seen) {
     impl_->last_error = file_label(impl_->layout.callstream_path) + ": missing bundle_header";
@@ -1925,6 +2012,15 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
   }
 
   impl_->validated_checksum_paths = std::move(validated_checksum_paths);
+  if (options.collect_open_timing) {
+    const auto parse_callstream_duration =
+        parse_callstream_total_duration > callstream_register_blob_refs_duration
+            ? parse_callstream_total_duration - callstream_register_blob_refs_duration
+            : std::chrono::steady_clock::duration{};
+    impl_->open_timing.parse_assets_index_ms = duration_ms(parse_assets_index_duration);
+    impl_->open_timing.parse_callstream_ms = duration_ms(parse_callstream_duration);
+    impl_->open_timing.register_blob_refs_ms = duration_ms(register_blob_refs_duration);
+  }
   impl_->last_error.clear();
   impl_->open = true;
   return true;
@@ -1993,6 +2089,11 @@ bool TraceBundleReader::has_asset_index() const noexcept
 bool TraceBundleReader::prefix_limited() const noexcept
 {
   return impl_ && impl_->prefix_limited;
+}
+
+const TraceBundleReader::OpenTiming &TraceBundleReader::open_timing() const noexcept
+{
+  return impl_->open_timing;
 }
 
 const std::string &TraceBundleReader::last_error() const noexcept
