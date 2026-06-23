@@ -409,6 +409,80 @@ constexpr std::size_t kDescriptorViewBatchMaxOps = 1024;
 constexpr std::size_t kCopyDescriptorBatchMaxOps = 1024;
 constexpr std::size_t kCommandListBatchMaxOps = 1024;
 
+std::uint64_t env_u64(const char *name)
+{
+  const char *value = std::getenv(name);
+  if (!value || !*value) {
+    return 0;
+  }
+  char *end = nullptr;
+  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  if (end == value) {
+    return 0;
+  }
+  return static_cast<std::uint64_t>(parsed);
+}
+
+struct SealCheckpointTriggers {
+  std::uint64_t after_frame = 0;
+  std::uint64_t every_frames = 0;
+  bool has_after_frame = false;
+};
+
+const SealCheckpointTriggers &seal_checkpoint_triggers()
+{
+  static const SealCheckpointTriggers triggers = [] {
+    SealCheckpointTriggers result;
+    if (const char *after = std::getenv("APITRACE_D3D12_SEAL_CHECKPOINT_AFTER_FRAME");
+        after && *after) {
+      char *end = nullptr;
+      const unsigned long long parsed = std::strtoull(after, &end, 10);
+      if (end != after) {
+        result.after_frame = static_cast<std::uint64_t>(parsed);
+        result.has_after_frame = true;
+      }
+    }
+    result.every_frames = env_u64("APITRACE_D3D12_SEAL_CHECKPOINT_EVERY_FRAMES");
+    return result;
+  }();
+  return triggers;
+}
+
+void maybe_seal_checkpoint_after_present(std::uint64_t frame_index)
+{
+  if (frame_index == UINT64_MAX) {
+    return;
+  }
+
+  const auto &triggers = seal_checkpoint_triggers();
+  const bool after_frame_hit = triggers.has_after_frame && frame_index == triggers.after_frame;
+  const bool every_frames_hit =
+      triggers.every_frames != 0 &&
+      (frame_index + 1) >= triggers.every_frames &&
+      ((frame_index + 1) % triggers.every_frames) == 0;
+  if (!after_frame_hit && !every_frames_hit) {
+    return;
+  }
+
+  static std::atomic<bool> after_frame_sealed{false};
+  static std::atomic<bool> seal_in_progress{false};
+  if (seal_in_progress.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+  if (after_frame_hit) {
+    bool expected = false;
+    if (!after_frame_sealed.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+      if (!every_frames_hit) {
+        seal_in_progress.store(false, std::memory_order_release);
+        return;
+      }
+    }
+  }
+  runtime::seal_process_trace_session_checkpoint();
+  seal_in_progress.store(false, std::memory_order_release);
+}
+
 std::uint32_t fence_dependency_scope_id(std::string_view scope)
 {
   if (scope == "blit") {
@@ -3708,81 +3782,85 @@ std::uint64_t record_present(
     return 0;
   }
   ensure_external_swapchain_object(swapchain, "Present");
-  std::lock_guard event_lock(g_event_order_mutex);
-  flush_diagnostic_batches();
-  flush_command_list_batches();
+  std::uint64_t frame_index = UINT64_MAX;
+  {
+    std::lock_guard event_lock(g_event_order_mutex);
+    flush_diagnostic_batches();
+    flush_command_list_batches();
 
-  // Frame-end re-snapshot of the ranges USED THIS FRAME (BOUNDED + env-gated; default
-  // OFF so normal play is untouched). BUG: the homepage CG composite VS dynamically
-  // indexes a mapped cbuffer (a per-element transform palette via TEXCOORD-as-index);
-  // the submit-time snapshot can record a stale ZERO for that palette entry (the value
-  // settles relative to the async GPU read after submit), so retrace renders the
-  // composite off-screen and the CG never composites. Re-reading the frame's used
-  // ranges here, after the frame's CPU writes settle, captures the value the GPU reads;
-  // the palette is stable across frames so the next frame's composite reconstructs
-  // correctly. NOTE: must stay bounded - g_mapped_resources.captured_ranges accumulates
-  // for the whole session, so we re-snapshot ONLY this frame's ranges (g_present_recapture
-  // _ranges, cleared every present), never the full history.
-  maybe_recapture_present_ranges();
+    // Frame-end re-snapshot of the ranges USED THIS FRAME (BOUNDED + env-gated; default
+    // OFF so normal play is untouched). BUG: the homepage CG composite VS dynamically
+    // indexes a mapped cbuffer (a per-element transform palette via TEXCOORD-as-index);
+    // the submit-time snapshot can record a stale ZERO for that palette entry (the value
+    // settles relative to the async GPU read after submit), so retrace renders the
+    // composite off-screen and the CG never composites. Re-reading the frame's used
+    // ranges here, after the frame's CPU writes settle, captures the value the GPU reads;
+    // the palette is stable across frames so the next frame's composite reconstructs
+    // correctly. NOTE: must stay bounded - g_mapped_resources.captured_ranges accumulates
+    // for the whole session, so we re-snapshot ONLY this frame's ranges (g_present_recapture
+    // _ranges, cleared every present), never the full history.
+    maybe_recapture_present_ranges();
 
-  const auto present_test = is_present_test(flags);
-  const auto has_frame_index = frame_presented && !present_test && result_code == 0;
-  const auto frame_index = has_frame_index ? next_present_frame_index() : UINT64_MAX;
-  if (has_frame_index) {
-    const auto frame_begin_sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-    std::ostringstream frame_begin_payload;
-    frame_begin_payload << "{\"label\":\"FrameBegin\",\"frame_index\":" << frame_index << "}";
+    const auto present_test = is_present_test(flags);
+    const auto has_frame_index = frame_presented && !present_test && result_code == 0;
+    frame_index = has_frame_index ? next_present_frame_index() : UINT64_MAX;
+    if (has_frame_index) {
+      const auto frame_begin_sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+      std::ostringstream frame_begin_payload;
+      frame_begin_payload << "{\"label\":\"FrameBegin\",\"frame_index\":" << frame_index << "}";
+      record_boundary_event_unbatched(
+          frame_begin_sequence,
+          trace::BoundaryKind::Frame,
+          frame_begin_payload.str().c_str());
+    }
+
+    std::ostringstream payload;
+    payload << "{";
+    if (has_frame_index) {
+      payload << "\"frame_index\":" << frame_index << ",";
+    }
+    payload << "\"sync_interval\":" << sync_interval
+            << ",\"flags\":" << flags;
+    if (present_test) {
+      payload << ",\"present_test\":true";
+    } else if (!has_frame_index) {
+      payload << ",\"frame_presented\":false";
+    }
+    payload << "}";
+    const void *refs[] = {swapchain};
+    const auto present_sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    record_call_event_unbatched(
+        present_sequence,
+        "IDXGISwapChain::Present",
+        payload.str().c_str(),
+        refs,
+        1,
+        nullptr,
+        0,
+        result_code);
+    if (!has_frame_index) {
+      return UINT64_MAX;
+    }
+
+    std::ostringstream present_boundary_payload;
+    present_boundary_payload << "{\"label\":\"Present\",\"frame_index\":" << frame_index
+                             << ",\"sync_interval\":" << sync_interval
+                             << ",\"flags\":" << flags << "}";
+    const auto present_boundary_sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
     record_boundary_event_unbatched(
-        frame_begin_sequence,
+        present_boundary_sequence,
+        trace::BoundaryKind::Present,
+        present_boundary_payload.str().c_str());
+
+    std::ostringstream frame_end_payload;
+    frame_end_payload << "{\"label\":\"FrameEnd\",\"frame_index\":" << frame_index << "}";
+    const auto frame_end_sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    record_boundary_event_unbatched(
+        frame_end_sequence,
         trace::BoundaryKind::Frame,
-        frame_begin_payload.str().c_str());
+        frame_end_payload.str().c_str());
   }
-
-  std::ostringstream payload;
-  payload << "{";
-  if (has_frame_index) {
-    payload << "\"frame_index\":" << frame_index << ",";
-  }
-  payload << "\"sync_interval\":" << sync_interval
-          << ",\"flags\":" << flags;
-  if (present_test) {
-    payload << ",\"present_test\":true";
-  } else if (!has_frame_index) {
-    payload << ",\"frame_presented\":false";
-  }
-  payload << "}";
-  const void *refs[] = {swapchain};
-  const auto present_sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-  record_call_event_unbatched(
-      present_sequence,
-      "IDXGISwapChain::Present",
-      payload.str().c_str(),
-      refs,
-      1,
-      nullptr,
-      0,
-      result_code);
-  if (!has_frame_index) {
-    return UINT64_MAX;
-  }
-
-  std::ostringstream present_boundary_payload;
-  present_boundary_payload << "{\"label\":\"Present\",\"frame_index\":" << frame_index
-                           << ",\"sync_interval\":" << sync_interval
-                           << ",\"flags\":" << flags << "}";
-  const auto present_boundary_sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-  record_boundary_event_unbatched(
-      present_boundary_sequence,
-      trace::BoundaryKind::Present,
-      present_boundary_payload.str().c_str());
-
-  std::ostringstream frame_end_payload;
-  frame_end_payload << "{\"label\":\"FrameEnd\",\"frame_index\":" << frame_index << "}";
-  const auto frame_end_sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-  record_boundary_event_unbatched(
-      frame_end_sequence,
-      trace::BoundaryKind::Frame,
-      frame_end_payload.str().c_str());
+  maybe_seal_checkpoint_after_present(frame_index);
   return frame_index;
 }
 
