@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -83,6 +85,7 @@ std::mutex g_object_mutex;
 std::mutex g_event_order_mutex;
 std::mutex g_command_batch_mutex;
 std::mutex g_present_mutex;
+std::mutex g_shader_asset_memo_mutex;
 std::unordered_map<const void *, trace::ObjectId> g_object_ids;
 std::unordered_map<const void *, trace::ObjectKind> g_object_kinds;
 constexpr std::uint64_t kRootConstantBufferSnapshotBytes =
@@ -104,6 +107,54 @@ struct GpuVirtualAddressResolve {
 };
 
 std::unordered_map<const void *, ResourceGpuVirtualAddressState> g_resource_gpu_virtual_addresses;
+
+struct ShaderAssetMemoKey {
+  const void *data = nullptr;
+  std::size_t size = 0;
+
+  bool operator==(const ShaderAssetMemoKey &other) const noexcept
+  {
+    return data == other.data && size == other.size;
+  }
+};
+
+struct ShaderAssetMemoKeyHash {
+  std::size_t operator()(const ShaderAssetMemoKey &key) const noexcept
+  {
+    auto hash = std::hash<const void *>{}(key.data);
+    hash ^= std::hash<std::size_t>{}(key.size) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+    return hash;
+  }
+};
+
+struct ShaderAssetMemoEntry {
+  trace::AssetRecord asset;
+  std::string fast_fingerprint;
+};
+
+TraceSession *g_shader_asset_memo_session = nullptr;
+std::filesystem::path g_shader_asset_memo_bundle_root;
+std::uint64_t g_shader_asset_memo_initial_sequence = 0;
+std::unordered_map<ShaderAssetMemoKey, ShaderAssetMemoEntry, ShaderAssetMemoKeyHash> g_shader_asset_memo;
+
+void reset_shader_asset_memo_if_needed(TraceSession *session)
+{
+  if (!session) {
+    return;
+  }
+  const auto initial_sequence = session->initial_call_sequence();
+  const auto &bundle_root = session->options().bundle_root;
+  std::lock_guard lock(g_shader_asset_memo_mutex);
+  if (g_shader_asset_memo_session == session &&
+      g_shader_asset_memo_initial_sequence == initial_sequence &&
+      g_shader_asset_memo_bundle_root == bundle_root) {
+    return;
+  }
+  g_shader_asset_memo_session = session;
+  g_shader_asset_memo_bundle_root = bundle_root;
+  g_shader_asset_memo_initial_sequence = initial_sequence;
+  g_shader_asset_memo.clear();
+}
 
 struct CapturedMappedRange {
   std::uint64_t begin = 0;
@@ -576,6 +627,7 @@ TraceSession *session_for(trace::ApiKind api)
   auto *session = runtime::ensure_process_trace_session(api);
   if (session && api == trace::ApiKind::D3D12) {
     const auto initial_sequence = session->initial_call_sequence();
+    reset_shader_asset_memo_if_needed(session);
     auto current = g_sequence.load(std::memory_order_relaxed);
     while (current < initial_sequence &&
            !g_sequence.compare_exchange_weak(current, initial_sequence, std::memory_order_relaxed)) {
@@ -1986,12 +2038,32 @@ void flush_diagnostic_batches()
 // only thing lost is a transient in-flight dedup window -- acceptable under the
 // "keep only required synchronous work on the capture thread" rule.
 trace::AssetRecord register_asset_bytes(
+    TraceSession *session,
+    trace::AssetKind kind,
+    const char *debug_name,
+    const void *data,
+    std::size_t size);
+
+trace::AssetRecord register_asset_bytes(
     trace::AssetKind kind,
     const char *debug_name,
     const void *data,
     std::size_t size)
 {
   auto *session = session_for(trace::ApiKind::D3D12);
+  if (!session) {
+    return {};
+  }
+  return register_asset_bytes(session, kind, debug_name, data, size);
+}
+
+trace::AssetRecord register_asset_bytes(
+    TraceSession *session,
+    trace::AssetKind kind,
+    const char *debug_name,
+    const void *data,
+    std::size_t size)
+{
   if (!session) {
     return {};
   }
@@ -2008,6 +2080,54 @@ trace::AssetRecord register_asset_bytes(
   const auto *bytes = static_cast<const std::uint8_t *>(data);
   asset.payload_bytes.assign(bytes, bytes + size);
   return session->register_asset(std::move(asset));
+}
+
+trace::AssetRecord register_shader_asset_bytes(
+    const char *debug_name,
+    const void *data,
+    std::size_t size)
+{
+  auto *session = session_for(trace::ApiKind::D3D12);
+  if (!session) {
+    return {};
+  }
+  if (!data || size == 0) {
+    return register_asset_bytes(session, trace::AssetKind::ShaderDxil, debug_name, data, size);
+  }
+
+  const ShaderAssetMemoKey key{data, size};
+  ShaderAssetMemoEntry memo_entry;
+  bool has_memo_entry = false;
+  {
+    std::lock_guard lock(g_shader_asset_memo_mutex);
+    const auto found = g_shader_asset_memo.find(key);
+    if (found != g_shader_asset_memo.end() &&
+        found->second.asset.blob_id != 0 &&
+        !found->second.asset.relative_path.empty()) {
+      memo_entry = found->second;
+      has_memo_entry = true;
+    }
+  }
+
+  std::string fast_fingerprint;
+  if (has_memo_entry) {
+    fast_fingerprint = trace::fast_fingerprint_bytes(data, size);
+    if (memo_entry.fast_fingerprint == fast_fingerprint) {
+      return memo_entry.asset;
+    }
+  }
+
+  auto asset = register_asset_bytes(session, trace::AssetKind::ShaderDxil, debug_name, data, size);
+  if (asset.blob_id != 0 && !asset.relative_path.empty()) {
+    if (fast_fingerprint.empty()) {
+      fast_fingerprint = asset.fast_fingerprint.empty()
+                             ? trace::fast_fingerprint_bytes(data, size)
+                             : asset.fast_fingerprint;
+    }
+    std::lock_guard lock(g_shader_asset_memo_mutex);
+    g_shader_asset_memo[key] = ShaderAssetMemoEntry{asset, fast_fingerprint};
+  }
+  return asset;
 }
 
 std::string hex_encode_bytes(const void *data, std::size_t size)
@@ -2138,8 +2258,7 @@ std::string raw_shader_asset_json(
   if (!bytecode.pShaderBytecode || bytecode.BytecodeLength == 0) {
     return std::string("\"") + field_name + "\":null";
   }
-  const auto asset = register_asset_bytes(
-      trace::AssetKind::ShaderDxil,
+  const auto asset = register_shader_asset_bytes(
       (std::string("d3d12-") + field_name).c_str(),
       bytecode.pShaderBytecode,
       bytecode.BytecodeLength);
@@ -2170,8 +2289,7 @@ ShaderAssetMetadataJson shader_asset_metadata_json(
     const auto null_field = std::string("\"") + field_name + "\":null";
     return {null_field, null_field};
   }
-  const auto asset = register_asset_bytes(
-      trace::AssetKind::ShaderDxil,
+  const auto asset = register_shader_asset_bytes(
       (std::string("d3d12-") + field_name).c_str(),
       bytecode.pShaderBytecode,
       bytecode.BytecodeLength);
