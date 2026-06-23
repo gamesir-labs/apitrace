@@ -193,6 +193,29 @@
       return;
     }
 
+    std::string error;
+    const json *payload = payload_to_json_cached_ref(event, error);
+    if (!payload) {
+      event_ordered_record_error(event, std::move(error));
+      return;
+    }
+
+    struct PayloadOverrideScope {
+      const json *&slot;
+      const json *saved;
+
+      PayloadOverrideScope(const json *&override_slot, const json *payload_override)
+          : slot(override_slot), saved(override_slot)
+      {
+        slot = payload_override;
+      }
+
+      ~PayloadOverrideScope()
+      {
+        slot = saved;
+      }
+    } payload_override_scope(record_one_payload_override_, payload);
+
     record_one(native_it->second, record);
     if (!record_one_ok_) {
       event_ordered_record_error(event, record_one_error_);
@@ -205,17 +228,11 @@
       ++event_ordered_dispatches_recorded_;
     }
 
-    json payload;
-    std::string error;
-    if (!payload_to_json(event, payload, error)) {
+    if (!update_target_texture_watch_render_targets(native_it->second, record, *payload, error)) {
       event_ordered_record_error(event, std::move(error));
       return;
     }
-    if (!update_target_texture_watch_render_targets(native_it->second, record, payload, error)) {
-      event_ordered_record_error(event, std::move(error));
-      return;
-    }
-    update_target_texture_watch_state(native_it->second, record, payload);
+    update_target_texture_watch_state(native_it->second, record, *payload);
   }
 
   void handle_record_event(const trace::EventRecord &event)

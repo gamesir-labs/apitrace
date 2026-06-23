@@ -342,31 +342,47 @@ std::string record_prefix(const trace::EventRecord &event)
   return message.str();
 }
 
-bool payload_to_json(const trace::EventRecord &event, json &payload, std::string &error)
+struct CachedPayloadJson {
+  const json *payload = nullptr;
+  bool ok = false;
+  const std::string *error = nullptr;
+};
+
+CachedPayloadJson payload_to_json_cached(const trace::EventRecord &event)
 {
   thread_local const trace::EventRecord *tl_event = nullptr;
   thread_local json tl_payload;
   thread_local bool tl_ok = false;
   thread_local std::string tl_error;
-  if (tl_event == &event) {
-    payload = tl_payload;     // 命中：返回拷贝（与原行为等价，调用者可安全修改自己的拷贝）
-    error = tl_error;
-    return tl_ok;
+  if (tl_event != &event) {
+    tl_payload = json::parse(event.payload, nullptr, false);
+    tl_ok = true;
+    tl_error.clear();
+    if (tl_payload.is_discarded() || !tl_payload.is_object()) {
+      tl_error = record_prefix(event) + ": payload must be a JSON object";
+      tl_ok = false;
+    }
+    tl_event = &event;
   }
-  json parsed = json::parse(event.payload, nullptr, false);
-  bool ok = true;
-  std::string err;
-  if (parsed.is_discarded() || !parsed.is_object()) {
-    err = record_prefix(event) + ": payload must be a JSON object";
-    ok = false;
+  return CachedPayloadJson{&tl_payload, tl_ok, &tl_error};
+}
+
+bool payload_to_json(const trace::EventRecord &event, json &payload, std::string &error)
+{
+  const CachedPayloadJson cached = payload_to_json_cached(event);
+  payload = *cached.payload;  // 返回拷贝（与原行为等价，调用者可安全修改自己的拷贝）
+  error = *cached.error;
+  return cached.ok;
+}
+
+const json *payload_to_json_cached_ref(const trace::EventRecord &event, std::string &error)
+{
+  const CachedPayloadJson cached = payload_to_json_cached(event);
+  error = *cached.error;
+  if (!cached.ok) {
+    return nullptr;
   }
-  tl_event = &event;
-  tl_payload = parsed;
-  tl_ok = ok;
-  tl_error = err;
-  payload = std::move(parsed);
-  error = err;
-  return ok;
+  return cached.payload;
 }
 
 bool validate_object_refs(const trace::EventRecord &event, const D3D12ObjectRegistry &objects, std::string &error)
