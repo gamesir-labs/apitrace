@@ -111,11 +111,9 @@ public:
           error += " (" + removed + ")";
         }
       }
-      log_lazy_pso_summary();
       return false;
     }
     wait_for_gpu();
-    log_lazy_pso_summary();
     replay_milestone((std::string("dbg:setpso_calls=") + std::to_string(dbg_setpso_calls_) +
                       " copy_calls=" + std::to_string(dbg_copy_calls_)).c_str());
     replay_milestone("replay:done");
@@ -135,20 +133,6 @@ public:
       out << what << "\n";
       out.flush();
     }
-  }
-
-  void log_lazy_pso_summary() const
-  {
-    if (!lazy_pso_enabled_) {
-      return;
-    }
-    const auto model_pso_count =
-        backend_.pipeline_versions_.empty() ? backend_.pipelines_.size()
-                                            : backend_.pipeline_versions_.size();
-    replay_milestone((std::string("lazy_pso_created=") +
-                      std::to_string(lazy_pso_created_) +
-                      " model_pso=" + std::to_string(model_pso_count))
-                         .c_str());
   }
 
   // Log the top command kinds by cumulative record time, prefixed with `prefix`. Shared by the
@@ -1840,15 +1824,6 @@ private:
 
   bool create_pipelines(std::string &error)
   {
-    if (lazy_pso_enabled_) {
-      replay_milestone((std::string("lazy_pso_prebuild=0 model_pso=") +
-                        std::to_string(backend_.pipeline_versions_.empty()
-                                           ? backend_.pipelines_.size()
-                                           : backend_.pipeline_versions_.size()))
-                           .c_str());
-      return true;
-    }
-
     for (const auto &[object_id, pipeline] : backend_.pipelines_) {
       ComPtr<ID3D12PipelineState> native;
       if (!create_native_pipeline(pipeline, native, error)) {
@@ -5117,36 +5092,25 @@ private:
   }
 
   // Resolve the initial pipeline state recorded on the BeginCommandList marker at `begin_index`
-  // (CreateCommandList/Reset initial_pipeline_state_object_id).
-  bool initial_pipeline_state_for(
-      std::size_t begin_index,
-      ID3D12PipelineState *&pipeline,
-      std::string &error)
+  // (CreateCommandList/Reset initial_pipeline_state_object_id). Returns nullptr if none / unresolved.
+  ID3D12PipelineState *initial_pipeline_state_for(std::size_t begin_index, std::string &error)
   {
-    pipeline = nullptr;
     if (begin_index >= backend_.replay_commands_.size()) {
-      return true;
+      return nullptr;
     }
     const auto &begin_cmd = backend_.replay_commands_[begin_index];
     if (begin_cmd.kind != D3D12ReplayBackend::ReplayCommandKind::BeginCommandList) {
-      return true;
+      return nullptr;
     }
     const json payload = json::parse(begin_cmd.payload, nullptr, false);
     if (payload.is_discarded() || !payload.is_object()) {
-      return true;
+      return nullptr;
     }
     const auto pso_id = payload_u64(payload, "initial_pipeline_state_object_id");
     if (pso_id == 0) {
-      return true;
+      return nullptr;
     }
-    pipeline = pipeline_for(static_cast<trace::ObjectId>(pso_id), begin_cmd.sequence, error);
-    if (!pipeline) {
-      if (!error.empty()) {
-        return false;
-      }
-      return fail(error, "initial command list PSO references an unknown PSO");
-    }
-    return true;
+    return pipeline_for(static_cast<trace::ObjectId>(pso_id), begin_cmd.sequence, error);
   }
 
   bool record_command_list(
@@ -5163,8 +5127,8 @@ private:
     // Reset with the recorded initial pipeline state, not nullptr. Some applications bind graphics
     // PSO through Reset/CreateCommandList and then draw without a separate SetPipelineState.
     // Passing nullptr leaves the list with no PSO and drops those draws.
-    ID3D12PipelineState *initial_pso = nullptr;
-    if (!initial_pipeline_state_for(begin_index, initial_pso, error)) {
+    ID3D12PipelineState *initial_pso = initial_pipeline_state_for(begin_index, error);
+    if (!error.empty()) {
       return false;
     }
     // Diagnostic (BUG-007): a native list whose TYPE is not DIRECT but whose recorded interval has
@@ -5448,88 +5412,33 @@ private:
     return resource_it->second.resource.get();
   }
 
-  bool pipeline_has_multiple_versions(trace::ObjectId object_id) const
-  {
-    const auto indexed = backend_.pipeline_versions_by_id_.find(object_id);
-    if (indexed != backend_.pipeline_versions_by_id_.end()) {
-      return indexed->second.size() > 1;
-    }
-    std::size_t count = 0;
-    for (const auto &pipeline : backend_.pipeline_versions_) {
-      if (pipeline.pipeline_state_object_id == object_id && ++count > 1) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   ID3D12PipelineState *pipeline_for(
       trace::ObjectId object_id,
       std::uint64_t sequence,
-      std::string &error)
+      std::string &error) const
   {
-    if (!lazy_pso_enabled_) {
-      const auto version_it = pipeline_version_natives_.find(object_id);
-      if (version_it != pipeline_version_natives_.end() && !version_it->second.empty()) {
-        const auto &versions = version_it->second;
-        const ComPtr<ID3D12PipelineState> *chosen = nullptr;
-        for (const auto &[create_seq, native] : versions) {
-          if (create_seq <= sequence) {
-            chosen = &native;
-          } else {
-            break;
-          }
-        }
-        if (chosen == nullptr) {
-          chosen = &versions.front().second;
-        }
-        return chosen->get();
-      }
-      const auto pipeline_it = pipelines_.find(object_id);
-      return pipeline_it == pipelines_.end() ? nullptr : pipeline_it->second.get();
-    }
-
-    const D3D12ReplayBackend::PipelineSemanticState *pipeline =
-        backend_.pipeline_at(object_id, sequence);
-    if (pipeline == nullptr) {
-      return nullptr;
-    }
-    const bool versioned = pipeline_has_multiple_versions(object_id);
-    if (versioned) {
-      const auto version_it = pipeline_version_natives_.find(object_id);
-      if (version_it != pipeline_version_natives_.end()) {
-        for (const auto &[create_seq, native] : version_it->second) {
-          if (create_seq == pipeline->create_sequence) {
-            return native.get();
-          }
+    (void)error;
+    const auto version_it = pipeline_version_natives_.find(object_id);
+    if (version_it != pipeline_version_natives_.end() && !version_it->second.empty()) {
+      const auto &versions = version_it->second;
+      const ComPtr<ID3D12PipelineState> *chosen = nullptr;
+      for (const auto &[create_seq, native] : versions) {
+        if (create_seq <= sequence) {
+          chosen = &native;
+        } else {
+          break;
         }
       }
-    } else {
-      const auto pipeline_it = pipelines_.find(object_id);
-      if (pipeline_it != pipelines_.end()) {
-        return pipeline_it->second.get();
+      if (chosen == nullptr) {
+        chosen = &versions.front().second;
       }
+      return chosen->get();
     }
-
-    ComPtr<ID3D12PipelineState> native;
-    if (!create_native_pipeline(*pipeline, native, error)) {
+    const auto pipeline_it = pipelines_.find(object_id);
+    if (pipeline_it == pipelines_.end()) {
       return nullptr;
     }
-    if (!native) {
-      fail(error, "pipeline creation returned null PSO");
-      return nullptr;
-    }
-    ID3D12PipelineState *raw = native.get();
-    if (versioned) {
-      auto &versions = pipeline_version_natives_[object_id];
-      versions.emplace_back(pipeline->create_sequence, std::move(native));
-      std::stable_sort(versions.begin(), versions.end(),
-                       [](const auto &a, const auto &b) { return a.first < b.first; });
-    } else {
-      pipelines_[object_id] = std::move(native);
-    }
-    ++lazy_pso_created_;
-    return raw;
+    return pipeline_it->second.get();
   }
 
   NativeCommandList *native_command_list_for(
@@ -7370,8 +7279,6 @@ private:
   bool replay_stop_sequence_reached_ = false;
   bool replay_stop_command_list_id_initialized_ = false;
   trace::ObjectId replay_stop_command_list_id_ = 0;
-  bool lazy_pso_enabled_ = env_enabled("APITRACE_D3D12_REPLAY_LAZY_PSO", false);
-  std::uint64_t lazy_pso_created_ = 0;
   bool frame_timing_enabled_ = env_enabled("APITRACE_D3D12_REPLAY_FRAME_TIMING", false);
   bool frame_timing_active_ = false;
   std::chrono::steady_clock::time_point frame_timing_last_present_{};

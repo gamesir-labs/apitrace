@@ -8,6 +8,7 @@
       error = "D3D12 event-ordered replay backend was not initialized";
       return false;
     }
+    const bool perf_diag = std::getenv("DXMT_PERF_STATS") != nullptr;
 
     replay_milestone("[event-ordered] replay:begin");
     event_ordered_categories_hit_.clear();
@@ -40,6 +41,7 @@
     event_ordered_copied_descriptor_storage_.clear();
     event_ordered_resource_updates_applied_keys_.clear();
     event_ordered_copy_descriptors_applied_keys_.clear();
+    backend_.event_ordered_counters_.clear();
     backend_.event_ordered_perf_breakdown_.clear();
     backend_.event_ordered_replay_timing_ = {};
     begin_event_ordered_present_timing();
@@ -78,10 +80,16 @@
     bool swapchain_ready = swapchain_bootstrapped();
     std::uint64_t event_count = 0;
     for (const auto &event : reader.events()) {
-      const auto _iter_t0 = std::chrono::steady_clock::now();
+      std::chrono::steady_clock::time_point _iter_t0;
+      if (perf_diag) {
+        _iter_t0 = std::chrono::steady_clock::now();
+      }
       const std::uint64_t event_sequence = event.callsite.sequence;
       {
-        const auto _t0 = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point _t0;
+        if (perf_diag) {
+          _t0 = std::chrono::steady_clock::now();
+        }
         ScopedMsAccumulator timer(backend_.event_ordered_replay_timing_.semantic_replay_event_ms);
         if (!backend_.replay_event(event)) {
           if (!backend_.last_error().empty()) {
@@ -93,17 +101,24 @@
           }
           return false;
         }
-        backend_.event_ordered_replay_timing_.us_replay_event +=
-            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _t0).count();
+        if (perf_diag) {
+          backend_.event_ordered_replay_timing_.us_replay_event +=
+              std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _t0).count();
+        }
       }
 
       ++event_count;
       {
-        const auto _t0 = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point _t0;
+        if (perf_diag) {
+          _t0 = std::chrono::steady_clock::now();
+        }
         ScopedMsAccumulator timer(backend_.event_ordered_replay_timing_.content_sync_ms);
         event_ordered_sync_resource_content_before_consumer(event);
-        backend_.event_ordered_replay_timing_.us_content_sync +=
-            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _t0).count();
+        if (perf_diag) {
+          backend_.event_ordered_replay_timing_.us_content_sync +=
+              std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _t0).count();
+        }
       }
       if (!event_ordered_maybe_bootstrap_swapchain(event, swapchain_ready, error)) {
         return false;
@@ -111,14 +126,21 @@
 
       const auto dispatch_category = event_ordered_dispatch_category(event);
       {
-        const auto _t0 = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point _t0;
+        if (perf_diag) {
+          _t0 = std::chrono::steady_clock::now();
+        }
         ScopedMsAccumulator timer(event_ordered_dispatch_timing_bucket(dispatch_category));
         dispatch_live(event);
-        backend_.event_ordered_replay_timing_.us_dispatch +=
-            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _t0).count();
+        if (perf_diag) {
+          backend_.event_ordered_replay_timing_.us_dispatch +=
+              std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _t0).count();
+        }
       }
-      backend_.event_ordered_replay_timing_.us_iter_total +=
-          std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _iter_t0).count();
+      if (perf_diag) {
+        backend_.event_ordered_replay_timing_.us_iter_total +=
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _iter_t0).count();
+      }
       if (event_ordered_stop_requested_) {
         break;
       }
@@ -133,9 +155,11 @@
     const std::string summary = "[event-ordered] iterated " + std::to_string(event_count) +
                                 " events, categories_hit=" + event_ordered_categories_summary();
     event_ordered_log(summary);
-    backend_.event_ordered_counters_ = event_ordered_counters_summary();
-    backend_.event_ordered_perf_breakdown_ = event_ordered_perf_breakdown_summary();
-    event_ordered_log(backend_.event_ordered_counters_);
+    if (perf_diag) {
+      backend_.event_ordered_counters_ = event_ordered_counters_summary();
+      backend_.event_ordered_perf_breakdown_ = event_ordered_perf_breakdown_summary();
+      event_ordered_log(backend_.event_ordered_counters_);
+    }
     replay_milestone("[event-ordered] replay:done");
     return true;
   }

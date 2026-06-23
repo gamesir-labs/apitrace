@@ -2301,6 +2301,7 @@ bool ReplaySession::run()
   const bool d3d12_event_ordered_replay =
       !impl_->options.enable_metal_retrace &&
       env_enabled("APITRACE_D3D12_RETRACE_EVENT_ORDERED");
+  const bool d3d12_event_ordered_perf_diag = std::getenv("DXMT_PERF_STATS") != nullptr;
   if (!impl_->options.enable_metal_retrace) {
     reader_options.stop_after_sequence = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE");
     reader_options.stop_after_present_frame = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME");
@@ -2334,7 +2335,7 @@ bool ReplaySession::run()
   }
   if (d3d12_event_ordered_replay) {
     reader_options.parse_callstream_events = true;
-    reader_options.collect_open_timing = true;
+    reader_options.collect_open_timing = d3d12_event_ordered_perf_diag;
   }
   const auto open_begin = std::chrono::steady_clock::now();
   if (!impl_->reader.open(impl_->options.bundle_root, reader_options)) {
@@ -2455,11 +2456,13 @@ bool ReplaySession::run()
       const auto backend_init_begin = std::chrono::steady_clock::now();
       if (!backend.initialize(impl_->reader)) {
         impl_->statistics.backend_init_ms = elapsed_ms(backend_init_begin);
-        impl_->statistics.d3d12_event_ordered_perf_breakdown =
-            event_ordered_perf_breakdown(
-                impl_->reader.open_timing(),
-                backend.event_ordered_init_timing(),
-                backend.event_ordered_perf_breakdown());
+        if (d3d12_event_ordered_perf_diag) {
+          impl_->statistics.d3d12_event_ordered_perf_breakdown =
+              event_ordered_perf_breakdown(
+                  impl_->reader.open_timing(),
+                  backend.event_ordered_init_timing(),
+                  backend.event_ordered_perf_breakdown());
+        }
         impl_->last_error = backend.last_error().empty()
                                 ? "failed to initialize D3D12 replay backend"
                                 : backend.last_error();
@@ -2470,11 +2473,13 @@ bool ReplaySession::run()
       const auto event_replay_begin = std::chrono::steady_clock::now();
       if (!backend.replay_event_ordered(impl_->reader)) {
         impl_->statistics.event_replay_ms = elapsed_ms(event_replay_begin);
-        impl_->statistics.d3d12_event_ordered_perf_breakdown =
-            event_ordered_perf_breakdown(
-                impl_->reader.open_timing(),
-                backend.event_ordered_init_timing(),
-                backend.event_ordered_perf_breakdown());
+        if (d3d12_event_ordered_perf_diag) {
+          impl_->statistics.d3d12_event_ordered_perf_breakdown =
+              event_ordered_perf_breakdown(
+                  impl_->reader.open_timing(),
+                  backend.event_ordered_init_timing(),
+                  backend.event_ordered_perf_breakdown());
+        }
         impl_->last_error = backend.last_error().empty()
                                 ? "D3D12 event-ordered replay failed"
                                 : backend.last_error();
@@ -2485,12 +2490,14 @@ bool ReplaySession::run()
       impl_->statistics.frames_seen = backend.frames_seen_;
       impl_->statistics.presents_seen = backend.presents_seen_;
       impl_->statistics.metal_calls_replayed = backend.event_ordered_metal_calls_replayed_;
-      impl_->statistics.d3d12_event_ordered_counters = backend.event_ordered_counters();
-      impl_->statistics.d3d12_event_ordered_perf_breakdown =
-          event_ordered_perf_breakdown(
-              impl_->reader.open_timing(),
-              backend.event_ordered_init_timing(),
-              backend.event_ordered_perf_breakdown());
+      if (d3d12_event_ordered_perf_diag) {
+        impl_->statistics.d3d12_event_ordered_counters = backend.event_ordered_counters();
+        impl_->statistics.d3d12_event_ordered_perf_breakdown =
+            event_ordered_perf_breakdown(
+                impl_->reader.open_timing(),
+                backend.event_ordered_init_timing(),
+                backend.event_ordered_perf_breakdown());
+      }
       backend.shutdown();
       return true;
     }
