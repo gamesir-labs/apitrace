@@ -2211,18 +2211,18 @@ private:
     if (history_it == descriptor_slot_history_.end() || history_it->second.empty()) {
       return nullptr;
     }
-    const auto &history = history_it->second;
-    const auto upper = std::upper_bound(
-        history.begin(),
-        history.end(),
-        sequence,
-        [](std::uint64_t value, const DescriptorSlotHistoryEntry &entry) {
-          return value < entry.sequence;
-        });
-    if (upper == history.begin()) {
-      return nullptr;
+    const D3D12ReplayBackend::DescriptorSemanticState *found = nullptr;
+    std::uint64_t found_sequence = 0;
+    for (const auto &entry : history_it->second) {
+      if (entry.descriptor == nullptr || entry.sequence > sequence) {
+        continue;
+      }
+      if (found == nullptr || entry.sequence >= found_sequence) {
+        found = entry.descriptor;
+        found_sequence = entry.sequence;
+      }
     }
-    return (upper - 1)->descriptor;
+    return found;
   }
 
   bool materialize_cpu_descriptor_at(

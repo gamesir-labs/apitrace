@@ -315,6 +315,9 @@ private:
     if (function_name == "ID3D12CommandQueue::ExecuteCommandLists") {
       return "ExecuteCommandLists";
     }
+    if (function_name == "ID3D12CommandQueue::UpdateTileMappings") {
+      return "UpdateTileMappings(P4)";
+    }
     if (function_name == "ID3D12CommandQueue::Signal") {
       return "QueueSignal";
     }
@@ -423,6 +426,10 @@ private:
     }
     if (event_ordered_is_copy_descriptors_event(event)) {
       event_ordered_apply_copy_descriptors(event);
+      return;
+    }
+    if (function_name == "ID3D12CommandQueue::UpdateTileMappings") {
+      event_ordered_log_stub_once("UpdateTileMappings(P4)", event);
       return;
     }
 

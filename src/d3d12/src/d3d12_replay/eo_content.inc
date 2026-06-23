@@ -26,7 +26,15 @@
     if (lhs.update->written_end != rhs.update->written_end) {
       return lhs.update->written_end < rhs.update->written_end;
     }
-    return lhs.update->relative_path.generic_string() < rhs.update->relative_path.generic_string();
+    const auto lhs_path = lhs.update->relative_path.generic_string();
+    const auto rhs_path = rhs.update->relative_path.generic_string();
+    if (lhs_path != rhs_path) {
+      return lhs_path < rhs_path;
+    }
+    if (lhs.update->bytes.size() != rhs.update->bytes.size()) {
+      return lhs.update->bytes.size() < rhs.update->bytes.size();
+    }
+    return lhs.update->blob_refs < rhs.update->blob_refs;
   }
 
   bool event_ordered_resource_update_seen(
@@ -42,7 +50,9 @@
           entry.update->subresource == update.subresource &&
           entry.update->written_begin == update.written_begin &&
           entry.update->written_end == update.written_end &&
-          entry.update->relative_path.generic_string() == update.relative_path.generic_string()) {
+          entry.update->relative_path.generic_string() == update.relative_path.generic_string() &&
+          entry.update->bytes.size() == update.bytes.size() &&
+          entry.update->blob_refs == update.blob_refs) {
         return true;
       }
     }
@@ -103,7 +113,11 @@
     key << entry.update->subresource << ":"
         << entry.update->written_begin << ":"
         << entry.update->written_end << ":"
-        << entry.update->relative_path.generic_string();
+        << entry.update->relative_path.generic_string() << ":"
+        << entry.update->bytes.size();
+    for (const auto blob_ref : entry.update->blob_refs) {
+      key << ":" << blob_ref;
+    }
     return key.str();
   }
 
@@ -247,6 +261,17 @@
     return false;
   }
 
+  static std::string event_ordered_descriptor_copy_key(
+      const D3D12ReplayBackend::CopyDescriptorSemanticState &copy)
+  {
+    std::ostringstream key;
+    key << copy.create_sequence << ":" << copy.descriptor_heap_type;
+    for (const auto &pair : copy.descriptors) {
+      key << ":" << pair.dst_descriptor << "<-" << pair.src_descriptor;
+    }
+    return key.str();
+  }
+
   void event_ordered_apply_copy_descriptors(const trace::EventRecord &event)
   {
     bool applied_any = false;
@@ -254,7 +279,7 @@
       if (!event_ordered_copy_belongs_to_event(copy, event)) {
         continue;
       }
-      const auto key = std::to_string(copy.create_sequence);
+      const auto key = event_ordered_descriptor_copy_key(copy);
       if (!event_ordered_copy_descriptors_applied_keys_.insert(key).second) {
         continue;
       }
