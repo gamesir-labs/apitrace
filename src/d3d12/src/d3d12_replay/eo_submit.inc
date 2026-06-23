@@ -137,6 +137,7 @@
     }
     queue->ExecuteCommandLists(static_cast<UINT>(native_lists.size()), native_lists.data());
     event_ordered_command_lists_submitted_ += native_lists.size();
+    backend_.event_ordered_metal_calls_replayed_ += native_lists.size();
 
     const std::string removed = device_removed_detail();
     if (!removed.empty()) {

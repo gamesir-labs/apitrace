@@ -499,6 +499,7 @@ bool D3D12ReplayBackend::initialize(const trace::TraceBundleReader &reader)
   draw_calls_seen_ = 0;
   dispatch_calls_seen_ = 0;
   last_sequence_ = 0;
+  event_ordered_metal_calls_replayed_ = 0;
   bundle_root_ = reader.layout().root_path;
   present_frames_.clear();
   present_semantics_.clear();

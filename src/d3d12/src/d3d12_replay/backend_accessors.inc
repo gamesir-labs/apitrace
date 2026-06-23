@@ -40,6 +40,7 @@ void D3D12ReplayBackend::shutdown()
   draw_calls_seen_ = 0;
   dispatch_calls_seen_ = 0;
   last_sequence_ = 0;
+  event_ordered_metal_calls_replayed_ = 0;
 }
 
 const std::string &D3D12ReplayBackend::last_error() const noexcept

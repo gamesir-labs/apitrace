@@ -199,6 +199,11 @@
       return;
     }
     ++event_ordered_recorded_commands_;
+    if (record.kind == D3D12ReplayBackend::ReplayCommandKind::Draw) {
+      ++event_ordered_draws_recorded_;
+    } else if (record.kind == D3D12ReplayBackend::ReplayCommandKind::Dispatch) {
+      ++event_ordered_dispatches_recorded_;
+    }
 
     json payload;
     std::string error;

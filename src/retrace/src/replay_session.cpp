@@ -2449,6 +2449,7 @@ bool ReplaySession::run()
       impl_->statistics.calls_replayed = backend.commands_replayed_;
       impl_->statistics.frames_seen = backend.frames_seen_;
       impl_->statistics.presents_seen = backend.presents_seen_;
+      impl_->statistics.metal_calls_replayed = backend.event_ordered_metal_calls_replayed_;
       impl_->statistics.d3d12_event_ordered_counters = backend.event_ordered_counters();
       backend.shutdown();
       return true;

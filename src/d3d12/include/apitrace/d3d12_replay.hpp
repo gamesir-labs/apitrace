@@ -113,6 +113,7 @@ public:
   std::uint64_t draw_calls_seen_ = 0;
   std::uint64_t dispatch_calls_seen_ = 0;
   std::uint64_t last_sequence_ = 0;
+  std::uint64_t event_ordered_metal_calls_replayed_ = 0;
   std::string event_ordered_counters_;
   std::unordered_map<trace::BlobId, std::filesystem::path> blob_paths_;
   D3D12ObjectRegistry objects_;

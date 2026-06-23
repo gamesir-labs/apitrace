@@ -7422,11 +7422,17 @@ private:
   std::uint64_t event_ordered_resource_updates_applied_ = 0;
   std::uint64_t event_ordered_copy_descriptors_applied_ = 0;
   std::uint64_t event_ordered_command_lists_submitted_ = 0;
+  std::uint64_t event_ordered_draws_recorded_ = 0;
+  std::uint64_t event_ordered_dispatches_recorded_ = 0;
+  std::uint64_t event_ordered_presents_executed_ = 0;
+  std::uint64_t event_ordered_present_errors_ = 0;
   std::uint64_t event_ordered_queue_signals_ = 0;
   std::uint64_t event_ordered_queue_waits_ = 0;
   std::uint64_t event_ordered_fence_signals_ = 0;
   std::uint64_t event_ordered_cpu_waits_ = 0;
   std::uint64_t event_ordered_cpu_wait_timeouts_ = 0;
+  bool event_ordered_stop_requested_ = false;
+  std::unordered_set<std::uint64_t> event_ordered_presented_frames_;
   std::unordered_set<std::string> event_ordered_resource_updates_applied_keys_;
   std::unordered_set<std::string> event_ordered_copy_descriptors_applied_keys_;
 #if !defined(_WIN32)

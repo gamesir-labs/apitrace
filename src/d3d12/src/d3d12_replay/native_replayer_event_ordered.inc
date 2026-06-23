@@ -18,11 +18,17 @@
     event_ordered_resource_updates_applied_ = 0;
     event_ordered_copy_descriptors_applied_ = 0;
     event_ordered_command_lists_submitted_ = 0;
+    event_ordered_draws_recorded_ = 0;
+    event_ordered_dispatches_recorded_ = 0;
+    event_ordered_presents_executed_ = 0;
+    event_ordered_present_errors_ = 0;
     event_ordered_queue_signals_ = 0;
     event_ordered_queue_waits_ = 0;
     event_ordered_fence_signals_ = 0;
     event_ordered_cpu_waits_ = 0;
     event_ordered_cpu_wait_timeouts_ = 0;
+    event_ordered_stop_requested_ = false;
+    event_ordered_presented_frames_.clear();
     resource_update_timeline_.clear();
     descriptor_copy_timeline_.clear();
     next_resource_update_index_ = 0;
@@ -49,6 +55,17 @@
       return false;
     }
 
+    begin_frame_timing();
+    struct EventOrderedFrameTimingScope {
+      D3D12NativeReplayer *self = nullptr;
+      ~EventOrderedFrameTimingScope()
+      {
+        if (self) {
+          self->finish_frame_timing();
+        }
+      }
+    } frame_timing_scope{this};
+
     bool swapchain_ready = swapchain_bootstrapped();
     std::uint64_t event_count = 0;
     for (const auto &event : reader.events()) {
@@ -71,6 +88,9 @@
       }
 
       dispatch_live(event);
+      if (event_ordered_stop_requested_) {
+        break;
+      }
     }
 
     if (!event_ordered_final_drain_queues(error)) {
@@ -372,6 +392,10 @@ private:
            " resource_updates_applied=" + std::to_string(event_ordered_resource_updates_applied_) +
            " copy_descriptors_applied=" + std::to_string(event_ordered_copy_descriptors_applied_) +
            " command_lists_submitted=" + std::to_string(event_ordered_command_lists_submitted_) +
+           " draws_recorded=" + std::to_string(event_ordered_draws_recorded_) +
+           " dispatches_recorded=" + std::to_string(event_ordered_dispatches_recorded_) +
+           " presents_executed=" + std::to_string(event_ordered_presents_executed_) +
+           " present_errors=" + std::to_string(event_ordered_present_errors_) +
            " queue_signals=" + std::to_string(event_ordered_queue_signals_) +
            " queue_waits=" + std::to_string(event_ordered_queue_waits_) +
            " fence_signals=" + std::to_string(event_ordered_fence_signals_) +
@@ -396,9 +420,169 @@ private:
 #include "eo_record.inc"
 #include "eo_submit.inc"
 
+  struct EventOrderedPresentPayload {
+    std::uint64_t frame_index = 0;
+    UINT sync_interval = 0;
+    UINT flags = 0;
+  };
+
+  void event_ordered_present_error(const trace::EventRecord &event, std::string error)
+  {
+    const std::string line = "[event-ordered] present:error seq=" +
+                             std::to_string(event.callsite.sequence) +
+                             " fn=" + event_ordered_event_name(event) +
+                             " " + error;
+    backend_.last_error_ = std::move(error);
+    ++event_ordered_present_errors_;
+    event_ordered_log(line);
+  }
+
+  bool event_ordered_present_payload(
+      const trace::EventRecord &event,
+      EventOrderedPresentPayload &present,
+      std::string &error) const
+  {
+    json payload;
+    if (!payload_to_json(event, payload, error)) {
+      return false;
+    }
+    if (!require_payload_key(event, payload, "frame_index", error) ||
+        !require_payload_key(event, payload, "sync_interval", error) ||
+        !require_payload_key(event, payload, "flags", error)) {
+      return false;
+    }
+    present.frame_index = payload_u64(payload, "frame_index");
+    present.sync_interval = static_cast<UINT>(payload_u32(payload, "sync_interval"));
+    present.flags = static_cast<UINT>(payload_u32(payload, "flags"));
+    return true;
+  }
+
+  bool event_ordered_verify_present_semantics(
+      const trace::EventRecord &event,
+      const EventOrderedPresentPayload &present,
+      bool boundary,
+      std::string &error) const
+  {
+    const auto semantic_it = backend_.present_semantics_.find(present.frame_index);
+    if (semantic_it == backend_.present_semantics_.end() || !semantic_it->second.has_call) {
+      error = "Present references missing captured IDXGISwapChain::Present frame_index=" +
+              std::to_string(present.frame_index);
+      return false;
+    }
+    const auto &semantic = semantic_it->second;
+    if (semantic.sync_interval != present.sync_interval || semantic.flags != present.flags) {
+      error = "Present parameters do not match captured IDXGISwapChain::Present frame_index=" +
+              std::to_string(present.frame_index);
+      return false;
+    }
+    if (boundary) {
+      if (!semantic.has_boundary || semantic.boundary_sequence != event.callsite.sequence) {
+        error = "Present boundary sequence does not match indexed Present semantics frame_index=" +
+                std::to_string(present.frame_index);
+        return false;
+      }
+    } else if (semantic.call_sequence != event.callsite.sequence) {
+      error = "IDXGISwapChain::Present call sequence does not match indexed Present semantics frame_index=" +
+              std::to_string(present.frame_index);
+      return false;
+    }
+    return true;
+  }
+
+  UINT event_ordered_current_back_buffer_index() const
+  {
+    return swap_chain_ ? swap_chain_->GetCurrentBackBufferIndex() : headless_back_buffer_index_;
+  }
+
+  void event_ordered_handle_present_call(const trace::EventRecord &event)
+  {
+    if (event.object_refs.empty() || event.object_refs.front() == 0) {
+      event_ordered_present_error(event, "IDXGISwapChain::Present missing swapchain object ref");
+      return;
+    }
+
+    EventOrderedPresentPayload present;
+    std::string error;
+    if (!event_ordered_present_payload(event, present, error) ||
+        !event_ordered_verify_present_semantics(event, present, false, error)) {
+      event_ordered_present_error(event, std::move(error));
+    }
+  }
+
+  void event_ordered_handle_present_boundary(const trace::EventRecord &event)
+  {
+    EventOrderedPresentPayload present;
+    std::string error;
+    if (!event_ordered_present_payload(event, present, error) ||
+        !event_ordered_verify_present_semantics(event, present, true, error)) {
+      event_ordered_present_error(event, std::move(error));
+      return;
+    }
+
+    if (!event_ordered_presented_frames_.insert(present.frame_index).second) {
+      event_ordered_log("[event-ordered] present:skip-duplicate frame=" +
+                        std::to_string(present.frame_index));
+      return;
+    }
+
+    const UINT back_buffer_index = event_ordered_current_back_buffer_index();
+    if (back_buffer_index >= kBufferCount) {
+      event_ordered_present_error(
+          event,
+          "Present resolved invalid back-buffer index=" + std::to_string(back_buffer_index));
+      return;
+    }
+
+    if (!capture_present_frame(present.frame_index, present.sync_interval, present.flags, error)) {
+      event_ordered_present_error(
+          event,
+          error.empty() ? "capture_present_frame failed for frame=" +
+                              std::to_string(present.frame_index)
+                        : std::move(error));
+    }
+
+    if (swap_chain_) {
+      const HRESULT hr = swap_chain_->Present(present.sync_interval, present.flags);
+      record_present_semantics(present.sync_interval, present.flags, hr);
+      if (FAILED(hr)) {
+        event_ordered_present_error(event, hresult_error("IDXGISwapChain::Present", hr));
+      }
+    } else {
+      record_present_semantics(present.sync_interval, present.flags, S_OK);
+      headless_back_buffer_index_ = (headless_back_buffer_index_ + 1) % kBufferCount;
+    }
+
+    ++event_ordered_presents_executed_;
+    log_frame_timing(present.frame_index);
+    if (present_delay_ms_ != 0) {
+#ifdef _WIN32
+      Sleep(present_delay_ms_);
+#else
+      std::this_thread::sleep_for(std::chrono::milliseconds(present_delay_ms_));
+#endif
+    }
+    if (swap_chain_ && !pump_messages()) {
+      event_ordered_present_error(event, "replay window closed");
+      event_ordered_stop_requested_ = true;
+    }
+    if (replay_stop_after_present_frame_ != 0 &&
+        present.frame_index >= replay_stop_after_present_frame_) {
+      event_ordered_stop_requested_ = true;
+    }
+  }
+
   void dispatch_live(const trace::EventRecord &event)
   {
     const std::string_view function_name(event.callsite.function_name);
+    if (event.kind == trace::EventKind::Boundary &&
+        event.boundary == trace::BoundaryKind::Present) {
+      event_ordered_handle_present_boundary(event);
+      return;
+    }
+    if (function_name == "IDXGISwapChain::Present") {
+      event_ordered_handle_present_call(event);
+      return;
+    }
     if (event_ordered_contains(function_name, "CreateHeap") ||
         event_ordered_contains(function_name, "CreateQueryHeap")) {
       materialize_create_memory(event);
