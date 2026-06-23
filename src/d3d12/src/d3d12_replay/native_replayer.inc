@@ -75,7 +75,7 @@ public:
 
 class D3D12NativeReplayer {
 public:
-  explicit D3D12NativeReplayer(const D3D12ReplayBackend &backend) : backend_(backend) {}
+  explicit D3D12NativeReplayer(D3D12ReplayBackend &backend) : backend_(backend) {}
 
   ~D3D12NativeReplayer()
   {
@@ -184,6 +184,8 @@ public:
     replay_milestone(end.c_str());
     return ok;
   }
+
+#include "native_replayer_event_ordered.inc"
 
 private:
   void emit_frame_timing_line(const std::string &line) const
@@ -7192,7 +7194,7 @@ private:
     UINT capacity = 4096;
   };
 
-  const D3D12ReplayBackend &backend_;
+  D3D12ReplayBackend &backend_;
   HWND hwnd_ = nullptr;
   UINT present_delay_ms_ = static_cast<UINT>(env_u32("APITRACE_D3D12_RETRACE_PRESENT_DELAY_MS"));
   std::uint64_t replay_stop_after_present_frame_ = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME");
@@ -7245,6 +7247,8 @@ private:
   std::unordered_map<trace::ObjectId, ComPtr<ID3D12QueryHeap>> query_heaps_;
   std::array<CpuDescriptorScratch, D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES> cpu_descriptor_scratch_;
   std::unordered_map<std::uint64_t, std::vector<DescriptorSlotHistoryEntry>> descriptor_slot_history_;
+  std::unordered_set<std::string> event_ordered_categories_hit_;
+  std::vector<std::string> event_ordered_categories_hit_order_;
   mutable bool shader_candidate_index_built_ = false;
   mutable std::unordered_map<std::uint64_t, std::vector<std::filesystem::path>> shader_candidate_paths_by_size_;
   std::unordered_map<trace::ObjectId, NativeResource> resources_;
@@ -7275,9 +7279,15 @@ private:
 
 class D3D12NativeReplayer {
 public:
-  explicit D3D12NativeReplayer(const D3D12ReplayBackend &) {}
+  explicit D3D12NativeReplayer(D3D12ReplayBackend &) {}
 
   bool replay(std::string &error)
+  {
+    error = "D3D12 native command replay incomplete";
+    return false;
+  }
+
+  bool replay_event_ordered(const trace::TraceBundleReader &, std::string &error)
   {
     error = "D3D12 native command replay incomplete";
     return false;

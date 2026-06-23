@@ -25,6 +25,7 @@ public:
 
   bool initialize(const trace::TraceBundleReader &reader);
   bool replay_event(const trace::EventRecord &event);
+  bool replay_event_ordered(const trace::TraceBundleReader &reader);
   bool finalize_replay();
   bool validate_only();
   void shutdown();

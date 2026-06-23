@@ -2511,6 +2511,16 @@ bool D3D12ReplayBackend::finalize_replay()
   return native_replayer.replay(last_error_);
 }
 
+bool D3D12ReplayBackend::replay_event_ordered(const trace::TraceBundleReader &reader)
+{
+  if (!initialized_) {
+    last_error_ = "D3D12 replay backend was not initialized";
+    return false;
+  }
+  D3D12NativeReplayer native_replayer(*this);
+  return native_replayer.replay_event_ordered(reader, last_error_);
+}
+
 bool D3D12ReplayBackend::validate_only()
 {
   build_pipeline_version_index();

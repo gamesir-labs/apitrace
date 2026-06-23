@@ -2276,6 +2276,9 @@ bool ReplaySession::run()
   trace::TraceBundleReader::OpenOptions reader_options;
   reader_options.load_metal_sideband = impl_->options.enable_metal_retrace;
   reader_options.validate_checksum_contents = false;
+  const bool d3d12_event_ordered_replay =
+      !impl_->options.enable_metal_retrace &&
+      env_enabled("APITRACE_D3D12_RETRACE_EVENT_ORDERED");
   if (!impl_->options.enable_metal_retrace) {
     reader_options.stop_after_sequence = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE");
     reader_options.stop_after_present_frame = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME");
@@ -2295,6 +2298,7 @@ bool ReplaySession::run()
   // load, the D3D12 branch re-opens the reader with events to fall back to reconstruction.
   bool will_try_replay_model = false;
   if (!impl_->options.enable_metal_retrace &&
+      !d3d12_event_ordered_replay &&
       reader_options.stop_after_sequence == 0 &&
       reader_options.stop_after_present_frame == 0 &&
       !env_enabled("APITRACE_D3D12_RETRACE_IGNORE_MODEL")) {
@@ -2305,6 +2309,9 @@ bool ReplaySession::run()
   }
   if (will_try_replay_model) {
     reader_options.parse_callstream_events = false;
+  }
+  if (d3d12_event_ordered_replay) {
+    reader_options.parse_callstream_events = true;
   }
   const auto open_begin = std::chrono::steady_clock::now();
   if (!impl_->reader.open(impl_->options.bundle_root, reader_options)) {
@@ -2416,6 +2423,35 @@ bool ReplaySession::run()
 
     impl_->statistics.backend_name =
         impl_->options.backend == BackendKind::NativeD3D12 ? "native-d3d12" : "bundle-d3d12";
+
+    if (d3d12_event_ordered_replay) {
+      impl_->statistics.backend_name += "-event-ordered";
+      milestone_log("model:skipped — APITRACE_D3D12_RETRACE_EVENT_ORDERED set");
+      const auto backend_init_begin = std::chrono::steady_clock::now();
+      if (!backend.initialize(impl_->reader)) {
+        impl_->statistics.backend_init_ms = elapsed_ms(backend_init_begin);
+        impl_->last_error = backend.last_error().empty()
+                                ? "failed to initialize D3D12 replay backend"
+                                : backend.last_error();
+        return false;
+      }
+      impl_->statistics.backend_init_ms = elapsed_ms(backend_init_begin);
+
+      const auto event_replay_begin = std::chrono::steady_clock::now();
+      if (!backend.replay_event_ordered(impl_->reader)) {
+        impl_->statistics.event_replay_ms = elapsed_ms(event_replay_begin);
+        impl_->last_error = backend.last_error().empty()
+                                ? "D3D12 event-ordered replay failed"
+                                : backend.last_error();
+        return false;
+      }
+      impl_->statistics.event_replay_ms = elapsed_ms(event_replay_begin);
+      impl_->statistics.calls_replayed = backend.commands_replayed_;
+      impl_->statistics.frames_seen = backend.frames_seen_;
+      impl_->statistics.presents_seen = backend.presents_seen_;
+      backend.shutdown();
+      return true;
+    }
 
     // Fast path: if bundle-finalize persisted a reconstructed replay model, load it and skip the
     // CPU-heavy initialize()+replay_event reconstruction, going straight to finalize/validate.
