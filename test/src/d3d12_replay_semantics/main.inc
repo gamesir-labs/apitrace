@@ -1613,8 +1613,23 @@ int main(int argc, char **argv)
     std::cerr << "failed to write Unmap wrong-blob-ref bundle\n";
     return 1;
   }
-  if (!expect_d3d12_replay_failure(unmap_wrong_blob_ref_bundle, "asset path is not covered by blob_refs")) {
-    std::cerr << "D3D12 replay accepted an Unmap buffer path missing from blob_refs\n";
+  apitrace::trace::TraceBundleReader unmap_wrong_blob_ref_reader;
+  if (!open_finalized_bundle(unmap_wrong_blob_ref_reader, unmap_wrong_blob_ref_bundle)) {
+    std::cerr << "reader failed to reopen Unmap wrong-blob-ref bundle: "
+              << unmap_wrong_blob_ref_reader.last_error() << "\n";
+    return 1;
+  }
+  apitrace::d3d12::D3D12ReplayBackend unmap_wrong_blob_ref_backend;
+  if (!replay_all_events(unmap_wrong_blob_ref_reader, unmap_wrong_blob_ref_backend)) {
+    std::cerr << "D3D12 replay rejected a skippable Unmap buffer path missing from blob_refs: "
+              << unmap_wrong_blob_ref_backend.last_error() << "\n";
+    return 1;
+  }
+  const auto *unmap_wrong_blob_ref_resource =
+      apitrace::d3d12::D3D12ReplayBackendTestHook::resource_state(unmap_wrong_blob_ref_backend, 2);
+  if (!unmap_wrong_blob_ref_resource ||
+      !unmap_wrong_blob_ref_resource->data_updates.empty()) {
+    std::cerr << "D3D12 replay did not skip the uncovered Unmap buffer payload\n";
     return 1;
   }
 

@@ -111,9 +111,11 @@ public:
           error += " (" + removed + ")";
         }
       }
+      log_lazy_pso_summary();
       return false;
     }
     wait_for_gpu();
+    log_lazy_pso_summary();
     replay_milestone((std::string("dbg:setpso_calls=") + std::to_string(dbg_setpso_calls_) +
                       " copy_calls=" + std::to_string(dbg_copy_calls_)).c_str());
     replay_milestone("replay:done");
@@ -133,6 +135,20 @@ public:
       out << what << "\n";
       out.flush();
     }
+  }
+
+  void log_lazy_pso_summary() const
+  {
+    if (!lazy_pso_enabled_) {
+      return;
+    }
+    const auto model_pso_count =
+        backend_.pipeline_versions_.empty() ? backend_.pipelines_.size()
+                                            : backend_.pipeline_versions_.size();
+    replay_milestone((std::string("lazy_pso_created=") +
+                      std::to_string(lazy_pso_created_) +
+                      " model_pso=" + std::to_string(model_pso_count))
+                         .c_str());
   }
 
   // Log the top command kinds by cumulative record time, prefixed with `prefix`. Shared by the
@@ -170,6 +186,72 @@ public:
   }
 
 private:
+  void emit_frame_timing_line(const std::string &line) const
+  {
+    std::fprintf(stderr, "%s\n", line.c_str());
+    std::fflush(stderr);
+    replay_milestone(line.c_str());
+  }
+
+  void begin_frame_timing()
+  {
+    if (!frame_timing_enabled_) {
+      return;
+    }
+    frame_timing_active_ = true;
+    frame_timing_last_present_ = std::chrono::steady_clock::now();
+    frame_timing_frame_batches_ = 0;
+    frame_timing_frame_waited_ms_ = 0.0;
+    frame_timing_total_waited_ms_ = 0.0;
+    frame_timing_total_frames_ = 0;
+  }
+
+  void log_frame_timing(std::uint64_t present_frame_index)
+  {
+    if (!frame_timing_active_) {
+      return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(now - frame_timing_last_present_).count();
+    ++frame_timing_total_frames_;
+
+    std::ostringstream line;
+    line << "frame=" << present_frame_index
+         << " elapsed_ms=" << elapsed_ms
+         << " batches=" << frame_timing_frame_batches_
+         << " waited_ms=" << frame_timing_frame_waited_ms_;
+    emit_frame_timing_line(line.str());
+
+    frame_timing_last_present_ = now;
+    frame_timing_frame_batches_ = 0;
+    frame_timing_frame_waited_ms_ = 0.0;
+  }
+
+  void accumulate_submit_wait_timing(std::chrono::steady_clock::time_point wait_begin)
+  {
+    if (!frame_timing_active_) {
+      return;
+    }
+    const double waited_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_begin)
+            .count();
+    frame_timing_frame_waited_ms_ += waited_ms;
+    frame_timing_total_waited_ms_ += waited_ms;
+  }
+
+  void finish_frame_timing()
+  {
+    if (!frame_timing_active_) {
+      return;
+    }
+    std::ostringstream line;
+    line << "total_wait_ms=" << frame_timing_total_waited_ms_
+         << " total_frames=" << frame_timing_total_frames_;
+    emit_frame_timing_line(line.str());
+    frame_timing_active_ = false;
+  }
+
   struct NativeResource {
     ComPtr<ID3D12Resource> resource;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
@@ -1560,130 +1642,141 @@ private:
     return desc;
   }
 
-  bool create_pipelines(std::string &error)
+  bool create_native_pipeline(
+      const D3D12ReplayBackend::PipelineSemanticState &pipeline,
+      ComPtr<ID3D12PipelineState> &native,
+      std::string &error)
   {
-    const auto make_native_pipeline = [&](const D3D12ReplayBackend::PipelineSemanticState &pipeline,
-                                          ComPtr<ID3D12PipelineState> &native,
-                                          std::string &error) -> bool {
-      ID3D12RootSignature *root_signature = nullptr;
-      if (!pipeline.uses_embedded_root_signature) {
-        const auto root_it = root_signatures_.find(pipeline.root_signature_object_id);
-        if (root_it == root_signatures_.end()) {
-          return fail(error, "pipeline references an unknown root signature");
-        }
-        root_signature = root_it->second.get();
+    ID3D12RootSignature *root_signature = nullptr;
+    if (!pipeline.uses_embedded_root_signature) {
+      const auto root_it = root_signatures_.find(pipeline.root_signature_object_id);
+      if (root_it == root_signatures_.end()) {
+        return fail(error, "pipeline references an unknown root signature");
       }
-      json pipeline_asset;
-      if (!read_pipeline_asset_json(backend_.bundle_root_, pipeline.relative_path, &pipeline_asset, error)) {
+      root_signature = root_it->second.get();
+    }
+    json pipeline_asset;
+    if (!read_pipeline_asset_json(backend_.bundle_root_, pipeline.relative_path, &pipeline_asset, error)) {
+      return false;
+    }
+    D3D12_BLEND_DESC blend{};
+    D3D12_RASTERIZER_DESC rasterizer{};
+    D3D12_DEPTH_STENCIL_DESC depth_stencil{};
+    if (!pipeline.graphics) {
+      std::vector<std::uint8_t> cs;
+      if (!read_shader_bytes(pipeline_asset, "cs", cs, error)) {
         return false;
       }
-      D3D12_BLEND_DESC blend{};
-      D3D12_RASTERIZER_DESC rasterizer{};
-      D3D12_DEPTH_STENCIL_DESC depth_stencil{};
-      if (!pipeline.graphics) {
-        std::vector<std::uint8_t> cs;
-        if (!read_shader_bytes(pipeline_asset, "cs", cs, error)) {
-          return false;
-        }
-        D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
-        desc.pRootSignature = root_signature;
-        desc.CS = D3D12_SHADER_BYTECODE{cs.data(), cs.size()};
-        desc.NodeMask = pipeline.node_mask;
-        desc.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(pipeline.flags);
-        const auto create_compute_pipeline =
-            [&](const D3D12_COMPUTE_PIPELINE_STATE_DESC &pipeline_desc,
-                ComPtr<ID3D12PipelineState> &pipeline_state) -> HRESULT {
-          return device_->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(pipeline_state.put()));
-        };
-        HRESULT hr = create_compute_pipeline(desc, native);
-        if (FAILED(hr)) {
-          if (retry_compute_pso_shader_candidates(pipeline, pipeline_asset, desc, create_compute_pipeline, native)) {
-            return true;
-          }
-          error = hresult_error("CreateComputePipelineState", hr) +
-                  " path=" + pipeline.relative_path.generic_string() +
-                  " object=" + std::to_string(pipeline.pipeline_state_object_id) +
-                  " create_sequence=" + std::to_string(pipeline.create_sequence) +
-                  " root=" + std::to_string(pipeline.root_signature_object_id) +
-                  " cs_bytes=" + std::to_string(cs.size());
-          return false;
-        }
-        return true;
-      }
-      if (!require_object(pipeline_asset, "blend_state", blend, error) ||
-          !require_object(pipeline_asset, "rasterizer_state", rasterizer, error) ||
-          !require_object(pipeline_asset, "depth_stencil_state", depth_stencil, error)) {
-        return false;
-      }
-      std::vector<std::uint8_t> vs;
-      std::vector<std::uint8_t> ps;
-      std::vector<std::uint8_t> ds;
-      std::vector<std::uint8_t> hs;
-      std::vector<std::uint8_t> gs;
-      if (!read_shader_bytes(pipeline_asset, "vs", vs, error) ||
-          !read_shader_bytes(pipeline_asset, "ps", ps, error) ||
-          !read_shader_bytes(pipeline_asset, "ds", ds, error) ||
-          !read_shader_bytes(pipeline_asset, "hs", hs, error) ||
-          !read_shader_bytes(pipeline_asset, "gs", gs, error)) {
-        return false;
-      }
-      std::vector<std::string> semantic_names;
-      std::vector<D3D12_INPUT_ELEMENT_DESC> input_elements;
-      D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+      D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
       desc.pRootSignature = root_signature;
-      desc.VS = D3D12_SHADER_BYTECODE{vs.data(), vs.size()};
-      desc.PS = D3D12_SHADER_BYTECODE{ps.data(), ps.size()};
-      desc.DS = D3D12_SHADER_BYTECODE{ds.data(), ds.size()};
-      desc.HS = D3D12_SHADER_BYTECODE{hs.data(), hs.size()};
-      desc.GS = D3D12_SHADER_BYTECODE{gs.data(), gs.size()};
-      desc.BlendState = blend_desc(pipeline_asset);
-      desc.SampleMask = pipeline.sample_mask;
-      desc.RasterizerState = rasterizer_desc(pipeline_asset);
-      desc.DepthStencilState = depth_stencil_desc(pipeline_asset);
-      desc.InputLayout = input_layout_desc(pipeline_asset, semantic_names, input_elements);
-      desc.PrimitiveTopologyType = static_cast<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(pipeline.primitive_topology_type);
-      desc.NumRenderTargets = pipeline.num_render_targets;
-      for (std::size_t index = 0; index < pipeline.rtv_formats.size() && index < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++index) {
-        desc.RTVFormats[index] = static_cast<DXGI_FORMAT>(pipeline.rtv_formats[index]);
-      }
-      desc.DSVFormat = static_cast<DXGI_FORMAT>(pipeline.dsv_format);
-      desc.SampleDesc.Count = pipeline.sample_count;
-      desc.SampleDesc.Quality = pipeline.sample_quality;
+      desc.CS = D3D12_SHADER_BYTECODE{cs.data(), cs.size()};
       desc.NodeMask = pipeline.node_mask;
       desc.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(pipeline.flags);
-      desc.IBStripCutValue = static_cast<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>(pipeline.ib_strip_cut_value);
-      const auto create_graphics_pipeline =
-          [&](const D3D12_GRAPHICS_PIPELINE_STATE_DESC &pipeline_desc,
+      const auto create_compute_pipeline =
+          [&](const D3D12_COMPUTE_PIPELINE_STATE_DESC &pipeline_desc,
               ComPtr<ID3D12PipelineState> &pipeline_state) -> HRESULT {
-        return device_->CreateGraphicsPipelineState(&pipeline_desc, IID_PPV_ARGS(pipeline_state.put()));
+        return device_->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(pipeline_state.put()));
       };
-      HRESULT hr = create_graphics_pipeline(desc, native);
+      HRESULT hr = create_compute_pipeline(desc, native);
       if (FAILED(hr)) {
-        if (retry_graphics_pso_shader_candidates(pipeline, pipeline_asset, desc, create_graphics_pipeline, native)) {
+        if (retry_compute_pso_shader_candidates(pipeline, pipeline_asset, desc, create_compute_pipeline, native)) {
           return true;
         }
-        error = hresult_error("CreateGraphicsPipelineState", hr) +
+        error = hresult_error("CreateComputePipelineState", hr) +
                 " path=" + pipeline.relative_path.generic_string() +
                 " object=" + std::to_string(pipeline.pipeline_state_object_id) +
                 " create_sequence=" + std::to_string(pipeline.create_sequence) +
                 " root=" + std::to_string(pipeline.root_signature_object_id) +
-                " rts=" + std::to_string(pipeline.num_render_targets) +
-                " dsv=" + std::to_string(pipeline.dsv_format) +
-                " sample=" + std::to_string(pipeline.sample_count) + "x" +
-                std::to_string(pipeline.sample_quality) +
-                " vs_bytes=" + std::to_string(vs.size()) +
-                " ps_bytes=" + std::to_string(ps.size()) +
-                " ds_bytes=" + std::to_string(ds.size()) +
-                " hs_bytes=" + std::to_string(hs.size()) +
-                " gs_bytes=" + std::to_string(gs.size());
+                " cs_bytes=" + std::to_string(cs.size());
         return false;
       }
       return true;
+    }
+    if (!require_object(pipeline_asset, "blend_state", blend, error) ||
+        !require_object(pipeline_asset, "rasterizer_state", rasterizer, error) ||
+        !require_object(pipeline_asset, "depth_stencil_state", depth_stencil, error)) {
+      return false;
+    }
+    std::vector<std::uint8_t> vs;
+    std::vector<std::uint8_t> ps;
+    std::vector<std::uint8_t> ds;
+    std::vector<std::uint8_t> hs;
+    std::vector<std::uint8_t> gs;
+    if (!read_shader_bytes(pipeline_asset, "vs", vs, error) ||
+        !read_shader_bytes(pipeline_asset, "ps", ps, error) ||
+        !read_shader_bytes(pipeline_asset, "ds", ds, error) ||
+        !read_shader_bytes(pipeline_asset, "hs", hs, error) ||
+        !read_shader_bytes(pipeline_asset, "gs", gs, error)) {
+      return false;
+    }
+    std::vector<std::string> semantic_names;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> input_elements;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = root_signature;
+    desc.VS = D3D12_SHADER_BYTECODE{vs.data(), vs.size()};
+    desc.PS = D3D12_SHADER_BYTECODE{ps.data(), ps.size()};
+    desc.DS = D3D12_SHADER_BYTECODE{ds.data(), ds.size()};
+    desc.HS = D3D12_SHADER_BYTECODE{hs.data(), hs.size()};
+    desc.GS = D3D12_SHADER_BYTECODE{gs.data(), gs.size()};
+    desc.BlendState = blend_desc(pipeline_asset);
+    desc.SampleMask = pipeline.sample_mask;
+    desc.RasterizerState = rasterizer_desc(pipeline_asset);
+    desc.DepthStencilState = depth_stencil_desc(pipeline_asset);
+    desc.InputLayout = input_layout_desc(pipeline_asset, semantic_names, input_elements);
+    desc.PrimitiveTopologyType = static_cast<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(pipeline.primitive_topology_type);
+    desc.NumRenderTargets = pipeline.num_render_targets;
+    for (std::size_t index = 0; index < pipeline.rtv_formats.size() && index < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++index) {
+      desc.RTVFormats[index] = static_cast<DXGI_FORMAT>(pipeline.rtv_formats[index]);
+    }
+    desc.DSVFormat = static_cast<DXGI_FORMAT>(pipeline.dsv_format);
+    desc.SampleDesc.Count = pipeline.sample_count;
+    desc.SampleDesc.Quality = pipeline.sample_quality;
+    desc.NodeMask = pipeline.node_mask;
+    desc.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(pipeline.flags);
+    desc.IBStripCutValue = static_cast<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>(pipeline.ib_strip_cut_value);
+    const auto create_graphics_pipeline =
+        [&](const D3D12_GRAPHICS_PIPELINE_STATE_DESC &pipeline_desc,
+            ComPtr<ID3D12PipelineState> &pipeline_state) -> HRESULT {
+      return device_->CreateGraphicsPipelineState(&pipeline_desc, IID_PPV_ARGS(pipeline_state.put()));
     };
+    HRESULT hr = create_graphics_pipeline(desc, native);
+    if (FAILED(hr)) {
+      if (retry_graphics_pso_shader_candidates(pipeline, pipeline_asset, desc, create_graphics_pipeline, native)) {
+        return true;
+      }
+      error = hresult_error("CreateGraphicsPipelineState", hr) +
+              " path=" + pipeline.relative_path.generic_string() +
+              " object=" + std::to_string(pipeline.pipeline_state_object_id) +
+              " create_sequence=" + std::to_string(pipeline.create_sequence) +
+              " root=" + std::to_string(pipeline.root_signature_object_id) +
+              " rts=" + std::to_string(pipeline.num_render_targets) +
+              " dsv=" + std::to_string(pipeline.dsv_format) +
+              " sample=" + std::to_string(pipeline.sample_count) + "x" +
+              std::to_string(pipeline.sample_quality) +
+              " vs_bytes=" + std::to_string(vs.size()) +
+              " ps_bytes=" + std::to_string(ps.size()) +
+              " ds_bytes=" + std::to_string(ds.size()) +
+              " hs_bytes=" + std::to_string(hs.size()) +
+              " gs_bytes=" + std::to_string(gs.size());
+      return false;
+    }
+    return true;
+  }
+
+  bool create_pipelines(std::string &error)
+  {
+    if (lazy_pso_enabled_) {
+      replay_milestone((std::string("lazy_pso_prebuild=0 model_pso=") +
+                        std::to_string(backend_.pipeline_versions_.empty()
+                                           ? backend_.pipelines_.size()
+                                           : backend_.pipeline_versions_.size()))
+                           .c_str());
+      return true;
+    }
 
     for (const auto &[object_id, pipeline] : backend_.pipelines_) {
       ComPtr<ID3D12PipelineState> native;
-      if (!make_native_pipeline(pipeline, native, error)) {
+      if (!create_native_pipeline(pipeline, native, error)) {
         return false;
       }
       pipelines_.emplace(object_id, std::move(native));
@@ -1698,7 +1791,7 @@ private:
         continue;  // single version: pipelines_ already holds it
       }
       ComPtr<ID3D12PipelineState> native;
-      if (!make_native_pipeline(pipeline, native, error)) {
+      if (!create_native_pipeline(pipeline, native, error)) {
         return false;
       }
       pipeline_version_natives_[pipeline.pipeline_state_object_id].emplace_back(
@@ -2591,6 +2684,16 @@ private:
     // Build the per-command-list interval index once, so per-batch interval lookups are a binary
     // search instead of a full scan of replay_commands_ (which is O(total commands) per batch).
     build_command_list_intervals();
+    begin_frame_timing();
+    struct FrameTimingScope {
+      D3D12NativeReplayer *self = nullptr;
+      ~FrameTimingScope()
+      {
+        if (self) {
+          self->finish_frame_timing();
+        }
+      }
+    } frame_timing_scope{this};
     for (const auto &batch : backend_.submissions_.completed_batches()) {
       // Per-batch timing + command-count instrumentation: a batch that takes a long time gets a
       // milestone with how many commands it recorded, so a slow anchor batch is attributable to
@@ -2676,7 +2779,7 @@ private:
           replay_milestone((std::string("submit:executed batch=") +
                             std::to_string(replay_batch_index_)).c_str());
         }
-        wait_for_gpu(batch_queue);
+        wait_for_gpu(batch_queue, true);
         if (trace_batch) {
           replay_milestone((std::string("submit:waited batch=") +
                             std::to_string(replay_batch_index_)).c_str());
@@ -2712,6 +2815,9 @@ private:
                " elapsed_ms=" + std::to_string(batch_ms))
                   .c_str());
         }
+      }
+      if (frame_timing_enabled_) {
+        ++frame_timing_frame_batches_;
       }
       ++replay_batch_index_;
       const bool stop_targets_recorded_list = replay_stop_command_list_id() != 0;
@@ -2760,6 +2866,7 @@ private:
           record_present_semantics(sync_interval, flags, S_OK);
           headless_back_buffer_index_ = (headless_back_buffer_index_ + 1) % kBufferCount;
         }
+        log_frame_timing(present_frame_index);
         if (present_delay_ms_ != 0) {
 #ifdef _WIN32
           Sleep(present_delay_ms_);
@@ -4907,25 +5014,36 @@ private:
   }
 
   // Resolve the initial pipeline state recorded on the BeginCommandList marker at `begin_index`
-  // (CreateCommandList/Reset initial_pipeline_state_object_id). Returns nullptr if none / unresolved.
-  ID3D12PipelineState *initial_pipeline_state_for(std::size_t begin_index)
+  // (CreateCommandList/Reset initial_pipeline_state_object_id).
+  bool initial_pipeline_state_for(
+      std::size_t begin_index,
+      ID3D12PipelineState *&pipeline,
+      std::string &error)
   {
+    pipeline = nullptr;
     if (begin_index >= backend_.replay_commands_.size()) {
-      return nullptr;
+      return true;
     }
     const auto &begin_cmd = backend_.replay_commands_[begin_index];
     if (begin_cmd.kind != D3D12ReplayBackend::ReplayCommandKind::BeginCommandList) {
-      return nullptr;
+      return true;
     }
     const json payload = json::parse(begin_cmd.payload, nullptr, false);
     if (payload.is_discarded() || !payload.is_object()) {
-      return nullptr;
+      return true;
     }
     const auto pso_id = payload_u64(payload, "initial_pipeline_state_object_id");
     if (pso_id == 0) {
-      return nullptr;
+      return true;
     }
-    return pipeline_for(static_cast<trace::ObjectId>(pso_id), begin_cmd.sequence);
+    pipeline = pipeline_for(static_cast<trace::ObjectId>(pso_id), begin_cmd.sequence, error);
+    if (!pipeline) {
+      if (!error.empty()) {
+        return false;
+      }
+      return fail(error, "initial command list PSO references an unknown PSO");
+    }
+    return true;
   }
 
   bool record_command_list(
@@ -4942,7 +5060,10 @@ private:
     // Reset with the recorded initial pipeline state, not nullptr. Some applications bind graphics
     // PSO through Reset/CreateCommandList and then draw without a separate SetPipelineState.
     // Passing nullptr leaves the list with no PSO and drops those draws.
-    ID3D12PipelineState *initial_pso = initial_pipeline_state_for(begin_index);
+    ID3D12PipelineState *initial_pso = nullptr;
+    if (!initial_pipeline_state_for(begin_index, initial_pso, error)) {
+      return false;
+    }
     // Diagnostic (BUG-007): a native list whose TYPE is not DIRECT but whose recorded interval has
     // Draw commands is the mismatch (graphics PSO/draw on a COPY/COMPUTE list -> DXMT drops them).
     if (std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG")) {
@@ -5224,26 +5345,88 @@ private:
     return resource_it->second.resource.get();
   }
 
-  ID3D12PipelineState *pipeline_for(trace::ObjectId object_id, std::uint64_t sequence) const
+  bool pipeline_has_multiple_versions(trace::ObjectId object_id) const
   {
-    const auto version_it = pipeline_version_natives_.find(object_id);
-    if (version_it != pipeline_version_natives_.end() && !version_it->second.empty()) {
-      const auto &versions = version_it->second;
-      const ComPtr<ID3D12PipelineState> *chosen = nullptr;
-      for (const auto &[create_seq, native] : versions) {
-        if (create_seq <= sequence) {
-          chosen = &native;
-        } else {
-          break;
+    const auto indexed = backend_.pipeline_versions_by_id_.find(object_id);
+    if (indexed != backend_.pipeline_versions_by_id_.end()) {
+      return indexed->second.size() > 1;
+    }
+    std::size_t count = 0;
+    for (const auto &pipeline : backend_.pipeline_versions_) {
+      if (pipeline.pipeline_state_object_id == object_id && ++count > 1) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  ID3D12PipelineState *pipeline_for(
+      trace::ObjectId object_id,
+      std::uint64_t sequence,
+      std::string &error)
+  {
+    if (!lazy_pso_enabled_) {
+      const auto version_it = pipeline_version_natives_.find(object_id);
+      if (version_it != pipeline_version_natives_.end() && !version_it->second.empty()) {
+        const auto &versions = version_it->second;
+        const ComPtr<ID3D12PipelineState> *chosen = nullptr;
+        for (const auto &[create_seq, native] : versions) {
+          if (create_seq <= sequence) {
+            chosen = &native;
+          } else {
+            break;
+          }
+        }
+        if (chosen == nullptr) {
+          chosen = &versions.front().second;
+        }
+        return chosen->get();
+      }
+      const auto pipeline_it = pipelines_.find(object_id);
+      return pipeline_it == pipelines_.end() ? nullptr : pipeline_it->second.get();
+    }
+
+    const D3D12ReplayBackend::PipelineSemanticState *pipeline =
+        backend_.pipeline_at(object_id, sequence);
+    if (pipeline == nullptr) {
+      return nullptr;
+    }
+    const bool versioned = pipeline_has_multiple_versions(object_id);
+    if (versioned) {
+      const auto version_it = pipeline_version_natives_.find(object_id);
+      if (version_it != pipeline_version_natives_.end()) {
+        for (const auto &[create_seq, native] : version_it->second) {
+          if (create_seq == pipeline->create_sequence) {
+            return native.get();
+          }
         }
       }
-      if (chosen == nullptr) {
-        chosen = &versions.front().second;
+    } else {
+      const auto pipeline_it = pipelines_.find(object_id);
+      if (pipeline_it != pipelines_.end()) {
+        return pipeline_it->second.get();
       }
-      return chosen->get();
     }
-    const auto pipeline_it = pipelines_.find(object_id);
-    return pipeline_it == pipelines_.end() ? nullptr : pipeline_it->second.get();
+
+    ComPtr<ID3D12PipelineState> native;
+    if (!create_native_pipeline(*pipeline, native, error)) {
+      return nullptr;
+    }
+    if (!native) {
+      fail(error, "pipeline creation returned null PSO");
+      return nullptr;
+    }
+    ID3D12PipelineState *raw = native.get();
+    if (versioned) {
+      auto &versions = pipeline_version_natives_[object_id];
+      versions.emplace_back(pipeline->create_sequence, std::move(native));
+      std::stable_sort(versions.begin(), versions.end(),
+                       [](const auto &a, const auto &b) { return a.first < b.first; });
+    } else {
+      pipelines_[object_id] = std::move(native);
+    }
+    ++lazy_pso_created_;
+    return raw;
   }
 
   NativeCommandList *native_command_list_for(
@@ -5562,8 +5745,11 @@ private:
     if (command.object_refs.size() < 2) {
       return fail(error, "SetPipelineState missing PSO object");
     }
-    ID3D12PipelineState *pipeline = pipeline_for(command.object_refs[1], command.sequence);
+    ID3D12PipelineState *pipeline = pipeline_for(command.object_refs[1], command.sequence, error);
     if (!pipeline) {
+      if (!error.empty()) {
+        return false;
+      }
       return fail(error, "SetPipelineState references an unknown PSO");
     }
     list->SetPipelineState(pipeline);
@@ -6185,8 +6371,11 @@ private:
     if (command.function_name == "ID3D12GraphicsCommandList::ClearState") {
       ID3D12PipelineState *pipeline = nullptr;
       if (command.object_refs.size() >= 2 && command.object_refs[1] != 0) {
-        pipeline = pipeline_for(command.object_refs[1], command.sequence);
+        pipeline = pipeline_for(command.object_refs[1], command.sequence, error);
         if (!pipeline) {
+          if (!error.empty()) {
+            return false;
+          }
           return fail(error, "ClearState references an unknown PSO");
         }
       }
@@ -6933,11 +7122,16 @@ private:
     return raw;
   }
 
-  void wait_for_gpu(ID3D12CommandQueue *signal_queue = nullptr)
+  void wait_for_gpu(ID3D12CommandQueue *signal_queue = nullptr, bool count_frame_timing = false)
   {
     ID3D12CommandQueue *q = signal_queue ? signal_queue : queue_.get();
     if (!q || !fence_) {
       return;
+    }
+    const bool time_wait = frame_timing_active_ && count_frame_timing;
+    std::chrono::steady_clock::time_point wait_begin;
+    if (time_wait) {
+      wait_begin = std::chrono::steady_clock::now();
     }
     const UINT64 value = ++fence_value_;
     if (FAILED(q->Signal(fence_.get(), value))) {
@@ -6953,6 +7147,9 @@ private:
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 #endif
+    if (time_wait) {
+      accumulate_submit_wait_timing(wait_begin);
+    }
   }
 
   // Returns a human-readable device-removed reason if the device has faulted, else an empty string.
@@ -7003,6 +7200,15 @@ private:
   bool replay_stop_sequence_reached_ = false;
   bool replay_stop_command_list_id_initialized_ = false;
   trace::ObjectId replay_stop_command_list_id_ = 0;
+  bool lazy_pso_enabled_ = env_enabled("APITRACE_D3D12_REPLAY_LAZY_PSO", false);
+  std::uint64_t lazy_pso_created_ = 0;
+  bool frame_timing_enabled_ = env_enabled("APITRACE_D3D12_REPLAY_FRAME_TIMING", false);
+  bool frame_timing_active_ = false;
+  std::chrono::steady_clock::time_point frame_timing_last_present_{};
+  std::uint64_t frame_timing_frame_batches_ = 0;
+  double frame_timing_frame_waited_ms_ = 0.0;
+  double frame_timing_total_waited_ms_ = 0.0;
+  std::uint64_t frame_timing_total_frames_ = 0;
   UINT64 fence_value_ = 0;
   std::uint64_t replay_batch_index_ = 0;
   // Per-command-kind cumulative record time (microseconds) + invocation counts, to attribute a slow

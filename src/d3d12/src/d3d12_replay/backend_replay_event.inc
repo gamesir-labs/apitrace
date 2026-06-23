@@ -3343,28 +3343,40 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         last_error_ = record_prefix(event) + ": Unmap buffer asset is missing blob_refs";
         return false;
       }
-      if (!verify_event_blob_refs_cover_paths(event, {std::filesystem::path(buffer_path)}, blob_paths_, last_error_)) {
-        return false;
-      }
-      const auto absolute_buffer_path = bundle_root_ / buffer_path;
-      std::vector<std::uint8_t> bytes;
-      std::string asset_error;
-      if (!read_prefix_asset_bytes(absolute_buffer_path, written_end - written_begin, bytes, asset_error)) {
-        last_error_ = record_prefix(event) + ": " + asset_error;
-        return false;
-      }
-      ResourceDataUpdate update;
-      update.sequence = event.callsite.sequence;
-      update.apply_sequence = payload_u64(payload, "apply_sequence");
-      update.subresource = subresource;
-      update.written_begin = written_begin;
-      update.written_end = written_end;
-      update.relative_path = buffer_path;
-      update.blob_refs = event.blob_refs;
-      update.bytes = std::move(bytes);
-      if (!append_resource_data_update(event.object_refs.front(), std::move(update), last_error_)) {
-        last_error_ = record_prefix(event) + ": " + last_error_;
-        return false;
+      std::string blob_ref_error;
+      if (!verify_event_blob_refs_cover_paths(
+              event, {std::filesystem::path(buffer_path)}, blob_paths_, blob_ref_error)) {
+        if (blob_ref_error.find("asset path is not covered by blob_refs: ") == std::string::npos) {
+          last_error_ = std::move(blob_ref_error);
+          return false;
+        }
+        std::fprintf(
+            stderr,
+            "warning: D3D12 replay skipped Unmap buffer payload at sequence %llu: "
+            "asset path is not covered by blob_refs: %s\n",
+            static_cast<unsigned long long>(event.callsite.sequence),
+            std::filesystem::path(buffer_path).generic_string().c_str());
+      } else {
+        const auto absolute_buffer_path = bundle_root_ / buffer_path;
+        std::vector<std::uint8_t> bytes;
+        std::string asset_error;
+        if (!read_prefix_asset_bytes(absolute_buffer_path, written_end - written_begin, bytes, asset_error)) {
+          last_error_ = record_prefix(event) + ": " + asset_error;
+          return false;
+        }
+        ResourceDataUpdate update;
+        update.sequence = event.callsite.sequence;
+        update.apply_sequence = payload_u64(payload, "apply_sequence");
+        update.subresource = subresource;
+        update.written_begin = written_begin;
+        update.written_end = written_end;
+        update.relative_path = buffer_path;
+        update.blob_refs = event.blob_refs;
+        update.bytes = std::move(bytes);
+        if (!append_resource_data_update(event.object_refs.front(), std::move(update), last_error_)) {
+          last_error_ = record_prefix(event) + ": " + last_error_;
+          return false;
+        }
       }
     }
     resource_it->second.mapped = false;
