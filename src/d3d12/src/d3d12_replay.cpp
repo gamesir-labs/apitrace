@@ -344,12 +344,29 @@ std::string record_prefix(const trace::EventRecord &event)
 
 bool payload_to_json(const trace::EventRecord &event, json &payload, std::string &error)
 {
-  payload = json::parse(event.payload, nullptr, false);
-  if (payload.is_discarded() || !payload.is_object()) {
-    error = record_prefix(event) + ": payload must be a JSON object";
-    return false;
+  thread_local const trace::EventRecord *tl_event = nullptr;
+  thread_local json tl_payload;
+  thread_local bool tl_ok = false;
+  thread_local std::string tl_error;
+  if (tl_event == &event) {
+    payload = tl_payload;     // 命中：返回拷贝（与原行为等价，调用者可安全修改自己的拷贝）
+    error = tl_error;
+    return tl_ok;
   }
-  return true;
+  json parsed = json::parse(event.payload, nullptr, false);
+  bool ok = true;
+  std::string err;
+  if (parsed.is_discarded() || !parsed.is_object()) {
+    err = record_prefix(event) + ": payload must be a JSON object";
+    ok = false;
+  }
+  tl_event = &event;
+  tl_payload = parsed;
+  tl_ok = ok;
+  tl_error = err;
+  payload = std::move(parsed);
+  error = err;
+  return ok;
 }
 
 bool validate_object_refs(const trace::EventRecord &event, const D3D12ObjectRegistry &objects, std::string &error)
