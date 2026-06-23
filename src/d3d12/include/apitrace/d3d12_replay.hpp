@@ -42,6 +42,10 @@ public:
     std::uint64_t final_drain_ms = 0;
     std::uint64_t first_present_ms = 0;
     std::uint64_t steady_per_frame_ms = 0;
+    std::uint64_t us_replay_event = 0;
+    std::uint64_t us_content_sync = 0;
+    std::uint64_t us_dispatch = 0;
+    std::uint64_t us_iter_total = 0;
   };
 
   D3D12ReplayBackend();

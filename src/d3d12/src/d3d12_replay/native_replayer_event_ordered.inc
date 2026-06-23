@@ -78,8 +78,10 @@
     bool swapchain_ready = swapchain_bootstrapped();
     std::uint64_t event_count = 0;
     for (const auto &event : reader.events()) {
+      const auto _iter_t0 = std::chrono::steady_clock::now();
       const std::uint64_t event_sequence = event.callsite.sequence;
       {
+        const auto _t0 = std::chrono::steady_clock::now();
         ScopedMsAccumulator timer(backend_.event_ordered_replay_timing_.semantic_replay_event_ms);
         if (!backend_.replay_event(event)) {
           if (!backend_.last_error().empty()) {
@@ -91,12 +93,17 @@
           }
           return false;
         }
+        backend_.event_ordered_replay_timing_.us_replay_event +=
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _t0).count();
       }
 
       ++event_count;
       {
+        const auto _t0 = std::chrono::steady_clock::now();
         ScopedMsAccumulator timer(backend_.event_ordered_replay_timing_.content_sync_ms);
         event_ordered_sync_resource_content_before_consumer(event);
+        backend_.event_ordered_replay_timing_.us_content_sync +=
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _t0).count();
       }
       if (!event_ordered_maybe_bootstrap_swapchain(event, swapchain_ready, error)) {
         return false;
@@ -104,9 +111,14 @@
 
       const auto dispatch_category = event_ordered_dispatch_category(event);
       {
+        const auto _t0 = std::chrono::steady_clock::now();
         ScopedMsAccumulator timer(event_ordered_dispatch_timing_bucket(dispatch_category));
         dispatch_live(event);
+        backend_.event_ordered_replay_timing_.us_dispatch +=
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _t0).count();
       }
+      backend_.event_ordered_replay_timing_.us_iter_total +=
+          std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _iter_t0).count();
       if (event_ordered_stop_requested_) {
         break;
       }
@@ -481,7 +493,11 @@ private:
            " pso_create_ms=" + std::to_string(timing.pso_create_ms) +
            " final_drain_ms=" + std::to_string(timing.final_drain_ms) +
            " first_present_ms=" + std::to_string(timing.first_present_ms) +
-           " steady_per_frame_ms=" + std::to_string(timing.steady_per_frame_ms);
+           " steady_per_frame_ms=" + std::to_string(timing.steady_per_frame_ms) +
+           " us_replay_event_ms=" + std::to_string(timing.us_replay_event / 1000.0) +
+           " us_content_sync_ms=" + std::to_string(timing.us_content_sync / 1000.0) +
+           " us_dispatch_ms=" + std::to_string(timing.us_dispatch / 1000.0) +
+           " us_iter_total_ms=" + std::to_string(timing.us_iter_total / 1000.0);
   }
 
   void event_ordered_log_stub_once(const std::string &category, const trace::EventRecord &event)
