@@ -185,8 +185,6 @@ public:
     return ok;
   }
 
-#include "native_replayer_event_ordered.inc"
-
 private:
   void emit_frame_timing_line(const std::string &line) const
   {
@@ -405,6 +403,9 @@ private:
     }
 #endif
     command_lists_.clear();
+    command_allocators_.clear();
+    app_fences_.clear();
+    replay_queues_by_object_.clear();
     query_heaps_.clear();
     command_signatures_.clear();
     pipelines_.clear();
@@ -417,6 +418,7 @@ private:
     back_buffers_[1].reset();
     fence_.reset();
     swap_chain_.reset();
+    factory_.reset();
     queue_.reset();
     device_.reset();
 #if !defined(_WIN32)
@@ -674,19 +676,18 @@ private:
     return effective;
   }
 
-  bool bootstrap(std::string &error)
+  bool bootstrap_device(std::string &error)
   {
-    UINT width = 0;
-    UINT height = 0;
-    if (!infer_window_size(width, height)) {
-      return fail(error, "trace is missing swapchain back-buffer semantics");
+    if (device_ && queue_ && fence_) {
+      return true;
     }
 
-    ComPtr<IDXGIFactory4> factory;
-    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(factory.put()));
-    if (FAILED(hr)) {
-      error = hresult_error("CreateDXGIFactory1", hr);
-      return false;
+    if (!factory_) {
+      HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(factory_.put()));
+      if (FAILED(hr)) {
+        error = hresult_error("CreateDXGIFactory1", hr);
+        return false;
+      }
     }
 
     D3D_FEATURE_LEVEL feature_level = D3D_FEATURE_LEVEL_11_0;
@@ -695,7 +696,7 @@ private:
       feature_level = static_cast<D3D_FEATURE_LEVEL>(device.minimum_feature_level);
       break;
     }
-    hr = D3D12CreateDevice(nullptr, feature_level, IID_PPV_ARGS(device_.put()));
+    HRESULT hr = D3D12CreateDevice(nullptr, feature_level, IID_PPV_ARGS(device_.put()));
     if (FAILED(hr)) {
       error = hresult_error("D3D12CreateDevice", hr);
       return false;
@@ -709,11 +710,51 @@ private:
       return false;
     }
 
+    hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence_.put()));
+    if (FAILED(hr)) {
+      error = hresult_error("CreateFence", hr);
+      return false;
+    }
+#ifdef _WIN32
+    fence_event_ = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    if (!fence_event_) {
+      return fail(error, "CreateEventA failed");
+    }
+#endif
+    return true;
+  }
+
+  bool swapchain_bootstrapped() const
+  {
+    for (const auto &back_buffer : back_buffers_) {
+      if (!back_buffer) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool bootstrap_swapchain(std::string &error)
+  {
+    if (swapchain_bootstrapped()) {
+      return true;
+    }
+    if (!bootstrap_device(error)) {
+      return false;
+    }
+
+    UINT width = 0;
+    UINT height = 0;
+    if (!infer_window_size(width, height)) {
+      return fail(error, "trace is missing swapchain back-buffer semantics");
+    }
+
     const bool headless = headless_enabled();
     const DXGI_FORMAT swapchain_format = effective_swapchain_back_buffer_format();
     if (swapchain_format == DXGI_FORMAT_UNKNOWN) {
       return fail(error, "trace is missing swapchain back-buffer format semantics");
     }
+    HRESULT hr = S_OK;
     if (headless) {
       // Offscreen path: create kBufferCount committed render-target textures matching the effective
       // back-buffer format. Older bundles may miss ResizeBuffers, so the recorded resource format can
@@ -817,12 +858,12 @@ private:
     swap_chain_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     ComPtr<IDXGISwapChain1> swap_chain1;
-    hr = factory->CreateSwapChainForHwnd(queue_.get(), hwnd_, &swap_chain_desc, nullptr, nullptr, swap_chain1.put());
+    hr = factory_->CreateSwapChainForHwnd(queue_.get(), hwnd_, &swap_chain_desc, nullptr, nullptr, swap_chain1.put());
     if (FAILED(hr)) {
       error = hresult_error("CreateSwapChainForHwnd", hr);
       return false;
     }
-    factory->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER);
+    factory_->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER);
     hr = swap_chain1->QueryInterface(IID_PPV_ARGS(swap_chain_.put()));
     if (FAILED(hr)) {
       error = hresult_error("QueryInterface(IDXGISwapChain3)", hr);
@@ -836,19 +877,17 @@ private:
       }
     }
     }
-
-    hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence_.put()));
-    if (FAILED(hr)) {
-      error = hresult_error("CreateFence", hr);
-      return false;
-    }
-#ifdef _WIN32
-    fence_event_ = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-    if (!fence_event_) {
-      return fail(error, "CreateEventA failed");
-    }
-#endif
     return true;
+  }
+
+  bool bootstrap(std::string &error)
+  {
+    UINT width = 0;
+    UINT height = 0;
+    if (!infer_window_size(width, height)) {
+      return fail(error, "trace is missing swapchain back-buffer semantics");
+    }
+    return bootstrap_device(error) && bootstrap_swapchain(error);
   }
 
   static D3D12_HEAP_PROPERTIES heap_properties(const D3D12ReplayBackend::HeapSemanticState &semantic_heap)
@@ -1026,6 +1065,9 @@ private:
     native.state = static_cast<D3D12_RESOURCE_STATES>(resource.initial_state);
     native.swapchain_back_buffer = resource.swapchain_back_buffer;
     if (resource.swapchain_back_buffer) {
+      if (!bootstrap_swapchain(error)) {
+        return false;
+      }
       if (resource.swapchain_buffer_index >= kBufferCount || !back_buffers_[resource.swapchain_buffer_index]) {
         return fail(error, "swapchain back-buffer index is out of range");
       }
@@ -7234,6 +7276,7 @@ private:
 #endif
   ComPtr<ID3D12Device> device_;
   ComPtr<ID3D12CommandQueue> queue_;
+  ComPtr<IDXGIFactory4> factory_;
   ComPtr<IDXGISwapChain3> swap_chain_;
   ComPtr<ID3D12Fence> fence_;
   ComPtr<ID3D12Resource> back_buffers_[kBufferCount];
@@ -7243,6 +7286,9 @@ private:
   std::unordered_map<trace::ObjectId, std::vector<std::pair<std::uint64_t, ComPtr<ID3D12PipelineState>>>>
       pipeline_version_natives_;
   std::unordered_map<trace::ObjectId, ComPtr<ID3D12CommandSignature>> command_signatures_;
+  std::unordered_map<trace::ObjectId, ComPtr<ID3D12CommandAllocator>> command_allocators_;
+  std::unordered_map<trace::ObjectId, ComPtr<ID3D12Fence>> app_fences_;
+  std::unordered_map<trace::ObjectId, ComPtr<ID3D12CommandQueue>> replay_queues_by_object_;
   std::unordered_map<trace::ObjectId, NativeHeap> heaps_;
   std::unordered_map<trace::ObjectId, ComPtr<ID3D12QueryHeap>> query_heaps_;
   std::array<CpuDescriptorScratch, D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES> cpu_descriptor_scratch_;
@@ -7273,6 +7319,9 @@ private:
   std::unique_ptr<trace::TraceBundleWriter> capture_writer_;
   std::uint64_t capture_sequence_ = 0;
 #endif
+
+public:
+#include "native_replayer_event_ordered.inc"
 };
 
 #else

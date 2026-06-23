@@ -13,7 +13,11 @@
     event_ordered_categories_hit_.clear();
     event_ordered_categories_hit_order_.clear();
 
-    bool bootstrapped = false;
+    if (!log_stage("event_ordered_bootstrap_device", [&] { return bootstrap_device(error); })) {
+      return false;
+    }
+
+    bool swapchain_ready = swapchain_bootstrapped();
     std::uint64_t event_count = 0;
     for (const auto &event : reader.events()) {
       if (!backend_.replay_event(event)) {
@@ -28,18 +32,11 @@
       }
 
       ++event_count;
-      if (!bootstrapped && event_ordered_bootstrap_ready()) {
-        if (!log_stage("event_ordered_bootstrap", [&] { return bootstrap(error); })) {
-          return false;
-        }
-        bootstrapped = true;
+      if (!event_ordered_maybe_bootstrap_swapchain(event, swapchain_ready, error)) {
+        return false;
       }
 
       dispatch_live(event);
-    }
-
-    if (!bootstrapped) {
-      return fail(error, "event-ordered replay could not bootstrap: missing device or swapchain back-buffer semantics");
     }
 
     wait_for_gpu();
@@ -51,11 +48,75 @@
   }
 
 private:
-  bool event_ordered_bootstrap_ready() const
+  bool event_ordered_swapchain_bootstrap_ready() const
   {
     UINT width = 0;
     UINT height = 0;
-    return !backend_.devices_.empty() && infer_window_size(width, height);
+    return infer_window_size(width, height);
+  }
+
+  bool event_ordered_is_swapchain_create_event(const trace::EventRecord &event) const
+  {
+    return event_ordered_contains(event.callsite.function_name, "CreateSwapChain");
+  }
+
+  bool event_ordered_is_present_event(const trace::EventRecord &event) const
+  {
+    if (event.kind == trace::EventKind::Boundary && event.boundary == trace::BoundaryKind::Present) {
+      return true;
+    }
+    return event.callsite.function_name == "IDXGISwapChain::Present";
+  }
+
+  bool event_ordered_is_swapchain_backbuffer_alias_event(const trace::EventRecord &event) const
+  {
+    if (!event_ordered_contains(event.callsite.function_name, "CreateCommittedResource")) {
+      return false;
+    }
+
+    json payload;
+    std::string ignored_error;
+    if (!payload_to_json(event, payload, ignored_error)) {
+      return false;
+    }
+    return payload.value("swapchain_back_buffer", false);
+  }
+
+  bool event_ordered_maybe_bootstrap_swapchain(
+      const trace::EventRecord &event,
+      bool &swapchain_ready,
+      std::string &error)
+  {
+    if (swapchain_ready) {
+      return true;
+    }
+
+    const bool swapchain_create = event_ordered_is_swapchain_create_event(event);
+    const bool backbuffer_alias = event_ordered_is_swapchain_backbuffer_alias_event(event);
+    const bool present = event_ordered_is_present_event(event);
+    if (!swapchain_create && !backbuffer_alias && !present) {
+      return true;
+    }
+
+    if (!event_ordered_swapchain_bootstrap_ready()) {
+      if (backbuffer_alias) {
+        return fail(
+            error,
+            "event-ordered replay reached a swapchain back-buffer alias before swapchain semantics were ready");
+      }
+      if (present) {
+        return fail(
+            error,
+            "event-ordered replay reached Present before swapchain back-buffer semantics were ready");
+      }
+      return true;
+    }
+
+    if (!log_stage("event_ordered_bootstrap_swapchain", [&] { return bootstrap_swapchain(error); })) {
+      return false;
+    }
+    swapchain_ready = true;
+    return true;
   }
 
   void event_ordered_log(const std::string &line) const
@@ -243,15 +304,64 @@ private:
     return summary;
   }
 
-  void dispatch_live(const trace::EventRecord &event)
+  void event_ordered_log_stub_once(const std::string &category, const trace::EventRecord &event)
   {
-    const std::string category = event_ordered_category(event);
     if (event_ordered_categories_hit_.insert(category).second) {
       event_ordered_categories_hit_order_.push_back(category);
       event_ordered_log("[event-ordered] stub: " + category + " fn=" + event_ordered_event_name(event));
     }
+  }
 
-    // TODO(event-ordered): materialize live operations by reusing resources_, pipelines_,
-    // descriptor_heaps_, command_lists_, back_buffers_, heaps_, root_signatures_,
-    // command_signatures_, query_heaps_, queue_, queues_by_type_, and fence_.
+#include "eo_create_memory.inc"
+#include "eo_create_resources.inc"
+#include "eo_create_descriptors.inc"
+#include "eo_create_pipelines.inc"
+#include "eo_create_command_objects.inc"
+
+  void dispatch_live(const trace::EventRecord &event)
+  {
+    const std::string_view function_name(event.callsite.function_name);
+    if (event_ordered_contains(function_name, "CreateHeap") ||
+        event_ordered_contains(function_name, "CreateQueryHeap")) {
+      materialize_create_memory(event);
+      return;
+    }
+    if (event_ordered_contains(function_name, "CreateCommittedResource") ||
+        event_ordered_contains(function_name, "CreatePlacedResource") ||
+        event_ordered_contains(function_name, "CreateReservedResource")) {
+      materialize_create_resources(event);
+      return;
+    }
+    if (event_ordered_contains(function_name, "CreateDescriptorHeap") ||
+        function_name == "ID3D12Device::CreateDescriptorViewBatch" ||
+        function_name == "ID3D12Device::CreateConstantBufferView" ||
+        function_name == "ID3D12Device::CreateShaderResourceView" ||
+        function_name == "ID3D12Device::CreateUnorderedAccessView" ||
+        function_name == "ID3D12Device::CreateRenderTargetView" ||
+        function_name == "ID3D12Device::CreateDepthStencilView" ||
+        function_name == "ID3D12Device::CreateSampler") {
+      materialize_create_descriptors(event);
+      return;
+    }
+    if (function_name == "ID3D12Device::CreateGraphicsPipelineState" ||
+        function_name == "ID3D12Device::CreateComputePipelineState" ||
+        function_name == "ID3D12Device2::CreatePipelineState" ||
+        event_ordered_contains(function_name, "CreateRootSignature") ||
+        event_ordered_contains(function_name, "CreateCommandSignature")) {
+      materialize_create_pipelines(event);
+      return;
+    }
+    if (event_ordered_contains(function_name, "CreateCommandQueue") ||
+        event_ordered_contains(function_name, "CreateCommandAllocator") ||
+        event_ordered_contains(function_name, "CreateCommandList") ||
+        event_ordered_contains(function_name, "CreateFence")) {
+      materialize_create_command_objects(event);
+      return;
+    }
+
+    event_ordered_log_stub_once(event_ordered_category(event), event);
+
+    // TODO(event-ordered): materialize remaining live operations for record,
+    // ExecuteCommandLists, QueueSignal, QueueWait, FenceSignal,
+    // FenceSetEventOnCompletion, Map, Unmap, Present, ReleaseDestroy, and Default.
   }
