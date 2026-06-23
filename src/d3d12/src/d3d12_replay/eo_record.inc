@@ -116,6 +116,7 @@
 
     event_ordered_hold_allocator_ref(native, allocator_it->second.get());
     event_ordered_reset_record_sidecar(native, initial_pipeline_state_object_id);
+    ++event_ordered_lists_reset_;
   }
 
   void event_ordered_handle_command_list_close(const trace::EventRecord &event)
@@ -138,6 +139,7 @@
       return;
     }
     native.recorded_until_sequence = event.callsite.sequence;
+    ++event_ordered_lists_closed_;
   }
 
   void event_ordered_handle_command_allocator_reset(const trace::EventRecord &event)
@@ -161,6 +163,7 @@
       event_ordered_record_error(
           event,
           hresult_error("ID3D12CommandAllocator::Reset", hr));
+      return;
     }
   }
 
@@ -195,6 +198,7 @@
       event_ordered_record_error(event, record_one_error_);
       return;
     }
+    ++event_ordered_recorded_commands_;
 
     json payload;
     std::string error;

@@ -127,6 +127,10 @@
       descriptor_slot_history_[descriptor->descriptor].push_back(
           DescriptorSlotHistoryEntry{descriptor->create_sequence, descriptor});
     }
+    for (const auto &copied : event_ordered_copied_descriptor_storage_) {
+      descriptor_slot_history_[copied.descriptor].push_back(
+          DescriptorSlotHistoryEntry{copied.create_sequence, &copied});
+    }
     next_descriptor_index_ = descriptor_timeline_.size();
   }
 

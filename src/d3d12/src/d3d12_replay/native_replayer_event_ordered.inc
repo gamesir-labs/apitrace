@@ -12,6 +12,19 @@
     replay_milestone("[event-ordered] replay:begin");
     event_ordered_categories_hit_.clear();
     event_ordered_categories_hit_order_.clear();
+    event_ordered_recorded_commands_ = 0;
+    event_ordered_lists_reset_ = 0;
+    event_ordered_lists_closed_ = 0;
+    event_ordered_resource_updates_applied_ = 0;
+    event_ordered_copy_descriptors_applied_ = 0;
+    resource_update_timeline_.clear();
+    descriptor_copy_timeline_.clear();
+    next_resource_update_index_ = 0;
+    next_descriptor_copy_index_ = 0;
+    event_ordered_resource_update_storage_.clear();
+    event_ordered_copied_descriptor_storage_.clear();
+    event_ordered_resource_updates_applied_keys_.clear();
+    event_ordered_copy_descriptors_applied_keys_.clear();
     struct EventOrderedRecordingScope {
       D3D12NativeReplayer *self = nullptr;
       bool saved = false;
@@ -33,18 +46,20 @@
     bool swapchain_ready = swapchain_bootstrapped();
     std::uint64_t event_count = 0;
     for (const auto &event : reader.events()) {
+      const std::uint64_t event_sequence = event.callsite.sequence;
       if (!backend_.replay_event(event)) {
         if (!backend_.last_error().empty()) {
-          error = "sequence " + std::to_string(event.callsite.sequence) + " " +
+          error = "sequence " + std::to_string(event_sequence) + " " +
                   event_ordered_event_name(event) + ": " + backend_.last_error();
         } else {
-          error = "sequence " + std::to_string(event.callsite.sequence) + " " +
+          error = "sequence " + std::to_string(event_sequence) + " " +
                   event_ordered_event_name(event) + ": D3D12 event-ordered replay failed";
         }
         return false;
       }
 
       ++event_count;
+      event_ordered_sync_resource_content_before_consumer(event);
       if (!event_ordered_maybe_bootstrap_swapchain(event, swapchain_ready, error)) {
         return false;
       }
@@ -56,6 +71,7 @@
     const std::string summary = "[event-ordered] iterated " + std::to_string(event_count) +
                                 " events, categories_hit=" + event_ordered_categories_summary();
     event_ordered_log(summary);
+    event_ordered_log(event_ordered_counters_summary());
     replay_milestone("[event-ordered] replay:done");
     return true;
   }
@@ -335,6 +351,16 @@ private:
     return summary;
   }
 
+  std::string event_ordered_counters_summary() const
+  {
+    return "[event-ordered] counters recorded_commands=" +
+           std::to_string(event_ordered_recorded_commands_) +
+           " lists_reset=" + std::to_string(event_ordered_lists_reset_) +
+           " lists_closed=" + std::to_string(event_ordered_lists_closed_) +
+           " resource_updates_applied=" + std::to_string(event_ordered_resource_updates_applied_) +
+           " copy_descriptors_applied=" + std::to_string(event_ordered_copy_descriptors_applied_);
+  }
+
   void event_ordered_log_stub_once(const std::string &category, const trace::EventRecord &event)
   {
     if (event_ordered_categories_hit_.insert(category).second) {
@@ -348,6 +374,7 @@ private:
 #include "eo_create_descriptors.inc"
 #include "eo_create_pipelines.inc"
 #include "eo_create_command_objects.inc"
+#include "eo_content.inc"
 #include "eo_record.inc"
 
   void dispatch_live(const trace::EventRecord &event)
@@ -392,6 +419,10 @@ private:
     }
     if (event_ordered_is_record_call(event)) {
       handle_record_event(event);
+      return;
+    }
+    if (event_ordered_is_copy_descriptors_event(event)) {
+      event_ordered_apply_copy_descriptors(event);
       return;
     }
 

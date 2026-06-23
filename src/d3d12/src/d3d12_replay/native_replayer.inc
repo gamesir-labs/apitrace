@@ -2363,6 +2363,14 @@ private:
     while (next_resource_update_index_ < resource_update_timeline_.size() &&
            resource_update_timeline_[next_resource_update_index_].sequence <= sequence) {
       const auto &entry = resource_update_timeline_[next_resource_update_index_];
+      std::string event_ordered_key;
+      if (event_ordered_recording_) {
+        event_ordered_key = event_ordered_resource_update_key(entry);
+        if (!event_ordered_resource_updates_applied_keys_.insert(event_ordered_key).second) {
+          ++next_resource_update_index_;
+          continue;
+        }
+      }
       // Resolve the SAME version that reads (record_copy/bindings via resource_for) will see at this
       // update's sequence, NOT the flat resources_ last-version. For a reused object_id (a per-frame
       // ring/pool upload buffer, e.g. one seen reused 192x), the flat map points at the final native
@@ -2371,10 +2379,19 @@ private:
       const ReplaySequenceScope update_scope(this, entry.sequence);
       ID3D12Resource *target = resource_for(entry.resource_object_id, error);
       if (!target) {
+        if (event_ordered_recording_) {
+          event_ordered_resource_updates_applied_keys_.erase(event_ordered_key);
+        }
         return false;
       }
       if (!upload_resource_data(target, *entry.update, error)) {
+        if (event_ordered_recording_) {
+          event_ordered_resource_updates_applied_keys_.erase(event_ordered_key);
+        }
         return false;
+      }
+      if (event_ordered_recording_) {
+        ++event_ordered_resource_updates_applied_;
       }
       ++next_resource_update_index_;
     }
@@ -7377,6 +7394,8 @@ private:
   std::vector<const D3D12ReplayBackend::SamplerSemanticState *> sampler_timeline_;
   std::vector<const D3D12ReplayBackend::CopyDescriptorSemanticState *> descriptor_copy_timeline_;
   std::vector<ResourceDataUpdateRef> resource_update_timeline_;
+  std::deque<D3D12ReplayBackend::ResourceDataUpdate> event_ordered_resource_update_storage_;
+  std::deque<D3D12ReplayBackend::DescriptorSemanticState> event_ordered_copied_descriptor_storage_;
   std::size_t next_descriptor_index_ = 0;
   std::size_t next_sampler_index_ = 0;
   std::size_t next_descriptor_copy_index_ = 0;
@@ -7386,6 +7405,13 @@ private:
   bool record_one_ok_ = true;
   std::string record_one_error_;
   bool event_ordered_recording_ = false;
+  std::uint64_t event_ordered_recorded_commands_ = 0;
+  std::uint64_t event_ordered_lists_reset_ = 0;
+  std::uint64_t event_ordered_lists_closed_ = 0;
+  std::uint64_t event_ordered_resource_updates_applied_ = 0;
+  std::uint64_t event_ordered_copy_descriptors_applied_ = 0;
+  std::unordered_set<std::string> event_ordered_resource_updates_applied_keys_;
+  std::unordered_set<std::string> event_ordered_copy_descriptors_applied_keys_;
 #if !defined(_WIN32)
   std::unique_ptr<trace::TraceBundleWriter> capture_writer_;
   std::uint64_t capture_sequence_ = 0;
