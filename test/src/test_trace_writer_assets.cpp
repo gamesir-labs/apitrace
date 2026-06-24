@@ -3,12 +3,15 @@
 #include "apitrace/trace_bundle_io.hpp"
 #include "apitrace/translation_link_writer.hpp"
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -18,6 +21,35 @@
 #endif
 
 namespace {
+
+std::mutex g_seal_checkpoint_hook_mutex;
+std::condition_variable g_seal_checkpoint_hook_cv;
+bool g_seal_checkpoint_hook_entered = false;
+bool g_seal_checkpoint_hook_release = false;
+
+void reset_seal_checkpoint_hook_state()
+{
+  std::lock_guard lock(g_seal_checkpoint_hook_mutex);
+  g_seal_checkpoint_hook_entered = false;
+  g_seal_checkpoint_hook_release = false;
+}
+
+void release_seal_checkpoint_hook()
+{
+  {
+    std::lock_guard lock(g_seal_checkpoint_hook_mutex);
+    g_seal_checkpoint_hook_release = true;
+  }
+  g_seal_checkpoint_hook_cv.notify_all();
+}
+
+void seal_checkpoint_pause_hook()
+{
+  std::unique_lock lock(g_seal_checkpoint_hook_mutex);
+  g_seal_checkpoint_hook_entered = true;
+  g_seal_checkpoint_hook_cv.notify_all();
+  g_seal_checkpoint_hook_cv.wait(lock, []() { return g_seal_checkpoint_hook_release; });
+}
 
 std::string read_text(const std::filesystem::path &path)
 {
@@ -377,6 +409,115 @@ bool slow_spool_backpressure_stays_bounded(const std::filesystem::path &bundle)
          max_unpublished <= kMaxInFlightBytes + kPayloadBytes &&
          final_unpublished <= kPayloadBytes &&
          indexed_spooled_assets >= kAssetCount - 1;
+}
+
+bool write_seal_checkpoint_concurrency_bundle(const std::filesystem::path &bundle)
+{
+  std::filesystem::remove_all(bundle);
+  set_env_var("APITRACE_CACHE_EVENTS", "1");
+  set_env_var("APITRACE_ASYNC_ASSET_THRESHOLD", "1");
+
+  apitrace::trace::TraceBundleWriter writer;
+  if (!writer.open(bundle)) {
+    unset_env_var("APITRACE_ASYNC_ASSET_THRESHOLD");
+    unset_env_var("APITRACE_CACHE_EVENTS");
+    std::cerr << "failed to open seal-checkpoint-concurrency bundle\n";
+    return false;
+  }
+  writer.write_metadata({apitrace::trace::ApiKind::D3D12, 1, "seal-checkpoint-concurrency-test", false});
+
+  std::vector<std::uint8_t> bytes(64 * 1024, 0x2a);
+  apitrace::trace::AssetRecord asset;
+  asset.blob_id = 930;
+  asset.kind = apitrace::trace::AssetKind::Buffer;
+  asset.debug_name = "seal-concurrency-buffer";
+  asset.payload_bytes = bytes;
+  asset = writer.register_asset(std::move(asset));
+
+  apitrace::trace::EventRecord first_event;
+  first_event.kind = apitrace::trace::EventKind::Call;
+  first_event.callsite.sequence = 1;
+  first_event.callsite.function_name = "ID3D12Resource::Unmap";
+  first_event.callsite.result_code = 0;
+  first_event.blob_refs = {asset.blob_id};
+  first_event.payload =
+      std::string("{\"buffer_path\":\"") + asset.relative_path.generic_string() + "\"}";
+  writer.append_call_event(first_event);
+
+  reset_seal_checkpoint_hook_state();
+  apitrace::trace::TraceBundleWriter::TestHooks::set_seal_checkpoint_heavy_phase_hook_for_test(
+      seal_checkpoint_pause_hook);
+
+  std::atomic_bool seal_done{false};
+  std::atomic_bool producer_done{false};
+  std::thread seal_thread([&]() {
+    writer.seal_checkpoint();
+    seal_done.store(true, std::memory_order_release);
+  });
+
+  {
+    std::unique_lock lock(g_seal_checkpoint_hook_mutex);
+    if (!g_seal_checkpoint_hook_cv.wait_for(
+            lock,
+            std::chrono::seconds(5),
+            []() { return g_seal_checkpoint_hook_entered; })) {
+      apitrace::trace::TraceBundleWriter::TestHooks::set_seal_checkpoint_heavy_phase_hook_for_test(nullptr);
+      release_seal_checkpoint_hook();
+      seal_thread.join();
+      writer.close();
+      unset_env_var("APITRACE_ASYNC_ASSET_THRESHOLD");
+      unset_env_var("APITRACE_CACHE_EVENTS");
+      std::cerr << "seal checkpoint did not enter the test heavy phase\n";
+      return false;
+    }
+  }
+
+  std::thread producer_thread([&]() {
+    apitrace::trace::EventRecord event;
+    event.kind = apitrace::trace::EventKind::Call;
+    event.callsite.sequence = 2;
+    event.callsite.function_name = "ID3D12Fence::GetCompletedValue";
+    event.callsite.result_code = 0;
+    event.payload = "{\"value\":2}";
+    writer.append_call_event(event);
+    producer_done.store(true, std::memory_order_release);
+  });
+
+  bool producer_completed_while_seal_parked = false;
+  for (unsigned attempt = 0; attempt < 100; ++attempt) {
+    if (producer_done.load(std::memory_order_acquire)) {
+      producer_completed_while_seal_parked = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  const bool seal_still_parked = !seal_done.load(std::memory_order_acquire);
+
+  release_seal_checkpoint_hook();
+  producer_thread.join();
+  seal_thread.join();
+  apitrace::trace::TraceBundleWriter::TestHooks::set_seal_checkpoint_heavy_phase_hook_for_test(nullptr);
+  writer.close();
+
+  unset_env_var("APITRACE_ASYNC_ASSET_THRESHOLD");
+  unset_env_var("APITRACE_CACHE_EVENTS");
+
+  if (!producer_completed_while_seal_parked || !seal_still_parked) {
+    std::cerr << "event producer was blocked by parked seal checkpoint heavy phase\n";
+    return false;
+  }
+
+  if (!std::filesystem::is_regular_file(bundle / "seal-checkpoint-primary.ready")) {
+    std::cerr << "seal checkpoint did not publish ready marker\n";
+    return false;
+  }
+  const auto checksums_json = read_text(bundle / "checksums.json");
+  if (!checksum_matches_file(checksums_json, bundle, "callstream.jsonl") ||
+      !checksum_matches_file(checksums_json, bundle, "assets.json")) {
+    std::cerr << "seal checkpoint concurrency bundle has inconsistent checkpoint checksums\n";
+    return false;
+  }
+  return true;
 }
 
 bool replace_text_in_file(
@@ -1145,6 +1286,12 @@ int main(int argc, char **argv)
       bundle.parent_path() / (bundle.filename().generic_string() + "-slow-spool-backpressure");
   if (!slow_spool_backpressure_stays_bounded(slow_spool_bundle)) {
     std::cerr << "slow spool capture should block and keep published asset prefix bounded\n";
+    return 1;
+  }
+  const auto seal_concurrency_bundle =
+      bundle.parent_path() / (bundle.filename().generic_string() + "-seal-checkpoint-concurrency");
+  if (!write_seal_checkpoint_concurrency_bundle(seal_concurrency_bundle)) {
+    std::cerr << "seal checkpoint should not block event producers during heavy checkpoint work\n";
     return 1;
   }
 

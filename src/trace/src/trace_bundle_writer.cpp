@@ -82,6 +82,10 @@ std::uint64_t default_spool_asset_checkpoint_bytes()
   return 16ull * 1024ull * 1024ull;
 }
 
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
+std::atomic<void (*)()> seal_checkpoint_heavy_phase_hook_for_test{nullptr};
+#endif
+
 template <typename Event>
 void stamp_event_timing(Event &event, std::uint64_t monotonic_origin_ns)
 {
@@ -5585,7 +5589,7 @@ struct TraceBundleWriter::Impl {
       write_text_atomic(layout.asset_index_path, asset_index);
       known_file_digests_snapshot[kAssetIndexFileName] =
           content_hash_bytes(asset_index.data(), asset_index.size());
-	      mark_spool_checkpoint_published(completed_spool_checkpoint_offset());
+      mark_spool_checkpoint_published(full_scan_committed_spool_offset);
     }
 
     auto relative_paths = full_scan
@@ -6852,6 +6856,11 @@ std::uint64_t TraceBundleWriter::TestHooks::spool_published_offset_for_test(
 {
   return writer.impl_ ? writer.impl_->published_spool_checkpoint_offset() : 0;
 }
+
+void TraceBundleWriter::TestHooks::set_seal_checkpoint_heavy_phase_hook_for_test(void (*hook)())
+{
+  seal_checkpoint_heavy_phase_hook_for_test.store(hook, std::memory_order_release);
+}
 #endif
 
 void TraceBundleWriter::flush()
@@ -6874,7 +6883,11 @@ void TraceBundleWriter::seal_checkpoint()
   if (!impl_ || !impl_->open) {
     return;
   }
-  TimedWriterLock lock(impl_->event_mutex, impl_->writer_stats ? &impl_->event_lock_stats : nullptr);
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
+  if (auto hook = seal_checkpoint_heavy_phase_hook_for_test.load(std::memory_order_acquire)) {
+    hook();
+  }
+#endif
   impl_->drain_async_work_for_checkpoint();
   const bool incomplete = impl_->write_capture_incomplete_file();
   impl_->checkpoint_once(true);
