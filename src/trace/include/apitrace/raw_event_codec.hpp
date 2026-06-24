@@ -13,7 +13,8 @@ namespace apitrace::trace::raw {
 constexpr std::uint32_t kRawEventContractVersion = 1;
 
 enum class RawEventOpcode : std::uint32_t {
-  PassthroughFinalJson = 0x0001,
+  Passthrough = 0x0001,
+  PassthroughFinalJson = Passthrough,
   ResourceCreate = 0x0101,
   ResourceUnmap = 0x0102,
   GraphicsPipelineCreate = 0x0201,
@@ -36,6 +37,7 @@ enum class RawBlobKind : std::uint32_t {
 struct DecodedRawEvent {
   EventRecord event;
   std::vector<AssetRecord> assets;
+  bool passthrough = false;
   std::string passthrough_jsonl_record;
 };
 

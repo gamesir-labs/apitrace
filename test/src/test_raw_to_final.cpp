@@ -4,6 +4,7 @@
 #include "nlohmann/json.hpp"
 
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -81,6 +82,17 @@ std::vector<std::uint8_t> read_file_bytes(const std::filesystem::path &path)
       std::istreambuf_iterator<char>());
 }
 
+std::vector<std::string> read_lines(const std::filesystem::path &path)
+{
+  std::vector<std::string> lines;
+  std::ifstream input(path, std::ios::binary);
+  std::string line;
+  while (std::getline(input, line)) {
+    lines.push_back(line);
+  }
+  return lines;
+}
+
 bool append_raw_event(
     apitrace::trace::raw::RawCaptureWriter &writer,
     std::uint64_t sequence,
@@ -144,6 +156,47 @@ bool write_synthetic_raw_capture(const std::filesystem::path &bundle)
   }
 
   if (!expect(writer.flush_commit(), "failed to commit synthetic raw capture")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+  writer.close();
+  return true;
+}
+
+bool write_passthrough_mixed_raw_capture(
+    const std::filesystem::path &bundle,
+    const std::string &passthrough_before,
+    const std::string &passthrough_after)
+{
+  using namespace apitrace::trace::raw;
+
+  std::filesystem::remove_all(bundle);
+  RawCaptureWriter writer;
+  if (!expect(writer.open(bundle), "failed to open passthrough raw writer")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  if (!append_raw_event(
+          writer,
+          1,
+          RawEventOpcode::Passthrough,
+          encode_passthrough_final_json_payload(passthrough_before)) ||
+      !append_raw_event(
+          writer,
+          2,
+          RawEventOpcode::DrawInstanced,
+          encode_draw_instanced_payload(500, 3, 1, 0, 0)) ||
+      !append_raw_event(
+          writer,
+          3,
+          RawEventOpcode::Passthrough,
+          encode_passthrough_final_json_payload(passthrough_after))) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  if (!expect(writer.flush_commit(), "failed to commit passthrough raw capture")) {
     std::cerr << writer.last_error() << "\n";
     return false;
   }
@@ -233,6 +286,42 @@ bool validate_final_bundle(const std::filesystem::path &bundle)
   return true;
 }
 
+bool validate_passthrough_mixed_bundle(
+    const std::filesystem::path &bundle,
+    const std::string &passthrough_before,
+    const std::string &passthrough_after)
+{
+  const auto lines = read_lines(bundle / "callstream.jsonl");
+  if (!expect(lines.size() == 4, "unexpected passthrough callstream line count")) {
+    return false;
+  }
+  if (!expect(lines[1] == passthrough_before, "first passthrough line was not preserved verbatim")) {
+    return false;
+  }
+  if (!expect(lines[3] == passthrough_after, "second passthrough line was not preserved verbatim")) {
+    return false;
+  }
+
+  const auto records = read_jsonl(bundle / "callstream.jsonl");
+  if (!expect(records.size() == 4, "unexpected passthrough JSONL record count")) {
+    return false;
+  }
+  if (!expect(records[0].value("record_kind", "") == "bundle_header", "missing passthrough bundle header")) {
+    return false;
+  }
+  if (!expect(records[1].value("sequence", 0) == 1 &&
+                  records[2].value("sequence", 0) == 2 &&
+                  records[3].value("sequence", 0) == 3,
+              "passthrough mixed sequence order mismatch")) {
+    return false;
+  }
+  if (!expect(records[2].value("function", "") == "ID3D12GraphicsCommandList::DrawInstanced",
+              "binary event was not interleaved between passthrough events")) {
+    return false;
+  }
+  return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -248,6 +337,11 @@ int main(int argc, char **argv)
 
   const auto work_dir = unique_work_dir();
   const auto bundle = work_dir / "synthetic-raw.apitrace";
+  const auto passthrough_bundle = work_dir / "synthetic-passthrough-raw.apitrace";
+  const std::string passthrough_before =
+      "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12GraphicsCommandList::SetPipelineState\",\"result_code\":0,\"object_refs\":[500,700],\"payload\":{\"state\":\"passthrough-before\",\"spacing\":\"kept exactly\"}}";
+  const std::string passthrough_after =
+      "{\"record_kind\":\"boundary\",\"sequence\":3,\"time_ns\":1003,\"elapsed_ns\":0,\"boundary\":\"DebugMarker\",\"payload\":{\"label\":\"passthrough-after\",\"nested\":{\"value\":42}}}";
   std::filesystem::remove_all(work_dir);
   std::filesystem::create_directories(work_dir);
 
@@ -255,7 +349,11 @@ int main(int argc, char **argv)
       write_synthetic_raw_capture(bundle) &&
       run_command(quote_arg(argv[1]) + " --raw-format --no-progress " + quote_arg(bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(bundle)) &&
-      validate_final_bundle(bundle);
+      validate_final_bundle(bundle) &&
+      write_passthrough_mixed_raw_capture(passthrough_bundle, passthrough_before, passthrough_after) &&
+      run_command(quote_arg(argv[1]) + " --raw-format --no-progress " + quote_arg(passthrough_bundle)) &&
+      run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(passthrough_bundle)) &&
+      validate_passthrough_mixed_bundle(passthrough_bundle, passthrough_before, passthrough_after);
 
   std::filesystem::remove_all(work_dir);
   if (!ok) {
