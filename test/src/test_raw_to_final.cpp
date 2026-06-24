@@ -609,6 +609,82 @@ bool write_passthrough_with_blob_raw_capture(
   return true;
 }
 
+bool write_passthrough_blob_remap_collision_raw_capture(
+    const std::filesystem::path &bundle,
+    std::uint64_t provisional_blob_id,
+    const std::string &provisional_asset_path,
+    const std::string &passthrough_blob_line)
+{
+  using namespace apitrace::trace::raw;
+
+  std::filesystem::remove_all(bundle);
+  RawCaptureWriter writer;
+  if (!expect(writer.open(bundle), "failed to open passthrough remap raw writer")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  const std::string seed_asset_path = "buffers/existing-collision.buffer";
+  const std::string seed_line =
+      "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12Resource::Unmap\",\"result_code\":0,\"blob_refs\":[" +
+      std::to_string(provisional_blob_id) +
+      "],\"payload\":{\"blob_id\":" + std::to_string(provisional_blob_id) +
+      ",\"buffer_path\":\"" + seed_asset_path +
+      "\",\"written_range\":{\"begin\":0,\"end\":3}}}";
+  const std::vector<std::uint8_t> seed_blob = {0x01, 0x02, 0x03};
+  const std::vector<std::uint8_t> passthrough_blob = {0xaa, 0xbb, 0xcc, 0xdd};
+  const auto seed_raw_blob_id = writer.append_blob(
+      seed_blob.data(),
+      seed_blob.size(),
+      static_cast<std::uint32_t>(RawBlobKind::Buffer),
+      1);
+  const auto raw_blob_id = writer.append_blob(
+      passthrough_blob.data(),
+      passthrough_blob.size(),
+      static_cast<std::uint32_t>(RawBlobKind::Buffer),
+      2);
+  if (!expect(seed_raw_blob_id != kInvalidRawBlobId && raw_blob_id != kInvalidRawBlobId,
+              "failed to append passthrough remap bytes")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  PassthroughBlobDescriptor seed_descriptor;
+  seed_descriptor.provisional_asset_path = seed_asset_path;
+  seed_descriptor.final_blob_id = provisional_blob_id;
+  seed_descriptor.raw_blob_id = seed_raw_blob_id;
+  seed_descriptor.raw_blob_kind = static_cast<std::uint32_t>(RawBlobKind::Buffer);
+  seed_descriptor.debug_name = "existing-collision-buffer";
+
+  PassthroughBlobDescriptor descriptor;
+  descriptor.provisional_asset_path = provisional_asset_path;
+  descriptor.final_blob_id = provisional_blob_id;
+  descriptor.raw_blob_id = raw_blob_id;
+  descriptor.raw_blob_kind = static_cast<std::uint32_t>(RawBlobKind::Buffer);
+  descriptor.debug_name = "passthrough-remapped-buffer";
+
+  if (!append_raw_event(
+          writer,
+          1,
+          RawEventOpcode::PassthroughWithBlob,
+          encode_passthrough_with_blob_payload(seed_line, {seed_descriptor})) ||
+      !append_raw_event(
+          writer,
+          2,
+          RawEventOpcode::PassthroughWithBlob,
+          encode_passthrough_with_blob_payload(passthrough_blob_line, {descriptor}))) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  if (!expect(writer.flush_commit(), "failed to commit passthrough remap raw capture")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+  writer.close();
+  return true;
+}
+
 bool write_duplicate_content_raw_capture(const std::filesystem::path &bundle)
 {
   using namespace apitrace::trace::raw;
@@ -1139,6 +1215,86 @@ bool validate_passthrough_with_blob_bundle(
   return true;
 }
 
+bool validate_passthrough_blob_remap_bundle(
+    const std::filesystem::path &bundle,
+    std::uint64_t provisional_blob_id,
+    const std::string &provisional_asset_path,
+    bool expect_metal_payload)
+{
+  const auto records = read_jsonl(bundle / "callstream.jsonl");
+  if (!expect(records.size() == 3, "unexpected passthrough remap callstream record count")) {
+    return false;
+  }
+  const auto &seed = records[1];
+  if (!expect(seed["blob_refs"].is_array() &&
+                  seed["blob_refs"].size() == 1 &&
+                  seed["blob_refs"][0].get<std::uint64_t>() == provisional_blob_id,
+              "passthrough remap seed event did not keep provisional blob id")) {
+    return false;
+  }
+  const auto &event = records[2];
+  if (!expect(event["blob_refs"].is_array() && event["blob_refs"].size() == 1,
+              "passthrough remap event missing one blob ref")) {
+    return false;
+  }
+  const auto published_blob_id = event["blob_refs"][0].get<std::uint64_t>();
+  if (!expect(published_blob_id != provisional_blob_id,
+              "passthrough remap event kept dangling provisional blob id")) {
+    return false;
+  }
+
+  const auto payload = event.value("payload", json::object());
+  if (expect_metal_payload) {
+    if (!expect(event.value("function", std::string()) == "MTLBuffer.updateContents",
+                "metal passthrough remap function mismatch") ||
+        !expect(payload.value("blob_id", 0ull) == published_blob_id,
+                "metal passthrough payload blob_id was not remapped") ||
+        !expect(payload.value("data_path", std::string()) != provisional_asset_path,
+                "metal passthrough payload path kept provisional asset path")) {
+      return false;
+    }
+  } else {
+    if (!expect(event.value("function", std::string()) == "ID3D12Resource::Unmap",
+                "D3D12 passthrough remap function mismatch") ||
+        !expect(payload.value("blob_id", 0ull) == published_blob_id,
+                "D3D12 passthrough payload blob_id was not remapped") ||
+        !expect(payload.value("buffer_path", std::string()) != provisional_asset_path,
+                "D3D12 passthrough payload path kept provisional asset path")) {
+      return false;
+    }
+  }
+
+  const auto assets_json = json::parse(std::ifstream(bundle / "assets.json"), nullptr, false);
+  if (!expect(!assets_json.is_discarded() && assets_json.contains("assets"),
+              "passthrough remap assets.json missing")) {
+    return false;
+  }
+  std::string published_path;
+  bool saw_seed_blob = false;
+  bool saw_provisional_blob = false;
+  for (const auto &asset : assets_json["assets"]) {
+    const auto blob_id = asset.value("blob_id", 0ull);
+    const auto path = asset.value("path", std::string());
+    if (blob_id == published_blob_id) {
+      published_path = path;
+    }
+    if (blob_id == provisional_blob_id) {
+      saw_seed_blob = true;
+    }
+    if (blob_id == provisional_blob_id && path == provisional_asset_path) {
+      saw_provisional_blob = true;
+    }
+  }
+  if (!expect(saw_seed_blob, "passthrough remap collision seed asset missing") ||
+      !expect(!saw_provisional_blob, "passthrough remap published asset kept provisional blob id") ||
+      !expect(!published_path.empty(), "passthrough remap published asset missing from index") ||
+      !expect(read_file_bytes(bundle / published_path) == std::vector<std::uint8_t>({0xaa, 0xbb, 0xcc, 0xdd}),
+              "passthrough remap published asset bytes mismatch")) {
+    return false;
+  }
+  return true;
+}
+
 bool run_streaming_equivalence_test(
     const std::filesystem::path &source_bundle,
     const std::filesystem::path &legacy_bundle,
@@ -1199,6 +1355,8 @@ int main(int argc, char **argv)
   const auto bundle = work_dir / "synthetic-raw.apitrace";
   const auto passthrough_bundle = work_dir / "synthetic-passthrough-raw.apitrace";
   const auto passthrough_blob_bundle = work_dir / "synthetic-passthrough-with-blob-raw.apitrace";
+  const auto passthrough_d3d12_remap_bundle = work_dir / "synthetic-passthrough-d3d12-remap.apitrace";
+  const auto passthrough_metal_remap_bundle = work_dir / "synthetic-passthrough-metal-remap.apitrace";
   const auto duplicate_content_bundle = work_dir / "synthetic-duplicate-content-raw.apitrace";
   const auto dual_write_bundle = work_dir / "synthetic-dual-write.apitrace";
   const auto dual_write_old_bundle = work_dir / "synthetic-dual-write-old.apitrace";
@@ -1216,6 +1374,22 @@ int main(int argc, char **argv)
       "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12Resource::Unmap\",\"result_code\":0,\"blob_refs\":[77],\"payload\":{\"buffer_path\":\"buffers/asset-000000000000004d.buffer\",\"written_range\":{\"begin\":0,\"end\":4}}}";
   const std::string passthrough_non_blob_line =
       "{\"record_kind\":\"call\",\"sequence\":2,\"time_ns\":1002,\"elapsed_ns\":0,\"function\":\"ID3D12GraphicsCommandList::DrawInstanced\",\"result_code\":0,\"object_refs\":[500],\"payload\":{\"vertex_count_per_instance\":3,\"instance_count\":1,\"start_vertex_location\":0,\"start_instance_location\":0}}";
+  const std::uint64_t remap_collision_blob_id = 4462313;
+  const std::string remap_provisional_path = "buffers/asset-00000000004462313.buffer";
+  const std::string passthrough_d3d12_remap_line =
+      "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12Resource::Unmap\",\"result_code\":0,\"blob_refs\":[" +
+      std::to_string(remap_collision_blob_id) +
+      "],\"payload\":{\"blob_id\":" + std::to_string(remap_collision_blob_id) +
+      ",\"buffer_path\":\"" + remap_provisional_path +
+      "\",\"nested\":{\"blob_id\":" + std::to_string(remap_collision_blob_id) +
+      "},\"written_range\":{\"begin\":0,\"end\":4}}}";
+  const std::string passthrough_metal_remap_line =
+      "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"MTLBuffer.updateContents\",\"result_code\":0,\"blob_refs\":[" +
+      std::to_string(remap_collision_blob_id) +
+      "],\"payload\":{\"blob_id\":" + std::to_string(remap_collision_blob_id) +
+      ",\"data_path\":\"" + remap_provisional_path +
+      "\",\"bytes\":{\"blob_id\":" + std::to_string(remap_collision_blob_id) +
+      "},\"range\":{\"offset\":0,\"length\":4}}}";
   std::filesystem::remove_all(work_dir);
   std::filesystem::create_directories(work_dir);
 
@@ -1232,6 +1406,30 @@ int main(int argc, char **argv)
       run_command(quote_arg(argv[1]) + " --raw-format --no-progress " + quote_arg(passthrough_blob_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(passthrough_blob_bundle)) &&
       validate_passthrough_with_blob_bundle(passthrough_blob_bundle, passthrough_blob_line, passthrough_non_blob_line) &&
+      write_passthrough_blob_remap_collision_raw_capture(
+          passthrough_d3d12_remap_bundle,
+          remap_collision_blob_id,
+          remap_provisional_path,
+          passthrough_d3d12_remap_line) &&
+      run_command(quote_arg(argv[1]) + " --raw-format --no-progress --jobs 1 " + quote_arg(passthrough_d3d12_remap_bundle)) &&
+      run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(passthrough_d3d12_remap_bundle)) &&
+      validate_passthrough_blob_remap_bundle(
+          passthrough_d3d12_remap_bundle,
+          remap_collision_blob_id,
+          remap_provisional_path,
+          false) &&
+      write_passthrough_blob_remap_collision_raw_capture(
+          passthrough_metal_remap_bundle,
+          remap_collision_blob_id,
+          remap_provisional_path,
+          passthrough_metal_remap_line) &&
+      run_command(quote_arg(argv[1]) + " --raw-format --no-progress --jobs 1 " + quote_arg(passthrough_metal_remap_bundle)) &&
+      run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(passthrough_metal_remap_bundle)) &&
+      validate_passthrough_blob_remap_bundle(
+          passthrough_metal_remap_bundle,
+          remap_collision_blob_id,
+          remap_provisional_path,
+          true) &&
       write_duplicate_content_raw_capture(duplicate_content_bundle) &&
       run_command(quote_arg(argv[1]) + " --raw-format --no-progress " + quote_arg(duplicate_content_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(duplicate_content_bundle)) &&

@@ -737,7 +737,7 @@ std::string raw_event_contract_markdown()
       "- PresentCall 0x0401 / PresentBoundary 0x0404: u64 swap_chain_object_id, u64 frame_index, u32 sync_interval, u32 flags.\n"
       "- FrameBegin 0x0402 / FrameEnd 0x0403: u64 frame_index. Final payloads include label=FrameBegin or label=FrameEnd for existing tail-consistency checks.\n"
       "- Passthrough 0x0001: opaque final_jsonl_record bytes. Payload is the exact UTF-8 final callstream JSON line, without a length prefix or trailing newline. Finalization writes this opaque callstream JSON line unchanged for events not covered by the binary subset and not referencing assets.\n"
-      "- PassthroughWithBlob 0x0002: str final_jsonl_record, u32 blob_count, repeated descriptor {str provisional_asset_path, u64 final_blob_id, u64 raw_blob_id, u32 raw_blob_kind, str debug_name}. The JSON line is still opaque and byte-identical to the live final callstream line. Finalization materializes each raw blob to provisional_asset_path using final_blob_id, writes the JSON line unchanged, then existing bundle finalize stages hash, dedup, canonicalize, and rewrite references.\n";
+      "- PassthroughWithBlob 0x0002: str final_jsonl_record, u32 blob_count, repeated descriptor {str provisional_asset_path, u64 final_blob_id, u64 raw_blob_id, u32 raw_blob_kind, str debug_name}. The JSON line is otherwise opaque and byte-identical to the live final callstream line. Finalization materializes each raw blob to provisional_asset_path using final_blob_id and rewrites only blob id/path references if publication remaps them before appending the line; existing bundle finalize stages then hash, dedup, canonicalize, and rewrite references.\n";
 }
 
 std::vector<std::uint8_t> encode_resource_create_payload(

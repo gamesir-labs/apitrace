@@ -540,6 +540,25 @@ std::string replace_all_copy(std::string text, std::string_view from, std::strin
   return text;
 }
 
+bool rewrite_blob_refs(json &node, const std::unordered_map<std::uint64_t, std::uint64_t> &blob_id_remap);
+
+std::string rewrite_passthrough_blob_refs_copy(
+    const std::string &line,
+    const std::unordered_map<std::uint64_t, std::uint64_t> &blob_id_remap)
+{
+  if (blob_id_remap.empty()) {
+    return line;
+  }
+  auto record = json::parse(line, nullptr, false);
+  if (record.is_discarded()) {
+    return line;
+  }
+  if (!rewrite_blob_refs(record, blob_id_remap)) {
+    return line;
+  }
+  return record.dump();
+}
+
 bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stats)
 {
   if (options.dry_run) {
@@ -575,13 +594,29 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
   const auto emit_decoded_event = [&](apitrace::trace::raw::DecodedRawEvent &&decoded_event) {
     bool wrote_assets = false;
     if (decoded_event.passthrough) {
+      std::unordered_map<std::uint64_t, std::uint64_t> blob_id_remap;
+      std::unordered_map<std::string, std::string> relative_path_remap;
       for (auto &asset : decoded_event.assets) {
+        const auto input_blob_id = asset.blob_id;
+        const auto input_relative_path = asset.relative_path.generic_string();
         auto registered = writer.register_asset(std::move(asset));
         wrote_assets = true;
         ++stats.raw_to_final_assets;
         stats.raw_to_final_asset_bytes += registered.byte_size;
+        if (registered.blob_id != input_blob_id) {
+          blob_id_remap.emplace(input_blob_id, registered.blob_id);
+        }
+        const auto registered_relative_path = registered.relative_path.generic_string();
+        if (!input_relative_path.empty() && input_relative_path != registered_relative_path) {
+          relative_path_remap.emplace(input_relative_path, registered_relative_path);
+        }
       }
-      writer.append_callstream_json_line(decoded_event.passthrough_jsonl_record);
+      auto passthrough_line =
+          rewrite_passthrough_blob_refs_copy(decoded_event.passthrough_jsonl_record, blob_id_remap);
+      for (const auto &entry : relative_path_remap) {
+        passthrough_line = replace_all_copy(passthrough_line, entry.first, entry.second);
+      }
+      writer.append_callstream_json_line(passthrough_line);
       ++stats.raw_to_final_events;
       if (wrote_assets) {
         writer.flush_asset_writes();
