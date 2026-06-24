@@ -556,12 +556,21 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     return false;
   }
 
+  std::string existing_header_line;
+  {
+    std::ifstream existing_callstream(options.bundle_root / apitrace::trace::kCallstreamFileName, std::ios::binary);
+    std::getline(existing_callstream, existing_header_line);
+  }
   apitrace::trace::TraceBundleWriter writer;
   if (!writer.open(options.bundle_root)) {
     std::cerr << "error: failed to open final bundle writer for raw materialization\n";
     return false;
   }
-  writer.write_metadata({apitrace::trace::ApiKind::D3D12, apitrace::trace::kFormatVersion, "raw-to-final", false});
+  if (existing_header_line.find("\"record_kind\":\"bundle_header\"") != std::string::npos) {
+    writer.append_existing_header_json_line(existing_header_line);
+  } else {
+    writer.write_metadata({apitrace::trace::ApiKind::D3D12, apitrace::trace::kFormatVersion, "raw-to-final", false});
+  }
 
   for (const auto &decoded_event : decoded.events) {
     if (decoded_event.passthrough) {

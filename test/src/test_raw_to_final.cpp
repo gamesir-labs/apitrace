@@ -1,5 +1,6 @@
 #include "apitrace/raw_capture_io.hpp"
 #include "apitrace/raw_event_codec.hpp"
+#include "apitrace/trace_session.hpp"
 
 #include "nlohmann/json.hpp"
 
@@ -55,6 +56,143 @@ bool run_command(const std::string &command)
     return false;
   }
   return true;
+}
+
+bool copy_directory(const std::filesystem::path &source, const std::filesystem::path &target)
+{
+  std::error_code error;
+  std::filesystem::remove_all(target, error);
+  std::filesystem::create_directories(target, error);
+  if (error) {
+    std::cerr << "failed to create copy target: " << target << ": " << error.message() << "\n";
+    return false;
+  }
+  for (std::filesystem::recursive_directory_iterator it(source, error), end; it != end; it.increment(error)) {
+    if (error) {
+      std::cerr << "failed to iterate copy source: " << source << ": " << error.message() << "\n";
+      return false;
+    }
+    const auto relative = std::filesystem::relative(it->path(), source, error);
+    if (error) {
+      std::cerr << "failed to compute relative path: " << it->path() << ": " << error.message() << "\n";
+      return false;
+    }
+    const auto destination = target / relative;
+    if (it->is_directory(error)) {
+      std::filesystem::create_directories(destination, error);
+    } else if (it->is_regular_file(error)) {
+      std::filesystem::create_directories(destination.parent_path(), error);
+      std::filesystem::copy_file(it->path(), destination, std::filesystem::copy_options::overwrite_existing, error);
+    }
+    if (error) {
+      std::cerr << "failed to copy " << it->path() << " to " << destination << ": " << error.message() << "\n";
+      return false;
+    }
+  }
+  return true;
+}
+
+apitrace::TraceOptions trace_options(const std::filesystem::path &bundle)
+{
+  apitrace::TraceOptions options;
+  options.api = apitrace::trace::ApiKind::D3D12;
+  options.bundle_root = bundle;
+  options.capture.raw_format_reserved = true;
+  return options;
+}
+
+apitrace::trace::EventRecord make_call_event(
+    std::uint64_t sequence,
+    const char *function_name,
+    std::string payload,
+    std::vector<apitrace::trace::ObjectId> object_refs = {},
+    std::vector<apitrace::trace::BlobId> blob_refs = {})
+{
+  apitrace::trace::EventRecord event;
+  event.kind = apitrace::trace::EventKind::Call;
+  event.callsite.sequence = sequence;
+  event.callsite.function_name = function_name;
+  event.callsite.result_code = 0;
+  event.object_refs = std::move(object_refs);
+  event.blob_refs = std::move(blob_refs);
+  event.payload = std::move(payload);
+  return event;
+}
+
+bool write_synthetic_dual_write_capture(const std::filesystem::path &bundle)
+{
+  std::filesystem::remove_all(bundle);
+  apitrace::TraceSession session(trace_options(bundle));
+  session.begin();
+  session.append_call_event(make_call_event(
+      11,
+      "ID3D12GraphicsCommandList::SetPipelineState",
+      "{\"state\":\"synthetic-non-blob\",\"spacing\":\"kept exactly\"}",
+      {500, 300}));
+
+  apitrace::trace::AssetRecord buffer;
+  buffer.blob_id = 77;
+  buffer.kind = apitrace::trace::AssetKind::Buffer;
+  buffer.debug_name = "d3d12-resource-unmap";
+  buffer.payload_bytes = {0x01, 0x02, 0x03, 0x04};
+  buffer = session.register_asset(std::move(buffer));
+  session.append_call_event(make_call_event(
+      12,
+      "ID3D12Resource::Unmap",
+      "{\"buffer_path\":\"" + buffer.relative_path.generic_string() +
+          "\",\"written_range\":{\"begin\":0,\"end\":4}}",
+      {200},
+      {buffer.blob_id}));
+
+  apitrace::trace::AssetRecord vs;
+  vs.blob_id = 78;
+  vs.kind = apitrace::trace::AssetKind::ShaderDxbc;
+  vs.debug_name = "raw-vs-bytecode";
+  vs.payload_bytes = {'v', 's', '-', 'd', 'x', 'b', 'c'};
+  vs = session.register_asset(std::move(vs));
+  apitrace::trace::AssetRecord ps;
+  ps.blob_id = 79;
+  ps.kind = apitrace::trace::AssetKind::ShaderDxbc;
+  ps.debug_name = "raw-ps-bytecode";
+  ps.payload_bytes = {'p', 's', '-', 'd', 'x', 'b', 'c'};
+  ps = session.register_asset(std::move(ps));
+  const std::string pso_payload =
+      "{\"pso_raw_version\":1"
+      ",\"pso_kind\":\"graphics\""
+      ",\"root_signature_object_id\":400"
+      ",\"node_mask\":0"
+      ",\"flags\":0"
+      ",\"input_layout\":[]"
+      ",\"blend_state\":{}"
+      ",\"sample_mask\":4294967295"
+      ",\"rasterizer_state\":{}"
+      ",\"depth_stencil_state\":{}"
+      ",\"stream_output\":{}"
+      ",\"primitive_topology_type\":3"
+      ",\"num_render_targets\":1"
+      ",\"rtv_formats\":[28,0,0,0,0,0,0,0]"
+      ",\"dsv_format\":0"
+      ",\"sample_desc\":{\"count\":1,\"quality\":0}"
+      ",\"ib_strip_cut_value\":0"
+      ",\"vs\":{\"bytecode_size\":" + std::to_string(vs.byte_size) + ",\"blob_id\":" + std::to_string(vs.blob_id) + "}"
+      ",\"ps\":{\"bytecode_size\":" + std::to_string(ps.byte_size) + ",\"blob_id\":" + std::to_string(ps.blob_id) + "}"
+      ",\"ds\":null,\"hs\":null,\"gs\":null"
+      ",\"requires_dxmt_backend\":false}";
+  session.append_call_event(make_call_event(
+      13,
+      "ID3D12Device::CreateGraphicsPipelineState",
+      pso_payload,
+      {100, 400, 300},
+      {vs.blob_id, ps.blob_id}));
+
+  session.append_call_event(make_call_event(
+      14,
+      "ID3D12GraphicsCommandList::DrawInstanced",
+      "{\"vertex_count_per_instance\":3,\"instance_count\":1,\"start_vertex_location\":0,\"start_instance_location\":0}",
+      {500}));
+  session.end();
+  return std::filesystem::exists(bundle / "raw" / "events.bin") &&
+         std::filesystem::exists(bundle / "raw" / "blobs.bin");
 }
 
 std::vector<json> read_jsonl(const std::filesystem::path &path)
@@ -427,6 +565,30 @@ bool validate_passthrough_with_blob_bundle(
   return true;
 }
 
+bool run_dual_write_parity_test(
+    const std::filesystem::path &source_bundle,
+    const std::filesystem::path &old_bundle,
+    const std::filesystem::path &raw_bundle,
+    const char *finalize,
+    const char *check,
+    const std::filesystem::path &compare_script)
+{
+  return write_synthetic_dual_write_capture(source_bundle) &&
+         copy_directory(source_bundle, old_bundle) &&
+         copy_directory(source_bundle, raw_bundle) &&
+         run_command(quote_arg(finalize) + " --no-progress --jobs 1 " + quote_arg(old_bundle)) &&
+         run_command(quote_arg(finalize) + " --raw-format --no-progress --jobs 1 " + quote_arg(raw_bundle)) &&
+         run_command(quote_arg(check) + " --verify-hashes " + quote_arg(old_bundle)) &&
+         run_command(quote_arg(check) + " --verify-hashes " + quote_arg(raw_bundle)) &&
+         expect(read_file_bytes(old_bundle / "callstream.jsonl") == read_file_bytes(raw_bundle / "callstream.jsonl"),
+                "dual-write old/raw finalized callstream mismatch") &&
+         run_command("python3 " + quote_arg(compare_script) +
+                     " --bundle-finalize " + quote_arg(finalize) +
+                     " --bundle-check " + quote_arg(check) +
+                     " --work-dir " + quote_arg(source_bundle.parent_path() / "compare-work") +
+                     " --jobs 1 " + quote_arg(source_bundle));
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -444,6 +606,10 @@ int main(int argc, char **argv)
   const auto bundle = work_dir / "synthetic-raw.apitrace";
   const auto passthrough_bundle = work_dir / "synthetic-passthrough-raw.apitrace";
   const auto passthrough_blob_bundle = work_dir / "synthetic-passthrough-with-blob-raw.apitrace";
+  const auto dual_write_bundle = work_dir / "synthetic-dual-write.apitrace";
+  const auto dual_write_old_bundle = work_dir / "synthetic-dual-write-old.apitrace";
+  const auto dual_write_raw_bundle = work_dir / "synthetic-dual-write-raw.apitrace";
+  const auto compare_script = std::filesystem::current_path() / "scripts" / "compare-raw-parity.py";
   const std::string passthrough_before =
       "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12GraphicsCommandList::SetPipelineState\",\"result_code\":0,\"object_refs\":[500,700],\"payload\":{\"state\":\"passthrough-before\",\"spacing\":\"kept exactly\"}}";
   const std::string passthrough_after =
@@ -467,7 +633,14 @@ int main(int argc, char **argv)
       write_passthrough_with_blob_raw_capture(passthrough_blob_bundle, passthrough_blob_line, passthrough_non_blob_line) &&
       run_command(quote_arg(argv[1]) + " --raw-format --no-progress " + quote_arg(passthrough_blob_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(passthrough_blob_bundle)) &&
-      validate_passthrough_with_blob_bundle(passthrough_blob_bundle, passthrough_blob_line, passthrough_non_blob_line);
+      validate_passthrough_with_blob_bundle(passthrough_blob_bundle, passthrough_blob_line, passthrough_non_blob_line) &&
+      run_dual_write_parity_test(
+          dual_write_bundle,
+          dual_write_old_bundle,
+          dual_write_raw_bundle,
+          argv[1],
+          argv[2],
+          compare_script);
 
   std::filesystem::remove_all(work_dir);
   if (!ok) {

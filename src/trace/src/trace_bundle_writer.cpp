@@ -5949,6 +5949,19 @@ void TraceBundleWriter::append_prepared_call_event(EventRecord &&event, std::str
   impl_->signal_checkpoint_work(1, 0);
 }
 
+void TraceBundleWriter::append_existing_header_json_line(std::string_view json_line)
+{
+  if (!impl_->open || !impl_->callstream_stream.is_open()) {
+    return;
+  }
+  if (impl_->metadata_written.load(std::memory_order_acquire)) {
+    return;
+  }
+  impl_->callstream_stream.write_line(std::string(json_line));
+  impl_->metadata_written.store(true, std::memory_order_release);
+  impl_->signal_checkpoint_work(1, 0);
+}
+
 void TraceBundleWriter::append_callstream_json_line(std::string_view json_line)
 {
   if (!impl_->open || !impl_->callstream_stream.is_open()) {

@@ -58,6 +58,7 @@ public:
   void append_prepared_call_event(EventRecord &&event, std::string_view serialized_line);
   void append_call_event(const EventRecord &event);
   void append_call_event(EventRecord &&event);
+  void append_existing_header_json_line(std::string_view json_line);
   void append_callstream_json_line(std::string_view json_line);
   void append_metal_event(const MetalEventRecord &event);
   AssetRecord register_asset(const AssetRecord &asset);
