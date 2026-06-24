@@ -1928,10 +1928,13 @@ int main(int argc, char **argv)
       std::cerr << "failed to write middle-missing-blob bundle\n";
       return 1;
     }
+    set_env_var("DXMT_FINALIZE_MAX_TRUNCATE_FRAMES", "1");
     if (run_bundle_finalize(bundle_finalize, middle_missing_blob_bundle) == 0) {
+      unset_env_var("DXMT_FINALIZE_MAX_TRUNCATE_FRAMES");
       std::cerr << "bundle-finalize silently truncated a middle missing blob instead of failing\n";
       return 1;
     }
+    unset_env_var("DXMT_FINALIZE_MAX_TRUNCATE_FRAMES");
   }
 
   const auto triggered_checkpoint_bundle = bundle.parent_path() / (bundle.filename().generic_string() + "-triggered-checkpoint");

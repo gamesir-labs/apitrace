@@ -39,6 +39,8 @@ using json = nlohmann::json;
 namespace {
 
 constexpr const char *kSidebandAssetIndexPath = "analysis/sideband-assets.json";
+constexpr const char *kMaxTruncateFramesEnv = "DXMT_FINALIZE_MAX_TRUNCATE_FRAMES";
+constexpr std::uint64_t kDefaultMaxTruncateFrames = 120;
 constexpr std::size_t kFileCopyBufferSize = 8ull * 1024ull * 1024ull;
 constexpr const char *kEmptySha256Digest =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -63,6 +65,7 @@ struct Options {
   bool verify_existing_canonical = false;
   bool verify_jsonl_records = false;
   bool persist_replay_model_only = false;
+  std::uint64_t max_truncate_frames = kDefaultMaxTruncateFrames;
 };
 
 struct AssetEntry {
@@ -116,6 +119,8 @@ struct Stats {
   std::size_t dropped_jsonl_lines = 0;
   std::size_t truncated_inconsistent_jsonl_files = 0;
   std::uint64_t truncated_inconsistent_jsonl_bytes = 0;
+  std::uint64_t truncated_inconsistent_frames = 0;
+  std::uint64_t surviving_frame_count = 0;
   std::size_t dropped_unreferenced_truncated_assets = 0;
   std::size_t refreshed_asset_hashes = 0;
   std::size_t checksum_files = 0;
@@ -345,6 +350,23 @@ bool ci_environment()
   return ci && *ci && std::string(ci) != "0";
 }
 
+std::uint64_t max_truncate_frames_from_env()
+{
+  const char *value = std::getenv(kMaxTruncateFramesEnv);
+  if (!value || !*value) {
+    return kDefaultMaxTruncateFrames;
+  }
+  char *end = nullptr;
+  errno = 0;
+  const auto parsed = std::strtoull(value, &end, 10);
+  if (errno != 0 || end == value || (end && *end != '\0')) {
+    std::cerr << "warning: ignoring invalid " << kMaxTruncateFramesEnv
+              << "=" << value << "; using " << kDefaultMaxTruncateFrames << "\n";
+    return kDefaultMaxTruncateFrames;
+  }
+  return static_cast<std::uint64_t>(parsed);
+}
+
 std::string format_bytes(std::uint64_t bytes)
 {
   const char *units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
@@ -490,6 +512,8 @@ void print_usage(const char *argv0)
       << "                     Re-hash existing canonical asset files before reusing them.\n"
       << "  --verify-jsonl-records\n"
       << "                     Parse every JSONL record during reference rewriting.\n"
+      << "  --tolerate-missing-blobs\n"
+      << "                     Deprecated compatibility alias; missing blobs are truncated, never zero-filled.\n"
       << "  --persist-replay-model-only\n"
       << "                     Only rebuild the D3D12 replay model and update its checksums.\n";
 }
@@ -498,6 +522,7 @@ std::optional<Options> parse_args(int argc, char **argv)
 {
   Options options;
   options.progress = stderr_is_tty() && !ci_environment();
+  options.max_truncate_frames = max_truncate_frames_from_env();
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--dry-run") {
@@ -514,6 +539,9 @@ std::optional<Options> parse_args(int argc, char **argv)
       options.verify_existing_canonical = true;
     } else if (arg == "--verify-jsonl-records") {
       options.verify_jsonl_records = true;
+    } else if (arg == "--tolerate-missing-blobs") {
+      std::cerr << "warning: --tolerate-missing-blobs is deprecated; "
+                << "bundle-finalize now truncates incomplete tails and never zero-fills missing blobs\n";
     } else if (arg == "--persist-replay-model-only") {
       options.persist_replay_model_only = true;
     } else if (arg == "--jobs") {
@@ -4297,20 +4325,10 @@ struct CallstreamPrefixResult {
   bool truncated = false;
   bool failed = false;
   std::uint64_t kept_frame_count = 0;
+  std::uint64_t dropped_frame_count = 0;
+  std::uint64_t first_dropped_frame = 0;
   std::string error;
 };
-
-bool inconsistency_matches_incomplete_spool_ref(
-    std::string_view reason,
-    std::uint64_t sequence,
-    const IncompleteSpoolRef &incomplete_spool_ref)
-{
-  if (incomplete_spool_ref.blob_id == 0 || sequence != incomplete_spool_ref.sequence) {
-    return false;
-  }
-  const auto expected = "missing blob_id " + std::to_string(incomplete_spool_ref.blob_id);
-  return reason == expected;
-}
 
 bool json_u64_value(const json &node, std::uint64_t &value)
 {
@@ -4857,7 +4875,6 @@ CallstreamPrefixResult truncate_callstream_to_complete_prefix(
     const std::vector<AssetEntry> &assets,
     const Options &options,
     Stats &stats,
-    const IncompleteSpoolRef &incomplete_spool_ref,
     std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> &rewritten_digests)
 {
   CallstreamPrefixResult result;
@@ -4886,8 +4903,7 @@ CallstreamPrefixResult truncate_callstream_to_complete_prefix(
   bool inconsistent = false;
   std::string inconsistent_reason;
   std::uint64_t inconsistent_sequence = 0;
-  bool expected_incomplete_tail = false;
-  bool later_frame_progress = false;
+  std::unordered_set<std::uint64_t> later_progress_frames;
   auto complete_frame_offset = [&]() {
     if (saw_frame_boundary) {
       return last_complete_offset;
@@ -4912,12 +4928,7 @@ CallstreamPrefixResult truncate_callstream_to_complete_prefix(
     inconsistent_sequence = sequence;
     const auto kept_frame = complete_frame_index();
     result.kept_frame_count = kept_frame == std::numeric_limits<std::uint64_t>::max() ? 0 : kept_frame + 1;
-    expected_incomplete_tail =
-        inconsistency_matches_incomplete_spool_ref(
-            inconsistent_reason,
-            inconsistent_sequence,
-            incomplete_spool_ref);
-    return !expected_incomplete_tail;
+    return true;
   };
   const bool scanned = scan_jsonl_file(callstream_path, [&](const JsonlLineView &line_view) {
     const auto line = line_view.line;
@@ -4929,10 +4940,9 @@ CallstreamPrefixResult truncate_callstream_to_complete_prefix(
     if (inconsistent) {
       const auto frame_index = frame_index_from_line(line);
       if (frame_index &&
-          *frame_index > result.kept_frame_count &&
+          *frame_index >= result.kept_frame_count &&
           line_may_contain_present_progress_marker(line)) {
-        later_frame_progress = true;
-        return false;
+        later_progress_frames.insert(*frame_index);
       }
       return true;
     }
@@ -5074,6 +5084,7 @@ CallstreamPrefixResult truncate_callstream_to_complete_prefix(
       return result;
     }
     result.truncated = true;
+    stats.surviving_frame_count = result.kept_frame_count;
     stats.truncated_inconsistent_jsonl_bytes += static_cast<std::uint64_t>(old_size - target_offset);
     ++stats.truncated_inconsistent_jsonl_files;
     std::cerr << "warning: truncating callstream.jsonl at " << target_offset
@@ -5095,17 +5106,22 @@ CallstreamPrefixResult truncate_callstream_to_complete_prefix(
 
   const auto kept_frame = complete_frame_index();
   result.kept_frame_count = kept_frame == std::numeric_limits<std::uint64_t>::max() ? 0 : kept_frame + 1;
+  result.dropped_frame_count = static_cast<std::uint64_t>(later_progress_frames.size());
+  result.first_dropped_frame = result.kept_frame_count;
 
-  if (!expected_incomplete_tail && later_frame_progress) {
+  if (!later_progress_frames.empty() && result.dropped_frame_count > options.max_truncate_frames) {
     result.failed = true;
-    result.error = "callstream has non-tail inconsistency";
+    result.error = "mid-stream integrity failure: would truncate " +
+                   std::to_string(result.dropped_frame_count) +
+                   " frames from frame " + std::to_string(result.first_dropped_frame) +
+                   " to end";
     if (!inconsistent_reason.empty()) {
       result.error += ": " + inconsistent_reason;
     }
     if (inconsistent_sequence != 0) {
       result.error += " at sequence " + std::to_string(inconsistent_sequence);
     }
-    result.error += "; later frames still exist, so this is not a tail truncation";
+    result.error += " -- capture lost data mid-stream (not just a tail); bundle unusable, re-capture needed.";
     return result;
   }
 
@@ -5116,11 +5132,14 @@ CallstreamPrefixResult truncate_callstream_to_complete_prefix(
     return result;
   }
   result.truncated = true;
+  stats.truncated_inconsistent_frames += result.dropped_frame_count;
+  stats.surviving_frame_count = result.kept_frame_count;
   stats.truncated_inconsistent_jsonl_bytes += static_cast<std::uint64_t>(old_size - target_offset);
   ++stats.truncated_inconsistent_jsonl_files;
   std::cerr << "warning: truncating callstream.jsonl at " << target_offset
             << " bytes after " << result.kept_frame_count
-            << " complete frames due to " << inconsistent_reason;
+            << " complete frames; dropped " << result.dropped_frame_count
+            << " present frames due to " << inconsistent_reason;
   if (inconsistent_sequence != 0) {
     std::cerr << " at sequence " << inconsistent_sequence;
   }
@@ -5155,6 +5174,12 @@ std::optional<std::uint64_t> metal_present_frame_index(const json &record)
   return frame_index;
 }
 
+bool line_may_contain_metal_frame_progress_marker(std::string_view line)
+{
+  return line.find("\"PresentDrawable\"") != std::string::npos &&
+         line.find("\"frame_index\"") != std::string::npos;
+}
+
 void truncate_metal_callstream_to_frame_count(
     const fs::path &bundle_root,
     std::uint64_t frame_count,
@@ -5179,8 +5204,7 @@ void truncate_metal_callstream_to_frame_count(
     while (std::getline(input, line)) {
       const auto line_bytes = static_cast<std::uint64_t>(line.size() + (input.eof() ? 0 : 1));
       const auto line_end_offset = offset + line_bytes;
-      if (line.find("\"PresentDrawable\"") != std::string::npos &&
-          line.find("\"frame_index\"") != std::string::npos) {
+      if (line_may_contain_metal_frame_progress_marker(line)) {
         const auto record = json::parse(line, nullptr, false);
         if (!record.is_discarded()) {
           if (const auto frame_index = metal_present_frame_index(record);
@@ -7083,7 +7107,6 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
             assets,
             options,
             stats,
-            incomplete_spool_ref,
             rewritten_digests);
     if (callstream_prefix.failed) {
       std::cerr << "error: " << callstream_prefix.error << "\n";
@@ -7357,6 +7380,8 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
             << " dropped_jsonl_lines=" << stats.dropped_jsonl_lines
             << " truncated_inconsistent_jsonl_files=" << stats.truncated_inconsistent_jsonl_files
             << " truncated_inconsistent_jsonl_bytes=" << stats.truncated_inconsistent_jsonl_bytes
+            << " truncated_inconsistent_frames=" << stats.truncated_inconsistent_frames
+            << " surviving_frame_count=" << stats.surviving_frame_count
             << " refreshed_asset_hashes=" << stats.refreshed_asset_hashes
             << " hashed_unique_files=" << stats.hashed_unique_files
             << " hashed_asset_bytes=" << stats.hashed_asset_bytes
