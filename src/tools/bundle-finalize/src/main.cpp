@@ -590,6 +590,232 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
   }
 
   apitrace::trace::raw::RawEventDecoder decoder(reader);
+  struct ResourceFinalizeState {
+    bool known = false;
+    bool is_buffer = false;
+    std::optional<std::uint64_t> last_map_subresource;
+  };
+  std::unordered_map<apitrace::trace::ObjectId, ResourceFinalizeState> resources;
+  std::string raw_context_error;
+
+  const auto maybe_u64 = [](const json &value) -> std::optional<std::uint64_t> {
+    if (value.is_number_unsigned()) {
+      return value.get<std::uint64_t>();
+    }
+    if (value.is_number_integer()) {
+      const auto signed_value = value.get<std::int64_t>();
+      if (signed_value >= 0) {
+        return static_cast<std::uint64_t>(signed_value);
+      }
+    }
+    return std::nullopt;
+  };
+  const auto resource_desc_dimension = [&](const json &payload) -> std::optional<std::uint64_t> {
+    auto resource_desc = payload.find("resource_desc");
+    if (resource_desc == payload.end()) {
+      return std::nullopt;
+    }
+    if (!resource_desc->is_object()) {
+      return std::nullopt;
+    }
+    auto dimension = resource_desc->find("dimension");
+    if (dimension == resource_desc->end()) {
+      dimension = resource_desc->find("Dimension");
+    }
+    if (dimension == resource_desc->end()) {
+      return std::nullopt;
+    }
+    return maybe_u64(*dimension);
+  };
+  const auto track_final_event_context = [&](const apitrace::trace::EventRecord &event) -> bool {
+    json payload = json::object();
+    if (!event.payload.empty()) {
+      payload = json::parse(event.payload, nullptr, false);
+      if (payload.is_discarded() || !payload.is_object()) {
+        return true;
+      }
+    }
+
+    if (event.kind == apitrace::trace::EventKind::ObjectCreate &&
+        event.object_kind == apitrace::trace::ObjectKind::Resource) {
+      if (auto dimension = payload.contains("dimension") ? maybe_u64(payload["dimension"]) : std::nullopt) {
+        auto &state = resources[event.object_id];
+        state.known = true;
+        state.is_buffer = *dimension == 1;
+      }
+      return true;
+    }
+
+    if (event.kind != apitrace::trace::EventKind::Call) {
+      return true;
+    }
+
+    const auto &function = event.callsite.function_name;
+    if ((function == "ID3D12Device::CreateCommittedResource" ||
+         function == "ID3D12Device8::CreateCommittedResource2") &&
+        event.object_refs.size() >= 2) {
+      if (auto dimension = resource_desc_dimension(payload)) {
+        auto &state = resources[event.object_refs[1]];
+        state.known = true;
+        state.is_buffer = *dimension == 1;
+      }
+      return true;
+    }
+    if ((function == "ID3D12Device::CreatePlacedResource" ||
+         function == "ID3D12Device8::CreatePlacedResource1") &&
+        event.object_refs.size() >= 3) {
+      if (auto dimension = resource_desc_dimension(payload)) {
+        auto &state = resources[event.object_refs[2]];
+        state.known = true;
+        state.is_buffer = *dimension == 1;
+      }
+      return true;
+    }
+    if (function == "ID3D12Device::CreateReservedResource" && event.object_refs.size() >= 2) {
+      if (auto dimension = resource_desc_dimension(payload)) {
+        auto &state = resources[event.object_refs[1]];
+        state.known = true;
+        state.is_buffer = *dimension == 1;
+      }
+      return true;
+    }
+    if (function == "ID3D12Resource::Map" && !event.object_refs.empty()) {
+      auto subresource_it = payload.find("subresource");
+      if (subresource_it != payload.end()) {
+        if (auto subresource = maybe_u64(*subresource_it)) {
+          resources[event.object_refs.front()].last_map_subresource = *subresource;
+        }
+      }
+    }
+    return true;
+  };
+  const auto track_passthrough_context = [&](const std::string &line) -> bool {
+    auto record = json::parse(line, nullptr, false);
+    if (record.is_discarded() || !record.is_object()) {
+      return true;
+    }
+    const auto record_kind = record.value("record_kind", std::string());
+    json payload = json::object();
+    const auto payload_it = record.find("payload");
+    if (payload_it != record.end() && payload_it->is_object()) {
+      payload = *payload_it;
+    }
+
+    if (record_kind == "object_create" &&
+        record.value("object_kind", std::string()) == "Resource") {
+      const auto object_id = record.value("object_id", 0ull);
+      if (auto dimension = payload.contains("dimension") ? maybe_u64(payload["dimension"]) : std::nullopt) {
+        auto &state = resources[object_id];
+        state.known = true;
+        state.is_buffer = *dimension == 1;
+      }
+      return true;
+    }
+
+    if (record_kind != "call") {
+      return true;
+    }
+    const auto function = record.value("function", std::string());
+    const auto object_refs = record.value("object_refs", std::vector<std::uint64_t>{});
+    if ((function == "ID3D12Device::CreateCommittedResource" ||
+         function == "ID3D12Device8::CreateCommittedResource2") &&
+        object_refs.size() >= 2) {
+      if (auto dimension = resource_desc_dimension(payload)) {
+        auto &state = resources[object_refs[1]];
+        state.known = true;
+        state.is_buffer = *dimension == 1;
+      }
+      return true;
+    }
+    if ((function == "ID3D12Device::CreatePlacedResource" ||
+         function == "ID3D12Device8::CreatePlacedResource1") &&
+        object_refs.size() >= 3) {
+      if (auto dimension = resource_desc_dimension(payload)) {
+        auto &state = resources[object_refs[2]];
+        state.known = true;
+        state.is_buffer = *dimension == 1;
+      }
+      return true;
+    }
+    if (function == "ID3D12Device::CreateReservedResource" && object_refs.size() >= 2) {
+      if (auto dimension = resource_desc_dimension(payload)) {
+        auto &state = resources[object_refs[1]];
+        state.known = true;
+        state.is_buffer = *dimension == 1;
+      }
+      return true;
+    }
+    if (function == "ID3D12Resource::Map" && !object_refs.empty()) {
+      auto subresource_it = payload.find("subresource");
+      if (subresource_it != payload.end()) {
+        if (auto subresource = maybe_u64(*subresource_it)) {
+          resources[object_refs.front()].last_map_subresource = *subresource;
+        }
+      }
+    }
+    return true;
+  };
+  const auto finalize_binary_unmap_payload = [&](apitrace::trace::EventRecord &event) -> bool {
+    if (event.kind != apitrace::trace::EventKind::Call ||
+        event.callsite.function_name != "ID3D12Resource::Unmap") {
+      return true;
+    }
+    if (event.object_refs.empty() || event.object_refs.front() == 0) {
+      raw_context_error = "ResourceUnmap missing resource object id at sequence " +
+                          std::to_string(event.callsite.sequence);
+      return false;
+    }
+
+    auto payload = json::parse(event.payload, nullptr, false);
+    if (payload.is_discarded() || !payload.is_object()) {
+      raw_context_error = "ResourceUnmap payload is not a JSON object at sequence " +
+                          std::to_string(event.callsite.sequence);
+      return false;
+    }
+
+    const auto resource_id = event.object_refs.front();
+    auto &state = resources[resource_id];
+    std::uint64_t subresource = 0;
+    if (!state.known) {
+      raw_context_error = "ResourceUnmap for resource " + std::to_string(resource_id) +
+                          " has no prior ResourceCreate/CreateResource metadata at sequence " +
+                          std::to_string(event.callsite.sequence);
+      return false;
+    }
+    if (state.is_buffer) {
+      subresource = 0;
+    } else {
+      if (!state.last_map_subresource) {
+        raw_context_error = "ResourceUnmap for non-buffer resource " + std::to_string(resource_id) +
+                            " has no prior Map subresource at sequence " +
+                            std::to_string(event.callsite.sequence);
+        return false;
+      }
+      subresource = *state.last_map_subresource;
+    }
+
+    auto written_begin = payload.find("written_begin");
+    auto written_end = payload.find("written_end");
+    if (written_begin == payload.end() || written_end == payload.end()) {
+      raw_context_error = "ResourceUnmap missing flat written range at sequence " +
+                          std::to_string(event.callsite.sequence);
+      return false;
+    }
+    const auto begin = maybe_u64(*written_begin);
+    const auto end = maybe_u64(*written_end);
+    if (!begin || !end || *end < *begin) {
+      raw_context_error = "ResourceUnmap invalid written range at sequence " +
+                          std::to_string(event.callsite.sequence);
+      return false;
+    }
+
+    payload["resource_object_id"] = resource_id;
+    payload["subresource"] = subresource;
+    payload["written_size"] = *end - *begin;
+    payload.erase("written_range");
+    event.payload = payload.dump();
+    return true;
+  };
   bool ok = true;
   const auto emit_decoded_event = [&](apitrace::trace::raw::DecodedRawEvent &&decoded_event) {
     bool wrote_assets = false;
@@ -615,6 +841,9 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
           rewrite_passthrough_blob_refs_copy(decoded_event.passthrough_jsonl_record, blob_id_remap);
       for (const auto &entry : relative_path_remap) {
         passthrough_line = replace_all_copy(passthrough_line, entry.first, entry.second);
+      }
+      if (!track_passthrough_context(passthrough_line)) {
+        return false;
       }
       writer.append_callstream_json_line(passthrough_line);
       ++stats.raw_to_final_events;
@@ -642,6 +871,9 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
       if (!input_relative_path.empty() && input_relative_path != registered_relative_path) {
         event.payload = replace_all_copy(event.payload, input_relative_path, registered_relative_path);
       }
+    }
+    if (!finalize_binary_unmap_payload(event) || !track_final_event_context(event)) {
+      return false;
     }
     writer.append_call_event(std::move(event));
     ++stats.raw_to_final_events;
@@ -677,6 +909,10 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     }
     std::cerr << "\n";
     ok = false;
+  }
+  if (!ok && !raw_context_error.empty()) {
+    std::cerr << "error: failed to derive raw ResourceUnmap payload context: "
+              << raw_context_error << "\n";
   }
   if (!ok) {
     writer.close();

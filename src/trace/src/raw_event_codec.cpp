@@ -406,9 +406,12 @@ bool decode_resource_unmap(
   event.callsite.result_code = static_cast<std::int32_t>(record.header.result_or_flags);
   event.object_refs = {resource};
   event.blob_refs = {asset.blob_id};
-  event.payload = "{\"written_range\":{\"begin\":" + std::to_string(written_begin) +
-                  ",\"end\":" + std::to_string(written_end) +
-                  "},\"buffer_path\":\"" + asset.relative_path.generic_string() + "\"}";
+  event.payload = "{\"resource_object_id\":" + std::to_string(resource) +
+                  ",\"subresource\":0" +
+                  ",\"written_begin\":" + std::to_string(written_begin) +
+                  ",\"written_end\":" + std::to_string(written_end) +
+                  ",\"written_size\":" + std::to_string(written_end - written_begin) +
+                  ",\"buffer_path\":\"" + asset.relative_path.generic_string() + "\"}";
   decoded.assets.push_back(std::move(asset));
   return true;
 }

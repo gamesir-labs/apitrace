@@ -62,6 +62,16 @@ bool run_command(const std::string &command)
   return true;
 }
 
+bool run_command_expect_failure(const std::string &command)
+{
+  const auto result = std::system(command.c_str());
+  if (result == 0) {
+    std::cerr << "command unexpectedly succeeded: " << command << "\n";
+    return false;
+  }
+  return true;
+}
+
 bool set_env_var(const char *name, const char *value)
 {
 #ifdef _WIN32
@@ -152,8 +162,8 @@ bool write_synthetic_dual_write_capture(const std::filesystem::path &bundle)
   session.append_call_event(make_call_event(
       12,
       "ID3D12Resource::Unmap",
-      "{\"buffer_path\":\"" + buffer.relative_path.generic_string() +
-          "\",\"written_range\":{\"begin\":0,\"end\":4}}",
+      "{\"resource_object_id\":200,\"subresource\":0,\"written_begin\":0,\"written_end\":4,\"written_size\":4,"
+          "\"buffer_path\":\"" + buffer.relative_path.generic_string() + "\"}",
       {200},
       {buffer.blob_id}));
 
@@ -241,8 +251,9 @@ bool write_no_end_periodic_commit_capture(const std::filesystem::path &bundle)
     session.append_call_event(make_call_event(
         200,
         "ID3D12Resource::Unmap",
-        "{\"buffer_path\":\"" + buffer.relative_path.generic_string() +
-            "\",\"written_range\":{\"begin\":0,\"end\":" + std::to_string(buffer.byte_size) + "}}",
+        "{\"resource_object_id\":700,\"subresource\":0,\"written_begin\":0,\"written_end\":" +
+            std::to_string(buffer.byte_size) + ",\"written_size\":" + std::to_string(buffer.byte_size) +
+            ",\"buffer_path\":\"" + buffer.relative_path.generic_string() + "\"}",
         {700},
         {buffer.blob_id}));
 
@@ -629,8 +640,8 @@ bool write_passthrough_blob_remap_collision_raw_capture(
       "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12Resource::Unmap\",\"result_code\":0,\"blob_refs\":[" +
       std::to_string(provisional_blob_id) +
       "],\"payload\":{\"blob_id\":" + std::to_string(provisional_blob_id) +
-      ",\"buffer_path\":\"" + seed_asset_path +
-      "\",\"written_range\":{\"begin\":0,\"end\":3}}}";
+      ",\"resource_object_id\":200,\"subresource\":0,\"written_begin\":0,\"written_end\":3,\"written_size\":3"
+      ",\"buffer_path\":\"" + seed_asset_path + "\"}}";
   const std::vector<std::uint8_t> seed_blob = {0x01, 0x02, 0x03};
   const std::vector<std::uint8_t> passthrough_blob = {0xaa, 0xbb, 0xcc, 0xdd};
   const auto seed_raw_blob_id = writer.append_blob(
@@ -756,6 +767,69 @@ bool write_duplicate_content_raw_capture(const std::filesystem::path &bundle)
   }
 
   if (!expect(writer.flush_commit(), "failed to commit duplicate-content raw capture")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+  writer.close();
+  return true;
+}
+
+bool write_texture_unmap_raw_capture(
+    const std::filesystem::path &bundle,
+    bool include_prior_map)
+{
+  using namespace apitrace::trace::raw;
+
+  std::filesystem::remove_all(bundle);
+  RawCaptureWriter writer;
+  if (!expect(writer.open(bundle), "failed to open texture-unmap raw writer")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  const std::vector<std::uint8_t> texture_blob = {0x11, 0x22, 0x33, 0x44, 0x55};
+  const auto texture_raw_id = writer.append_blob(
+      texture_blob.data(),
+      texture_blob.size(),
+      static_cast<std::uint32_t>(RawBlobKind::Buffer),
+      2);
+  if (!expect(texture_raw_id != kInvalidRawBlobId, "failed to append texture-unmap raw blob")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  if (!append_raw_event(
+          writer,
+          1,
+          RawEventOpcode::ResourceCreate,
+          encode_resource_create_payload(100, 900, 2, 64, 64, 1, 1, 87, 0, 4, "texture-resource"))) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+  if (include_prior_map) {
+    const std::string map_line =
+        "{\"record_kind\":\"call\",\"sequence\":2,\"time_ns\":1002,\"elapsed_ns\":0,"
+        "\"function\":\"ID3D12Resource::Map\",\"result_code\":0,\"object_refs\":[900],"
+        "\"payload\":{\"subresource\":3,\"read_range\":null,\"mapped\":true}}";
+    if (!append_raw_event(
+            writer,
+            2,
+            RawEventOpcode::Passthrough,
+            encode_passthrough_final_json_payload(map_line))) {
+      std::cerr << writer.last_error() << "\n";
+      return false;
+    }
+  }
+  if (!append_raw_event(
+          writer,
+          include_prior_map ? 3 : 2,
+          RawEventOpcode::ResourceUnmap,
+          encode_resource_unmap_payload(900, texture_raw_id, 16, 16 + texture_blob.size()))) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  if (!expect(writer.flush_commit(), "failed to commit texture-unmap raw capture")) {
     std::cerr << writer.last_error() << "\n";
     return false;
   }
@@ -951,9 +1025,13 @@ bool validate_final_bundle(const std::filesystem::path &bundle)
               "Unmap buffer path was not canonicalized")) {
     return false;
   }
-  if (!expect(unmap["payload"]["written_range"].value("begin", 1) == 0 &&
-                  unmap["payload"]["written_range"].value("end", 0) == 6,
-              "Unmap written range mismatch")) {
+  const auto &unmap_payload = unmap["payload"];
+  if (!expect(unmap_payload.value("subresource", UINT64_MAX) == 0 &&
+                  unmap_payload.value("written_begin", UINT64_MAX) == 0 &&
+                  unmap_payload.value("written_end", 0ull) == 6 &&
+                  unmap_payload.value("written_size", 0ull) == 6 &&
+                  !unmap_payload.contains("written_range"),
+              "Unmap flat payload shape mismatch")) {
     return false;
   }
 
@@ -989,6 +1067,32 @@ bool validate_final_bundle(const std::filesystem::path &bundle)
   }
   if (!expect(read_file_bytes(bundle / buffer_asset_path) == std::vector<std::uint8_t>({0x10, 0x20, 0x30, 0x40, 0x50, 0x60}),
               "canonical buffer asset bytes mismatch")) {
+    return false;
+  }
+  return true;
+}
+
+bool validate_texture_unmap_raw_bundle(const std::filesystem::path &bundle)
+{
+  const auto records = read_jsonl(bundle / "callstream.jsonl");
+  std::vector<json> unmaps;
+  for (const auto &record : records) {
+    if (record.value("function", std::string()) == "ID3D12Resource::Unmap") {
+      unmaps.push_back(record);
+    }
+  }
+  if (!expect(unmaps.size() == 1, "texture-unmap bundle should contain one Unmap")) {
+    return false;
+  }
+  const auto &payload = unmaps.front()["payload"];
+  if (!expect(payload.value("resource_object_id", 0ull) == 900 &&
+                  payload.value("subresource", UINT64_MAX) == 3 &&
+                  payload.value("written_begin", UINT64_MAX) == 16 &&
+                  payload.value("written_end", 0ull) == 21 &&
+                  payload.value("written_size", 0ull) == 5 &&
+                  payload.value("buffer_path", std::string()).rfind("buffers/", 0) == 0 &&
+                  !payload.contains("written_range"),
+              "texture-unmap flat payload shape mismatch")) {
     return false;
   }
   return true;
@@ -1362,6 +1466,8 @@ int main(int argc, char **argv)
   const auto dual_write_old_bundle = work_dir / "synthetic-dual-write-old.apitrace";
   const auto dual_write_raw_bundle = work_dir / "synthetic-dual-write-raw.apitrace";
   const auto no_end_raw_bundle = work_dir / "synthetic-no-end-raw.apitrace";
+  const auto texture_unmap_bundle = work_dir / "synthetic-texture-unmap-raw.apitrace";
+  const auto texture_unmap_missing_map_bundle = work_dir / "synthetic-texture-unmap-missing-map-raw.apitrace";
   const auto streaming_equivalence_bundle = work_dir / "synthetic-streaming-equivalence.apitrace";
   const auto streaming_equivalence_legacy_bundle = work_dir / "synthetic-streaming-equivalence-legacy.apitrace";
   const auto streaming_equivalence_raw_bundle = work_dir / "synthetic-streaming-equivalence-raw.apitrace";
@@ -1371,7 +1477,7 @@ int main(int argc, char **argv)
   const std::string passthrough_after =
       "{\"record_kind\":\"boundary\",\"sequence\":3,\"time_ns\":1003,\"elapsed_ns\":0,\"boundary\":\"DebugMarker\",\"payload\":{\"label\":\"passthrough-after\",\"nested\":{\"value\":42}}}";
   const std::string passthrough_blob_line =
-      "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12Resource::Unmap\",\"result_code\":0,\"blob_refs\":[77],\"payload\":{\"buffer_path\":\"buffers/asset-000000000000004d.buffer\",\"written_range\":{\"begin\":0,\"end\":4}}}";
+      "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12Resource::Unmap\",\"result_code\":0,\"object_refs\":[200],\"blob_refs\":[77],\"payload\":{\"resource_object_id\":200,\"subresource\":0,\"written_begin\":0,\"written_end\":4,\"written_size\":4,\"buffer_path\":\"buffers/asset-000000000000004d.buffer\"}}";
   const std::string passthrough_non_blob_line =
       "{\"record_kind\":\"call\",\"sequence\":2,\"time_ns\":1002,\"elapsed_ns\":0,\"function\":\"ID3D12GraphicsCommandList::DrawInstanced\",\"result_code\":0,\"object_refs\":[500],\"payload\":{\"vertex_count_per_instance\":3,\"instance_count\":1,\"start_vertex_location\":0,\"start_instance_location\":0}}";
   const std::uint64_t remap_collision_blob_id = 4462313;
@@ -1380,9 +1486,10 @@ int main(int argc, char **argv)
       "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12Resource::Unmap\",\"result_code\":0,\"blob_refs\":[" +
       std::to_string(remap_collision_blob_id) +
       "],\"payload\":{\"blob_id\":" + std::to_string(remap_collision_blob_id) +
+      ",\"resource_object_id\":200,\"subresource\":0,\"written_begin\":0,\"written_end\":4,\"written_size\":4" +
       ",\"buffer_path\":\"" + remap_provisional_path +
       "\",\"nested\":{\"blob_id\":" + std::to_string(remap_collision_blob_id) +
-      "},\"written_range\":{\"begin\":0,\"end\":4}}}";
+      "}}}";
   const std::string passthrough_metal_remap_line =
       "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"MTLBuffer.updateContents\",\"result_code\":0,\"blob_refs\":[" +
       std::to_string(remap_collision_blob_id) +
@@ -1437,6 +1544,13 @@ int main(int argc, char **argv)
       write_no_end_periodic_commit_capture(no_end_raw_bundle) &&
       run_command(quote_arg(argv[1]) + " --raw-format --no-progress --jobs 1 " + quote_arg(no_end_raw_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(no_end_raw_bundle)) &&
+      write_texture_unmap_raw_capture(texture_unmap_bundle, true) &&
+      run_command(quote_arg(argv[1]) + " --raw-format --no-progress --jobs 1 " + quote_arg(texture_unmap_bundle)) &&
+      run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(texture_unmap_bundle)) &&
+      validate_texture_unmap_raw_bundle(texture_unmap_bundle) &&
+      write_texture_unmap_raw_capture(texture_unmap_missing_map_bundle, false) &&
+      run_command_expect_failure(
+          quote_arg(argv[1]) + " --raw-format --no-progress --jobs 1 " + quote_arg(texture_unmap_missing_map_bundle)) &&
       run_streaming_equivalence_test(
           streaming_equivalence_bundle,
           streaming_equivalence_legacy_bundle,
