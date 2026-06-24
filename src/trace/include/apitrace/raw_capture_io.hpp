@@ -58,6 +58,7 @@ public:
   bool append_event(const RawEventHeader &header, const void *payload, std::uint64_t payload_size);
   std::uint64_t append_blob(const void *bytes, std::uint64_t size, std::uint32_t kind, std::uint64_t producing_sequence);
   bool flush_commit();
+  bool flush_commit_if_needed(std::uint64_t bytes_threshold);
 
   bool is_open() const noexcept;
   const std::filesystem::path &raw_root() const noexcept;
@@ -67,9 +68,11 @@ public:
 private:
   bool write_headers_locked();
   bool write_commit_meta_locked();
+  bool close_locked();
   bool fail_locked(std::string message);
 
   mutable std::mutex mutex_;
+  std::mutex commit_mutex_;
   std::filesystem::path bundle_root_;
   std::filesystem::path raw_root_;
   class Impl;

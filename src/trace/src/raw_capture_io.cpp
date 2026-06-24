@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -11,6 +12,16 @@
 #include <system_error>
 #include <unordered_map>
 #include <utility>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace apitrace::trace::raw {
 
@@ -112,6 +123,47 @@ bool read_file_header(std::ifstream &input, std::uint64_t expected_magic)
          read_u32(header.data() + 12) == kRawCaptureEndianLittle;
 }
 
+bool durable_flush_path(const std::filesystem::path &path)
+{
+#ifdef _WIN32
+  HANDLE handle = CreateFileW(
+      path.wstring().c_str(),
+      GENERIC_WRITE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      nullptr,
+      OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  const bool ok = FlushFileBuffers(handle) != 0;
+  CloseHandle(handle);
+  return ok;
+#else
+  const int fd = ::open(path.c_str(), O_RDWR);
+  if (fd < 0) {
+    return false;
+  }
+  bool ok = true;
+  while (::fsync(fd) != 0) {
+    if (errno == EINTR) {
+      continue;
+    }
+    ok = false;
+    break;
+  }
+  while (::close(fd) != 0) {
+    if (errno == EINTR) {
+      continue;
+    }
+    ok = false;
+    break;
+  }
+  return ok;
+#endif
+}
+
 bool write_event_header(std::ofstream &output, const RawEventHeader &header)
 {
   return write_u64(output, header.sequence) &&
@@ -160,12 +212,20 @@ bool write_commit_meta_file(const std::filesystem::path &path, const RawCommitMe
   if (!output) {
     return false;
   }
-  return write_u64(output, kCommitMagic) &&
-         write_u32(output, kRawCaptureFormatVersion) &&
-         write_u32(output, kRawCaptureEndianLittle) &&
-         write_u64(output, meta.events_committed_bytes) &&
-         write_u64(output, meta.blobs_committed_bytes) &&
-         write_u64(output, meta.blob_index_committed_bytes);
+  if (!write_u64(output, kCommitMagic) ||
+      !write_u32(output, kRawCaptureFormatVersion) ||
+      !write_u32(output, kRawCaptureEndianLittle) ||
+      !write_u64(output, meta.events_committed_bytes) ||
+      !write_u64(output, meta.blobs_committed_bytes) ||
+      !write_u64(output, meta.blob_index_committed_bytes)) {
+    return false;
+  }
+  output.flush();
+  if (!output) {
+    return false;
+  }
+  output.close();
+  return durable_flush_path(path);
 }
 
 bool read_commit_meta_file(const std::filesystem::path &path, RawCommitMeta &meta)
@@ -230,8 +290,9 @@ RawCaptureWriter::~RawCaptureWriter()
 
 bool RawCaptureWriter::open(const std::filesystem::path &bundle_root)
 {
+  std::lock_guard<std::mutex> commit_lock(commit_mutex_);
   std::lock_guard<std::mutex> lock(mutex_);
-  close();
+  close_locked();
 
   bundle_root_ = bundle_root;
   raw_root_ = bundle_root_ / "raw";
@@ -265,8 +326,15 @@ bool RawCaptureWriter::open(const std::filesystem::path &bundle_root)
 
 void RawCaptureWriter::close()
 {
+  std::lock_guard<std::mutex> commit_lock(commit_mutex_);
+  std::lock_guard<std::mutex> lock(mutex_);
+  close_locked();
+}
+
+bool RawCaptureWriter::close_locked()
+{
   if (!impl_) {
-    return;
+    return true;
   }
   if (impl_->events.is_open()) {
     impl_->events.close();
@@ -278,6 +346,7 @@ void RawCaptureWriter::close()
     impl_->blob_index.close();
   }
   impl_.reset();
+  return true;
 }
 
 bool RawCaptureWriter::append_event(
@@ -353,24 +422,95 @@ std::uint64_t RawCaptureWriter::append_blob(
 
 bool RawCaptureWriter::flush_commit()
 {
+  std::lock_guard<std::mutex> commit_lock(commit_mutex_);
+  RawCommitMeta target;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!impl_) {
+      return fail_locked("raw capture writer is not open");
+    }
+    impl_->events.flush();
+    impl_->blobs.flush();
+    impl_->blob_index.flush();
+    if (!impl_->events || !impl_->blobs || !impl_->blob_index) {
+      return fail_locked("failed to flush raw capture files");
+    }
+    target.events_committed_bytes = tellp_u64(impl_->events);
+    target.blobs_committed_bytes = tellp_u64(impl_->blobs);
+    target.blob_index_committed_bytes = tellp_u64(impl_->blob_index);
+  }
+
+  if (!durable_flush_path(raw_root_ / "events.bin") ||
+      !durable_flush_path(raw_root_ / "blobs.bin") ||
+      !durable_flush_path(raw_root_ / "blobs.idx")) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return fail_locked("failed to fsync raw capture files");
+  }
+
   std::lock_guard<std::mutex> lock(mutex_);
   if (!impl_) {
     return fail_locked("raw capture writer is not open");
   }
-  impl_->events.flush();
-  impl_->blobs.flush();
-  impl_->blob_index.flush();
-  if (!impl_->events || !impl_->blobs || !impl_->blob_index) {
-    return fail_locked("failed to flush raw capture files");
+  impl_->committed = target;
+  return write_commit_meta_locked();
+}
+
+bool RawCaptureWriter::flush_commit_if_needed(std::uint64_t bytes_threshold)
+{
+  if (bytes_threshold == 0) {
+    return true;
   }
-  impl_->committed.events_committed_bytes = tellp_u64(impl_->events);
-  impl_->committed.blobs_committed_bytes = tellp_u64(impl_->blobs);
-  impl_->committed.blob_index_committed_bytes = tellp_u64(impl_->blob_index);
+  if (!commit_mutex_.try_lock()) {
+    return true;
+  }
+  std::lock_guard<std::mutex> commit_lock(commit_mutex_, std::adopt_lock);
+  RawCommitMeta target;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!impl_) {
+      return fail_locked("raw capture writer is not open");
+    }
+
+    const auto events_end = tellp_u64(impl_->events);
+    const auto blobs_end = tellp_u64(impl_->blobs);
+    const auto blob_index_end = tellp_u64(impl_->blob_index);
+    const auto pending_bytes =
+        (events_end - impl_->committed.events_committed_bytes) +
+        (blobs_end - impl_->committed.blobs_committed_bytes) +
+        (blob_index_end - impl_->committed.blob_index_committed_bytes);
+    if (pending_bytes < bytes_threshold) {
+      return true;
+    }
+
+    impl_->events.flush();
+    impl_->blobs.flush();
+    impl_->blob_index.flush();
+    if (!impl_->events || !impl_->blobs || !impl_->blob_index) {
+      return fail_locked("failed to flush raw capture files");
+    }
+    target.events_committed_bytes = events_end;
+    target.blobs_committed_bytes = blobs_end;
+    target.blob_index_committed_bytes = blob_index_end;
+  }
+
+  if (!durable_flush_path(raw_root_ / "events.bin") ||
+      !durable_flush_path(raw_root_ / "blobs.bin") ||
+      !durable_flush_path(raw_root_ / "blobs.idx")) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return fail_locked("failed to fsync raw capture files");
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!impl_) {
+    return fail_locked("raw capture writer is not open");
+  }
+  impl_->committed = target;
   return write_commit_meta_locked();
 }
 
 bool RawCaptureWriter::is_open() const noexcept
 {
+  std::lock_guard<std::mutex> lock(mutex_);
   return impl_ != nullptr;
 }
 

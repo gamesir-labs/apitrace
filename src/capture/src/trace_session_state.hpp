@@ -76,6 +76,7 @@ private:
   RuntimeBootstrap runtime_bootstrap_;
   std::unique_ptr<trace::raw::RawCaptureWriter> raw_writer_;
   std::unordered_map<trace::ObjectId, trace::ObjectRecord> objects_;
+  std::uint64_t raw_commit_cadence_bytes_ = 0;
   bool active_ = false;
 
   // TODO: separate session planning from session execution once preflight validation exists.

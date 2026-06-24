@@ -3,7 +3,9 @@
 #include "apitrace/raw_event_codec.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -16,6 +18,30 @@ bool event_references_captured_blob(const trace::EventRecord &event)
 {
   return !event.blob_refs.empty() ||
          event.payload.find("asset-") != std::string::npos;
+}
+
+std::uint64_t env_u64_or_default(const char *name, std::uint64_t fallback)
+{
+  const char *value = std::getenv(name);
+  if (!value || *value == '\0') {
+    return fallback;
+  }
+  char *end = nullptr;
+  const auto parsed = std::strtoull(value, &end, 10);
+  if (end == value ||
+      (end && *end != '\0') ||
+      parsed == std::numeric_limits<unsigned long long>::max()) {
+    return fallback;
+  }
+  return static_cast<std::uint64_t>(parsed);
+}
+
+std::uint64_t raw_commit_cadence_bytes()
+{
+  constexpr std::uint64_t kDefaultRawCommitCadenceBytes = 16ull * 1024ull * 1024ull;
+  return env_u64_or_default(
+      "APITRACE_RAW_COMMIT_BYTES",
+      env_u64_or_default("APITRACE_CHECKPOINT_ASSET_BYTES", kDefaultRawCommitCadenceBytes));
 }
 
 trace::raw::RawBlobKind raw_blob_kind_for_asset_kind(trace::AssetKind kind)
@@ -34,7 +60,7 @@ trace::raw::RawBlobKind raw_blob_kind_for_asset_kind(trace::AssetKind kind)
   }
 }
 
-void append_passthrough_raw_event(
+bool append_passthrough_raw_event(
     trace::raw::RawCaptureWriter &writer,
     const trace::EventRecord &event,
     std::string_view final_jsonl_record)
@@ -45,7 +71,7 @@ void append_passthrough_raw_event(
   header.opcode = static_cast<std::uint32_t>(trace::raw::RawEventOpcode::PassthroughFinalJson);
   header.result_or_flags = static_cast<std::uint32_t>(event.callsite.result_code);
   header.payload_len = final_jsonl_record.size();
-  writer.append_event(header, final_jsonl_record.data(), final_jsonl_record.size());
+  return writer.append_event(header, final_jsonl_record.data(), final_jsonl_record.size());
 }
 
 bool append_passthrough_with_blob_raw_event(
@@ -192,6 +218,7 @@ void TraceSessionState::begin()
   if (options_.capture.raw_format_reserved) {
     raw_writer_ = std::make_unique<trace::raw::RawCaptureWriter>();
     raw_writer_->open(options_.bundle_root);
+    raw_commit_cadence_bytes_ = raw_commit_cadence_bytes();
   }
   bundle_sink_.write_initial_metadata();
   runtime_bootstrap_.install_entry_hooks();
@@ -244,11 +271,17 @@ void TraceSessionState::append_call_event(trace::EventRecord &&event)
   event = writer.prepare_call_event(std::move(event));
   if (!event_references_captured_blob(event)) {
     const auto final_jsonl_record = trace::event_record_json(event);
-    append_passthrough_raw_event(*raw_writer_, event, final_jsonl_record);
+    const bool raw_appended = append_passthrough_raw_event(*raw_writer_, event, final_jsonl_record);
+    if (raw_appended) {
+      raw_writer_->flush_commit_if_needed(raw_commit_cadence_bytes_);
+    }
     writer.append_prepared_call_event(std::move(event), final_jsonl_record);
   } else {
     const auto final_jsonl_record = trace::event_record_json(event);
-    append_passthrough_with_blob_raw_event(*raw_writer_, writer, event, final_jsonl_record);
+    const bool raw_appended = append_passthrough_with_blob_raw_event(*raw_writer_, writer, event, final_jsonl_record);
+    if (raw_appended) {
+      raw_writer_->flush_commit_if_needed(raw_commit_cadence_bytes_);
+    }
     writer.append_prepared_call_event(std::move(event), final_jsonl_record);
   }
 }

@@ -58,6 +58,15 @@ bool run_command(const std::string &command)
   return true;
 }
 
+bool set_env_var(const char *name, const char *value)
+{
+#ifdef _WIN32
+  return _putenv_s(name, value ? value : "") == 0;
+#else
+  return value ? setenv(name, value, 1) == 0 : unsetenv(name) == 0;
+#endif
+}
+
 bool copy_directory(const std::filesystem::path &source, const std::filesystem::path &target)
 {
   std::error_code error;
@@ -193,6 +202,91 @@ bool write_synthetic_dual_write_capture(const std::filesystem::path &bundle)
   session.end();
   return std::filesystem::exists(bundle / "raw" / "events.bin") &&
          std::filesystem::exists(bundle / "raw" / "blobs.bin");
+}
+
+bool write_no_end_periodic_commit_capture(const std::filesystem::path &bundle)
+{
+  std::filesystem::remove_all(bundle);
+  if (!expect(set_env_var("APITRACE_RAW_COMMIT_BYTES", "512"),
+              "failed to set raw commit cadence test env")) {
+    return false;
+  }
+
+  {
+    apitrace::TraceSession session(trace_options(bundle));
+    session.begin();
+    for (std::uint64_t index = 0; index < 8; ++index) {
+      const std::string padding(96, static_cast<char>('a' + index));
+      session.append_call_event(make_call_event(
+          100 + index,
+          "ID3D12GraphicsCommandList::SetPipelineState",
+          "{\"padding\":\"" + padding + "\"}",
+          {500 + index}));
+    }
+
+    apitrace::trace::AssetRecord buffer;
+    buffer.blob_id = 177;
+    buffer.kind = apitrace::trace::AssetKind::Buffer;
+    buffer.debug_name = "periodic-commit-buffer";
+    buffer.payload_bytes.assign(768, 0x5a);
+    buffer = session.register_asset(std::move(buffer));
+    session.append_call_event(make_call_event(
+        200,
+        "ID3D12Resource::Unmap",
+        "{\"buffer_path\":\"" + buffer.relative_path.generic_string() +
+            "\",\"written_range\":{\"begin\":0,\"end\":" + std::to_string(buffer.byte_size) + "}}",
+        {700},
+        {buffer.blob_id}));
+
+    session.append_call_event(make_call_event(
+        201,
+        "ID3D12GraphicsCommandList::DrawInstanced",
+        "{\"vertex_count_per_instance\":3,\"instance_count\":1,\"start_vertex_location\":0,\"start_instance_location\":0}",
+        {500}));
+  }
+
+  if (!expect(set_env_var("APITRACE_RAW_COMMIT_BYTES", nullptr),
+              "failed to clear raw commit cadence test env")) {
+    return false;
+  }
+
+  apitrace::trace::raw::RawCaptureReader reader;
+  if (!expect(reader.open(bundle), "no-end raw reader could not open periodic capture")) {
+    std::cerr << reader.last_error() << "\n";
+    return false;
+  }
+  const auto committed = reader.committed_prefix();
+  if (!expect(committed.events_committed_bytes > 16 &&
+                  committed.blobs_committed_bytes > 16 &&
+                  committed.blob_index_committed_bytes > 16,
+              "periodic raw commit did not advance all committed prefixes before end()")) {
+    return false;
+  }
+  const auto events = reader.read_events();
+  if (!expect(events.size() >= 9, "periodic raw commit did not expose events through committed prefix")) {
+    return false;
+  }
+  bool saw_blob_event = false;
+  for (const auto &event : events) {
+    if (event.header.sequence == 200) {
+      saw_blob_event = true;
+      break;
+    }
+  }
+  if (!expect(saw_blob_event, "periodic raw commit did not include the blob-referencing event")) {
+    return false;
+  }
+  if (!expect(reader.blob_extents().size() == 1, "periodic raw commit did not expose committed blob extent")) {
+    return false;
+  }
+  std::vector<std::uint8_t> blob;
+  if (!expect(reader.read_blob(reader.blob_extents().front().raw_blob_id, blob),
+              "periodic raw commit exposed a torn blob reference") ||
+      !expect(blob.size() == 768 && blob.front() == 0x5a && blob.back() == 0x5a,
+              "periodic raw commit blob payload mismatch")) {
+    return false;
+  }
+  return true;
 }
 
 std::vector<json> read_jsonl(const std::filesystem::path &path)
@@ -609,6 +703,7 @@ int main(int argc, char **argv)
   const auto dual_write_bundle = work_dir / "synthetic-dual-write.apitrace";
   const auto dual_write_old_bundle = work_dir / "synthetic-dual-write-old.apitrace";
   const auto dual_write_raw_bundle = work_dir / "synthetic-dual-write-raw.apitrace";
+  const auto no_end_raw_bundle = work_dir / "synthetic-no-end-raw.apitrace";
   const auto compare_script = std::filesystem::current_path() / "scripts" / "compare-raw-parity.py";
   const std::string passthrough_before =
       "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12GraphicsCommandList::SetPipelineState\",\"result_code\":0,\"object_refs\":[500,700],\"payload\":{\"state\":\"passthrough-before\",\"spacing\":\"kept exactly\"}}";
@@ -634,6 +729,9 @@ int main(int argc, char **argv)
       run_command(quote_arg(argv[1]) + " --raw-format --no-progress " + quote_arg(passthrough_blob_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(passthrough_blob_bundle)) &&
       validate_passthrough_with_blob_bundle(passthrough_blob_bundle, passthrough_blob_line, passthrough_non_blob_line) &&
+      write_no_end_periodic_commit_capture(no_end_raw_bundle) &&
+      run_command(quote_arg(argv[1]) + " --raw-format --no-progress --jobs 1 " + quote_arg(no_end_raw_bundle)) &&
+      run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(no_end_raw_bundle)) &&
       run_dual_write_parity_test(
           dual_write_bundle,
           dual_write_old_bundle,
