@@ -93,6 +93,7 @@ set(APITRACE_CORE_SOURCES
     src/retrace/src/d3d11_replay_parser.cpp
     src/trace/src/metal_callstream_writer.cpp
     src/trace/src/payload_object_refs.cpp
+    src/trace/src/raw_capture_io.cpp
     src/trace/src/trace_bundle_reader.cpp
     src/trace/src/trace_bundle_writer.cpp
     src/trace/src/translation_link_writer.cpp
@@ -378,6 +379,11 @@ if(NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
     target_link_libraries(apitrace_test_bundle_finalize_integrity PRIVATE apitrace_core_test_hooks)
     target_compile_definitions(apitrace_test_bundle_finalize_integrity PRIVATE APITRACE_ENABLE_TEST_HOOKS)
     target_compile_features(apitrace_test_bundle_finalize_integrity PRIVATE cxx_std_17)
+
+    add_executable(apitrace_test_raw_capture_io test/src/test_raw_capture_io.cpp)
+    target_link_libraries(apitrace_test_raw_capture_io PRIVATE apitrace_core_test_hooks)
+    target_compile_definitions(apitrace_test_raw_capture_io PRIVATE APITRACE_ENABLE_TEST_HOOKS)
+    target_compile_features(apitrace_test_raw_capture_io PRIVATE cxx_std_17)
 
     add_executable(apitrace_test_payload_object_refs test/src/test_payload_object_refs.cpp)
     target_link_libraries(apitrace_test_payload_object_refs PRIVATE apitrace_core apitrace_nlohmann_json)

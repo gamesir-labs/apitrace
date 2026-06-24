@@ -63,6 +63,12 @@ std::filesystem::path resolve_bundle_root(trace::ApiKind api)
   return std::filesystem::current_path() / name.str();
 }
 
+bool env_flag_enabled(const char *name)
+{
+  const char *value = std::getenv(name);
+  return value && *value != '\0' && *value != '0';
+}
+
 void shutdown_process_capture_impl()
 {
   auto &session = process_capture_session();
@@ -206,6 +212,7 @@ TraceSession *ensure_process_trace_session(trace::ApiKind api)
     TraceOptions options;
     options.api = api;
     options.capture.mode = CaptureMode::ProxyDll;
+    options.capture.raw_format_reserved = env_flag_enabled("DXMT_CAPTURE_RAW_FORMAT");
     options.bundle_root = resolve_bundle_root(api);
     session = std::make_unique<TraceSession>(std::move(options));
     session->begin();

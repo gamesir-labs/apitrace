@@ -27,6 +27,10 @@ struct CaptureOptions {
   bool follow_child_processes = true;
   bool hook_dynamic_modules = true;
   bool capture_initial_resources = true;
+  // Reserved for the Phase 1a raw capture format. Parsed from
+  // DXMT_CAPTURE_RAW_FORMAT, but intentionally inert until a later phase wires
+  // writer selection into the live D3D capture path.
+  bool raw_format_reserved = false;
 };
 
 } // namespace apitrace::runtime
