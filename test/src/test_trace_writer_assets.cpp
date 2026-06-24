@@ -286,6 +286,99 @@ bool primary_open_restarts_bundle(const std::filesystem::path &bundle)
          reader.events()[0].blob_refs[0] == 702;
 }
 
+bool slow_spool_backpressure_stays_bounded(const std::filesystem::path &bundle)
+{
+  std::filesystem::remove_all(bundle);
+  set_env_var("APITRACE_WRITER_STATS", "1");
+  set_env_var("APITRACE_ASYNC_ASSET_WORKERS", "1");
+  set_env_var("APITRACE_ASYNC_ASSET_THRESHOLD", "1");
+  set_env_var("APITRACE_CHECKPOINT_ASSET_BYTES", "4096");
+  set_env_var("APITRACE_TEST_ASSET_WRITE_DELAY_MS", "20");
+  set_env_var("DXMT_CAPTURE_MAX_INFLIGHT_BYTES", "16384");
+  set_env_var("DXMT_CAPTURE_LOW_WATER_BYTES", "8192");
+  unset_env_var("DXMT_CAPTURE_FAST_UNSAFE");
+
+  apitrace::trace::TraceBundleWriter writer;
+  if (!writer.open(bundle)) {
+    return false;
+  }
+  writer.write_metadata({apitrace::trace::ApiKind::D3D12, 1, "slow-spool-backpressure-test", false});
+  writer.write_object_index({{900, apitrace::trace::ObjectKind::Resource, 0, "slow-spool-resource"}});
+
+  constexpr std::size_t kPayloadBytes = 4096;
+  constexpr std::size_t kAssetCount = 24;
+  constexpr std::uint64_t kMaxInFlightBytes = 16384;
+  std::vector<std::uint8_t> payload(kPayloadBytes, 0x6d);
+  std::uint64_t max_unpublished = 0;
+  std::uint64_t max_register_ms = 0;
+  std::size_t blocked_registers = 0;
+
+  for (std::size_t index = 0; index < kAssetCount; ++index) {
+    payload[0] = static_cast<std::uint8_t>(index);
+    apitrace::trace::AssetRecord asset;
+    asset.blob_id = 900 + index;
+    asset.kind = apitrace::trace::AssetKind::Buffer;
+    asset.debug_name = "d3d12-resource-unmap";
+    asset.payload_bytes = payload;
+
+    const auto begin = std::chrono::steady_clock::now();
+    asset = writer.register_asset(std::move(asset));
+    const auto elapsed_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - begin)
+            .count());
+    max_register_ms = std::max(max_register_ms, elapsed_ms);
+    if (elapsed_ms >= 10)
+      ++blocked_registers;
+
+    apitrace::trace::EventRecord event;
+    event.kind = apitrace::trace::EventKind::Call;
+    event.callsite.sequence = index + 1;
+    event.callsite.function_name = "ID3D12Resource::Unmap";
+    event.blob_refs = {asset.blob_id};
+    event.payload = std::string("{\"buffer_path\":\"") + asset.relative_path.generic_string() + "\"}";
+    writer.append_call_event(event);
+
+    const auto reserved =
+        apitrace::trace::TraceBundleWriter::TestHooks::spool_reserved_offset_for_test(writer);
+    const auto published =
+        apitrace::trace::TraceBundleWriter::TestHooks::spool_published_offset_for_test(writer);
+    max_unpublished = std::max(max_unpublished, reserved > published ? reserved - published : 0);
+    if (max_unpublished > kMaxInFlightBytes + kPayloadBytes) {
+      std::cerr << "slow spool backlog exceeded bound: " << max_unpublished << "\n";
+      writer.close();
+      return false;
+    }
+  }
+
+  writer.checkpoint();
+  const auto reserved =
+      apitrace::trace::TraceBundleWriter::TestHooks::spool_reserved_offset_for_test(writer);
+  const auto published =
+      apitrace::trace::TraceBundleWriter::TestHooks::spool_published_offset_for_test(writer);
+  const auto final_unpublished = reserved > published ? reserved - published : 0;
+  const auto assets_json = read_text(bundle / "assets.json");
+  const auto indexed_spooled_assets = count_substrings(assets_json, "\"payload_path\":\"spool/asset-payloads.bin\"");
+  writer.close();
+
+  unset_env_var("APITRACE_TEST_ASSET_WRITE_DELAY_MS");
+  unset_env_var("APITRACE_ASYNC_ASSET_THRESHOLD");
+  unset_env_var("APITRACE_CHECKPOINT_ASSET_BYTES");
+  unset_env_var("DXMT_CAPTURE_MAX_INFLIGHT_BYTES");
+  unset_env_var("DXMT_CAPTURE_LOW_WATER_BYTES");
+
+  std::cerr << "slow-spool-backpressure max_unpublished_bytes=" << max_unpublished
+            << " final_unpublished_bytes=" << final_unpublished
+            << " blocked_registers=" << blocked_registers
+            << " max_register_ms=" << max_register_ms
+            << " indexed_spooled_assets=" << indexed_spooled_assets << "\n";
+
+  return blocked_registers != 0 &&
+         max_unpublished <= kMaxInFlightBytes + kPayloadBytes &&
+         final_unpublished <= kPayloadBytes &&
+         indexed_spooled_assets >= kAssetCount - 1;
+}
+
 bool replace_text_in_file(
     const std::filesystem::path &path,
     const std::string &needle,
@@ -1046,6 +1139,12 @@ int main(int argc, char **argv)
       bundle.parent_path() / (bundle.filename().generic_string() + "-primary-restart");
   if (!primary_open_restarts_bundle(primary_restart_bundle)) {
     std::cerr << "primary writer should restart an existing bundle instead of appending a new session\n";
+    return 1;
+  }
+  const auto slow_spool_bundle =
+      bundle.parent_path() / (bundle.filename().generic_string() + "-slow-spool-backpressure");
+  if (!slow_spool_backpressure_stays_bounded(slow_spool_bundle)) {
+    std::cerr << "slow spool capture should block and keep published asset prefix bounded\n";
     return 1;
   }
 

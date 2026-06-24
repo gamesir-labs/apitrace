@@ -79,7 +79,7 @@ std::size_t default_async_asset_worker_count()
 
 std::uint64_t default_spool_asset_checkpoint_bytes()
 {
-  return 2ull * 1024ull * 1024ull * 1024ull;
+  return 16ull * 1024ull * 1024ull;
 }
 
 template <typename Event>
@@ -1700,6 +1700,15 @@ std::size_t env_size_or_default(const char *name, std::size_t default_value)
   return static_cast<std::size_t>(parsed);
 }
 
+std::size_t clamped_low_watermark(std::size_t high_watermark, std::size_t low_watermark)
+{
+  if (high_watermark == 0)
+    return 0;
+  if (low_watermark == 0)
+    return std::max<std::size_t>(1, high_watermark / 2);
+  return std::min(low_watermark, high_watermark);
+}
+
 struct SparseWriteResult {
   bool ok = true;
   bool retryable = false;
@@ -2693,9 +2702,19 @@ public:
     test_terminal_failure_ = enabled;
   }
 
+  void set_test_write_delay(std::chrono::milliseconds delay)
+  {
+    test_write_delay_ = delay;
+  }
+
   std::uint64_t reserve_spool_range(std::uint64_t byte_size)
   {
     return spool_next_offset_.fetch_add(byte_size, std::memory_order_relaxed);
+  }
+
+  std::uint64_t spool_reserved_offset() const
+  {
+    return spool_next_offset_.load(std::memory_order_relaxed);
   }
 
   void set_worker_count(std::size_t worker_count)
@@ -3030,6 +3049,8 @@ private:
       return sparse_write_failure("injected terminal spool write failure", EIO, false);
     if (job.attempt < test_failures_before_success_)
       return sparse_write_failure("injected retryable spool write failure", EIO, true);
+    if (test_write_delay_.count() > 0)
+      std::this_thread::sleep_for(test_write_delay_);
 #ifndef _WIN32
     {
       TimedAtomicWriterPhase phase(lock_stats_ ? &file_open_stats_ : nullptr);
@@ -3461,6 +3482,7 @@ private:
   bool integrity_enabled_ = true;
   std::size_t test_failures_before_success_ = 0;
   bool test_terminal_failure_ = false;
+  std::chrono::milliseconds test_write_delay_{0};
   std::atomic_uint64_t spool_next_offset_{0};
 	  std::size_t pending_bytes_ = 0;
   std::size_t regular_pending_bytes_ = 0;
@@ -4214,9 +4236,11 @@ struct TraceBundleWriter::Impl {
 	  std::condition_variable asset_completion_cv;
 	  std::deque<AsyncAssetWriter::Completion> asset_completion_events;
 	  std::thread asset_completion_thread;
-  std::mutex spool_checkpoint_mutex;
+  mutable std::mutex spool_checkpoint_mutex;
+  std::condition_variable spool_checkpoint_cv;
   std::map<std::uint64_t, std::uint64_t> completed_spool_ranges;
   std::uint64_t spool_checkpoint_committed_offset = 0;
+  std::uint64_t spool_checkpoint_published_offset = 0;
   std::vector<CaptureFailureRecord> asset_write_failures;
 	  std::atomic_uint64_t next_asset_id{1};
   std::size_t async_asset_threshold = 1024ull * 1024ull;
@@ -4323,6 +4347,9 @@ struct TraceBundleWriter::Impl {
   bool inline_finalize = false;
   bool async_callstream_serialize = true;
   bool asset_spool_write = true;
+  bool capture_integrity_enabled = true;
+  std::size_t capture_max_unpublished_spool_bytes = 128ull * 1024ull * 1024ull;
+  std::size_t capture_low_unpublished_spool_bytes = 64ull * 1024ull * 1024ull;
   std::filesystem::path asset_spool_relative_path = std::filesystem::path(kAssetSpoolDirectoryName) / kAssetSpoolFileName;
   bool writer_stats = false;
   bool sync_checkpoints = false;
@@ -4754,38 +4781,94 @@ struct TraceBundleWriter::Impl {
     if (end < begin)
       return;
 
-    std::lock_guard lock(spool_checkpoint_mutex);
-    if (end <= spool_checkpoint_committed_offset)
-      return;
+    {
+      std::lock_guard lock(spool_checkpoint_mutex);
+      if (end <= spool_checkpoint_committed_offset)
+        return;
 
-    auto next = completed_spool_ranges.lower_bound(begin);
-    if (next != completed_spool_ranges.begin()) {
-      auto previous = std::prev(next);
-      if (previous->second >= begin) {
-        begin = std::min(begin, previous->first);
-        end = std::max(end, previous->second);
-        next = completed_spool_ranges.erase(previous);
+      auto next = completed_spool_ranges.lower_bound(begin);
+      if (next != completed_spool_ranges.begin()) {
+        auto previous = std::prev(next);
+        if (previous->second >= begin) {
+          begin = std::min(begin, previous->first);
+          end = std::max(end, previous->second);
+          next = completed_spool_ranges.erase(previous);
+        }
+      }
+      while (next != completed_spool_ranges.end() && next->first <= end) {
+        end = std::max(end, next->second);
+        next = completed_spool_ranges.erase(next);
+      }
+      completed_spool_ranges[begin] = end;
+
+      auto head = completed_spool_ranges.begin();
+      while (head != completed_spool_ranges.end() &&
+             head->first <= spool_checkpoint_committed_offset) {
+        if (head->second > spool_checkpoint_committed_offset)
+          spool_checkpoint_committed_offset = head->second;
+        head = completed_spool_ranges.erase(head);
       }
     }
-    while (next != completed_spool_ranges.end() && next->first <= end) {
-      end = std::max(end, next->second);
-      next = completed_spool_ranges.erase(next);
-    }
-    completed_spool_ranges[begin] = end;
-
-    auto head = completed_spool_ranges.begin();
-    while (head != completed_spool_ranges.end() &&
-           head->first <= spool_checkpoint_committed_offset) {
-      if (head->second > spool_checkpoint_committed_offset)
-        spool_checkpoint_committed_offset = head->second;
-      head = completed_spool_ranges.erase(head);
-    }
+    spool_checkpoint_cv.notify_all();
   }
 
   std::uint64_t completed_spool_checkpoint_offset()
   {
     std::lock_guard lock(spool_checkpoint_mutex);
     return spool_checkpoint_committed_offset;
+  }
+
+  std::uint64_t published_spool_checkpoint_offset() const
+  {
+    std::lock_guard lock(spool_checkpoint_mutex);
+    return spool_checkpoint_published_offset;
+  }
+
+  void mark_spool_checkpoint_published(std::uint64_t offset)
+  {
+    {
+      std::lock_guard lock(spool_checkpoint_mutex);
+      spool_checkpoint_published_offset = std::max(spool_checkpoint_published_offset, offset);
+    }
+    spool_checkpoint_cv.notify_all();
+  }
+
+  void wait_for_spool_publication_budget(std::uint64_t payload_size)
+  {
+    if (!capture_integrity_enabled || payload_size == 0 || capture_max_unpublished_spool_bytes == 0)
+      return;
+
+    const auto high_watermark = std::max<std::uint64_t>(
+        static_cast<std::uint64_t>(capture_max_unpublished_spool_bytes),
+        payload_size);
+    const auto low_watermark = std::min<std::uint64_t>(
+        static_cast<std::uint64_t>(capture_low_unpublished_spool_bytes),
+        high_watermark);
+    bool crossed_high_watermark = false;
+
+    for (;;) {
+      const auto reserved = asset_writer.spool_reserved_offset();
+      const auto published = published_spool_checkpoint_offset();
+      const auto unpublished = reserved > published ? reserved - published : 0;
+      const auto projected = unpublished + payload_size;
+      if (projected <= high_watermark &&
+          (!crossed_high_watermark || unpublished <= low_watermark)) {
+        return;
+      }
+
+      crossed_high_watermark = true;
+      write_lightweight_asset_index_checkpoint();
+
+      std::unique_lock lock(spool_checkpoint_mutex);
+      spool_checkpoint_cv.wait_for(lock, std::chrono::milliseconds(2), [&]() {
+        const auto current_reserved = asset_writer.spool_reserved_offset();
+        const auto current_unpublished = current_reserved > spool_checkpoint_published_offset
+                                             ? current_reserved - spool_checkpoint_published_offset
+                                             : 0;
+        return current_unpublished <= low_watermark ||
+               current_unpublished + payload_size <= high_watermark;
+      });
+    }
   }
 
   std::string capture_incomplete_json() const
@@ -5285,9 +5368,11 @@ struct TraceBundleWriter::Impl {
 
     if (open_mode == TraceBundleOpenMode::SidebandOnly) {
       write_text_atomic(layout.analysis_directory_path / kSidebandAssetShardFileName, asset_index);
+      mark_spool_checkpoint_published(committed_spool_offset);
     } else if (open_mode == TraceBundleOpenMode::Primary &&
                should_write_asset_index(layout.asset_index_path, asset_snapshot, metal_asset_snapshot)) {
       write_text_atomic(layout.asset_index_path, asset_index);
+      mark_spool_checkpoint_published(committed_spool_offset);
     }
 
     checkpoint_signal_events.store(0, std::memory_order_relaxed);
@@ -5395,6 +5480,7 @@ struct TraceBundleWriter::Impl {
           known_file_digests_snapshot,
 	          known_file_sizes_snapshot);
 	      write_text_atomic(layout.analysis_directory_path / kSidebandAssetShardFileName, sideband_asset_index);
+      mark_spool_checkpoint_published(completed_spool_checkpoint_offset());
 	    if (open_mode == TraceBundleOpenMode::SidebandOnly) {
 	      checkpoint_signal_events.store(0, std::memory_order_relaxed);
 	      checkpoint_signal_asset_bytes.store(0, std::memory_order_relaxed);
@@ -5442,6 +5528,7 @@ struct TraceBundleWriter::Impl {
       write_text_atomic(layout.asset_index_path, asset_index);
       known_file_digests_snapshot[kAssetIndexFileName] =
           content_hash_bytes(asset_index.data(), asset_index.size());
+      mark_spool_checkpoint_published(completed_spool_checkpoint_offset());
     }
 
     auto relative_paths = full_scan
@@ -5592,6 +5679,7 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
   impl_->async_callstream_serialize =
       env_flag_enabled_default("APITRACE_ASYNC_CALLSTREAM_SERIALIZE", true);
   impl_->asset_spool_write = env_flag_enabled_default("APITRACE_ASSET_SPOOL_WRITE", true);
+  impl_->capture_integrity_enabled = !env_flag_enabled("DXMT_CAPTURE_FAST_UNSAFE");
   impl_->writer_stats = env_flag_enabled("APITRACE_WRITER_STATS");
   impl_->sync_checkpoints = env_flag_enabled("APITRACE_SYNC_CHECKPOINTS");
   impl_->async_asset_threshold = env_size_or_default("APITRACE_ASYNC_ASSET_THRESHOLD", impl_->async_asset_threshold);
@@ -5603,20 +5691,33 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
       env_size_or_default("APITRACE_COMPLETED_ASSET_CACHE_MAX", impl_->completed_asset_cache_budget);
   impl_->async_line_max_pending_bytes =
       env_size_or_default("APITRACE_ASYNC_LINE_MAX_PENDING", 256ull * 1024ull * 1024ull);
+  impl_->capture_max_unpublished_spool_bytes =
+      env_size_or_default("DXMT_CAPTURE_MAX_INFLIGHT_BYTES", impl_->capture_max_unpublished_spool_bytes);
+  impl_->capture_low_unpublished_spool_bytes = clamped_low_watermark(
+      impl_->capture_max_unpublished_spool_bytes,
+      env_size_or_default("DXMT_CAPTURE_LOW_WATER_BYTES", impl_->capture_max_unpublished_spool_bytes / 2));
   impl_->callstream_stream.set_max_pending_bytes(impl_->async_line_max_pending_bytes);
   impl_->metal_callstream_stream.set_max_pending_bytes(impl_->async_line_max_pending_bytes);
-	  impl_->asset_writer.set_max_pending_bytes(env_size_or_default("APITRACE_ASYNC_ASSET_MAX_PENDING", 2ull * 1024ull * 1024ull * 1024ull));
-	  impl_->asset_writer.set_hard_max_pending_bytes(env_size_or_default("APITRACE_ASYNC_ASSET_HARD_MAX_PENDING", 8ull * 1024ull * 1024ull * 1024ull));
+  const auto default_asset_pending = impl_->capture_integrity_enabled
+                                         ? impl_->capture_max_unpublished_spool_bytes
+                                         : 2ull * 1024ull * 1024ull * 1024ull;
+  const auto default_asset_hard_pending = impl_->capture_integrity_enabled
+                                              ? impl_->capture_max_unpublished_spool_bytes
+                                              : 8ull * 1024ull * 1024ull * 1024ull;
+	  impl_->asset_writer.set_max_pending_bytes(env_size_or_default("APITRACE_ASYNC_ASSET_MAX_PENDING", default_asset_pending));
+	  impl_->asset_writer.set_hard_max_pending_bytes(env_size_or_default("APITRACE_ASYNC_ASSET_HARD_MAX_PENDING", default_asset_hard_pending));
 	  impl_->asset_writer.set_bulk_threshold(env_size_or_default("APITRACE_ASYNC_ASSET_BULK_THRESHOLD", impl_->async_asset_threshold));
 	  impl_->asset_writer.set_worker_count(
         env_size_or_default("APITRACE_ASYNC_ASSET_WORKERS", default_async_asset_worker_count()));
   impl_->asset_writer.set_sparse_write_enabled(env_flag_enabled("APITRACE_ASSET_SPARSE_WRITE"));
   impl_->asset_writer.set_spool_write_enabled(impl_->asset_spool_write);
-  impl_->asset_writer.set_integrity_enabled(!env_flag_enabled("DXMT_CAPTURE_FAST_UNSAFE"));
+  impl_->asset_writer.set_integrity_enabled(impl_->capture_integrity_enabled);
   impl_->asset_writer.set_test_failures_before_success(
       env_size_or_default("APITRACE_TEST_ASSET_SPOOL_FAIL_BEFORE_SUCCESS", 0));
   impl_->asset_writer.set_test_terminal_failure(
       env_flag_enabled("APITRACE_TEST_ASSET_SPOOL_TERMINAL_FAILURE"));
+  impl_->asset_writer.set_test_write_delay(std::chrono::milliseconds(
+      env_size_or_default("APITRACE_TEST_ASSET_WRITE_DELAY_MS", 0)));
 	  if (impl_->writer_stats) {
     impl_->callstream_stream.set_lock_stats(&impl_->callstream_lock_stats);
     impl_->metal_callstream_stream.set_lock_stats(&impl_->metal_callstream_lock_stats);
@@ -5694,7 +5795,11 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
   impl_->checkpoint_event_interval =
       env_size_or_default("APITRACE_CHECKPOINT_EVENT_INTERVAL", impl_->checkpoint_event_interval);
   const auto default_checkpoint_asset_bytes =
-      impl_->asset_spool_write ? default_spool_asset_checkpoint_bytes() : impl_->checkpoint_asset_bytes_interval;
+      impl_->asset_spool_write
+          ? std::min<std::uint64_t>(
+                default_spool_asset_checkpoint_bytes(),
+                std::max<std::uint64_t>(1, impl_->capture_low_unpublished_spool_bytes))
+          : impl_->checkpoint_asset_bytes_interval;
   impl_->checkpoint_asset_bytes_interval =
       env_size_or_default("APITRACE_CHECKPOINT_ASSET_BYTES", default_checkpoint_asset_bytes);
   if (impl_->open)
@@ -5949,6 +6054,7 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
             impl_->asset_spool_write && should_spool_deferred_asset(finalized) &&
             !payload_may_reference_asset_alias(finalized.relative_path, *payload);
         if (spool_payload) {
+          impl_->wait_for_spool_publication_budget(payload->size());
           finalized.payload_path = impl_->asset_spool_relative_path;
           finalized.payload_offset = impl_->asset_writer.reserve_spool_range(payload->size());
           ++impl_->asset_spool_writes;
@@ -6601,6 +6707,18 @@ bool TraceBundleWriter::TestHooks::write_payload_direct_for_test(
     const std::vector<std::uint8_t> &payload)
 {
   return write_payload_direct(output, payload).ok;
+}
+
+std::uint64_t TraceBundleWriter::TestHooks::spool_reserved_offset_for_test(
+    const TraceBundleWriter &writer)
+{
+  return writer.impl_ ? writer.impl_->asset_writer.spool_reserved_offset() : 0;
+}
+
+std::uint64_t TraceBundleWriter::TestHooks::spool_published_offset_for_test(
+    const TraceBundleWriter &writer)
+{
+  return writer.impl_ ? writer.impl_->published_spool_checkpoint_offset() : 0;
 }
 
 void TraceBundleWriter::flush()
