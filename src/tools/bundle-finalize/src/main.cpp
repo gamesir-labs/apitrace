@@ -43,6 +43,8 @@ constexpr const char *kSidebandAssetIndexPath = "analysis/sideband-assets.json";
 constexpr const char *kMaxTruncateFramesEnv = "DXMT_FINALIZE_MAX_TRUNCATE_FRAMES";
 constexpr std::uint64_t kDefaultMaxTruncateFrames = 120;
 constexpr std::size_t kFileCopyBufferSize = 8ull * 1024ull * 1024ull;
+constexpr std::uint64_t kJsonlMaxChunkSize = 64ull * 1024ull * 1024ull;
+constexpr std::uint64_t kJsonlMinChunkSize = 64ull * 1024ull;
 constexpr const char *kEmptySha256Digest =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -2875,8 +2877,6 @@ struct JsonlLineView {
 template <typename Callback>
 bool scan_jsonl_file(const fs::path &path, Callback &&callback)
 {
-  constexpr std::uint64_t kMaxChunkSize = 64ull * 1024ull * 1024ull;
-  constexpr std::uint64_t kMinChunkSize = 64ull * 1024ull;
   std::ifstream input(path, std::ios::binary);
   if (!input.is_open()) {
     return false;
@@ -2886,7 +2886,7 @@ bool scan_jsonl_file(const fs::path &path, Callback &&callback)
   const auto file_size = fs::file_size(path, size_error);
   const auto file_size64 = static_cast<std::uint64_t>(file_size);
   const auto chunk_size = static_cast<std::size_t>(
-      size_error ? kMaxChunkSize : std::min(kMaxChunkSize, std::max(kMinChunkSize, file_size64)));
+      size_error ? kJsonlMaxChunkSize : std::min(kJsonlMaxChunkSize, std::max(kJsonlMinChunkSize, file_size64)));
   std::vector<char> buffer(chunk_size);
   std::string carry;
   std::uint64_t absolute_offset = 0;
@@ -2976,8 +2976,6 @@ bool scan_jsonl_file_for_rewrite(
     const std::unordered_map<std::uint64_t, std::uint64_t> &blob_id_remap,
     Callback &&callback)
 {
-  constexpr std::uint64_t kMaxChunkSize = 64ull * 1024ull * 1024ull;
-  constexpr std::uint64_t kMinChunkSize = 64ull * 1024ull;
   std::ifstream input(path, std::ios::binary);
   if (!input.is_open()) {
     return false;
@@ -2987,7 +2985,7 @@ bool scan_jsonl_file_for_rewrite(
   const auto file_size = fs::file_size(path, size_error);
   const auto file_size64 = static_cast<std::uint64_t>(file_size);
   const auto chunk_size = static_cast<std::size_t>(
-      size_error ? kMaxChunkSize : std::min(kMaxChunkSize, std::max(kMinChunkSize, file_size64)));
+      size_error ? kJsonlMaxChunkSize : std::min(kJsonlMaxChunkSize, std::max(kJsonlMinChunkSize, file_size64)));
   std::vector<char> buffer(chunk_size);
   std::string carry;
   std::uint64_t absolute_offset = 0;
@@ -5220,6 +5218,300 @@ std::optional<std::uint64_t> line_sequence_fast(std::string_view line)
   return std::nullopt;
 }
 
+struct SequenceRepairState {
+  std::uint64_t last_local_sequence = 0;
+  std::uint64_t last_global_sequence = 0;
+  std::uint64_t segment_base = 0;
+};
+
+struct SequenceRepairStep {
+  bool needs_remap = false;
+  bool overflow = false;
+  bool output_regressed = false;
+  bool segment_regressed = false;
+  std::uint64_t local_sequence = 0;
+  std::uint64_t global_sequence = 0;
+  std::uint64_t segment_base = 0;
+};
+
+SequenceRepairStep advance_sequence_repair_state(SequenceRepairState &state, std::uint64_t local_sequence)
+{
+  SequenceRepairStep step;
+  step.local_sequence = local_sequence;
+  if (local_sequence < state.last_local_sequence) {
+    state.segment_base = state.last_global_sequence;
+    state.last_local_sequence = 0;
+    step.segment_regressed = true;
+  }
+  step.segment_base = state.segment_base;
+  if (!add_u64_checked(local_sequence, state.segment_base, step.global_sequence)) {
+    step.overflow = true;
+    return step;
+  }
+  state.last_local_sequence = local_sequence;
+  if (step.global_sequence < state.last_global_sequence) {
+    step.output_regressed = true;
+    return step;
+  }
+  state.last_global_sequence = std::max(state.last_global_sequence, step.global_sequence);
+  step.needs_remap = step.global_sequence != local_sequence;
+  return step;
+}
+
+std::string remap_callstream_sequence_line(std::string_view line, std::uint64_t global_sequence, std::uint64_t segment_base)
+{
+  auto record = parse_jsonl_line(line);
+  if (record.is_discarded() || !record.is_object()) {
+    return {};
+  }
+  record["sequence"] = global_sequence;
+  if (auto payload = record.find("payload"); payload != record.end()) {
+    remap_embedded_sequence_fields(*payload, segment_base, true);
+  }
+  return record.dump();
+}
+
+struct JsonlByteChunk {
+  std::uint64_t offset = 0;
+  std::uint64_t size = 0;
+};
+
+std::uint64_t sequence_repair_chunk_size()
+{
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
+  if (const char *value = std::getenv("APITRACE_TEST_SEQUENCE_REPAIR_CHUNK_BYTES")) {
+    char *end = nullptr;
+    errno = 0;
+    const auto parsed = std::strtoull(value, &end, 10);
+    if (errno == 0 && end != value && parsed > 0) {
+      return std::max<std::uint64_t>(16, static_cast<std::uint64_t>(parsed));
+    }
+  }
+#endif
+  return kJsonlMaxChunkSize;
+}
+
+std::vector<JsonlByteChunk> build_newline_aligned_jsonl_chunks(const fs::path &path, std::uint64_t target_chunk_size)
+{
+  std::vector<JsonlByteChunk> chunks;
+  std::error_code size_error;
+  const auto file_size = static_cast<std::uint64_t>(fs::file_size(path, size_error));
+  if (size_error || file_size == 0) {
+    return chunks;
+  }
+
+  std::ifstream input(path, std::ios::binary);
+  if (!input.is_open()) {
+    return chunks;
+  }
+
+  std::uint64_t chunk_begin = 0;
+  while (chunk_begin < file_size) {
+    std::uint64_t chunk_end = std::min(file_size, chunk_begin + target_chunk_size);
+    if (chunk_end < file_size) {
+      input.clear();
+      input.seekg(static_cast<std::streamoff>(chunk_end), std::ios::beg);
+      char ch = 0;
+      while (chunk_end < file_size && input.get(ch)) {
+        ++chunk_end;
+        if (ch == '\n') {
+          break;
+        }
+      }
+    }
+    chunks.push_back({chunk_begin, chunk_end - chunk_begin});
+    chunk_begin = chunk_end;
+  }
+  return chunks;
+}
+
+bool read_jsonl_byte_chunk(const fs::path &path, const JsonlByteChunk &chunk, std::string &out)
+{
+  out.clear();
+  if (chunk.size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    return false;
+  }
+  std::ifstream input(path, std::ios::binary);
+  if (!input.is_open()) {
+    return false;
+  }
+  input.seekg(static_cast<std::streamoff>(chunk.offset), std::ios::beg);
+  if (!input.good()) {
+    return false;
+  }
+  out.resize(static_cast<std::size_t>(chunk.size));
+  if (!out.empty()) {
+    input.read(out.data(), static_cast<std::streamsize>(out.size()));
+    if (static_cast<std::size_t>(input.gcount()) != out.size()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template <typename Callback>
+bool for_each_jsonl_line_in_chunk(std::string_view text, std::uint64_t chunk_offset, Callback &&callback)
+{
+  std::size_t cursor = 0;
+  while (cursor < text.size()) {
+    const auto newline = text.find('\n', cursor);
+    const bool has_newline = newline != std::string_view::npos;
+    const auto end = has_newline ? newline + 1 : text.size();
+    auto line = text.substr(cursor, (has_newline ? newline : end) - cursor);
+    if (!line.empty() && line.back() == '\r') {
+      line.remove_suffix(1);
+    }
+    JsonlLineView view;
+    view.line = line;
+    view.offset = chunk_offset + static_cast<std::uint64_t>(cursor);
+    view.byte_size = static_cast<std::uint64_t>(end - cursor);
+    view.has_newline = has_newline;
+    if (!callback(view)) {
+      return false;
+    }
+    cursor = end;
+  }
+  return true;
+}
+
+struct SequenceRepairSequenceRun {
+  std::uint64_t first_sequence = 0;
+  std::uint64_t last_sequence = 0;
+};
+
+struct SequenceRepairChunkSummary {
+  std::uint64_t line_count = 0;
+  std::uint64_t input_bytes = 0;
+  bool internal_regression = false;
+  bool failed = false;
+  std::optional<std::uint64_t> first_sequence;
+  std::optional<std::uint64_t> last_sequence;
+  std::vector<SequenceRepairSequenceRun> sequence_runs;
+  SequenceRepairState initial_state;
+};
+
+SequenceRepairChunkSummary summarize_sequence_repair_chunk(
+    const fs::path &callstream_path,
+    const JsonlByteChunk &chunk)
+{
+  SequenceRepairChunkSummary summary;
+  summary.input_bytes = chunk.size;
+  std::string text;
+  if (!read_jsonl_byte_chunk(callstream_path, chunk, text)) {
+    summary.failed = true;
+    return summary;
+  }
+
+  std::uint64_t previous_sequence = 0;
+  for_each_jsonl_line_in_chunk(text, chunk.offset, [&](const JsonlLineView &line_view) {
+    ++summary.line_count;
+    const auto sequence = line_sequence_fast(line_view.line);
+    if (!sequence || *sequence == 0) {
+      return true;
+    }
+    if (!summary.first_sequence) {
+      summary.first_sequence = *sequence;
+    }
+    if (summary.sequence_runs.empty() || *sequence < previous_sequence) {
+      if (!summary.sequence_runs.empty()) {
+        summary.internal_regression = true;
+      }
+      summary.sequence_runs.push_back({*sequence, *sequence});
+    } else {
+      summary.sequence_runs.back().last_sequence = *sequence;
+    }
+    if (*sequence < previous_sequence) {
+      summary.internal_regression = true;
+    }
+    previous_sequence = *sequence;
+    summary.last_sequence = *sequence;
+    return true;
+  });
+  return summary;
+}
+
+bool write_sequence_repaired_chunk(
+    const fs::path &callstream_path,
+    const JsonlByteChunk &chunk,
+    SequenceRepairState state,
+    HashedOutputFile &output,
+    Stats &stats,
+    bool dry_run,
+    bool &rewrite_failed)
+{
+  std::string text;
+  if (!read_jsonl_byte_chunk(callstream_path, chunk, text)) {
+    rewrite_failed = true;
+    return false;
+  }
+
+  bool ok = true;
+  for_each_jsonl_line_in_chunk(text, chunk.offset, [&](const JsonlLineView &line_view) {
+    ++stats.jsonl_records;
+    stats.input_bytes += line_view.byte_size;
+
+    const auto local_sequence = line_sequence_fast(line_view.line);
+    if (!local_sequence || *local_sequence == 0) {
+      if (!dry_run) {
+        if (line_view.has_newline && line_view.byte_size == line_view.line.size() + 1) {
+          output.write_text(std::string_view(
+              text.data() + static_cast<std::size_t>(line_view.offset - chunk.offset),
+              static_cast<std::size_t>(line_view.byte_size)));
+        } else {
+          output.write_line(line_view.line);
+        }
+      }
+      note_jsonl_output(stats, line_view.line);
+      return true;
+    }
+
+    const auto step = advance_sequence_repair_state(state, *local_sequence);
+    if (step.overflow) {
+      rewrite_failed = true;
+      std::cerr << "warning: sequence remap overflow in " << callstream_path
+                << " at byte offset " << line_view.offset << "\n";
+      ok = false;
+      return false;
+    }
+    if (step.output_regressed) {
+      rewrite_failed = true;
+      std::cerr << "warning: sequence still regressed after remap in " << callstream_path
+                << " at byte offset " << line_view.offset << "\n";
+      ok = false;
+      return false;
+    }
+
+    if (step.needs_remap) {
+      const auto rewritten = remap_callstream_sequence_line(line_view.line, step.global_sequence, step.segment_base);
+      if (rewritten.empty()) {
+        rewrite_failed = true;
+        std::cerr << "warning: failed to parse sequence-remap record in " << callstream_path
+                  << " at byte offset " << line_view.offset << "\n";
+        ok = false;
+        return false;
+      }
+      if (!dry_run) {
+        output.write_line(rewritten);
+      }
+      note_jsonl_output(stats, rewritten);
+      ++stats.remapped_sequence_records;
+    } else {
+      if (!dry_run) {
+        if (line_view.has_newline && line_view.byte_size == line_view.line.size() + 1) {
+          output.write_text(std::string_view(
+              text.data() + static_cast<std::size_t>(line_view.offset - chunk.offset),
+              static_cast<std::size_t>(line_view.byte_size)));
+        } else {
+          output.write_line(line_view.line);
+        }
+      }
+      note_jsonl_output(stats, line_view.line);
+    }
+    return true;
+  });
+  return ok;
+}
+
 std::unordered_set<std::string> repair_callstream_sequence_regressions(
     const fs::path &bundle_root,
     const Options &options,
@@ -5256,10 +5548,223 @@ std::unordered_set<std::string> repair_callstream_sequence_regressions(
     return rewritten_paths;
   }
 
+  if (options.jobs > 1) {
+    auto chunks = build_newline_aligned_jsonl_chunks(callstream_path, sequence_repair_chunk_size());
+    if (!chunks.empty()) {
+      std::vector<SequenceRepairChunkSummary> summaries(chunks.size());
+      std::atomic<std::size_t> next_summary{0};
+      const auto summary_worker = [&]() {
+        for (;;) {
+          const auto index = next_summary.fetch_add(1, std::memory_order_relaxed);
+          if (index >= chunks.size()) {
+            return;
+          }
+          summaries[index] = summarize_sequence_repair_chunk(callstream_path, chunks[index]);
+        }
+      };
+
+      std::vector<std::thread> summary_threads;
+      const auto summary_thread_count = std::max<std::size_t>(1, std::min(options.jobs, chunks.size()));
+      summary_threads.reserve(summary_thread_count);
+      for (std::size_t i = 0; i < summary_thread_count; ++i) {
+        summary_threads.emplace_back(summary_worker);
+      }
+      for (auto &thread : summary_threads) {
+        thread.join();
+      }
+
+      bool summary_failed = false;
+      SequenceRepairState prefix_state;
+      for (auto &summary : summaries) {
+        if (summary.failed) {
+          summary_failed = true;
+          break;
+        }
+        summary.initial_state = prefix_state;
+        for (const auto &run : summary.sequence_runs) {
+          auto step = advance_sequence_repair_state(prefix_state, run.first_sequence);
+          if (step.overflow || step.output_regressed) {
+            summary_failed = true;
+            break;
+          }
+          if (step.segment_regressed) {
+            ++stats.sequence_regression_segments;
+          }
+          if (run.last_sequence != run.first_sequence) {
+            step = advance_sequence_repair_state(prefix_state, run.last_sequence);
+            if (step.overflow || step.output_regressed) {
+              summary_failed = true;
+              break;
+            }
+            if (step.segment_regressed) {
+              ++stats.sequence_regression_segments;
+            }
+          }
+        }
+        if (summary_failed) {
+          break;
+        }
+      }
+
+      if (!summary_failed) {
+        bool rewrite_failed = false;
+        const auto temporary = temporary_rewrite_path(callstream_path);
+        HashedOutputFile output;
+        if (!options.dry_run) {
+          output.open(temporary);
+          if (!output.is_open()) {
+            std::cerr << "warning: failed to open temporary rewrite file " << temporary << "\n";
+            return rewritten_paths;
+          }
+        }
+
+        ++stats.jsonl_passes;
+        std::vector<fs::path> chunk_temporaries(chunks.size());
+        std::vector<Stats> chunk_stats(chunks.size());
+        if (!options.dry_run) {
+          std::vector<std::atomic<bool>> chunk_ok(chunks.size());
+          for (auto &ok : chunk_ok) {
+            ok.store(false, std::memory_order_relaxed);
+          }
+          std::atomic<std::size_t> next_rewrite{0};
+          std::mutex rewrite_error_mutex;
+          const auto rewrite_worker = [&]() {
+            for (;;) {
+              const auto index = next_rewrite.fetch_add(1, std::memory_order_relaxed);
+              if (index >= chunks.size()) {
+                return;
+              }
+              const auto chunk_temporary =
+                  temporary.parent_path() /
+                  (temporary.filename().generic_string() + ".chunk-" + std::to_string(index));
+              chunk_temporaries[index] = chunk_temporary;
+              HashedOutputFile chunk_output;
+              chunk_output.open(chunk_temporary);
+              if (!chunk_output.is_open()) {
+                std::lock_guard<std::mutex> lock(rewrite_error_mutex);
+                rewrite_failed = true;
+                return;
+              }
+              bool chunk_failed = false;
+              const bool ok = write_sequence_repaired_chunk(
+                  callstream_path,
+                  chunks[index],
+                  summaries[index].initial_state,
+                  chunk_output,
+                  chunk_stats[index],
+                  false,
+                  chunk_failed);
+              chunk_output.close();
+              if (!ok || chunk_failed) {
+                std::lock_guard<std::mutex> lock(rewrite_error_mutex);
+                rewrite_failed = true;
+                return;
+              }
+              chunk_ok[index].store(true, std::memory_order_relaxed);
+            }
+          };
+
+          std::vector<std::thread> rewrite_threads;
+          const auto rewrite_thread_count = std::max<std::size_t>(1, std::min(options.jobs, chunks.size()));
+          rewrite_threads.reserve(rewrite_thread_count);
+          for (std::size_t i = 0; i < rewrite_thread_count; ++i) {
+            rewrite_threads.emplace_back(rewrite_worker);
+          }
+          for (auto &thread : rewrite_threads) {
+            thread.join();
+          }
+
+          for (std::size_t index = 0; index < chunks.size(); ++index) {
+            if (!chunk_ok[index].load(std::memory_order_relaxed)) {
+              rewrite_failed = true;
+              continue;
+            }
+            std::ifstream chunk_input(chunk_temporaries[index], std::ios::binary);
+            if (!chunk_input.is_open()) {
+              rewrite_failed = true;
+              continue;
+            }
+            std::vector<char> buffer(kFileCopyBufferSize);
+            while (chunk_input) {
+              chunk_input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+              const auto read_count = chunk_input.gcount();
+              if (read_count > 0) {
+                output.write_text(std::string_view(buffer.data(), static_cast<std::size_t>(read_count)));
+              }
+            }
+          }
+        } else {
+          for (std::size_t index = 0; index < chunks.size(); ++index) {
+            bool chunk_failed = false;
+            if (!write_sequence_repaired_chunk(
+                    callstream_path,
+                    chunks[index],
+                    summaries[index].initial_state,
+                    output,
+                    stats,
+                    true,
+                    chunk_failed) ||
+                chunk_failed) {
+              rewrite_failed = true;
+              break;
+            }
+          }
+        }
+
+        if (!options.dry_run) {
+          for (std::size_t index = 0; index < chunks.size(); ++index) {
+            stats.jsonl_records += chunk_stats[index].jsonl_records;
+            stats.input_bytes += chunk_stats[index].input_bytes;
+            stats.output_bytes += chunk_stats[index].output_bytes;
+            stats.remapped_sequence_records += chunk_stats[index].remapped_sequence_records;
+          }
+        }
+
+        if (rewrite_failed) {
+          if (!options.dry_run) {
+            output.close();
+            std::error_code remove_error;
+            fs::remove(temporary, remove_error);
+          }
+          for (const auto &chunk_temporary : chunk_temporaries) {
+            if (!chunk_temporary.empty()) {
+              std::error_code remove_error;
+              fs::remove(chunk_temporary, remove_error);
+            }
+          }
+          return rewritten_paths;
+        }
+
+        ++stats.rewritten_text_files;
+        rewritten_paths.insert(apitrace::trace::kCallstreamFileName);
+        if (!options.dry_run) {
+          const auto digest_and_size = output.digest_and_size();
+          output.close();
+          if (!replace_with_temporary_file(callstream_path, temporary)) {
+            rewritten_paths.clear();
+          } else {
+            remember_rewritten_digest(
+                bundle_root,
+                fs::path(apitrace::trace::kCallstreamFileName),
+                digest_and_size,
+                digest_cache,
+                rewritten_digests,
+                stats);
+          }
+          for (const auto &chunk_temporary : chunk_temporaries) {
+            if (!chunk_temporary.empty()) {
+              std::error_code remove_error;
+              fs::remove(chunk_temporary, remove_error);
+            }
+          }
+        }
+        return rewritten_paths;
+      }
+    }
+  }
+
   bool rewrite_failed = false;
-  std::uint64_t last_global_sequence = 0;
-  std::uint64_t segment_base = 0;
-  last_local_sequence = 0;
+  SequenceRepairState state;
 
   const auto temporary = temporary_rewrite_path(callstream_path);
   HashedOutputFile output;
@@ -5285,41 +5790,32 @@ std::unordered_set<std::string> repair_callstream_sequence_regressions(
       return true;
     }
 
-    if (*local_sequence < last_local_sequence) {
-      segment_base = last_global_sequence;
-      last_local_sequence = 0;
+    const auto step = advance_sequence_repair_state(state, *local_sequence);
+    if (step.segment_regressed) {
       ++stats.sequence_regression_segments;
     }
-
-    std::uint64_t global_sequence = 0;
-    if (!add_u64_checked(*local_sequence, segment_base, global_sequence)) {
+    if (step.overflow) {
       rewrite_failed = true;
       std::cerr << "warning: sequence remap overflow in " << callstream_path
                 << " at byte offset " << line_view.offset << "\n";
       return false;
     }
-    last_local_sequence = *local_sequence;
-
-    if (global_sequence < last_global_sequence) {
+    if (step.output_regressed) {
       rewrite_failed = true;
       std::cerr << "warning: sequence still regressed after remap in " << callstream_path
                 << " at byte offset " << line_view.offset << "\n";
       return false;
     }
 
-    if (global_sequence != *local_sequence) {
-      auto record = parse_jsonl_line(line_view.line);
-      if (record.is_discarded() || !record.is_object()) {
+    if (step.needs_remap) {
+      const auto rewritten =
+          remap_callstream_sequence_line(line_view.line, step.global_sequence, step.segment_base);
+      if (rewritten.empty()) {
         rewrite_failed = true;
         std::cerr << "warning: failed to parse sequence-remap record in " << callstream_path
                   << " at byte offset " << line_view.offset << "\n";
         return false;
       }
-      record["sequence"] = global_sequence;
-      if (auto payload = record.find("payload"); payload != record.end()) {
-        remap_embedded_sequence_fields(*payload, segment_base, true);
-      }
-      const auto rewritten = record.dump();
       if (!options.dry_run) {
         output.write_line(rewritten);
       }
@@ -5332,7 +5828,6 @@ std::unordered_set<std::string> repair_callstream_sequence_regressions(
       note_jsonl_output(stats, line_view.line);
     }
 
-    last_global_sequence = std::max(last_global_sequence, global_sequence);
     return true;
   });
 

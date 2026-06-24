@@ -81,6 +81,37 @@ bool set_env_var(const char *name, const char *value)
 #endif
 }
 
+struct ScopedEnvVar {
+  explicit ScopedEnvVar(const char *env_name, const char *value)
+      : name(env_name)
+  {
+#ifdef _WIN32
+    char *existing = nullptr;
+    std::size_t size = 0;
+    if (_dupenv_s(&existing, &size, name.c_str()) == 0 && existing) {
+      had_previous = true;
+      previous = existing;
+      std::free(existing);
+    }
+#else
+    if (const char *existing = std::getenv(name.c_str())) {
+      had_previous = true;
+      previous = existing;
+    }
+#endif
+    set_env_var(name.c_str(), value);
+  }
+
+  ~ScopedEnvVar()
+  {
+    set_env_var(name.c_str(), had_previous ? previous.c_str() : nullptr);
+  }
+
+  std::string name;
+  bool had_previous = false;
+  std::string previous;
+};
+
 bool copy_directory(const std::filesystem::path &source, const std::filesystem::path &target)
 {
   std::error_code error;
@@ -1442,6 +1473,51 @@ bool run_dual_write_parity_test(
                      " --jobs 1 " + quote_arg(source_bundle));
 }
 
+bool write_sequence_regression_bundle(const std::filesystem::path &bundle)
+{
+  std::filesystem::remove_all(bundle);
+  std::filesystem::create_directories(bundle);
+  std::ofstream metadata(bundle / "metadata.json", std::ios::binary | std::ios::trunc);
+  metadata << "{\"schema\":\"apitrace.bundle.v1\",\"api\":\"d3d12\",\"created_by\":\"sequence-regression-test\","
+              "\"version\":1,\"entry_file\":\"callstream.jsonl\"}\n";
+  metadata.close();
+
+  std::ofstream callstream(bundle / "callstream.jsonl", std::ios::binary | std::ios::trunc);
+  callstream
+      << "{\"record_kind\":\"bundle_header\",\"sequence\":1,\"time_ns\":1001,\"payload\":{\"label\":\"header\"}}\n"
+      << "{\"record_kind\":\"call\",\"sequence\":2,\"time_ns\":1002,\"function\":\"ID3D12GraphicsCommandList::DrawInstanced\",\"result_code\":0,\"payload\":{\"records\":[[2,7]],\"columns\":[\"sequence\",\"value\"],\"nested\":{\"d3d_sequence\":2}}}\n"
+      << "{\"record_kind\":\"boundary\",\"sequence\":3,\"time_ns\":1003,\"boundary\":\"DebugMarker\",\"payload\":{\"label\":\"before-reset\"}}\n"
+      << "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1004,\"function\":\"ID3D12GraphicsCommandList::Dispatch\",\"result_code\":0,\"payload\":{\"ops\":[[1,8]],\"columns\":[\"d3d_sequence\",\"value\"],\"sequence\":1}}\n"
+      << "{\"record_kind\":\"call\",\"sequence\":2,\"time_ns\":1005,\"function\":\"ID3D12GraphicsCommandList::SetPipelineState\",\"result_code\":0,\"payload\":{\"label\":\"after-reset\",\"nested\":{\"sequence\":2}}}\n"
+      << "{\"record_kind\":\"boundary\",\"sequence\":1,\"time_ns\":1006,\"boundary\":\"DebugMarker\",\"payload\":{\"records\":[[1]],\"columns\":[\"sequence\"]}}\n"
+      << "{\"record_kind\":\"call\",\"sequence\":2,\"time_ns\":1007,\"function\":\"ID3D12GraphicsCommandList::DrawInstanced\",\"result_code\":0,\"payload\":{\"label\":\"tail\",\"array\":[{\"sequence\":2}]}}\n";
+  callstream.close();
+
+  std::ofstream checksums(bundle / "checksums.json", std::ios::binary | std::ios::trunc);
+  checksums << "{\"schema\":\"apitrace.checksums.v1\",\"files\":{}}\n";
+  return true;
+}
+
+bool run_sequence_repair_parallel_parity_test(
+    const std::filesystem::path &source_bundle,
+    const std::filesystem::path &serial_bundle,
+    const std::filesystem::path &parallel_bundle,
+    const char *finalize,
+    const char *check)
+{
+  ScopedEnvVar forced_chunk_size("APITRACE_TEST_SEQUENCE_REPAIR_CHUNK_BYTES", "160");
+  return write_sequence_regression_bundle(source_bundle) &&
+         copy_directory(source_bundle, serial_bundle) &&
+         copy_directory(source_bundle, parallel_bundle) &&
+         run_command(quote_arg(finalize) + " --no-progress --jobs 1 " + quote_arg(serial_bundle)) &&
+         run_command(quote_arg(finalize) + " --no-progress --jobs 4 " + quote_arg(parallel_bundle)) &&
+         run_command(quote_arg(check) + " --verify-hashes " + quote_arg(serial_bundle)) &&
+         run_command(quote_arg(check) + " --verify-hashes " + quote_arg(parallel_bundle)) &&
+         expect(read_file_bytes(serial_bundle / "callstream.jsonl") ==
+                    read_file_bytes(parallel_bundle / "callstream.jsonl"),
+                "sequence repair serial/parallel callstream mismatch");
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -1471,6 +1547,9 @@ int main(int argc, char **argv)
   const auto streaming_equivalence_bundle = work_dir / "synthetic-streaming-equivalence.apitrace";
   const auto streaming_equivalence_legacy_bundle = work_dir / "synthetic-streaming-equivalence-legacy.apitrace";
   const auto streaming_equivalence_raw_bundle = work_dir / "synthetic-streaming-equivalence-raw.apitrace";
+  const auto sequence_regression_source_bundle = work_dir / "synthetic-sequence-regression-source.apitrace";
+  const auto sequence_regression_serial_bundle = work_dir / "synthetic-sequence-regression-serial.apitrace";
+  const auto sequence_regression_parallel_bundle = work_dir / "synthetic-sequence-regression-parallel.apitrace";
   const auto compare_script = std::filesystem::current_path() / "scripts" / "compare-raw-parity.py";
   const std::string passthrough_before =
       "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12GraphicsCommandList::SetPipelineState\",\"result_code\":0,\"object_refs\":[500,700],\"payload\":{\"state\":\"passthrough-before\",\"spacing\":\"kept exactly\"}}";
@@ -1563,7 +1642,13 @@ int main(int argc, char **argv)
           dual_write_raw_bundle,
           argv[1],
           argv[2],
-          compare_script);
+          compare_script) &&
+      run_sequence_repair_parallel_parity_test(
+          sequence_regression_source_bundle,
+          sequence_regression_serial_bundle,
+          sequence_regression_parallel_bundle,
+          argv[1],
+          argv[2]);
 
   if (ok) {
     std::filesystem::remove_all(work_dir);
