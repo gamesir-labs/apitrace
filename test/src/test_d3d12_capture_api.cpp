@@ -197,16 +197,23 @@ bool run_dual_write_capture_smoke(const char *argv0, const std::filesystem::path
   }
   const auto raw_events = raw_reader.read_events();
   bool saw_passthrough = false;
-  bool saw_unmap = false;
-  bool saw_draw = false;
+  bool saw_passthrough_with_blob = false;
+  bool saw_binary_subset = false;
   for (const auto &event : raw_events) {
     const auto opcode = static_cast<apitrace::trace::raw::RawEventOpcode>(event.header.opcode);
     saw_passthrough = saw_passthrough || opcode == apitrace::trace::raw::RawEventOpcode::PassthroughFinalJson;
-    saw_unmap = saw_unmap || opcode == apitrace::trace::raw::RawEventOpcode::ResourceUnmap;
-    saw_draw = saw_draw || opcode == apitrace::trace::raw::RawEventOpcode::DrawInstanced;
+    saw_passthrough_with_blob =
+        saw_passthrough_with_blob || opcode == apitrace::trace::raw::RawEventOpcode::PassthroughWithBlob;
+    saw_binary_subset = saw_binary_subset ||
+                        opcode == apitrace::trace::raw::RawEventOpcode::ResourceUnmap ||
+                        opcode == apitrace::trace::raw::RawEventOpcode::DrawInstanced;
   }
-  if (!saw_passthrough || !saw_unmap || !saw_draw || raw_reader.blob_extents().empty()) {
-    std::cerr << "raw dual-write did not include passthrough, binary subset, and blob records\n";
+  if (!saw_passthrough || !saw_passthrough_with_blob || raw_reader.blob_extents().empty()) {
+    std::cerr << "raw dual-write did not include passthrough, blob passthrough, and blob records\n";
+    return false;
+  }
+  if (saw_binary_subset) {
+    std::cerr << "raw dual-write unexpectedly emitted typed binary subset events\n";
     return false;
   }
 
@@ -218,7 +225,7 @@ bool run_dual_write_capture_smoke(const char *argv0, const std::filesystem::path
   if (records_text.find("\"function\":\"D3D12CreateDevice\"") == std::string::npos ||
       records_text.find("\"function\":\"ID3D12Resource::Unmap\"") == std::string::npos ||
       records_text.find("\"function\":\"ID3D12GraphicsCommandList::DrawInstanced\"") == std::string::npos) {
-    std::cerr << "raw-to-final output did not preserve passthrough and binary subset calls\n";
+    std::cerr << "raw-to-final output did not preserve passthrough dual-write calls\n";
     return false;
   }
   return true;
