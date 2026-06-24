@@ -2259,6 +2259,11 @@ struct JsonlLineTokens {
   bool blob_id_key = false;
 };
 
+struct ReferencedAssets {
+  std::unordered_set<std::string> paths;
+  std::unordered_set<std::uint64_t> blob_ids;
+};
+
 JsonlLineTokens scan_jsonl_line_tokens(std::string_view text)
 {
   JsonlLineTokens tokens;
@@ -2819,48 +2824,6 @@ bool scan_jsonl_file_for_rewrite(
   return flush_skipped();
 }
 
-std::unordered_set<std::string> collect_referenced_asset_paths(
-    const fs::path &bundle_root,
-    const std::unordered_map<std::string, std::string> &aliases)
-{
-  std::unordered_set<std::string> referenced_paths;
-  for (const auto &relative : text_reference_files(bundle_root)) {
-    const auto absolute = bundle_root / relative;
-    if (relative.extension() == ".jsonl") {
-      scan_jsonl_file(absolute, [&](const JsonlLineView &line_view) {
-        const auto line = line_view.line;
-        const auto tokens = scan_jsonl_line_tokens(line);
-        if (!tokens_may_contain_path_reference(tokens)) {
-          return true;
-        }
-        const auto record = json::parse(std::string(line), nullptr, false);
-        if (!record.is_discarded()) {
-          collect_path_references_from_json(record, aliases, referenced_paths);
-        }
-        return true;
-      });
-      continue;
-    }
-
-    std::ifstream input(absolute, std::ios::binary);
-    if (!input.is_open()) {
-      continue;
-    }
-    std::ostringstream text_buffer;
-    text_buffer << input.rdbuf();
-    const auto text = text_buffer.str();
-    if (!text_may_contain_rewritable_asset_path(text) &&
-        !text_may_contain_path_reference(text)) {
-      continue;
-    }
-    const auto root = json::parse(text, nullptr, false);
-    if (!root.is_discarded()) {
-      collect_path_references_from_json(root, aliases, referenced_paths);
-    }
-  }
-  return referenced_paths;
-}
-
 void collect_blob_references_from_json(const json &node, std::unordered_set<std::uint64_t> &blob_refs)
 {
   if (node.is_object()) {
@@ -2920,6 +2883,137 @@ void collect_blob_references_from_jsonl_line(std::string_view line, std::unorder
     }
   }
 }
+
+ReferencedAssets collect_referenced_assets(
+    const fs::path &bundle_root,
+    const std::unordered_map<std::string, std::string> &aliases,
+    bool collect_paths = true)
+{
+  ReferencedAssets referenced;
+  for (const auto &relative : text_reference_files(bundle_root)) {
+    const auto absolute = bundle_root / relative;
+    if (relative.extension() == ".jsonl") {
+      scan_jsonl_file(absolute, [&](const JsonlLineView &line_view) {
+        const auto line = line_view.line;
+        const auto tokens = scan_jsonl_line_tokens(line);
+        if (tokens.blob_refs_key) {
+          collect_blob_references_from_jsonl_line(line, referenced.blob_ids);
+        }
+        if (!collect_paths || !tokens_may_contain_path_reference(tokens)) {
+          return true;
+        }
+        const auto record = json::parse(std::string(line), nullptr, false);
+        if (!record.is_discarded()) {
+          collect_path_references_from_json(record, aliases, referenced.paths);
+        }
+        return true;
+      });
+      continue;
+    }
+
+    std::ifstream input(absolute, std::ios::binary);
+    if (!input.is_open()) {
+      continue;
+    }
+    std::ostringstream text_buffer;
+    text_buffer << input.rdbuf();
+    const auto text = text_buffer.str();
+    const bool may_contain_paths =
+        collect_paths &&
+        (text_may_contain_rewritable_asset_path(text) ||
+         text_may_contain_path_reference(text));
+    const bool may_contain_blobs = text_may_contain_blob_refs(text);
+    if (!may_contain_paths && !may_contain_blobs) {
+      continue;
+    }
+    const auto root = json::parse(text, nullptr, false);
+    if (root.is_discarded()) {
+      continue;
+    }
+    if (may_contain_paths) {
+      collect_path_references_from_json(root, aliases, referenced.paths);
+    }
+    if (may_contain_blobs) {
+      collect_blob_references_from_json(root, referenced.blob_ids);
+    }
+  }
+  return referenced;
+}
+
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
+ReferencedAssets collect_referenced_assets_two_pass_for_test(
+    const fs::path &bundle_root,
+    const std::unordered_map<std::string, std::string> &aliases)
+{
+  ReferencedAssets referenced;
+  for (const auto &relative : text_reference_files(bundle_root)) {
+    const auto absolute = bundle_root / relative;
+    if (relative.extension() == ".jsonl") {
+      scan_jsonl_file(absolute, [&](const JsonlLineView &line_view) {
+        const auto line = line_view.line;
+        const auto tokens = scan_jsonl_line_tokens(line);
+        if (!tokens_may_contain_path_reference(tokens)) {
+          return true;
+        }
+        const auto record = json::parse(std::string(line), nullptr, false);
+        if (!record.is_discarded()) {
+          collect_path_references_from_json(record, aliases, referenced.paths);
+        }
+        return true;
+      });
+      continue;
+    }
+
+    std::ifstream input(absolute, std::ios::binary);
+    if (!input.is_open()) {
+      continue;
+    }
+    std::ostringstream text_buffer;
+    text_buffer << input.rdbuf();
+    const auto text = text_buffer.str();
+    if (!text_may_contain_rewritable_asset_path(text) &&
+        !text_may_contain_path_reference(text)) {
+      continue;
+    }
+    const auto root = json::parse(text, nullptr, false);
+    if (!root.is_discarded()) {
+      collect_path_references_from_json(root, aliases, referenced.paths);
+    }
+  }
+
+  for (const auto &relative : text_reference_files(bundle_root)) {
+    const auto absolute = bundle_root / relative;
+    if (relative.extension() == ".jsonl") {
+      scan_jsonl_file(absolute, [&](const JsonlLineView &line_view) {
+        const auto line = line_view.line;
+        const auto tokens = scan_jsonl_line_tokens(line);
+        if (!tokens.blob_refs_key) {
+          return true;
+        }
+        collect_blob_references_from_jsonl_line(line, referenced.blob_ids);
+        return true;
+      });
+      continue;
+    }
+
+    std::ifstream input(absolute, std::ios::binary);
+    if (!input.is_open()) {
+      continue;
+    }
+    std::ostringstream text_buffer;
+    text_buffer << input.rdbuf();
+    const auto text = text_buffer.str();
+    if (!text_may_contain_blob_refs(text)) {
+      continue;
+    }
+    const auto root = json::parse(text, nullptr, false);
+    if (!root.is_discarded()) {
+      collect_blob_references_from_json(root, referenced.blob_ids);
+    }
+  }
+  return referenced;
+}
+#endif
 
 bool path_exists_as_asset_file(const fs::path &bundle_root, const std::string &path)
 {
@@ -3036,42 +3130,6 @@ void repair_finalized_single_blob_asset_index(
     asset.actual_size = 0;
     return true;
   });
-}
-
-std::unordered_set<std::uint64_t> collect_referenced_blob_ids(const fs::path &bundle_root)
-{
-  std::unordered_set<std::uint64_t> referenced_blob_ids;
-  for (const auto &relative : text_reference_files(bundle_root)) {
-    const auto absolute = bundle_root / relative;
-    if (relative.extension() == ".jsonl") {
-      scan_jsonl_file(absolute, [&](const JsonlLineView &line_view) {
-        const auto line = line_view.line;
-        const auto tokens = scan_jsonl_line_tokens(line);
-        if (!tokens.blob_refs_key) {
-          return true;
-        }
-        collect_blob_references_from_jsonl_line(line, referenced_blob_ids);
-        return true;
-      });
-      continue;
-    }
-
-    std::ifstream input(absolute, std::ios::binary);
-    if (!input.is_open()) {
-      continue;
-    }
-    std::ostringstream text_buffer;
-    text_buffer << input.rdbuf();
-    const auto text = text_buffer.str();
-    if (text.find("\"blob_refs\"") == std::string::npos) {
-      continue;
-    }
-    const auto root = json::parse(text, nullptr, false);
-    if (!root.is_discarded()) {
-      collect_blob_references_from_json(root, referenced_blob_ids);
-    }
-  }
-  return referenced_blob_ids;
 }
 
 bool is_typed_asset_file_path(const fs::path &relative)
@@ -7081,6 +7139,28 @@ int run_persist_replay_model_only(const Options &options)
 
 } // namespace
 
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
+namespace apitrace::tools {
+
+bool test_hook_bundle_finalize_reference_collection_matches_two_pass(
+    const fs::path &bundle_root,
+    std::size_t *path_ref_count,
+    std::size_t *blob_id_ref_count)
+{
+  const auto fused = collect_referenced_assets(bundle_root, {});
+  const auto two_pass = collect_referenced_assets_two_pass_for_test(bundle_root, {});
+  if (path_ref_count) {
+    *path_ref_count = fused.paths.size();
+  }
+  if (blob_id_ref_count) {
+    *blob_id_ref_count = fused.blob_ids.size();
+  }
+  return fused.paths == two_pass.paths && fused.blob_ids == two_pass.blob_ids;
+}
+
+} // namespace apitrace::tools
+#endif
+
 int apitrace::tools::run_bundle_finalize(int argc, char **argv){
   const auto parsed = parse_args(argc, argv);
   if (!parsed) {
@@ -7411,10 +7491,12 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
     }
   });
   run_stage(options, progress, stage_index, kStageCount, "rebuild_reference_graph", [&] {
+    auto referenced_assets_after_rewrite =
+        collect_referenced_assets(options.bundle_root, aliases, referenced_paths_after_rewrite.empty());
     if (referenced_paths_after_rewrite.empty()) {
-      referenced_paths_after_rewrite = collect_referenced_asset_paths(options.bundle_root, aliases);
+      referenced_paths_after_rewrite = std::move(referenced_assets_after_rewrite.paths);
     }
-    const auto referenced_blob_ids_after_rewrite = collect_referenced_blob_ids(options.bundle_root);
+    const auto &referenced_blob_ids_after_rewrite = referenced_assets_after_rewrite.blob_ids;
     stats.referenced_paths_collected = referenced_paths_after_rewrite.size();
     if (callstream_prefix.truncated && !options.dry_run) {
       drop_unreferenced_truncated_assets(

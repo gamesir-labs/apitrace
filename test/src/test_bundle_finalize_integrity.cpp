@@ -9,6 +9,13 @@
 #include <unordered_set>
 #include <vector>
 
+namespace apitrace::tools {
+bool test_hook_bundle_finalize_reference_collection_matches_two_pass(
+    const std::filesystem::path &bundle_root,
+    std::size_t *path_ref_count,
+    std::size_t *blob_id_ref_count);
+} // namespace apitrace::tools
+
 namespace {
 
 void set_env_var(const char *name, const char *value)
@@ -212,6 +219,17 @@ int main(int argc, char **argv)
   const auto tail_bundle = root / "tail-missing.apitrace";
   if (!write_missing_blob_bundle(tail_bundle, 3, 2)) {
     std::cerr << "failed to write tail fixture\n";
+    return 1;
+  }
+  std::size_t fused_path_refs = 0;
+  std::size_t fused_blob_id_refs = 0;
+  if (!apitrace::tools::test_hook_bundle_finalize_reference_collection_matches_two_pass(
+          tail_bundle,
+          &fused_path_refs,
+          &fused_blob_id_refs) ||
+      fused_path_refs == 0 ||
+      fused_blob_id_refs == 0) {
+    std::cerr << "fused reference collection diverged from the two-pass baseline\n";
     return 1;
   }
   if (run_bundle_finalize_with_threshold(bundle_finalize, tail_bundle, "2") != 0) {

@@ -378,7 +378,12 @@ if(NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
     target_compile_features(apitrace_test_trace_writer_assets PRIVATE cxx_std_17)
 
     add_executable(apitrace_test_bundle_finalize_integrity test/src/test_bundle_finalize_integrity.cpp)
+    target_sources(apitrace_test_bundle_finalize_integrity PRIVATE src/tools/bundle-finalize/src/main.cpp)
     target_link_libraries(apitrace_test_bundle_finalize_integrity PRIVATE apitrace_core_test_hooks)
+    target_link_libraries(apitrace_test_bundle_finalize_integrity PRIVATE apitrace_nlohmann_json)
+    if(APPLE AND APITRACE_BUILD_D3D_NATIVE_RETRACE)
+        target_link_libraries(apitrace_test_bundle_finalize_integrity PRIVATE apitrace_platform_macos)
+    endif()
     target_compile_definitions(apitrace_test_bundle_finalize_integrity PRIVATE APITRACE_ENABLE_TEST_HOOKS)
     target_compile_features(apitrace_test_bundle_finalize_integrity PRIVATE cxx_std_17)
 
