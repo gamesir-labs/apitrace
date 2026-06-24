@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -41,6 +42,7 @@ struct DecodedRawEvent {
   std::vector<AssetRecord> assets;
   bool passthrough = false;
   std::string passthrough_jsonl_record;
+  std::optional<std::uint64_t> resource_create_dimension;
 };
 
 struct PassthroughBlobDescriptor {

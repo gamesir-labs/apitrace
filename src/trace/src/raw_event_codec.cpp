@@ -371,6 +371,7 @@ bool decode_resource_create(
           << ",\"flags\":" << flags
           << ",\"initial_state\":" << initial_state << "}";
   event.payload = payload.str();
+  decoded.resource_create_dimension = dimension;
   return true;
 }
 

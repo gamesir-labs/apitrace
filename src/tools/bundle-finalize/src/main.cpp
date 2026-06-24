@@ -627,7 +627,48 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     }
     return maybe_u64(*dimension);
   };
-  const auto track_final_event_context = [&](const apitrace::trace::EventRecord &event) -> bool {
+
+  const auto remember_resource_dimension =
+      [&](apitrace::trace::ObjectId resource_id, std::uint64_t dimension) {
+        auto &state = resources[resource_id];
+        state.known = true;
+        state.is_buffer = dimension == 1;
+      };
+
+  const auto is_d3d12_resource_create_function = [](std::string_view function) {
+    return function == "ID3D12Device::CreateCommittedResource" ||
+           function == "ID3D12Device8::CreateCommittedResource2" ||
+           function == "ID3D12Device::CreatePlacedResource" ||
+           function == "ID3D12Device8::CreatePlacedResource1" ||
+           function == "ID3D12Device::CreateReservedResource";
+  };
+
+  const auto final_event_can_update_context = [&](const apitrace::trace::EventRecord &event) {
+    if (event.kind == apitrace::trace::EventKind::ObjectCreate) {
+      return event.object_kind == apitrace::trace::ObjectKind::Resource;
+    }
+    if (event.kind != apitrace::trace::EventKind::Call) {
+      return false;
+    }
+    const auto &function = event.callsite.function_name;
+    return is_d3d12_resource_create_function(function) ||
+           function == "ID3D12Resource::Map";
+  };
+
+  const auto track_final_event_context =
+      [&](const apitrace::trace::raw::DecodedRawEvent &decoded_event,
+          const apitrace::trace::EventRecord &event) -> bool {
+    if (!final_event_can_update_context(event)) {
+      return true;
+    }
+
+    if (event.kind == apitrace::trace::EventKind::ObjectCreate &&
+        event.object_kind == apitrace::trace::ObjectKind::Resource &&
+        decoded_event.resource_create_dimension) {
+      remember_resource_dimension(event.object_id, *decoded_event.resource_create_dimension);
+      return true;
+    }
+
     json payload = json::object();
     if (!event.payload.empty()) {
       payload = json::parse(event.payload, nullptr, false);
@@ -639,14 +680,8 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     if (event.kind == apitrace::trace::EventKind::ObjectCreate &&
         event.object_kind == apitrace::trace::ObjectKind::Resource) {
       if (auto dimension = payload.contains("dimension") ? maybe_u64(payload["dimension"]) : std::nullopt) {
-        auto &state = resources[event.object_id];
-        state.known = true;
-        state.is_buffer = *dimension == 1;
+        remember_resource_dimension(event.object_id, *dimension);
       }
-      return true;
-    }
-
-    if (event.kind != apitrace::trace::EventKind::Call) {
       return true;
     }
 
@@ -655,9 +690,7 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
          function == "ID3D12Device8::CreateCommittedResource2") &&
         event.object_refs.size() >= 2) {
       if (auto dimension = resource_desc_dimension(payload)) {
-        auto &state = resources[event.object_refs[1]];
-        state.known = true;
-        state.is_buffer = *dimension == 1;
+        remember_resource_dimension(event.object_refs[1], *dimension);
       }
       return true;
     }
@@ -665,17 +698,13 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
          function == "ID3D12Device8::CreatePlacedResource1") &&
         event.object_refs.size() >= 3) {
       if (auto dimension = resource_desc_dimension(payload)) {
-        auto &state = resources[event.object_refs[2]];
-        state.known = true;
-        state.is_buffer = *dimension == 1;
+        remember_resource_dimension(event.object_refs[2], *dimension);
       }
       return true;
     }
     if (function == "ID3D12Device::CreateReservedResource" && event.object_refs.size() >= 2) {
       if (auto dimension = resource_desc_dimension(payload)) {
-        auto &state = resources[event.object_refs[1]];
-        state.known = true;
-        state.is_buffer = *dimension == 1;
+        remember_resource_dimension(event.object_refs[1], *dimension);
       }
       return true;
     }
@@ -690,6 +719,21 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     return true;
   };
   const auto track_passthrough_context = [&](const std::string &line) -> bool {
+    const bool may_update_object_resource =
+        line.find("\"object_create\"") != std::string::npos &&
+        line.find("\"Resource\"") != std::string::npos;
+    const bool may_update_create_resource =
+        (line.find("\"ID3D12Device::CreateCommittedResource\"") != std::string::npos ||
+         line.find("\"ID3D12Device8::CreateCommittedResource2\"") != std::string::npos ||
+         line.find("\"ID3D12Device::CreatePlacedResource\"") != std::string::npos ||
+         line.find("\"ID3D12Device8::CreatePlacedResource1\"") != std::string::npos ||
+         line.find("\"ID3D12Device::CreateReservedResource\"") != std::string::npos);
+    const bool may_update_map =
+        line.find("\"ID3D12Resource::Map\"") != std::string::npos;
+    if (!may_update_object_resource && !may_update_create_resource && !may_update_map) {
+      return true;
+    }
+
     auto record = json::parse(line, nullptr, false);
     if (record.is_discarded() || !record.is_object()) {
       return true;
@@ -705,9 +749,7 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
         record.value("object_kind", std::string()) == "Resource") {
       const auto object_id = record.value("object_id", 0ull);
       if (auto dimension = payload.contains("dimension") ? maybe_u64(payload["dimension"]) : std::nullopt) {
-        auto &state = resources[object_id];
-        state.known = true;
-        state.is_buffer = *dimension == 1;
+        remember_resource_dimension(object_id, *dimension);
       }
       return true;
     }
@@ -721,9 +763,7 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
          function == "ID3D12Device8::CreateCommittedResource2") &&
         object_refs.size() >= 2) {
       if (auto dimension = resource_desc_dimension(payload)) {
-        auto &state = resources[object_refs[1]];
-        state.known = true;
-        state.is_buffer = *dimension == 1;
+        remember_resource_dimension(object_refs[1], *dimension);
       }
       return true;
     }
@@ -731,17 +771,13 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
          function == "ID3D12Device8::CreatePlacedResource1") &&
         object_refs.size() >= 3) {
       if (auto dimension = resource_desc_dimension(payload)) {
-        auto &state = resources[object_refs[2]];
-        state.known = true;
-        state.is_buffer = *dimension == 1;
+        remember_resource_dimension(object_refs[2], *dimension);
       }
       return true;
     }
     if (function == "ID3D12Device::CreateReservedResource" && object_refs.size() >= 2) {
       if (auto dimension = resource_desc_dimension(payload)) {
-        auto &state = resources[object_refs[1]];
-        state.known = true;
-        state.is_buffer = *dimension == 1;
+        remember_resource_dimension(object_refs[1], *dimension);
       }
       return true;
     }
@@ -872,7 +908,7 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
         event.payload = replace_all_copy(event.payload, input_relative_path, registered_relative_path);
       }
     }
-    if (!finalize_binary_unmap_payload(event) || !track_final_event_context(event)) {
+    if (!finalize_binary_unmap_payload(event) || !track_final_event_context(decoded_event, event)) {
       return false;
     }
     writer.append_call_event(std::move(event));
