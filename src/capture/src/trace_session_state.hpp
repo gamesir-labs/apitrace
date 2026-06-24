@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string_view>
 #include <unordered_map>
 
@@ -66,16 +67,14 @@ public:
   bool active() const noexcept;
   std::uint64_t initial_call_sequence() const noexcept;
   const TraceOptions &options() const noexcept;
+  trace::raw::RawCaptureWriter *raw_capture_writer() noexcept;
+  const trace::raw::RawCaptureWriter *raw_capture_writer() const noexcept;
 
 private:
-  void append_raw_dual_event(const trace::EventRecord &event);
-  std::uint64_t append_raw_blob_for_asset(const trace::AssetRecord &asset, std::uint64_t producing_sequence);
-
   TraceOptions options_;
   BundleCaptureSink bundle_sink_;
   RuntimeBootstrap runtime_bootstrap_;
-  trace::raw::RawCaptureWriter raw_writer_;
-  std::unordered_map<trace::BlobId, std::uint64_t> raw_blob_ids_by_asset_;
+  std::unique_ptr<trace::raw::RawCaptureWriter> raw_writer_;
   std::unordered_map<trace::ObjectId, trace::ObjectRecord> objects_;
   bool active_ = false;
 

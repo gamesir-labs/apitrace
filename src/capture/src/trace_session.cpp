@@ -85,4 +85,14 @@ const TraceOptions &TraceSession::options() const noexcept
   return impl_->state.options();
 }
 
+trace::raw::RawCaptureWriter *TraceSession::raw_capture_writer() noexcept
+{
+  return impl_ ? impl_->state.raw_capture_writer() : nullptr;
+}
+
+const trace::raw::RawCaptureWriter *TraceSession::raw_capture_writer() const noexcept
+{
+  return impl_ ? impl_->state.raw_capture_writer() : nullptr;
+}
+
 } // namespace apitrace
