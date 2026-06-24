@@ -50,6 +50,7 @@ public:
   // work.
   EventRecord prepare_call_event(EventRecord event) const;
   void append_prepared_call_event(EventRecord &&event);
+  void append_prepared_call_event(EventRecord &&event, std::string_view serialized_line);
   void append_call_event(const EventRecord &event);
   void append_call_event(EventRecord &&event);
   void append_callstream_json_line(std::string_view json_line);

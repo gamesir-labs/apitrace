@@ -1,0 +1,127 @@
+#include "apitrace/raw_capture_io.hpp"
+#include "apitrace/raw_event_codec.hpp"
+#include "apitrace/trace_session.hpp"
+
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
+
+namespace {
+
+std::filesystem::path unique_work_dir()
+{
+  const auto base = std::filesystem::temp_directory_path();
+  return base / ("apitrace-session-raw-passthrough-test-" + std::to_string(static_cast<unsigned long long>(
+                                                         reinterpret_cast<std::uintptr_t>(&base))));
+}
+
+bool expect(bool condition, const char *message)
+{
+  if (!condition) {
+    std::cerr << message << "\n";
+    return false;
+  }
+  return true;
+}
+
+std::vector<std::string> read_lines(const std::filesystem::path &path)
+{
+  std::vector<std::string> lines;
+  std::ifstream input(path, std::ios::binary);
+  std::string line;
+  while (std::getline(input, line)) {
+    lines.push_back(line);
+  }
+  return lines;
+}
+
+apitrace::TraceOptions trace_options(const std::filesystem::path &bundle, bool raw_enabled)
+{
+  apitrace::TraceOptions options;
+  options.api = apitrace::trace::ApiKind::D3D12;
+  options.bundle_root = bundle;
+  options.capture.raw_format_reserved = raw_enabled;
+  return options;
+}
+
+apitrace::trace::EventRecord make_event(
+    std::uint64_t sequence,
+    const char *function_name,
+    std::string payload,
+    std::vector<apitrace::trace::BlobId> blob_refs = {})
+{
+  apitrace::trace::EventRecord event;
+  event.kind = apitrace::trace::EventKind::Call;
+  event.callsite.sequence = sequence;
+  event.callsite.function_name = function_name;
+  event.callsite.result_code = 0;
+  event.payload = std::move(payload);
+  event.blob_refs = std::move(blob_refs);
+  return event;
+}
+
+bool run_passthrough_test(const std::filesystem::path &bundle)
+{
+  using namespace apitrace::trace::raw;
+
+  std::filesystem::remove_all(bundle);
+  {
+    apitrace::TraceSession session(trace_options(bundle, true));
+    session.begin();
+    session.append_call_event(make_event(11, "ID3D12GraphicsCommandList::DrawInstanced", "{\"vertex_count\":3}"));
+    session.append_call_event(make_event(12, "ID3D12Resource::Unmap", "{\"blob_id\":77}", {77}));
+    session.end();
+  }
+
+  const auto callstream_lines = read_lines(bundle / "callstream.jsonl");
+  if (!expect(callstream_lines.size() == 3, "expected header plus two callstream events")) {
+    return false;
+  }
+
+  RawCaptureReader reader;
+  if (!expect(reader.open(bundle), "failed to open raw capture")) {
+    std::cerr << reader.last_error() << "\n";
+    return false;
+  }
+  const auto records = reader.read_events();
+  if (!expect(records.size() == 1, "expected one passthrough raw event")) {
+    return false;
+  }
+  if (!expect(records[0].header.sequence == 11, "passthrough sequence mismatch") ||
+      !expect(records[0].header.opcode == static_cast<std::uint32_t>(RawEventOpcode::PassthroughFinalJson),
+              "passthrough opcode mismatch")) {
+    return false;
+  }
+
+  const std::string passthrough(
+      reinterpret_cast<const char *>(records[0].payload.data()),
+      reinterpret_cast<const char *>(records[0].payload.data() + records[0].payload.size()));
+  return expect(passthrough == callstream_lines[1], "passthrough payload did not byte-match callstream line");
+}
+
+bool run_flag_off_test(const std::filesystem::path &bundle)
+{
+  std::filesystem::remove_all(bundle);
+  {
+    apitrace::TraceSession session(trace_options(bundle, false));
+    session.begin();
+    session.append_call_event(make_event(21, "ID3D12CommandQueue::Signal", "{\"value\":1}"));
+    session.end();
+  }
+
+  return expect(!std::filesystem::exists(bundle / "raw" / "events.bin"), "raw events file exists when flag is off");
+}
+
+} // namespace
+
+int main()
+{
+  const auto root = unique_work_dir();
+  const bool ok = run_passthrough_test(root / "raw-on.apitrace") &&
+                  run_flag_off_test(root / "raw-off.apitrace");
+  std::filesystem::remove_all(root);
+  return ok ? 0 : 1;
+}

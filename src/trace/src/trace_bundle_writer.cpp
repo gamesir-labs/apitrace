@@ -5888,6 +5888,11 @@ void TraceBundleWriter::append_call_event(EventRecord &&event)
 
 void TraceBundleWriter::append_prepared_call_event(EventRecord &&event)
 {
+  append_prepared_call_event(std::move(event), {});
+}
+
+void TraceBundleWriter::append_prepared_call_event(EventRecord &&event, std::string_view serialized_line)
+{
   if (impl_->cache_events) {
     TimedWriterLock lock(impl_->event_mutex, impl_->writer_stats ? &impl_->event_lock_stats : nullptr);
     impl_->events.push_back(event);
@@ -5904,9 +5909,17 @@ void TraceBundleWriter::append_prepared_call_event(EventRecord &&event)
     impl_->callstream_may_reference_asset_alias.store(true, std::memory_order_relaxed);
   }
   if (impl_->async_callstream_serialize) {
-    impl_->callstream_stream.write_event(std::move(event));
+    if (serialized_line.empty()) {
+      impl_->callstream_stream.write_event(std::move(event));
+    } else {
+      impl_->callstream_stream.write_line(std::string(serialized_line));
+    }
   } else {
-    impl_->callstream_stream.write_line(event_record_json(event));
+    if (serialized_line.empty()) {
+      impl_->callstream_stream.write_line(event_record_json(event));
+    } else {
+      impl_->callstream_stream.write_line(std::string(serialized_line));
+    }
   }
   impl_->signal_checkpoint_work(1, 0);
 }

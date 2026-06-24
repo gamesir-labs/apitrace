@@ -1,5 +1,7 @@
 #include "trace_session_state.hpp"
 
+#include "apitrace/raw_event_codec.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <memory>
@@ -7,6 +9,30 @@
 #include <vector>
 
 namespace apitrace::capture::internal {
+
+namespace {
+
+bool event_references_captured_blob(const trace::EventRecord &event)
+{
+  return !event.blob_refs.empty() ||
+         event.payload.find("asset-") != std::string::npos;
+}
+
+void append_passthrough_raw_event(
+    trace::raw::RawCaptureWriter &writer,
+    const trace::EventRecord &event,
+    std::string_view final_jsonl_record)
+{
+  trace::raw::RawEventHeader header;
+  header.sequence = event.callsite.sequence;
+  header.timestamp_or_monotonic_counter = event.time_ns;
+  header.opcode = static_cast<std::uint32_t>(trace::raw::RawEventOpcode::PassthroughFinalJson);
+  header.result_or_flags = static_cast<std::uint32_t>(event.callsite.result_code);
+  header.payload_len = final_jsonl_record.size();
+  writer.append_event(header, final_jsonl_record.data(), final_jsonl_record.size());
+}
+
+} // namespace
 
 BundleCaptureSink::BundleCaptureSink(const TraceOptions &options) : options_(options) {}
 
@@ -139,12 +165,27 @@ void TraceSessionState::end()
 
 void TraceSessionState::append_call_event(const trace::EventRecord &event)
 {
-  bundle_sink_.writer().append_call_event(event);
+  trace::EventRecord copy = event;
+  append_call_event(std::move(copy));
 }
 
 void TraceSessionState::append_call_event(trace::EventRecord &&event)
 {
-  bundle_sink_.writer().append_call_event(std::move(event));
+  auto &writer = bundle_sink_.writer();
+  if (!raw_writer_) {
+    writer.append_call_event(std::move(event));
+    return;
+  }
+
+  event = writer.prepare_call_event(std::move(event));
+  if (!event_references_captured_blob(event)) {
+    const auto final_jsonl_record = trace::event_record_json(event);
+    append_passthrough_raw_event(*raw_writer_, event, final_jsonl_record);
+    writer.append_prepared_call_event(std::move(event), final_jsonl_record);
+  } else {
+    // TODO(Phase 2a-4): encode blob-bearing events through typed raw opcodes and append raw blobs.
+    writer.append_prepared_call_event(std::move(event));
+  }
 }
 
 void TraceSessionState::append_analysis_line(std::string_view stream_name, std::string_view json_line)

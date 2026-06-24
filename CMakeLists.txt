@@ -391,6 +391,11 @@ if(NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
     target_compile_definitions(apitrace_test_raw_to_final PRIVATE APITRACE_ENABLE_TEST_HOOKS)
     target_compile_features(apitrace_test_raw_to_final PRIVATE cxx_std_17)
 
+    add_executable(apitrace_test_trace_session_raw_passthrough test/src/test_trace_session_raw_passthrough.cpp)
+    target_link_libraries(apitrace_test_trace_session_raw_passthrough PRIVATE apitrace_core_test_hooks)
+    target_compile_definitions(apitrace_test_trace_session_raw_passthrough PRIVATE APITRACE_ENABLE_TEST_HOOKS)
+    target_compile_features(apitrace_test_trace_session_raw_passthrough PRIVATE cxx_std_17)
+
     add_executable(apitrace_test_payload_object_refs test/src/test_payload_object_refs.cpp)
     target_link_libraries(apitrace_test_payload_object_refs PRIVATE apitrace_core apitrace_nlohmann_json)
     target_include_directories(apitrace_test_payload_object_refs PRIVATE ${APITRACE_PRIVATE_INCLUDE_DIRS})
