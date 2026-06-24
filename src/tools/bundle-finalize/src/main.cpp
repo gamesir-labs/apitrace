@@ -1,6 +1,7 @@
 #include "apitrace/asset_index.hpp"
 #include "apitrace/bundle_layout.hpp"
 #include "apitrace/d3d12_replay.hpp"
+#include "apitrace/raw_event_codec.hpp"
 #include "apitrace/trace_bundle_io.hpp"
 #include "apitrace/tools/cli_entries.hpp"
 
@@ -59,6 +60,7 @@ struct Options {
   fs::path bundle_root;
   std::size_t jobs = default_job_count();
   bool dry_run = false;
+  bool raw_format = false;
   bool keep_duplicates = false;
   bool profile = false;
   bool progress = false;
@@ -173,6 +175,9 @@ struct Stats {
   std::size_t recovered_unindexed_asset_aliases = 0;
   std::uint64_t sequence_regression_segments = 0;
   std::uint64_t remapped_sequence_records = 0;
+  std::size_t raw_to_final_events = 0;
+  std::size_t raw_to_final_assets = 0;
+  std::uint64_t raw_to_final_asset_bytes = 0;
 };
 
 std::unordered_map<std::uint64_t, std::string> build_effective_path_by_blob_id(const std::vector<AssetEntry> &assets);
@@ -506,6 +511,7 @@ void print_usage(const char *argv0)
       << "\n"
       << "Options:\n"
       << "  --profile          Print per-stage timing and throughput to stderr.\n"
+      << "  --raw-format       Materialize raw/events.bin + raw/blobs.bin before normal finalization.\n"
       << "  --progress         Force interactive progress on stderr.\n"
       << "  --no-progress      Disable interactive progress on stderr.\n"
       << "  --verify-existing-canonical\n"
@@ -518,6 +524,72 @@ void print_usage(const char *argv0)
       << "                     Only rebuild the D3D12 replay model and update its checksums.\n";
 }
 
+std::string replace_all_copy(std::string text, std::string_view from, std::string_view to)
+{
+  if (from.empty()) {
+    return text;
+  }
+  std::size_t pos = 0;
+  while ((pos = text.find(from, pos)) != std::string::npos) {
+    text.replace(pos, from.size(), to.data(), to.size());
+    pos += to.size();
+  }
+  return text;
+}
+
+bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stats)
+{
+  if (options.dry_run) {
+    std::cerr << "error: --raw-format cannot be combined with --dry-run before materialization exists\n";
+    return false;
+  }
+
+  apitrace::trace::raw::RawCaptureReader reader;
+  if (!reader.open(options.bundle_root)) {
+    std::cerr << "error: failed to open raw capture: " << reader.last_error() << "\n";
+    return false;
+  }
+  const auto raw_events = reader.read_events();
+  const auto decoded = apitrace::trace::raw::decode_raw_events(reader, raw_events);
+  if (!decoded.error.empty()) {
+    std::cerr << "error: failed to decode raw capture: " << decoded.error << "\n";
+    return false;
+  }
+
+  apitrace::trace::TraceBundleWriter writer;
+  if (!writer.open(options.bundle_root)) {
+    std::cerr << "error: failed to open final bundle writer for raw materialization\n";
+    return false;
+  }
+  writer.write_metadata({apitrace::trace::ApiKind::D3D12, apitrace::trace::kFormatVersion, "raw-to-final", false});
+
+  for (const auto &decoded_event : decoded.events) {
+    auto event = decoded_event.event;
+    for (const auto &asset : decoded_event.assets) {
+      const auto input_blob_id = asset.blob_id;
+      const auto input_relative_path = asset.relative_path.generic_string();
+      auto registered = writer.register_asset(asset);
+      ++stats.raw_to_final_assets;
+      stats.raw_to_final_asset_bytes += registered.byte_size;
+      if (registered.blob_id != input_blob_id) {
+        for (auto &blob_id : event.blob_refs) {
+          if (blob_id == input_blob_id) {
+            blob_id = registered.blob_id;
+          }
+        }
+      }
+      const auto registered_relative_path = registered.relative_path.generic_string();
+      if (!input_relative_path.empty() && input_relative_path != registered_relative_path) {
+        event.payload = replace_all_copy(event.payload, input_relative_path, registered_relative_path);
+      }
+    }
+    writer.append_call_event(std::move(event));
+    ++stats.raw_to_final_events;
+  }
+  writer.close();
+  return true;
+}
+
 std::optional<Options> parse_args(int argc, char **argv)
 {
   Options options;
@@ -527,6 +599,8 @@ std::optional<Options> parse_args(int argc, char **argv)
     const std::string arg = argv[i];
     if (arg == "--dry-run") {
       options.dry_run = true;
+    } else if (arg == "--raw-format") {
+      options.raw_format = true;
     } else if (arg == "--keep-duplicates") {
       options.keep_duplicates = true;
     } else if (arg == "--profile") {
@@ -6967,7 +7041,7 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
   }
 
   const auto started = std::chrono::steady_clock::now();
-  constexpr std::size_t kStageCount = 24;
+  constexpr std::size_t kStageCount = 25;
   std::size_t stage_index = 0;
   ProgressReporter progress(options.progress);
   Stats stats;
@@ -6976,6 +7050,15 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
   std::unordered_map<std::string, std::string> canonical_aliases;
   IncompleteSpoolRef incomplete_spool_ref;
   std::size_t loaded_asset_count = 0;
+  bool raw_to_final_ok = true;
+  run_stage(options, progress, stage_index, kStageCount, "raw_to_final", [&] {
+    if (options.raw_format) {
+      raw_to_final_ok = materialize_raw_capture_to_final_bundle(options, stats);
+    }
+  });
+  if (!raw_to_final_ok) {
+    return 1;
+  }
   std::error_code callstream_size_error;
   const auto callstream_size =
       fs::file_size(options.bundle_root / apitrace::trace::kCallstreamFileName, callstream_size_error);
@@ -7357,6 +7440,9 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
             << " restored_inline_query_assets=" << stats.restored_inline_query_assets
             << " recovered_spooled_assets=" << stats.recovered_spooled_assets
             << " recovered_spooled_asset_bytes=" << stats.recovered_spooled_asset_bytes
+            << " raw_to_final_events=" << stats.raw_to_final_events
+            << " raw_to_final_assets=" << stats.raw_to_final_assets
+            << " raw_to_final_asset_bytes=" << stats.raw_to_final_asset_bytes
             << " repaired_missing_device_objects=" << stats.repaired_missing_device_objects
             << " sequence_regression_segments=" << stats.sequence_regression_segments
             << " remapped_sequence_records=" << stats.remapped_sequence_records
