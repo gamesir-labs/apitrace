@@ -1,3 +1,4 @@
+#include "apitrace/asset_index.hpp"
 #include "apitrace/raw_capture_io.hpp"
 #include "apitrace/raw_event_codec.hpp"
 #include "apitrace/trace_bundle_io.hpp"
@@ -362,6 +363,16 @@ std::vector<std::uint8_t> read_file_bytes(const std::filesystem::path &path)
   return std::vector<std::uint8_t>(
       std::istreambuf_iterator<char>(input),
       std::istreambuf_iterator<char>());
+}
+
+std::string sha256_bytes(const std::string &text)
+{
+  return apitrace::trace::content_hash_bytes(text.data(), text.size());
+}
+
+std::string sha256_bytes(const std::vector<std::uint8_t> &bytes)
+{
+  return apitrace::trace::content_hash_bytes(bytes.empty() ? nullptr : bytes.data(), bytes.size());
 }
 
 std::string replace_all_copy(std::string text, std::string_view from, std::string_view to)
@@ -1498,6 +1509,85 @@ bool write_sequence_regression_bundle(const std::filesystem::path &bundle)
   return true;
 }
 
+bool write_reference_rewrite_bundle(const std::filesystem::path &bundle)
+{
+  std::filesystem::remove_all(bundle);
+  std::filesystem::create_directories(bundle / "buffers");
+
+  const std::vector<std::uint8_t> seed_blob = {0x01, 0x02, 0x03};
+  const std::vector<std::uint8_t> remapped_blob = {0xaa, 0xbb, 0xcc, 0xdd};
+  const auto seed_hash = sha256_bytes(seed_blob);
+  const auto remapped_hash = sha256_bytes(remapped_blob);
+  const std::string seed_path = "buffers/" + seed_hash + ".buffer";
+  const std::string remapped_path = "buffers/" + remapped_hash + ".buffer";
+
+  {
+    std::ofstream output(bundle / seed_path, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char *>(seed_blob.data()), static_cast<std::streamsize>(seed_blob.size()));
+  }
+  {
+    std::ofstream output(bundle / remapped_path, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char *>(remapped_blob.data()), static_cast<std::streamsize>(remapped_blob.size()));
+  }
+
+  const std::uint64_t colliding_blob_id = 4462313;
+  const std::string metadata =
+      "{\"schema\":\"apitrace.bundle.v1\",\"api\":\"d3d12\",\"created_by\":\"reference-rewrite-test\","
+      "\"version\":1,\"entry_file\":\"callstream.jsonl\"}\n";
+  const std::string assets =
+      "{\n"
+      "  \"assets\": [\n"
+      "    {\n"
+      "      \"binary_payload\": true,\n"
+      "      \"blob_id\": " + std::to_string(colliding_blob_id) + ",\n"
+      "      \"byte_size\": " + std::to_string(seed_blob.size()) + ",\n"
+      "      \"content_hash\": \"" + seed_hash + "\",\n"
+      "      \"debug_name\": \"reference-rewrite-seed\",\n"
+      "      \"kind\": \"Buffer\",\n"
+      "      \"metal\": false,\n"
+      "      \"path\": \"" + seed_path + "\"\n"
+      "    },\n"
+      "    {\n"
+      "      \"binary_payload\": true,\n"
+      "      \"blob_id\": " + std::to_string(colliding_blob_id) + ",\n"
+      "      \"byte_size\": " + std::to_string(remapped_blob.size()) + ",\n"
+      "      \"content_hash\": \"" + remapped_hash + "\",\n"
+      "      \"debug_name\": \"reference-rewrite-remapped\",\n"
+      "      \"kind\": \"Buffer\",\n"
+      "      \"metal\": false,\n"
+      "      \"path\": \"" + remapped_path + "\"\n"
+      "    }\n"
+      "  ]\n"
+      "}\n";
+  const std::string callstream =
+      "{\"record_kind\":\"bundle_header\",\"format_version\":1,\"api\":\"D3D12\",\"producer\":\"reference-rewrite-test\",\"has_metal_callstream\":false,\"time_origin_ns\":1000,\"monotonic_origin_ns\":2000,\"entry_file\":\"callstream.jsonl\"}\n"
+      "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12Resource::Unmap\",\"result_code\":0,\"blob_refs\":[" +
+      std::to_string(colliding_blob_id) +
+      "],\"payload\":{\"blob_id\":" + std::to_string(colliding_blob_id) +
+      ",\"buffer_path\":\"" + seed_path +
+      "\",\"resource_object_id\":200,\"subresource\":0,\"written_begin\":0,\"written_end\":3,\"written_size\":3}}\n"
+      "{\"record_kind\":\"call\",\"sequence\":2,\"time_ns\":1002,\"elapsed_ns\":0,\"function\":\"ID3D12Resource::Unmap\",\"result_code\":0,\"blob_refs\":[" +
+      std::to_string(colliding_blob_id) +
+      "],\"payload\":{\"blob_id\":" + std::to_string(colliding_blob_id) +
+      ",\"buffer_path\":\"" + remapped_path +
+      "\",\"nested\":{\"blob_id\":" + std::to_string(colliding_blob_id) +
+      "},\"resource_object_id\":201,\"subresource\":0,\"written_begin\":0,\"written_end\":4,\"written_size\":4}}\n";
+  const std::string checksums =
+      "{\"schema\":\"apitrace.checksums.v1\",\"files\":{"
+      "\"assets.json\":\"sha256:" + sha256_bytes(assets) + ":" + std::to_string(assets.size()) + "\","
+      "\"callstream.jsonl\":\"sha256:" + sha256_bytes(callstream) + ":" + std::to_string(callstream.size()) + "\","
+      "\"metadata.json\":\"sha256:" + sha256_bytes(metadata) + ":" + std::to_string(metadata.size()) + "\","
+      "\"" + seed_path + "\":\"sha256:" + seed_hash + ":" + std::to_string(seed_blob.size()) + "\","
+      "\"" + remapped_path + "\":\"sha256:" + remapped_hash + ":" + std::to_string(remapped_blob.size()) + "\""
+      "}}\n";
+
+  std::ofstream(bundle / "metadata.json", std::ios::binary | std::ios::trunc) << metadata;
+  std::ofstream(bundle / "assets.json", std::ios::binary | std::ios::trunc) << assets;
+  std::ofstream(bundle / "callstream.jsonl", std::ios::binary | std::ios::trunc) << callstream;
+  std::ofstream(bundle / "checksums.json", std::ios::binary | std::ios::trunc) << checksums;
+  return true;
+}
+
 bool run_sequence_repair_parallel_parity_test(
     const std::filesystem::path &source_bundle,
     const std::filesystem::path &serial_bundle,
@@ -1516,6 +1606,26 @@ bool run_sequence_repair_parallel_parity_test(
          expect(read_file_bytes(serial_bundle / "callstream.jsonl") ==
                     read_file_bytes(parallel_bundle / "callstream.jsonl"),
                 "sequence repair serial/parallel callstream mismatch");
+}
+
+bool run_reference_rewrite_parallel_parity_test(
+    const std::filesystem::path &source_bundle,
+    const std::filesystem::path &serial_bundle,
+    const std::filesystem::path &parallel_bundle,
+    const char *finalize,
+    const char *check)
+{
+  ScopedEnvVar forced_chunk_size("APITRACE_TEST_REFERENCE_REWRITE_CHUNK_BYTES", "180");
+  return write_reference_rewrite_bundle(source_bundle) &&
+         copy_directory(source_bundle, serial_bundle) &&
+         copy_directory(source_bundle, parallel_bundle) &&
+         run_command(quote_arg(finalize) + " --no-progress --jobs 1 " + quote_arg(serial_bundle)) &&
+         run_command(quote_arg(finalize) + " --no-progress --jobs 4 " + quote_arg(parallel_bundle)) &&
+         run_command(quote_arg(check) + " --verify-hashes " + quote_arg(serial_bundle)) &&
+         run_command(quote_arg(check) + " --verify-hashes " + quote_arg(parallel_bundle)) &&
+         expect(read_file_bytes(serial_bundle / "callstream.jsonl") ==
+                    read_file_bytes(parallel_bundle / "callstream.jsonl"),
+                "reference rewrite serial/parallel callstream mismatch");
 }
 
 } // namespace
@@ -1550,6 +1660,9 @@ int main(int argc, char **argv)
   const auto sequence_regression_source_bundle = work_dir / "synthetic-sequence-regression-source.apitrace";
   const auto sequence_regression_serial_bundle = work_dir / "synthetic-sequence-regression-serial.apitrace";
   const auto sequence_regression_parallel_bundle = work_dir / "synthetic-sequence-regression-parallel.apitrace";
+  const auto reference_rewrite_source_bundle = work_dir / "synthetic-reference-rewrite-source.apitrace";
+  const auto reference_rewrite_serial_bundle = work_dir / "synthetic-reference-rewrite-serial.apitrace";
+  const auto reference_rewrite_parallel_bundle = work_dir / "synthetic-reference-rewrite-parallel.apitrace";
   const auto compare_script = std::filesystem::current_path() / "scripts" / "compare-raw-parity.py";
   const std::string passthrough_before =
       "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12GraphicsCommandList::SetPipelineState\",\"result_code\":0,\"object_refs\":[500,700],\"payload\":{\"state\":\"passthrough-before\",\"spacing\":\"kept exactly\"}}";
@@ -1647,6 +1760,12 @@ int main(int argc, char **argv)
           sequence_regression_source_bundle,
           sequence_regression_serial_bundle,
           sequence_regression_parallel_bundle,
+          argv[1],
+          argv[2]) &&
+      run_reference_rewrite_parallel_parity_test(
+          reference_rewrite_source_bundle,
+          reference_rewrite_serial_bundle,
+          reference_rewrite_parallel_bundle,
           argv[1],
           argv[2]);
 

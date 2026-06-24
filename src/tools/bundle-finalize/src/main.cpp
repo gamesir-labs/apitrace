@@ -2874,6 +2874,94 @@ struct JsonlLineView {
   bool has_newline = false;
 };
 
+struct JsonlByteChunk {
+  std::uint64_t offset = 0;
+  std::uint64_t size = 0;
+};
+
+std::vector<JsonlByteChunk> build_newline_aligned_jsonl_chunks(const fs::path &path, std::uint64_t target_chunk_size)
+{
+  std::vector<JsonlByteChunk> chunks;
+  std::error_code size_error;
+  const auto file_size = static_cast<std::uint64_t>(fs::file_size(path, size_error));
+  if (size_error || file_size == 0) {
+    return chunks;
+  }
+
+  std::ifstream input(path, std::ios::binary);
+  if (!input.is_open()) {
+    return chunks;
+  }
+
+  std::uint64_t chunk_begin = 0;
+  while (chunk_begin < file_size) {
+    std::uint64_t chunk_end = std::min(file_size, chunk_begin + target_chunk_size);
+    if (chunk_end < file_size) {
+      input.clear();
+      input.seekg(static_cast<std::streamoff>(chunk_end), std::ios::beg);
+      char ch = 0;
+      while (chunk_end < file_size && input.get(ch)) {
+        ++chunk_end;
+        if (ch == '\n') {
+          break;
+        }
+      }
+    }
+    chunks.push_back({chunk_begin, chunk_end - chunk_begin});
+    chunk_begin = chunk_end;
+  }
+  return chunks;
+}
+
+bool read_jsonl_byte_chunk(const fs::path &path, const JsonlByteChunk &chunk, std::string &out)
+{
+  out.clear();
+  if (chunk.size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    return false;
+  }
+  std::ifstream input(path, std::ios::binary);
+  if (!input.is_open()) {
+    return false;
+  }
+  input.seekg(static_cast<std::streamoff>(chunk.offset), std::ios::beg);
+  if (!input.good()) {
+    return false;
+  }
+  out.resize(static_cast<std::size_t>(chunk.size));
+  if (!out.empty()) {
+    input.read(out.data(), static_cast<std::streamsize>(out.size()));
+    if (static_cast<std::size_t>(input.gcount()) != out.size()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template <typename Callback>
+bool for_each_jsonl_line_in_chunk(std::string_view text, std::uint64_t chunk_offset, Callback &&callback)
+{
+  std::size_t cursor = 0;
+  while (cursor < text.size()) {
+    const auto newline = text.find('\n', cursor);
+    const bool has_newline = newline != std::string_view::npos;
+    const auto end = has_newline ? newline + 1 : text.size();
+    auto line = text.substr(cursor, (has_newline ? newline : end) - cursor);
+    if (!line.empty() && line.back() == '\r') {
+      line.remove_suffix(1);
+    }
+    JsonlLineView view;
+    view.line = line;
+    view.offset = chunk_offset + static_cast<std::uint64_t>(cursor);
+    view.byte_size = static_cast<std::uint64_t>(end - cursor);
+    view.has_newline = has_newline;
+    if (!callback(view)) {
+      return false;
+    }
+    cursor = end;
+  }
+  return true;
+}
+
 template <typename Callback>
 bool scan_jsonl_file(const fs::path &path, Callback &&callback)
 {
@@ -3128,6 +3216,21 @@ bool scan_jsonl_file_for_rewrite(
   }
 
   return flush_skipped();
+}
+
+std::uint64_t reference_rewrite_chunk_size()
+{
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
+  if (const char *value = std::getenv("APITRACE_TEST_REFERENCE_REWRITE_CHUNK_BYTES")) {
+    char *end = nullptr;
+    errno = 0;
+    const auto parsed = std::strtoull(value, &end, 10);
+    if (errno == 0 && end != value && parsed > 0) {
+      return std::max<std::uint64_t>(16, static_cast<std::uint64_t>(parsed));
+    }
+  }
+#endif
+  return kJsonlMaxChunkSize;
 }
 
 void collect_blob_references_from_json(const json &node, std::unordered_set<std::uint64_t> &blob_refs)
@@ -4093,6 +4196,427 @@ bool is_pipeline_reference_file(const fs::path &relative)
 bool rewrite_blob_refs(json &node, const std::unordered_map<std::uint64_t, std::uint64_t> &blob_id_remap);
 std::vector<std::string> recover_embedded_jsonl_records(const std::string &line);
 
+struct JsonlReferenceRewriteContext {
+  const std::unordered_map<std::string, std::string> &aliases;
+  const std::unordered_map<std::string, std::uint64_t> &blob_id_by_effective_path;
+  const std::unordered_map<std::uint64_t, std::string> &effective_path_by_blob_id;
+  const std::unordered_map<std::uint64_t, std::unordered_map<std::string, std::uint64_t>> &blob_id_remap_by_path;
+  const std::unordered_map<std::uint64_t, std::uint64_t> &blob_id_remap;
+  const std::unordered_set<std::string> &blob_id_remap_paths;
+  const Options &options;
+};
+
+struct JsonlReferenceRewriteLineResult {
+  bool ok = true;
+  bool changed = false;
+  bool sanitized = false;
+  bool recovered_any = false;
+  bool remapped_blob_refs_file = false;
+  bool primary_blob_ref_record = false;
+  std::size_t dropped_lines = 0;
+  std::uint64_t rewritten_records = 0;
+  std::vector<std::string> output_lines;
+  std::unordered_set<std::string> referenced_paths;
+};
+
+JsonlReferenceRewriteLineResult rewrite_jsonl_reference_line(
+    const JsonlLineView &line_view,
+    const JsonlReferenceRewriteContext &context,
+    bool collect_referenced_paths)
+{
+  JsonlReferenceRewriteLineResult result;
+  const auto line = line_view.line;
+  const auto tokens = scan_jsonl_line_tokens(line);
+  const bool may_have_path_reference = tokens_may_contain_path_reference(tokens);
+  const auto path_candidates = may_have_path_reference
+      ? scan_jsonl_path_rewrite_candidates(
+            line,
+            context.aliases,
+            context.blob_id_remap_paths,
+            !context.effective_path_by_blob_id.empty() && tokens.asset_token,
+            !context.blob_id_remap_by_path.empty() && tokens.blob_refs_key)
+      : JsonlPathRewriteCandidates{};
+  const bool may_rewrite_asset_path = path_candidates.alias_path;
+  const bool may_rewrite_single_blob_alias = path_candidates.single_blob_asset_alias;
+  const bool may_rewrite_path_mapped_blob_refs = path_candidates.path_mapped_blob_refs;
+  const bool may_rewrite_blob_refs =
+      (tokens.blob_refs_key || tokens.blob_id_key) &&
+      text_may_contain_blob_id_remap(line, context.blob_id_remap);
+  if (!may_rewrite_asset_path &&
+      !may_rewrite_single_blob_alias &&
+      !may_rewrite_path_mapped_blob_refs &&
+      !may_rewrite_blob_refs &&
+      !context.options.verify_jsonl_records) {
+    return result;
+  }
+
+  const auto line_text = std::string(line);
+  auto record = json::parse(line_text, nullptr, false);
+  if (record.is_discarded()) {
+    if (may_rewrite_blob_refs || context.options.verify_jsonl_records) {
+      bool recovered_any = false;
+      for (const auto &recovered : recover_embedded_jsonl_records(line_text)) {
+        auto recovered_record = json::parse(recovered, nullptr, false);
+        if (recovered_record.is_discarded()) {
+          continue;
+        }
+        const bool recovered_blob_refs_changed = rewrite_blob_refs(recovered_record, context.blob_id_remap);
+        result.output_lines.push_back(recovered_blob_refs_changed ? recovered_record.dump() : recovered);
+        if (recovered_blob_refs_changed) {
+          result.remapped_blob_refs_file = true;
+          result.primary_blob_ref_record = true;
+          result.changed = true;
+          ++result.rewritten_records;
+        }
+        recovered_any = true;
+      }
+      result.sanitized = true;
+      result.changed = true;
+      result.recovered_any = recovered_any;
+      if (!recovered_any) {
+        ++result.dropped_lines;
+      }
+      return result;
+    }
+    return result;
+  }
+
+  const bool paths_changed = rewrite_path_refs(record, context.aliases);
+  const bool single_blob_asset_alias_changed =
+      rewrite_single_blob_asset_alias_refs(record, context.effective_path_by_blob_id);
+  const bool blob_refs_changed =
+      rewrite_blob_refs_for_effective_paths(
+          record,
+          context.blob_id_by_effective_path,
+          paths_changed || single_blob_asset_alias_changed);
+  const bool path_mapped_blob_refs_changed =
+      rewrite_blob_refs_by_referenced_paths(record, context.blob_id_remap_by_path);
+  const bool remapped_blob_refs_changed = rewrite_blob_refs(record, context.blob_id_remap);
+  result.remapped_blob_refs_file = remapped_blob_refs_changed;
+  if (paths_changed ||
+      single_blob_asset_alias_changed ||
+      blob_refs_changed ||
+      path_mapped_blob_refs_changed ||
+      remapped_blob_refs_changed) {
+    if (collect_referenced_paths) {
+      collect_path_references_from_json(record, context.aliases, result.referenced_paths, false);
+    }
+    result.output_lines.push_back(record.dump());
+    result.changed = true;
+    ++result.rewritten_records;
+    result.primary_blob_ref_record = blob_refs_changed || path_mapped_blob_refs_changed || remapped_blob_refs_changed;
+  } else if (collect_referenced_paths) {
+    collect_path_references_from_json(record, context.aliases, result.referenced_paths, false);
+  }
+  return result;
+}
+
+struct JsonlReferenceRewriteChunkResult {
+  bool ok = true;
+  bool changed = false;
+  bool sanitized = false;
+  bool remapped_blob_refs_file = false;
+  std::size_t dropped_lines = 0;
+  Stats stats;
+  std::unordered_set<std::string> referenced_paths;
+};
+
+bool write_original_jsonl_line_from_chunk(
+    std::string_view chunk_text,
+    const JsonlByteChunk &chunk,
+    const JsonlLineView &line_view,
+    HashedOutputFile &output)
+{
+  if (line_view.has_newline && line_view.byte_size == line_view.line.size() + 1) {
+    output.write_text(std::string_view(
+        chunk_text.data() + static_cast<std::size_t>(line_view.offset - chunk.offset),
+        static_cast<std::size_t>(line_view.byte_size)));
+    return true;
+  }
+  output.write_line(line_view.line);
+  return true;
+}
+
+bool write_reference_rewritten_chunk(
+    const fs::path &jsonl_path,
+    const JsonlByteChunk &chunk,
+    const JsonlReferenceRewriteContext &context,
+    bool collect_referenced_paths,
+    HashedOutputFile &output,
+    JsonlReferenceRewriteChunkResult &result)
+{
+  std::string text;
+  if (!read_jsonl_byte_chunk(jsonl_path, chunk, text)) {
+    result.ok = false;
+    return false;
+  }
+
+  bool ok = true;
+  bool output_started = false;
+  std::uint64_t copied_until = chunk.offset;
+  auto copy_unchanged_prefix = [&](std::uint64_t end_offset) -> bool {
+    if (end_offset <= copied_until) {
+      return true;
+    }
+    output.write_text(std::string_view(
+        text.data() + static_cast<std::size_t>(copied_until - chunk.offset),
+        static_cast<std::size_t>(end_offset - copied_until)));
+    copied_until = end_offset;
+    return true;
+  };
+  for_each_jsonl_line_in_chunk(text, chunk.offset, [&](const JsonlLineView &line_view) {
+    ++result.stats.jsonl_records;
+    result.stats.input_bytes += line_view.byte_size;
+    const auto rewritten = rewrite_jsonl_reference_line(line_view, context, collect_referenced_paths);
+    if (!rewritten.ok) {
+      result.ok = false;
+      ok = false;
+      return false;
+    }
+    if (collect_referenced_paths) {
+      result.referenced_paths.insert(rewritten.referenced_paths.begin(), rewritten.referenced_paths.end());
+    }
+    if (rewritten.sanitized) {
+      result.sanitized = true;
+      result.dropped_lines += rewritten.dropped_lines;
+    }
+    result.remapped_blob_refs_file = result.remapped_blob_refs_file || rewritten.remapped_blob_refs_file;
+    if (rewritten.changed) {
+      result.changed = true;
+      if (!output_started) {
+        if (!copy_unchanged_prefix(line_view.offset)) {
+          result.ok = false;
+          ok = false;
+          return false;
+        }
+        output_started = true;
+      }
+      for (const auto &output_line : rewritten.output_lines) {
+        output.write_line(output_line);
+        note_jsonl_output(result.stats, output_line);
+      }
+      copied_until = line_view.offset + line_view.byte_size;
+      result.stats.rewritten_records += rewritten.rewritten_records;
+      if (rewritten.primary_blob_ref_record) {
+        ++result.stats.rewritten_primary_blob_ref_records;
+      }
+      return true;
+    }
+    if (output_started) {
+      write_original_jsonl_line_from_chunk(text, chunk, line_view, output);
+      copied_until = line_view.offset + line_view.byte_size;
+    }
+    note_jsonl_output(result.stats, line_view.line);
+    return true;
+  });
+  if (ok && !output_started) {
+    output.write_text(text);
+  } else if (ok && copied_until < chunk.offset + chunk.size) {
+    copy_unchanged_prefix(chunk.offset + chunk.size);
+  }
+  return ok && result.ok;
+}
+
+bool rewrite_jsonl_references_parallel(
+    const fs::path &bundle_root,
+    const fs::path &relative,
+    const JsonlReferenceRewriteContext &context,
+    Stats &stats,
+    std::unordered_set<std::string> *referenced_paths,
+    FileDigestCache *digest_cache,
+    std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> *rewritten_digests)
+{
+  const auto absolute = bundle_root / relative;
+  auto chunks = build_newline_aligned_jsonl_chunks(absolute, reference_rewrite_chunk_size());
+  if (chunks.empty()) {
+    return false;
+  }
+
+  const auto temporary = temporary_rewrite_path(absolute);
+  HashedOutputFile output;
+  if (!context.options.dry_run) {
+    output.open(temporary);
+    if (!output.is_open()) {
+      std::cerr << "warning: failed to open temporary rewrite file " << temporary << "\n";
+      return false;
+    }
+  }
+
+  bool rewrite_failed = false;
+  bool changed = false;
+  ++stats.jsonl_passes;
+  std::vector<JsonlReferenceRewriteChunkResult> chunk_results(chunks.size());
+  std::vector<fs::path> chunk_temporaries(chunks.size());
+
+  if (!context.options.dry_run) {
+    std::vector<std::atomic<bool>> chunk_ok(chunks.size());
+    for (auto &ok : chunk_ok) {
+      ok.store(false, std::memory_order_relaxed);
+    }
+    std::atomic<std::size_t> next_chunk{0};
+    std::mutex rewrite_error_mutex;
+    const auto rewrite_worker = [&]() {
+      for (;;) {
+        const auto index = next_chunk.fetch_add(1, std::memory_order_relaxed);
+        if (index >= chunks.size()) {
+          return;
+        }
+        const auto chunk_temporary =
+            temporary.parent_path() /
+            (temporary.filename().generic_string() + ".chunk-" + std::to_string(index));
+        chunk_temporaries[index] = chunk_temporary;
+        HashedOutputFile chunk_output;
+        chunk_output.open(chunk_temporary);
+        if (!chunk_output.is_open()) {
+          std::lock_guard<std::mutex> lock(rewrite_error_mutex);
+          rewrite_failed = true;
+          return;
+        }
+        const bool ok = write_reference_rewritten_chunk(
+            absolute,
+            chunks[index],
+            context,
+            referenced_paths != nullptr,
+            chunk_output,
+            chunk_results[index]);
+        chunk_output.close();
+        if (!ok || !chunk_results[index].ok) {
+          std::lock_guard<std::mutex> lock(rewrite_error_mutex);
+          rewrite_failed = true;
+          return;
+        }
+        chunk_ok[index].store(true, std::memory_order_relaxed);
+      }
+    };
+
+    std::vector<std::thread> threads;
+    const auto thread_count = std::max<std::size_t>(1, std::min(context.options.jobs, chunks.size()));
+    threads.reserve(thread_count);
+    for (std::size_t i = 0; i < thread_count; ++i) {
+      threads.emplace_back(rewrite_worker);
+    }
+    for (auto &thread : threads) {
+      thread.join();
+    }
+
+    std::vector<char> buffer(kFileCopyBufferSize);
+    for (std::size_t index = 0; index < chunks.size(); ++index) {
+      if (!chunk_ok[index].load(std::memory_order_relaxed)) {
+        rewrite_failed = true;
+        continue;
+      }
+      changed = changed || chunk_results[index].changed;
+      if (referenced_paths) {
+        referenced_paths->insert(chunk_results[index].referenced_paths.begin(), chunk_results[index].referenced_paths.end());
+      }
+      std::ifstream chunk_input(chunk_temporaries[index], std::ios::binary);
+      if (!chunk_input.is_open()) {
+        rewrite_failed = true;
+        continue;
+      }
+      while (chunk_input) {
+        chunk_input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto read_count = chunk_input.gcount();
+        if (read_count > 0) {
+          output.write_text(std::string_view(buffer.data(), static_cast<std::size_t>(read_count)));
+        }
+      }
+    }
+  } else {
+    for (std::size_t index = 0; index < chunks.size(); ++index) {
+      if (!write_reference_rewritten_chunk(
+              absolute,
+              chunks[index],
+              context,
+              referenced_paths != nullptr,
+              output,
+              chunk_results[index]) ||
+          !chunk_results[index].ok) {
+        rewrite_failed = true;
+        break;
+      }
+      changed = changed || chunk_results[index].changed;
+      if (referenced_paths) {
+        referenced_paths->insert(chunk_results[index].referenced_paths.begin(), chunk_results[index].referenced_paths.end());
+      }
+    }
+  }
+
+  for (std::size_t index = 0; index < chunks.size(); ++index) {
+    stats.jsonl_records += chunk_results[index].stats.jsonl_records;
+    stats.input_bytes += chunk_results[index].stats.input_bytes;
+    stats.output_bytes += chunk_results[index].stats.output_bytes;
+    stats.rewritten_records += chunk_results[index].stats.rewritten_records;
+    stats.rewritten_primary_blob_ref_records += chunk_results[index].stats.rewritten_primary_blob_ref_records;
+  }
+
+  if (rewrite_failed) {
+    if (!context.options.dry_run) {
+      output.close();
+      std::error_code remove_error;
+      fs::remove(temporary, remove_error);
+    }
+    for (const auto &chunk_temporary : chunk_temporaries) {
+      if (!chunk_temporary.empty()) {
+        std::error_code remove_error;
+        fs::remove(chunk_temporary, remove_error);
+      }
+    }
+    return false;
+  }
+
+  bool remapped_blob_refs_file = false;
+  bool sanitized_file = false;
+  for (const auto &chunk_result : chunk_results) {
+    remapped_blob_refs_file = remapped_blob_refs_file || chunk_result.remapped_blob_refs_file;
+    sanitized_file = sanitized_file || chunk_result.sanitized;
+    stats.dropped_jsonl_lines += chunk_result.dropped_lines;
+  }
+  if (sanitized_file) {
+    ++stats.sanitized_jsonl_files;
+  }
+  if (remapped_blob_refs_file) {
+    ++stats.rewritten_blob_ref_files;
+  }
+  if (!changed) {
+    if (!context.options.dry_run) {
+      output.close();
+      std::error_code remove_error;
+      fs::remove(temporary, remove_error);
+    }
+    for (const auto &chunk_temporary : chunk_temporaries) {
+      if (!chunk_temporary.empty()) {
+        std::error_code remove_error;
+        fs::remove(chunk_temporary, remove_error);
+      }
+    }
+    return true;
+  }
+
+  ++stats.rewritten_text_files;
+  if (!context.options.dry_run) {
+    const auto digest_and_size = output.digest_and_size();
+    output.close();
+    if (replace_with_temporary_file(absolute, temporary) && digest_cache && rewritten_digests) {
+      remember_rewritten_digest(
+          bundle_root,
+          relative,
+          digest_and_size,
+          *digest_cache,
+          *rewritten_digests,
+          stats);
+    }
+  }
+  for (const auto &chunk_temporary : chunk_temporaries) {
+    if (!chunk_temporary.empty()) {
+      std::error_code remove_error;
+      fs::remove(chunk_temporary, remove_error);
+    }
+  }
+  (void)sanitized_file;
+  return true;
+}
+
 std::unordered_set<std::string> rewrite_text_references(
     const fs::path &bundle_root,
     const std::unordered_map<std::string, std::string> &aliases,
@@ -4139,6 +4663,34 @@ std::unordered_set<std::string> rewrite_text_references(
 
     json root;
     if (relative.extension() == ".jsonl") {
+      if (options.jobs > 1 && !options.verify_jsonl_records) {
+        JsonlReferenceRewriteContext context{
+            aliases,
+            blob_id_by_effective_path,
+            effective_path_by_blob_id,
+            blob_id_remap_by_path,
+            blob_id_remap,
+            blob_id_remap_paths,
+            options};
+        const auto before_rewritten_text_files = stats.rewritten_text_files;
+        if (rewrite_jsonl_references_parallel(
+                bundle_root,
+                relative,
+                context,
+                stats,
+                referenced_paths,
+                digest_cache,
+                rewritten_digests) &&
+            stats.rewritten_text_files != before_rewritten_text_files) {
+          rewritten_paths.insert(relative_text);
+        }
+        ++file_index;
+        processed_bytes += size_error ? 0 : file_size;
+        if (progress) {
+          progress->update(file_index, reference_files.size(), processed_bytes, total_bytes);
+        }
+        continue;
+      }
       ++stats.jsonl_passes;
       bool changed = false;
       const auto temporary = temporary_rewrite_path(absolute);
@@ -5271,11 +5823,6 @@ std::string remap_callstream_sequence_line(std::string_view line, std::uint64_t 
   return record.dump();
 }
 
-struct JsonlByteChunk {
-  std::uint64_t offset = 0;
-  std::uint64_t size = 0;
-};
-
 std::uint64_t sequence_repair_chunk_size()
 {
 #if defined(APITRACE_ENABLE_TEST_HOOKS)
@@ -5289,89 +5836,6 @@ std::uint64_t sequence_repair_chunk_size()
   }
 #endif
   return kJsonlMaxChunkSize;
-}
-
-std::vector<JsonlByteChunk> build_newline_aligned_jsonl_chunks(const fs::path &path, std::uint64_t target_chunk_size)
-{
-  std::vector<JsonlByteChunk> chunks;
-  std::error_code size_error;
-  const auto file_size = static_cast<std::uint64_t>(fs::file_size(path, size_error));
-  if (size_error || file_size == 0) {
-    return chunks;
-  }
-
-  std::ifstream input(path, std::ios::binary);
-  if (!input.is_open()) {
-    return chunks;
-  }
-
-  std::uint64_t chunk_begin = 0;
-  while (chunk_begin < file_size) {
-    std::uint64_t chunk_end = std::min(file_size, chunk_begin + target_chunk_size);
-    if (chunk_end < file_size) {
-      input.clear();
-      input.seekg(static_cast<std::streamoff>(chunk_end), std::ios::beg);
-      char ch = 0;
-      while (chunk_end < file_size && input.get(ch)) {
-        ++chunk_end;
-        if (ch == '\n') {
-          break;
-        }
-      }
-    }
-    chunks.push_back({chunk_begin, chunk_end - chunk_begin});
-    chunk_begin = chunk_end;
-  }
-  return chunks;
-}
-
-bool read_jsonl_byte_chunk(const fs::path &path, const JsonlByteChunk &chunk, std::string &out)
-{
-  out.clear();
-  if (chunk.size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-    return false;
-  }
-  std::ifstream input(path, std::ios::binary);
-  if (!input.is_open()) {
-    return false;
-  }
-  input.seekg(static_cast<std::streamoff>(chunk.offset), std::ios::beg);
-  if (!input.good()) {
-    return false;
-  }
-  out.resize(static_cast<std::size_t>(chunk.size));
-  if (!out.empty()) {
-    input.read(out.data(), static_cast<std::streamsize>(out.size()));
-    if (static_cast<std::size_t>(input.gcount()) != out.size()) {
-      return false;
-    }
-  }
-  return true;
-}
-
-template <typename Callback>
-bool for_each_jsonl_line_in_chunk(std::string_view text, std::uint64_t chunk_offset, Callback &&callback)
-{
-  std::size_t cursor = 0;
-  while (cursor < text.size()) {
-    const auto newline = text.find('\n', cursor);
-    const bool has_newline = newline != std::string_view::npos;
-    const auto end = has_newline ? newline + 1 : text.size();
-    auto line = text.substr(cursor, (has_newline ? newline : end) - cursor);
-    if (!line.empty() && line.back() == '\r') {
-      line.remove_suffix(1);
-    }
-    JsonlLineView view;
-    view.line = line;
-    view.offset = chunk_offset + static_cast<std::uint64_t>(cursor);
-    view.byte_size = static_cast<std::uint64_t>(end - cursor);
-    view.has_newline = has_newline;
-    if (!callback(view)) {
-      return false;
-    }
-    cursor = end;
-  }
-  return true;
 }
 
 struct SequenceRepairSequenceRun {
