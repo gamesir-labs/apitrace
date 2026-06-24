@@ -1,7 +1,9 @@
 #include "apitrace/event_types.hpp"
+#include "apitrace/asset_index.hpp"
 #include "apitrace/trace_bundle_io.hpp"
 
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -14,6 +16,12 @@ bool test_hook_bundle_finalize_reference_collection_matches_two_pass(
     const std::filesystem::path &bundle_root,
     std::size_t *path_ref_count,
     std::size_t *blob_id_ref_count);
+bool test_hook_hash_assets_shared_payload_slices(
+    const std::filesystem::path &bundle_root,
+    std::size_t jobs,
+    std::size_t *payload_slice_tasks,
+    std::size_t *planned_payload_threads,
+    std::vector<std::string> *content_hashes);
 } // namespace apitrace::tools
 
 namespace {
@@ -80,6 +88,13 @@ int run_bundle_finalize_with_threshold(
   const auto status = std::system(command.c_str());
   unset_env_var("DXMT_FINALIZE_MAX_TRUNCATE_FRAMES");
   return status;
+}
+
+void write_bytes(const std::filesystem::path &path, const std::vector<std::uint8_t> &bytes)
+{
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  output.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
 }
 
 void append_present_frame(
@@ -201,6 +216,49 @@ std::size_t count_present_frames(const std::filesystem::path &bundle)
   return frames.size();
 }
 
+bool verify_shared_payload_slice_hashing(const std::filesystem::path &root)
+{
+  const auto bundle = root / "shared-payload-slices.apitrace";
+  std::filesystem::remove_all(bundle);
+  std::filesystem::create_directories(bundle / "raw");
+
+  const std::vector<std::uint8_t> payload = {
+      'a', 'l', 'p', 'h', 'a',
+      'b', 'r', 'a', 'v', 'o',
+      'c', 'h', 'a', 'r', 'l',
+      'd', 'e', 'l', 't', 'a',
+  };
+  write_bytes(bundle / "raw" / "blobs.bin", payload);
+
+  std::size_t payload_slice_tasks = 0;
+  std::size_t planned_payload_threads = 0;
+  std::vector<std::string> actual_hashes;
+  if (!apitrace::tools::test_hook_hash_assets_shared_payload_slices(
+          bundle,
+          3,
+          &payload_slice_tasks,
+          &planned_payload_threads,
+          &actual_hashes)) {
+    std::cerr << "hash_assets did not hash the shared payload fixture\n";
+    return false;
+  }
+  if (payload_slice_tasks != 4 || planned_payload_threads <= 1) {
+    std::cerr << "hash_assets did not schedule shared-payload work at slice granularity\n";
+    return false;
+  }
+
+  std::vector<std::string> expected_hashes;
+  for (std::size_t offset = 0; offset < payload.size(); offset += 5) {
+    expected_hashes.push_back(apitrace::trace::content_hash_bytes(payload.data() + offset, 5));
+  }
+  if (actual_hashes != expected_hashes) {
+    std::cerr << "hash_assets changed shared-payload slice hashes\n";
+    return false;
+  }
+
+  return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -215,6 +273,10 @@ int main(int argc, char **argv)
   const std::filesystem::path bundle_finalize = argv[3];
   std::filesystem::remove_all(root);
   std::filesystem::create_directories(root);
+
+  if (!verify_shared_payload_slice_hashing(root)) {
+    return 1;
+  }
 
   const auto tail_bundle = root / "tail-missing.apitrace";
   if (!write_missing_blob_bundle(tail_bundle, 3, 2)) {

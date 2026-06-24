@@ -1555,6 +1555,13 @@ void stat_assets(const fs::path &bundle_root, std::vector<AssetEntry> &assets)
   }
 }
 
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
+struct HashAssetsDebugInfo {
+  std::size_t payload_slice_tasks = 0;
+  std::size_t planned_payload_threads = 0;
+};
+#endif
+
 void hash_assets(
     const fs::path &bundle_root,
     std::vector<AssetEntry> &assets,
@@ -1562,7 +1569,12 @@ void hash_assets(
     bool reuse_existing_hashes,
     Stats &stats,
     FileDigestCache &digest_cache,
-    ProgressReporter *progress)
+    ProgressReporter *progress
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
+    ,
+    HashAssetsDebugInfo *debug_info = nullptr
+#endif
+)
 {
   struct PathGroup {
     std::string path;
@@ -1632,41 +1644,25 @@ void hash_assets(
   }
 
   std::vector<std::size_t> file_group_indices;
-  struct PayloadTask {
-    std::string payload_path;
-    std::vector<std::size_t> group_indices;
-    std::uint64_t byte_size = 0;
-  };
-  std::unordered_map<std::string, std::size_t> payload_task_by_path;
-  std::vector<PayloadTask> payload_tasks;
+  std::vector<std::size_t> payload_group_indices;
   for (std::size_t index = 0; index < groups.size(); ++index) {
     auto &group = groups[index];
     if (!group.payload_slice) {
       file_group_indices.push_back(index);
       continue;
     }
-    const auto [it, inserted] = payload_task_by_path.emplace(group.payload_path, payload_tasks.size());
-    if (inserted) {
-      PayloadTask task;
-      task.payload_path = group.payload_path;
-      payload_tasks.push_back(std::move(task));
+    payload_group_indices.push_back(index);
+  }
+  std::sort(payload_group_indices.begin(), payload_group_indices.end(), [&](std::size_t lhs, std::size_t rhs) {
+    const auto &a = groups[lhs];
+    const auto &b = groups[rhs];
+    if (a.payload_path != b.payload_path) {
+      return a.payload_path < b.payload_path;
     }
-    auto &task = payload_tasks[it->second];
-    task.group_indices.push_back(index);
-    task.byte_size += group.byte_size;
-  }
-  for (auto &task : payload_tasks) {
-    std::sort(task.group_indices.begin(), task.group_indices.end(), [&](std::size_t lhs, std::size_t rhs) {
-      const auto &a = groups[lhs];
-      const auto &b = groups[rhs];
-      if (a.payload_offset != b.payload_offset) {
-        return a.payload_offset < b.payload_offset;
-      }
-      return a.byte_size < b.byte_size;
-    });
-  }
-  std::sort(payload_tasks.begin(), payload_tasks.end(), [](const PayloadTask &lhs, const PayloadTask &rhs) {
-    return lhs.byte_size > rhs.byte_size;
+    if (a.payload_offset != b.payload_offset) {
+      return a.payload_offset < b.payload_offset;
+    }
+    return a.byte_size < b.byte_size;
   });
 
   std::atomic<std::uint64_t> completed_files{0};
@@ -1729,32 +1725,31 @@ void hash_assets(
     return hasher.final_hex();
   };
 
-  std::atomic<std::size_t> next_payload_task{0};
+  std::atomic<std::size_t> next_payload_group{0};
   const auto payload_worker = [&]() {
     std::vector<std::uint8_t> buffer(kFileCopyBufferSize);
+    std::unordered_map<std::string, std::ifstream> payload_inputs;
     for (;;) {
-      const auto task_index = next_payload_task.fetch_add(1, std::memory_order_relaxed);
-      if (task_index >= payload_tasks.size()) {
+      const auto cursor = next_payload_group.fetch_add(1, std::memory_order_relaxed);
+      if (cursor >= payload_group_indices.size()) {
         return;
       }
-      const auto &task = payload_tasks[task_index];
-      std::ifstream input(bundle_root / task.payload_path, std::ios::binary);
+      auto &group = groups[payload_group_indices[cursor]];
+      auto &input = payload_inputs[group.payload_path];
       if (!input.is_open()) {
-        for (const auto group_index : task.group_indices) {
-          record_error(groups[group_index].path + ": failed to open payload slice file");
-          note_completed(groups[group_index]);
-        }
+        input.open(bundle_root / group.payload_path, std::ios::binary);
+      }
+      if (!input.is_open()) {
+        record_error(group.path + ": failed to open payload slice file");
+        note_completed(group);
         continue;
       }
-      for (const auto group_index : task.group_indices) {
-        auto &group = groups[group_index];
-        try {
-          group.digest = digest_payload_slice(input, group.payload_offset, group.byte_size, buffer);
-        } catch (const std::exception &error) {
-          record_error(group.path + ": " + error.what());
-        }
-        note_completed(group);
+      try {
+        group.digest = digest_payload_slice(input, group.payload_offset, group.byte_size, buffer);
+      } catch (const std::exception &error) {
+        record_error(group.path + ": " + error.what());
       }
+      note_completed(group);
     }
   };
 
@@ -1768,7 +1763,13 @@ void hash_assets(
     thread.join();
   }
   threads.clear();
-  const auto payload_thread_count = std::min(jobs, payload_tasks.size());
+  const auto payload_thread_count = std::min(jobs, payload_group_indices.size());
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
+  if (debug_info) {
+    debug_info->payload_slice_tasks = payload_group_indices.size();
+    debug_info->planned_payload_threads = payload_thread_count;
+  }
+#endif
   threads.reserve(payload_thread_count);
   for (std::size_t i = 0; i < payload_thread_count; ++i) {
     threads.emplace_back(payload_worker);
@@ -7156,6 +7157,60 @@ bool test_hook_bundle_finalize_reference_collection_matches_two_pass(
     *blob_id_ref_count = fused.blob_ids.size();
   }
   return fused.paths == two_pass.paths && fused.blob_ids == two_pass.blob_ids;
+}
+
+bool test_hook_hash_assets_shared_payload_slices(
+    const fs::path &bundle_root,
+    std::size_t jobs,
+    std::size_t *payload_slice_tasks,
+    std::size_t *planned_payload_threads,
+    std::vector<std::string> *content_hashes)
+{
+  std::vector<AssetEntry> assets;
+  for (std::size_t index = 0; index < 4; ++index) {
+    AssetEntry asset;
+    asset.blob_id = static_cast<std::uint64_t>(index + 1);
+    asset.path = "buffers/shared-slice-" + std::to_string(index) + ".buffer";
+    asset.kind = "Buffer";
+    asset.byte_size = 5;
+    asset.actual_size = 5;
+    asset.payload_path = "raw/blobs.bin";
+    asset.payload_offset = static_cast<std::uint64_t>(index * 5);
+    asset.payload_slice_exists = true;
+    asset.safe_payload_path = true;
+    assets.push_back(std::move(asset));
+  }
+
+  Stats stats;
+  FileDigestCache digest_cache;
+  HashAssetsDebugInfo debug_info;
+  hash_assets(
+      bundle_root,
+      assets,
+      jobs,
+      false,
+      stats,
+      digest_cache,
+      nullptr,
+      &debug_info);
+
+  if (payload_slice_tasks) {
+    *payload_slice_tasks = debug_info.payload_slice_tasks;
+  }
+  if (planned_payload_threads) {
+    *planned_payload_threads = debug_info.planned_payload_threads;
+  }
+  if (content_hashes) {
+    content_hashes->clear();
+    for (const auto &asset : assets) {
+      content_hashes->push_back(asset.content_hash);
+    }
+  }
+
+  return stats.hashed_assets == assets.size() &&
+         stats.hashed_unique_files == assets.size() &&
+         stats.spooled_assets == assets.size() &&
+         stats.spooled_asset_bytes == 20;
 }
 
 } // namespace apitrace::tools
