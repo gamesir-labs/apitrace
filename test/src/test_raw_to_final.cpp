@@ -494,6 +494,84 @@ bool write_passthrough_with_blob_raw_capture(
   return true;
 }
 
+bool write_duplicate_content_raw_capture(const std::filesystem::path &bundle)
+{
+  using namespace apitrace::trace::raw;
+
+  std::filesystem::remove_all(bundle);
+  RawCaptureWriter writer;
+  if (!expect(writer.open(bundle), "failed to open duplicate-content raw writer")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  const std::vector<std::uint8_t> duplicate_blob = {0xde, 0xad, 0xbe, 0xef};
+  const std::vector<std::uint8_t> unique_blob = {0xca, 0xfe, 0xba, 0xbe};
+  const auto duplicate_raw_id_a = writer.append_blob(
+      duplicate_blob.data(),
+      duplicate_blob.size(),
+      static_cast<std::uint32_t>(RawBlobKind::Buffer),
+      1);
+  const auto unique_raw_id = writer.append_blob(
+      unique_blob.data(),
+      unique_blob.size(),
+      static_cast<std::uint32_t>(RawBlobKind::Buffer),
+      2);
+  const auto duplicate_raw_id_b = writer.append_blob(
+      duplicate_blob.data(),
+      duplicate_blob.size(),
+      static_cast<std::uint32_t>(RawBlobKind::Buffer),
+      3);
+  if (!expect(duplicate_raw_id_a != kInvalidRawBlobId &&
+                  unique_raw_id != kInvalidRawBlobId &&
+                  duplicate_raw_id_b != kInvalidRawBlobId,
+              "failed to append duplicate-content raw blobs")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  if (!append_raw_event(
+          writer,
+          1,
+          RawEventOpcode::ResourceCreate,
+          encode_resource_create_payload(100, 200, 1, 4096, 1, 1, 1, 87, 0, 4, "resource-a")) ||
+      !append_raw_event(
+          writer,
+          2,
+          RawEventOpcode::ResourceCreate,
+          encode_resource_create_payload(100, 201, 1, 4096, 1, 1, 1, 87, 0, 4, "resource-b")) ||
+      !append_raw_event(
+          writer,
+          3,
+          RawEventOpcode::ResourceCreate,
+          encode_resource_create_payload(100, 202, 1, 4096, 1, 1, 1, 87, 0, 4, "resource-c")) ||
+      !append_raw_event(
+          writer,
+          4,
+          RawEventOpcode::ResourceUnmap,
+          encode_resource_unmap_payload(200, duplicate_raw_id_a, 0, duplicate_blob.size())) ||
+      !append_raw_event(
+          writer,
+          5,
+          RawEventOpcode::ResourceUnmap,
+          encode_resource_unmap_payload(201, unique_raw_id, 16, 16 + unique_blob.size())) ||
+      !append_raw_event(
+          writer,
+          6,
+          RawEventOpcode::ResourceUnmap,
+          encode_resource_unmap_payload(202, duplicate_raw_id_b, 32, 32 + duplicate_blob.size()))) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  if (!expect(writer.flush_commit(), "failed to commit duplicate-content raw capture")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+  writer.close();
+  return true;
+}
+
 bool validate_final_bundle(const std::filesystem::path &bundle)
 {
   const auto records = read_jsonl(bundle / "callstream.jsonl");
@@ -571,6 +649,79 @@ bool validate_final_bundle(const std::filesystem::path &bundle)
   }
   if (!expect(read_file_bytes(bundle / buffer_asset_path) == std::vector<std::uint8_t>({0x10, 0x20, 0x30, 0x40, 0x50, 0x60}),
               "canonical buffer asset bytes mismatch")) {
+    return false;
+  }
+  return true;
+}
+
+bool validate_duplicate_content_raw_bundle(const std::filesystem::path &bundle)
+{
+  const auto records = read_jsonl(bundle / "callstream.jsonl");
+  if (!expect(records.size() == 7, "unexpected duplicate-content callstream record count")) {
+    return false;
+  }
+
+  std::vector<json> unmaps;
+  for (const auto &record : records) {
+    if (record.value("function", std::string()) == "ID3D12Resource::Unmap") {
+      unmaps.push_back(record);
+    }
+  }
+  if (!expect(unmaps.size() == 3, "duplicate-content raw finalize suppressed Unmap events")) {
+    return false;
+  }
+
+  const auto duplicate_path_a = unmaps[0]["payload"].value("buffer_path", std::string());
+  const auto unique_path = unmaps[1]["payload"].value("buffer_path", std::string());
+  const auto duplicate_path_b = unmaps[2]["payload"].value("buffer_path", std::string());
+  if (!expect(!duplicate_path_a.empty() &&
+                  duplicate_path_a == duplicate_path_b &&
+                  duplicate_path_a != unique_path,
+              "duplicate-content raw blobs were not rewritten to one canonical asset path")) {
+    return false;
+  }
+  if (!expect(duplicate_path_a.rfind("buffers/", 0) == 0 &&
+                  duplicate_path_a.find("asset-") == std::string::npos,
+              "duplicate-content buffer path was not canonicalized")) {
+    return false;
+  }
+  if (!expect(std::filesystem::exists(bundle / duplicate_path_a) &&
+                  std::filesystem::exists(bundle / unique_path),
+              "deduped canonical buffer asset files missing")) {
+    return false;
+  }
+
+  const auto assets_json = json::parse(std::ifstream(bundle / "assets.json"), nullptr, false);
+  if (!expect(!assets_json.is_discarded() && assets_json.contains("assets"), "duplicate-content assets.json missing")) {
+    return false;
+  }
+
+  std::size_t duplicate_path_entries = 0;
+  std::size_t unique_path_entries = 0;
+  std::string duplicate_hash;
+  std::string unique_hash;
+  for (const auto &asset : assets_json["assets"]) {
+    const auto path = asset.value("path", std::string());
+    if (path == duplicate_path_a) {
+      ++duplicate_path_entries;
+      duplicate_hash = asset.value("content_hash", std::string());
+    }
+    if (path == unique_path) {
+      ++unique_path_entries;
+      unique_hash = asset.value("content_hash", std::string());
+    }
+  }
+  if (!expect(duplicate_path_entries == 2 &&
+                  unique_path_entries == 1 &&
+                  !duplicate_hash.empty() &&
+                  !unique_hash.empty() &&
+                  duplicate_hash != unique_hash,
+              "assets.json did not preserve deduped blob references on canonical files")) {
+    return false;
+  }
+  if (!expect(read_file_bytes(bundle / duplicate_path_a) == std::vector<std::uint8_t>({0xde, 0xad, 0xbe, 0xef}) &&
+                  read_file_bytes(bundle / unique_path) == std::vector<std::uint8_t>({0xca, 0xfe, 0xba, 0xbe}),
+              "deduped canonical buffer asset bytes mismatch")) {
     return false;
   }
   return true;
@@ -704,6 +855,7 @@ int main(int argc, char **argv)
   const auto bundle = work_dir / "synthetic-raw.apitrace";
   const auto passthrough_bundle = work_dir / "synthetic-passthrough-raw.apitrace";
   const auto passthrough_blob_bundle = work_dir / "synthetic-passthrough-with-blob-raw.apitrace";
+  const auto duplicate_content_bundle = work_dir / "synthetic-duplicate-content-raw.apitrace";
   const auto dual_write_bundle = work_dir / "synthetic-dual-write.apitrace";
   const auto dual_write_old_bundle = work_dir / "synthetic-dual-write-old.apitrace";
   const auto dual_write_raw_bundle = work_dir / "synthetic-dual-write-raw.apitrace";
@@ -733,6 +885,10 @@ int main(int argc, char **argv)
       run_command(quote_arg(argv[1]) + " --raw-format --no-progress " + quote_arg(passthrough_blob_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(passthrough_blob_bundle)) &&
       validate_passthrough_with_blob_bundle(passthrough_blob_bundle, passthrough_blob_line, passthrough_non_blob_line) &&
+      write_duplicate_content_raw_capture(duplicate_content_bundle) &&
+      run_command(quote_arg(argv[1]) + " --raw-format --no-progress " + quote_arg(duplicate_content_bundle)) &&
+      run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(duplicate_content_bundle)) &&
+      validate_duplicate_content_raw_bundle(duplicate_content_bundle) &&
       write_no_end_periodic_commit_capture(no_end_raw_bundle) &&
       run_command(quote_arg(argv[1]) + " --raw-format --no-progress --jobs 1 " + quote_arg(no_end_raw_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(no_end_raw_bundle)) &&
