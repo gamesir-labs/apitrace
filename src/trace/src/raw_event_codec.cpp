@@ -270,12 +270,6 @@ bool materialize_raw_blob(
     return false;
   }
 
-  std::vector<std::uint8_t> bytes;
-  if (!context.reader.read_blob(raw_blob_id, bytes)) {
-    error = "failed to read raw blob " + std::to_string(raw_blob_id);
-    return false;
-  }
-
   auto final_blob_id = preferred_blob_id;
   if (final_blob_id == 0) {
     const auto [it, inserted] = context.final_blob_by_raw_blob.emplace(raw_blob_id, context.next_blob_id);
@@ -288,9 +282,11 @@ bool materialize_raw_blob(
   asset.blob_id = final_blob_id;
   asset.kind = kind;
   asset.debug_name = std::move(debug_name);
-  asset.byte_size = static_cast<std::uint64_t>(bytes.size());
+  asset.byte_size = extent.size;
+  asset.payload_path = std::filesystem::path("raw") / "blobs.bin";
+  asset.payload_offset = extent.offset;
   asset.binary_payload = true;
-  asset.payload_bytes = std::move(bytes);
+  asset.payload_bytes.clear();
   asset.relative_path = std::move(preferred_relative_path);
   if (asset.relative_path.empty()) {
     asset.relative_path = generated_asset_relative_path(asset.kind, asset.blob_id);
@@ -887,61 +883,93 @@ std::vector<std::uint8_t> encode_passthrough_with_blob_payload(
   return bytes;
 }
 
+struct RawEventDecoder::Impl {
+  explicit Impl(const RawCaptureReader &reader)
+      : context{reader}
+  {
+  }
+
+  DecodeContext context;
+  std::string error;
+};
+
+RawEventDecoder::RawEventDecoder(const RawCaptureReader &reader)
+    : impl_(std::make_unique<Impl>(reader))
+{
+}
+
+RawEventDecoder::~RawEventDecoder() = default;
+
+bool RawEventDecoder::decode_event(const RawEventRecord &record, DecodedRawEvent &decoded)
+{
+  decoded = DecodedRawEvent{};
+  impl_->error.clear();
+
+  bool ok = false;
+  switch (static_cast<RawEventOpcode>(record.header.opcode)) {
+  case RawEventOpcode::Passthrough:
+    ok = decode_passthrough_final_json(record, decoded, impl_->error);
+    break;
+  case RawEventOpcode::PassthroughWithBlob:
+    ok = decode_passthrough_with_blob(impl_->context, record, decoded, impl_->error);
+    break;
+  case RawEventOpcode::ResourceCreate:
+    ok = decode_resource_create(record, decoded, impl_->error);
+    break;
+  case RawEventOpcode::ResourceUnmap:
+    ok = decode_resource_unmap(impl_->context, record, decoded, impl_->error);
+    break;
+  case RawEventOpcode::GraphicsPipelineCreate:
+    ok = decode_graphics_pipeline_create(impl_->context, record, decoded, impl_->error);
+    break;
+  case RawEventOpcode::DrawInstanced:
+    ok = decode_draw_instanced(record, decoded, impl_->error);
+    break;
+  case RawEventOpcode::Dispatch:
+    ok = decode_dispatch(record, decoded, impl_->error);
+    break;
+  case RawEventOpcode::PresentCall:
+    ok = decode_present_call(record, decoded, impl_->error);
+    break;
+  case RawEventOpcode::FrameBegin:
+    ok = decode_frame_boundary(record, "FrameBegin", BoundaryKind::Frame, decoded, impl_->error);
+    break;
+  case RawEventOpcode::FrameEnd:
+    ok = decode_frame_boundary(record, "FrameEnd", BoundaryKind::Frame, decoded, impl_->error);
+    break;
+  case RawEventOpcode::PresentBoundary:
+    ok = decode_present_boundary(record, decoded, impl_->error);
+    break;
+  default:
+    impl_->error = "unsupported raw event opcode " + std::to_string(record.header.opcode) +
+                   " at sequence " + std::to_string(record.header.sequence);
+    ok = false;
+    break;
+  }
+  if (!ok && impl_->error.empty()) {
+    impl_->error = "failed to decode raw event sequence " + std::to_string(record.header.sequence);
+  }
+  return ok;
+}
+
+const std::string &RawEventDecoder::last_error() const noexcept
+{
+  static const std::string empty;
+  return impl_ ? impl_->error : empty;
+}
+
 RawDecodeResult decode_raw_events(
     const RawCaptureReader &reader,
     const std::vector<RawEventRecord> &records)
 {
   RawDecodeResult result;
-  DecodeContext context{reader};
+  RawEventDecoder decoder(reader);
   result.events.reserve(records.size());
 
   for (const auto &record : records) {
     DecodedRawEvent decoded;
-    bool ok = false;
-    switch (static_cast<RawEventOpcode>(record.header.opcode)) {
-    case RawEventOpcode::Passthrough:
-      ok = decode_passthrough_final_json(record, decoded, result.error);
-      break;
-    case RawEventOpcode::PassthroughWithBlob:
-      ok = decode_passthrough_with_blob(context, record, decoded, result.error);
-      break;
-    case RawEventOpcode::ResourceCreate:
-      ok = decode_resource_create(record, decoded, result.error);
-      break;
-    case RawEventOpcode::ResourceUnmap:
-      ok = decode_resource_unmap(context, record, decoded, result.error);
-      break;
-    case RawEventOpcode::GraphicsPipelineCreate:
-      ok = decode_graphics_pipeline_create(context, record, decoded, result.error);
-      break;
-    case RawEventOpcode::DrawInstanced:
-      ok = decode_draw_instanced(record, decoded, result.error);
-      break;
-    case RawEventOpcode::Dispatch:
-      ok = decode_dispatch(record, decoded, result.error);
-      break;
-    case RawEventOpcode::PresentCall:
-      ok = decode_present_call(record, decoded, result.error);
-      break;
-    case RawEventOpcode::FrameBegin:
-      ok = decode_frame_boundary(record, "FrameBegin", BoundaryKind::Frame, decoded, result.error);
-      break;
-    case RawEventOpcode::FrameEnd:
-      ok = decode_frame_boundary(record, "FrameEnd", BoundaryKind::Frame, decoded, result.error);
-      break;
-    case RawEventOpcode::PresentBoundary:
-      ok = decode_present_boundary(record, decoded, result.error);
-      break;
-    default:
-      result.error = "unsupported raw event opcode " + std::to_string(record.header.opcode) +
-                     " at sequence " + std::to_string(record.header.sequence);
-      ok = false;
-      break;
-    }
-    if (!ok) {
-      if (result.error.empty()) {
-        result.error = "failed to decode raw event sequence " + std::to_string(record.header.sequence);
-      }
+    if (!decoder.decode_event(record, decoded)) {
+      result.error = decoder.last_error();
       return result;
     }
     result.events.push_back(std::move(decoded));

@@ -4,6 +4,7 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <functional>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -268,6 +269,37 @@ std::uint64_t file_size_or_zero(const std::filesystem::path &path)
 std::uint64_t clamp_prefix(std::uint64_t prefix, std::uint64_t file_size)
 {
   return std::min(prefix, file_size);
+}
+
+bool read_next_event(
+    std::ifstream &input,
+    std::uint64_t committed,
+    std::uint64_t &cursor,
+    RawEventRecord &record)
+{
+  if (cursor + kEventHeaderSize > committed) {
+    return false;
+  }
+
+  std::array<std::uint8_t, kEventHeaderSize> header_bytes{};
+  if (!read_exact(input, header_bytes.data(), header_bytes.size())) {
+    return false;
+  }
+  cursor += kEventHeaderSize;
+
+  record = RawEventRecord{};
+  record.header = read_event_header(header_bytes);
+  if (record.header.payload_len > committed - cursor ||
+      record.header.payload_len > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    return false;
+  }
+  record.payload.resize(static_cast<std::size_t>(record.header.payload_len));
+  if (!record.payload.empty() &&
+      !read_exact(input, record.payload.data(), record.payload.size())) {
+    return false;
+  }
+  cursor += record.header.payload_len;
+  return true;
 }
 
 } // namespace
@@ -555,6 +587,7 @@ bool RawCaptureWriter::fail_locked(std::string message)
 
 class RawCaptureReader::Impl {
 public:
+  mutable std::ifstream blobs;
   RawCommitMeta committed;
   std::vector<RawBlobExtent> blob_extents;
   std::unordered_map<std::uint64_t, RawBlobExtent> blob_extent_by_id;
@@ -581,6 +614,12 @@ bool RawCaptureReader::open(const std::filesystem::path &bundle_root)
     impl_.reset();
     return false;
   }
+  impl_->blobs.open(raw_root_ / "blobs.bin", std::ios::binary);
+  if (!impl_->blobs || !read_file_header(impl_->blobs, kBlobsMagic)) {
+    fail("invalid raw blobs file");
+    impl_.reset();
+    return false;
+  }
   return true;
 }
 
@@ -600,43 +639,46 @@ bool RawCaptureReader::is_open() const noexcept
 std::vector<RawEventRecord> RawCaptureReader::read_events() const
 {
   std::vector<RawEventRecord> records;
+  for_each_event([&records](RawEventRecord &&record) {
+    records.push_back(std::move(record));
+    return true;
+  });
+  return records;
+}
+
+bool RawCaptureReader::for_each_event(const std::function<bool(RawEventRecord &&record)> &callback) const
+{
   if (!impl_) {
-    return records;
+    return false;
   }
+  last_error_.clear();
 
   const auto events_path = raw_root_ / "events.bin";
   std::ifstream input(events_path, std::ios::binary);
   if (!input || !read_file_header(input, kEventsMagic)) {
-    return records;
+    last_error_ = "invalid raw events file";
+    return false;
   }
 
   const auto file_size = file_size_or_zero(events_path);
   const auto committed = clamp_prefix(impl_->committed.events_committed_bytes, file_size);
   std::uint64_t cursor = kFileHeaderSize;
   while (cursor + kEventHeaderSize <= committed) {
-    std::array<std::uint8_t, kEventHeaderSize> header_bytes{};
-    if (!read_exact(input, header_bytes.data(), header_bytes.size())) {
-      break;
-    }
-    cursor += kEventHeaderSize;
-
     RawEventRecord record;
-    record.header = read_event_header(header_bytes);
-    if (record.header.payload_len > committed - cursor) {
-      break;
+    if (!read_next_event(input, committed, cursor, record)) {
+      last_error_ = "invalid raw event record at byte offset " + std::to_string(cursor);
+      return false;
     }
-    if (record.header.payload_len > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-      break;
+    if (!callback(std::move(record))) {
+      return false;
     }
-    record.payload.resize(static_cast<std::size_t>(record.header.payload_len));
-    if (!record.payload.empty() &&
-        !read_exact(input, record.payload.data(), record.payload.size())) {
-      break;
-    }
-    cursor += record.header.payload_len;
-    records.push_back(std::move(record));
   }
-  return records;
+  if (cursor != committed) {
+    last_error_ = "raw events committed prefix ends inside an event header at byte offset " +
+                  std::to_string(cursor);
+    return false;
+  }
+  return true;
 }
 
 bool RawCaptureReader::read_blob(std::uint64_t raw_blob_id, std::vector<std::uint8_t> &bytes) const
@@ -654,11 +696,12 @@ bool RawCaptureReader::read_blob(std::uint64_t raw_blob_id, std::vector<std::uin
   if (extent.size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
     return false;
   }
-  std::ifstream input(raw_root_ / "blobs.bin", std::ios::binary);
-  if (!input || !read_file_header(input, kBlobsMagic)) {
+  auto &input = impl_->blobs;
+  input.clear();
+  input.seekg(static_cast<std::streamoff>(extent.offset), std::ios::beg);
+  if (!input) {
     return false;
   }
-  input.seekg(static_cast<std::streamoff>(extent.offset), std::ios::beg);
   bytes.resize(static_cast<std::size_t>(extent.size));
   if (!bytes.empty() && !read_exact(input, bytes.data(), bytes.size())) {
     bytes.clear();

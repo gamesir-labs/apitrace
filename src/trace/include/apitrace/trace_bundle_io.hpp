@@ -63,6 +63,7 @@ public:
   void append_metal_event(const MetalEventRecord &event);
   AssetRecord register_asset(const AssetRecord &asset);
   AssetRecord register_asset(AssetRecord &&asset);
+  void set_registered_asset_payload_retention_enabled(bool enabled);
   std::vector<RegisteredAssetPayload> registered_asset_payloads_for_blob_refs(
       const std::vector<BlobId> &blob_refs);
   AssetRecord register_metal_asset(MetalAssetKind kind, const AssetRecord &asset);
@@ -74,6 +75,7 @@ public:
   void append_translation_link_record(std::string_view stream_name, const TranslationLinkRecord &record);
   void write_checksum_index(const ChecksumIndex &checksums);
   void flush();
+  void flush_asset_writes();
   void checkpoint();
   void seal_checkpoint();
   void close();

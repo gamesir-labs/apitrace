@@ -1,16 +1,20 @@
 #include "apitrace/raw_capture_io.hpp"
 #include "apitrace/raw_event_codec.hpp"
+#include "apitrace/trace_bundle_io.hpp"
 #include "apitrace/trace_session.hpp"
 
 #include "nlohmann/json.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -318,6 +322,117 @@ std::vector<std::uint8_t> read_file_bytes(const std::filesystem::path &path)
       std::istreambuf_iterator<char>());
 }
 
+std::string replace_all_copy(std::string text, std::string_view from, std::string_view to)
+{
+  if (from.empty()) {
+    return text;
+  }
+  std::size_t pos = 0;
+  while ((pos = text.find(from, pos)) != std::string::npos) {
+    text.replace(pos, from.size(), to.data(), to.size());
+    pos += to.size();
+  }
+  return text;
+}
+
+json sorted_json_array(json array, const std::vector<std::string> &keys)
+{
+  if (!array.is_array()) {
+    return array;
+  }
+  std::sort(array.begin(), array.end(), [&](const json &lhs, const json &rhs) {
+    for (const auto &key : keys) {
+      const auto left = lhs.value(key, std::string());
+      const auto right = rhs.value(key, std::string());
+      if (left != right) {
+        return left < right;
+      }
+    }
+    return lhs.dump() < rhs.dump();
+  });
+  return array;
+}
+
+json normalized_assets_json(const std::filesystem::path &bundle)
+{
+  auto assets = json::parse(std::ifstream(bundle / "assets.json"), nullptr, false);
+  if (!assets.is_discarded() && assets.contains("assets")) {
+    assets["assets"] = sorted_json_array(assets["assets"], {"path", "kind", "content_hash"});
+  }
+  return assets;
+}
+
+json normalized_checksums_json(const std::filesystem::path &bundle)
+{
+  auto checksums = json::parse(std::ifstream(bundle / "checksums.json"), nullptr, false);
+  if (!checksums.is_discarded()) {
+    checksums.erase("bundle_hash");
+    auto files = checksums.find("files");
+    if (files != checksums.end() && files->is_object()) {
+      files->erase("callstream.jsonl");
+    }
+  }
+  return checksums;
+}
+
+std::vector<std::string> normalized_callstream_lines(const std::filesystem::path &bundle)
+{
+  std::vector<std::string> lines;
+  std::ifstream input(bundle / "callstream.jsonl", std::ios::binary);
+  std::string line;
+  while (std::getline(input, line)) {
+    auto record = json::parse(line, nullptr, false);
+    if (!record.is_discarded()) {
+      if (record.value("record_kind", std::string()) == "bundle_header") {
+        record["time_origin_ns"] = 0;
+        record["monotonic_origin_ns"] = 0;
+      }
+      if (record.contains("elapsed_ns")) {
+        record["elapsed_ns"] = 0;
+      }
+      line = record.dump();
+    }
+    lines.push_back(std::move(line));
+  }
+  return lines;
+}
+
+bool compare_asset_file_bytes(const std::filesystem::path &left, const std::filesystem::path &right)
+{
+  const auto assets = normalized_assets_json(left);
+  if (!expect(!assets.is_discarded() && assets.contains("assets"), "left assets.json missing for equivalence compare")) {
+    return false;
+  }
+  for (const auto &asset : assets["assets"]) {
+    const auto path = asset.value("path", std::string());
+    if (path.empty()) {
+      continue;
+    }
+    if (!expect(read_file_bytes(left / path) == read_file_bytes(right / path),
+                "streaming equivalence asset bytes mismatch")) {
+      std::cerr << "asset path: " << path << "\n";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool compare_finalized_bundles(const std::filesystem::path &left, const std::filesystem::path &right)
+{
+  if (!expect(normalized_assets_json(left) == normalized_assets_json(right),
+              "streaming equivalence assets.json mismatch")) {
+    return false;
+  }
+  const auto left_objects = left / "objects" / "objects.json";
+  const auto right_objects = right / "objects" / "objects.json";
+  if ((std::filesystem::exists(left_objects) || std::filesystem::exists(right_objects)) &&
+      !expect(read_file_bytes(left_objects) == read_file_bytes(right_objects),
+              "streaming equivalence object index mismatch")) {
+    return false;
+  }
+  return compare_asset_file_bytes(left, right);
+}
+
 std::vector<std::string> read_lines(const std::filesystem::path &path)
 {
   std::vector<std::string> lines;
@@ -572,6 +687,155 @@ bool write_duplicate_content_raw_capture(const std::filesystem::path &bundle)
   return true;
 }
 
+bool write_streaming_equivalence_raw_capture(const std::filesystem::path &bundle)
+{
+  using namespace apitrace::trace::raw;
+
+  std::filesystem::remove_all(bundle);
+  RawCaptureWriter writer;
+  if (!expect(writer.open(bundle), "failed to open streaming-equivalence raw writer")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  const std::vector<std::uint8_t> duplicate_blob(4096, 0x5c);
+  std::uint64_t sequence = 1;
+  if (!append_raw_event(writer, sequence++, RawEventOpcode::FrameBegin, encode_frame_boundary_payload(0))) {
+    return false;
+  }
+  for (std::uint64_t index = 0; index < 96; ++index) {
+    const auto resource_id = 2000 + index;
+    std::vector<std::uint8_t> blob;
+    if (index % 3 == 0) {
+      blob = duplicate_blob;
+    } else {
+      blob.assign(2048 + static_cast<std::size_t>(index % 7), static_cast<std::uint8_t>(index));
+    }
+    const auto raw_blob_id = writer.append_blob(
+        blob.data(),
+        blob.size(),
+        static_cast<std::uint32_t>(RawBlobKind::Buffer),
+        sequence + 1);
+    if (!expect(raw_blob_id != kInvalidRawBlobId, "failed to append streaming-equivalence raw blob")) {
+      return false;
+    }
+    if (!append_raw_event(
+            writer,
+            sequence++,
+            RawEventOpcode::ResourceCreate,
+            encode_resource_create_payload(
+                100,
+                resource_id,
+                1,
+                4096 + index,
+                1,
+                1,
+                1,
+                87,
+                0,
+                4,
+                "streaming-resource-" + std::to_string(index))) ||
+        !append_raw_event(
+            writer,
+            sequence++,
+            RawEventOpcode::ResourceUnmap,
+            encode_resource_unmap_payload(resource_id, raw_blob_id, index, index + blob.size())) ||
+        !append_raw_event(
+            writer,
+            sequence++,
+            RawEventOpcode::DrawInstanced,
+            encode_draw_instanced_payload(500, 3, 1, static_cast<std::uint32_t>(index), 0))) {
+      std::cerr << writer.last_error() << "\n";
+      return false;
+    }
+  }
+  if (!append_raw_event(writer, sequence++, RawEventOpcode::PresentCall, encode_present_payload(600, 0, 1, 0)) ||
+      !append_raw_event(writer, sequence++, RawEventOpcode::PresentBoundary, encode_present_payload(600, 0, 1, 0)) ||
+      !append_raw_event(writer, sequence++, RawEventOpcode::FrameEnd, encode_frame_boundary_payload(0))) {
+    return false;
+  }
+
+  if (!expect(writer.flush_commit(), "failed to commit streaming-equivalence raw capture")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+  writer.close();
+  return true;
+}
+
+bool validate_raw_blob_assets_are_path_backed(const std::filesystem::path &bundle)
+{
+  using namespace apitrace::trace::raw;
+
+  RawCaptureReader reader;
+  if (!expect(reader.open(bundle), "failed to open path-backed raw capture")) {
+    std::cerr << reader.last_error() << "\n";
+    return false;
+  }
+
+  std::unordered_map<std::uint64_t, RawBlobExtent> extent_by_id;
+  for (const auto &extent : reader.blob_extents()) {
+    extent_by_id.emplace(extent.raw_blob_id, extent);
+  }
+
+  RawEventDecoder decoder(reader);
+  bool saw_path_backed_asset = false;
+  const bool streamed = reader.for_each_event([&](RawEventRecord &&record) {
+    DecodedRawEvent decoded;
+    if (!decoder.decode_event(record, decoded)) {
+      std::cerr << decoder.last_error() << "\n";
+      return false;
+    }
+    for (const auto &asset : decoded.assets) {
+      const auto extent_it = extent_by_id.find(asset.blob_id);
+      if (!expect(extent_it != extent_by_id.end(), "decoded asset blob id missing from raw blob index") ||
+          !expect(asset.payload_bytes.empty(), "decoded raw asset retained payload bytes") ||
+          !expect(asset.payload_path.generic_string() == "raw/blobs.bin", "decoded raw asset payload path mismatch") ||
+          !expect(asset.payload_offset == extent_it->second.offset, "decoded raw asset payload offset mismatch") ||
+          !expect(asset.byte_size == extent_it->second.size, "decoded raw asset size mismatch")) {
+        return false;
+      }
+      saw_path_backed_asset = true;
+    }
+    return true;
+  });
+  return expect(streamed, "failed to stream path-backed raw capture") &&
+         expect(saw_path_backed_asset, "path-backed raw capture did not decode any assets");
+}
+
+bool load_asset_payload_bytes_for_legacy_baseline(
+    const std::filesystem::path &bundle,
+    apitrace::trace::AssetRecord &asset)
+{
+  if (!asset.payload_bytes.empty() || asset.payload_path.empty()) {
+    return true;
+  }
+  std::ifstream input(bundle / asset.payload_path, std::ios::binary);
+  if (!expect(input.is_open(), "legacy baseline failed to open payload source")) {
+    return false;
+  }
+  input.seekg(static_cast<std::streamoff>(asset.payload_offset), std::ios::beg);
+  if (!expect(input.good(), "legacy baseline failed to seek payload source")) {
+    return false;
+  }
+  if (!expect(asset.byte_size <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()),
+              "legacy baseline payload too large for test")) {
+    return false;
+  }
+  asset.payload_bytes.resize(static_cast<std::size_t>(asset.byte_size));
+  if (!asset.payload_bytes.empty()) {
+    input.read(reinterpret_cast<char *>(asset.payload_bytes.data()), static_cast<std::streamsize>(asset.payload_bytes.size()));
+    if (!expect(static_cast<std::size_t>(input.gcount()) == asset.payload_bytes.size(),
+                "legacy baseline short payload read")) {
+      asset.payload_bytes.clear();
+      return false;
+    }
+  }
+  asset.payload_path.clear();
+  asset.payload_offset = 0;
+  return true;
+}
+
 bool validate_final_bundle(const std::filesystem::path &bundle)
 {
   const auto records = read_jsonl(bundle / "callstream.jsonl");
@@ -651,6 +915,67 @@ bool validate_final_bundle(const std::filesystem::path &bundle)
               "canonical buffer asset bytes mismatch")) {
     return false;
   }
+  return true;
+}
+
+bool legacy_materialize_raw_capture_to_final_bundle(const std::filesystem::path &bundle)
+{
+  using namespace apitrace::trace;
+  using namespace apitrace::trace::raw;
+
+  RawCaptureReader reader;
+  if (!expect(reader.open(bundle), "legacy materializer failed to open raw capture")) {
+    std::cerr << reader.last_error() << "\n";
+    return false;
+  }
+  const auto raw_events = reader.read_events();
+  const auto decoded = decode_raw_events(reader, raw_events);
+  if (!expect(decoded.error.empty(), "legacy materializer failed to decode raw capture")) {
+    std::cerr << decoded.error << "\n";
+    return false;
+  }
+
+  TraceBundleWriter writer;
+  if (!expect(writer.open(bundle), "legacy materializer failed to open bundle writer")) {
+    return false;
+  }
+  writer.write_metadata({ApiKind::D3D12, kFormatVersion, "raw-to-final", false});
+  for (const auto &decoded_event : decoded.events) {
+    if (decoded_event.passthrough) {
+      for (const auto &asset : decoded_event.assets) {
+        auto legacy_asset = asset;
+        if (!load_asset_payload_bytes_for_legacy_baseline(bundle, legacy_asset)) {
+          return false;
+        }
+        writer.register_asset(std::move(legacy_asset));
+      }
+      writer.append_callstream_json_line(decoded_event.passthrough_jsonl_record);
+      continue;
+    }
+    auto event = decoded_event.event;
+    for (const auto &asset : decoded_event.assets) {
+      auto legacy_asset = asset;
+      if (!load_asset_payload_bytes_for_legacy_baseline(bundle, legacy_asset)) {
+        return false;
+      }
+      const auto input_blob_id = legacy_asset.blob_id;
+      const auto input_relative_path = legacy_asset.relative_path.generic_string();
+      auto registered = writer.register_asset(std::move(legacy_asset));
+      if (registered.blob_id != input_blob_id) {
+        for (auto &blob_id : event.blob_refs) {
+          if (blob_id == input_blob_id) {
+            blob_id = registered.blob_id;
+          }
+        }
+      }
+      const auto registered_relative_path = registered.relative_path.generic_string();
+      if (!input_relative_path.empty() && input_relative_path != registered_relative_path) {
+        event.payload = replace_all_copy(event.payload, input_relative_path, registered_relative_path);
+      }
+    }
+    writer.append_call_event(std::move(event));
+  }
+  writer.close();
   return true;
 }
 
@@ -814,6 +1139,25 @@ bool validate_passthrough_with_blob_bundle(
   return true;
 }
 
+bool run_streaming_equivalence_test(
+    const std::filesystem::path &source_bundle,
+    const std::filesystem::path &legacy_bundle,
+    const std::filesystem::path &streaming_bundle,
+    const char *finalize,
+    const char *check)
+{
+  return write_streaming_equivalence_raw_capture(source_bundle) &&
+         validate_raw_blob_assets_are_path_backed(source_bundle) &&
+         copy_directory(source_bundle, legacy_bundle) &&
+         copy_directory(source_bundle, streaming_bundle) &&
+         legacy_materialize_raw_capture_to_final_bundle(legacy_bundle) &&
+         run_command(quote_arg(finalize) + " --no-progress --jobs 1 " + quote_arg(legacy_bundle)) &&
+         run_command(quote_arg(finalize) + " --raw-format --no-progress --jobs 1 " + quote_arg(streaming_bundle)) &&
+         run_command(quote_arg(check) + " --verify-hashes " + quote_arg(legacy_bundle)) &&
+         run_command(quote_arg(check) + " --verify-hashes " + quote_arg(streaming_bundle)) &&
+         compare_finalized_bundles(legacy_bundle, streaming_bundle);
+}
+
 bool run_dual_write_parity_test(
     const std::filesystem::path &source_bundle,
     const std::filesystem::path &old_bundle,
@@ -860,6 +1204,9 @@ int main(int argc, char **argv)
   const auto dual_write_old_bundle = work_dir / "synthetic-dual-write-old.apitrace";
   const auto dual_write_raw_bundle = work_dir / "synthetic-dual-write-raw.apitrace";
   const auto no_end_raw_bundle = work_dir / "synthetic-no-end-raw.apitrace";
+  const auto streaming_equivalence_bundle = work_dir / "synthetic-streaming-equivalence.apitrace";
+  const auto streaming_equivalence_legacy_bundle = work_dir / "synthetic-streaming-equivalence-legacy.apitrace";
+  const auto streaming_equivalence_raw_bundle = work_dir / "synthetic-streaming-equivalence-raw.apitrace";
   const auto compare_script = std::filesystem::current_path() / "scripts" / "compare-raw-parity.py";
   const std::string passthrough_before =
       "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12GraphicsCommandList::SetPipelineState\",\"result_code\":0,\"object_refs\":[500,700],\"payload\":{\"state\":\"passthrough-before\",\"spacing\":\"kept exactly\"}}";
@@ -892,6 +1239,12 @@ int main(int argc, char **argv)
       write_no_end_periodic_commit_capture(no_end_raw_bundle) &&
       run_command(quote_arg(argv[1]) + " --raw-format --no-progress --jobs 1 " + quote_arg(no_end_raw_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(no_end_raw_bundle)) &&
+      run_streaming_equivalence_test(
+          streaming_equivalence_bundle,
+          streaming_equivalence_legacy_bundle,
+          streaming_equivalence_raw_bundle,
+          argv[1],
+          argv[2]) &&
       run_dual_write_parity_test(
           dual_write_bundle,
           dual_write_old_bundle,
@@ -900,7 +1253,11 @@ int main(int argc, char **argv)
           argv[2],
           compare_script);
 
-  std::filesystem::remove_all(work_dir);
+  if (ok) {
+    std::filesystem::remove_all(work_dir);
+  } else {
+    std::cerr << "preserving work_dir=" << work_dir << "\n";
+  }
   if (!ok) {
     return 1;
   }

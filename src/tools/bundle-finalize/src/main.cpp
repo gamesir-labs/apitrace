@@ -178,6 +178,9 @@ struct Stats {
   std::size_t raw_to_final_events = 0;
   std::size_t raw_to_final_assets = 0;
   std::uint64_t raw_to_final_asset_bytes = 0;
+  std::uint64_t raw_to_final_peak_event_payload_bytes = 0;
+  std::uint64_t raw_to_final_peak_decoded_asset_bytes = 0;
+  std::size_t raw_to_final_peak_assets_per_event = 0;
 };
 
 std::unordered_map<std::uint64_t, std::string> build_effective_path_by_blob_id(const std::vector<AssetEntry> &assets);
@@ -549,12 +552,6 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     std::cerr << "error: failed to open raw capture: " << reader.last_error() << "\n";
     return false;
   }
-  const auto raw_events = reader.read_events();
-  const auto decoded = apitrace::trace::raw::decode_raw_events(reader, raw_events);
-  if (!decoded.error.empty()) {
-    std::cerr << "error: failed to decode raw capture: " << decoded.error << "\n";
-    return false;
-  }
 
   std::string existing_header_line;
   {
@@ -566,28 +563,37 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     std::cerr << "error: failed to open final bundle writer for raw materialization\n";
     return false;
   }
+  writer.set_registered_asset_payload_retention_enabled(false);
   if (existing_header_line.find("\"record_kind\":\"bundle_header\"") != std::string::npos) {
     writer.append_existing_header_json_line(existing_header_line);
   } else {
     writer.write_metadata({apitrace::trace::ApiKind::D3D12, apitrace::trace::kFormatVersion, "raw-to-final", false});
   }
 
-  for (const auto &decoded_event : decoded.events) {
+  apitrace::trace::raw::RawEventDecoder decoder(reader);
+  bool ok = true;
+  const auto emit_decoded_event = [&](apitrace::trace::raw::DecodedRawEvent &&decoded_event) {
+    bool wrote_assets = false;
     if (decoded_event.passthrough) {
-      for (const auto &asset : decoded_event.assets) {
-        auto registered = writer.register_asset(asset);
+      for (auto &asset : decoded_event.assets) {
+        auto registered = writer.register_asset(std::move(asset));
+        wrote_assets = true;
         ++stats.raw_to_final_assets;
         stats.raw_to_final_asset_bytes += registered.byte_size;
       }
       writer.append_callstream_json_line(decoded_event.passthrough_jsonl_record);
       ++stats.raw_to_final_events;
-      continue;
+      if (wrote_assets) {
+        writer.flush_asset_writes();
+      }
+      return true;
     }
     auto event = decoded_event.event;
-    for (const auto &asset : decoded_event.assets) {
+    for (auto &asset : decoded_event.assets) {
       const auto input_blob_id = asset.blob_id;
       const auto input_relative_path = asset.relative_path.generic_string();
-      auto registered = writer.register_asset(asset);
+      auto registered = writer.register_asset(std::move(asset));
+      wrote_assets = true;
       ++stats.raw_to_final_assets;
       stats.raw_to_final_asset_bytes += registered.byte_size;
       if (registered.blob_id != input_blob_id) {
@@ -604,6 +610,42 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     }
     writer.append_call_event(std::move(event));
     ++stats.raw_to_final_events;
+    if (wrote_assets) {
+      writer.flush_asset_writes();
+    }
+    return true;
+  };
+  const bool streamed = reader.for_each_event([&](apitrace::trace::raw::RawEventRecord &&record) {
+    stats.raw_to_final_peak_event_payload_bytes =
+        std::max<std::uint64_t>(stats.raw_to_final_peak_event_payload_bytes, record.payload.size());
+    apitrace::trace::raw::DecodedRawEvent decoded_event;
+    if (!decoder.decode_event(record, decoded_event)) {
+      std::cerr << "error: failed to decode raw capture: " << decoder.last_error() << "\n";
+      ok = false;
+      return false;
+    }
+    std::uint64_t decoded_asset_bytes = 0;
+    for (const auto &asset : decoded_event.assets) {
+      decoded_asset_bytes += asset.payload_bytes.size();
+    }
+    stats.raw_to_final_peak_decoded_asset_bytes =
+        std::max(stats.raw_to_final_peak_decoded_asset_bytes, decoded_asset_bytes);
+    stats.raw_to_final_peak_assets_per_event =
+        std::max(stats.raw_to_final_peak_assets_per_event, decoded_event.assets.size());
+    ok = emit_decoded_event(std::move(decoded_event));
+    return ok;
+  });
+  if (!streamed && ok) {
+    std::cerr << "error: failed to stream raw capture events";
+    if (!reader.last_error().empty()) {
+      std::cerr << ": " << reader.last_error();
+    }
+    std::cerr << "\n";
+    ok = false;
+  }
+  if (!ok) {
+    writer.close();
+    return false;
   }
   writer.close();
   return true;
@@ -7462,6 +7504,9 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
             << " raw_to_final_events=" << stats.raw_to_final_events
             << " raw_to_final_assets=" << stats.raw_to_final_assets
             << " raw_to_final_asset_bytes=" << stats.raw_to_final_asset_bytes
+            << " raw_to_final_peak_event_payload_bytes=" << stats.raw_to_final_peak_event_payload_bytes
+            << " raw_to_final_peak_decoded_asset_bytes=" << stats.raw_to_final_peak_decoded_asset_bytes
+            << " raw_to_final_peak_assets_per_event=" << stats.raw_to_final_peak_assets_per_event
             << " repaired_missing_device_objects=" << stats.repaired_missing_device_objects
             << " sequence_regression_segments=" << stats.sequence_regression_segments
             << " remapped_sequence_records=" << stats.remapped_sequence_records

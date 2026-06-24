@@ -5,6 +5,7 @@
 #include "apitrace/raw_capture_io.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -53,6 +54,21 @@ struct PassthroughBlobDescriptor {
 struct RawDecodeResult {
   std::vector<DecodedRawEvent> events;
   std::string error;
+};
+
+class RawEventDecoder {
+public:
+  explicit RawEventDecoder(const RawCaptureReader &reader);
+  RawEventDecoder(const RawEventDecoder &) = delete;
+  RawEventDecoder &operator=(const RawEventDecoder &) = delete;
+  ~RawEventDecoder();
+
+  bool decode_event(const RawEventRecord &record, DecodedRawEvent &decoded);
+  const std::string &last_error() const noexcept;
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 std::string raw_event_contract_markdown();

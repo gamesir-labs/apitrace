@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -90,6 +91,7 @@ public:
 
   bool is_open() const noexcept;
   std::vector<RawEventRecord> read_events() const;
+  bool for_each_event(const std::function<bool(RawEventRecord &&record)> &callback) const;
   bool read_blob(std::uint64_t raw_blob_id, std::vector<std::uint8_t> &bytes) const;
   bool find_blob_extent(std::uint64_t raw_blob_id, RawBlobExtent &extent) const;
   const std::vector<RawBlobExtent> &blob_extents() const noexcept;
@@ -105,7 +107,7 @@ private:
   std::filesystem::path raw_root_;
   class Impl;
   std::unique_ptr<Impl> impl_;
-  std::string last_error_;
+  mutable std::string last_error_;
 };
 
 } // namespace apitrace::trace::raw

@@ -4259,7 +4259,8 @@ struct TraceBundleWriter::Impl {
   std::unordered_map<std::string, std::vector<std::size_t>> asset_record_indices_by_path;
   std::unordered_map<std::string, std::vector<std::size_t>> metal_asset_record_indices_by_path;
   std::unordered_map<std::uint64_t, RegisteredAssetPayload> registered_asset_payloads_by_blob_id;
-		  std::mutex asset_record_mutex;
+  bool retain_registered_asset_payloads = true;
+			  std::mutex asset_record_mutex;
 	  std::mutex asset_mutex;
 	  AsyncAssetWriter asset_writer;
 	  std::mutex asset_completion_mutex;
@@ -4807,10 +4808,12 @@ struct TraceBundleWriter::Impl {
 	    return asset;
 	  }
 
-  void remember_registered_asset_payload(AssetRecord asset, std::shared_ptr<const std::vector<std::uint8_t>> payload)
-  {
-    if (asset.blob_id == 0 || !payload)
+	  void remember_registered_asset_payload(AssetRecord asset, std::shared_ptr<const std::vector<std::uint8_t>> payload)
+	  {
+    if (!retain_registered_asset_payloads)
       return;
+	    if (asset.blob_id == 0 || !payload)
+	      return;
     TimedWriterLock lock(asset_record_mutex, writer_stats ? &asset_record_lock_stats : nullptr);
     registered_asset_payloads_by_blob_id[static_cast<std::uint64_t>(asset.blob_id)] =
         RegisteredAssetPayload{std::move(asset), std::move(payload)};
@@ -5081,8 +5084,10 @@ struct TraceBundleWriter::Impl {
             finalized.payload_offset = 0;
           }
 			    finalized.payload_bytes.clear();
-	    const bool can_cache_payload =
-	        completion.payload && completion.payload->size() <= exact_dedup_compare_threshold;
+		    const bool can_cache_payload =
+		        retain_registered_asset_payloads &&
+		        completion.payload &&
+		        completion.payload->size() <= exact_dedup_compare_threshold;
 	    const auto cache_payload_hash =
 	        can_cache_payload ? payload_dedup_hash(*completion.payload) : 0;
 
@@ -6415,6 +6420,18 @@ std::vector<TraceBundleWriter::RegisteredAssetPayload> TraceBundleWriter::regist
   return impl_->registered_asset_payloads_for_blob_refs(blob_refs);
 }
 
+void TraceBundleWriter::set_registered_asset_payload_retention_enabled(bool enabled)
+{
+  if (!impl_) {
+    return;
+  }
+  TimedWriterLock lock(impl_->asset_record_mutex, impl_->writer_stats ? &impl_->asset_record_lock_stats : nullptr);
+  impl_->retain_registered_asset_payloads = enabled;
+  if (!enabled) {
+    impl_->registered_asset_payloads_by_blob_id.clear();
+  }
+}
+
 AssetRecord TraceBundleWriter::register_metal_asset(MetalAssetKind kind, const AssetRecord &asset)
 {
   AssetRecord copy = asset;
@@ -6908,6 +6925,28 @@ void TraceBundleWriter::flush()
   if (!impl_ || !impl_->open) {
     return;
   }
+  for (auto &entry : impl_->analysis_stream_files) {
+    if (entry.second.is_open()) {
+      entry.second.flush();
+    }
+  }
+  if (impl_->callstream_stream.is_open()) {
+    impl_->callstream_stream.flush();
+  }
+  if (impl_->metal_callstream_stream.is_open()) {
+    impl_->metal_callstream_stream.flush();
+  }
+  impl_->asset_writer.drain();
+  impl_->drain_asset_completion_events();
+}
+
+void TraceBundleWriter::flush_asset_writes()
+{
+  if (!impl_ || !impl_->open) {
+    return;
+  }
+  impl_->asset_writer.drain();
+  impl_->drain_asset_completion_events();
 }
 
 void TraceBundleWriter::checkpoint()
