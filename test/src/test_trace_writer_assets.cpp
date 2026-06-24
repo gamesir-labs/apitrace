@@ -1850,10 +1850,27 @@ int main(int argc, char **argv)
         apitrace::trace::TraceBundleWriter::TestHooks::write_payload_sparse_for_test(unopened_output, small_bytes);
     const auto unopened_direct_result =
         apitrace::trace::TraceBundleWriter::TestHooks::write_payload_direct_for_test(unopened_output, small_bytes);
-    if (unopened_sparse_result || unopened_direct_result) {
+    const auto unopened_hash_result =
+        apitrace::trace::TraceBundleWriter::TestHooks::hash_and_write_payload_sparse_for_test(unopened_output, small_bytes);
+    if (unopened_sparse_result || unopened_direct_result || unopened_hash_result) {
       std::cerr << "unopened asset output streams must report write failure\n";
       return 1;
     }
+  }
+
+  {
+    const auto hard_write_failure_path = bundle.parent_path() / (bundle.filename().generic_string() + "-asset-hard-write-failure.bin");
+    std::filesystem::remove(hard_write_failure_path);
+    std::ofstream directory_output(hard_write_failure_path, std::ios::binary | std::ios::trunc);
+    directory_output.setstate(std::ios::badbit);
+    const auto hard_sparse_result =
+        apitrace::trace::TraceBundleWriter::TestHooks::write_payload_sparse_for_test(directory_output, small_bytes);
+    if (hard_sparse_result) {
+      std::cerr << "hard asset output write failures must not report success\n";
+      return 1;
+    }
+    directory_output.close();
+    std::filesystem::remove(hard_write_failure_path);
   }
 
   const auto retry_spool_bundle =
@@ -1918,6 +1935,54 @@ int main(int argc, char **argv)
       terminal_incomplete_json.find("injected terminal spool write failure") == std::string::npos ||
       std::filesystem::is_regular_file(terminal_spool_bundle / "seal-checkpoint-primary.ready")) {
     std::cerr << "terminal spooled asset write should make the capture loudly incomplete without ready marker\n";
+    return 1;
+  }
+
+  const auto no_hole_spool_bundle =
+      bundle.parent_path() / (bundle.filename().generic_string() + "-asset-spool-no-hole");
+  std::filesystem::remove_all(no_hole_spool_bundle);
+  set_env_var("APITRACE_ASYNC_ASSET_WORKERS", "1");
+  set_env_var("APITRACE_TEST_ASSET_SPOOL_TERMINAL_FAILURE_ONCE", "1");
+  {
+    apitrace::trace::TraceBundleWriter no_hole_writer;
+    if (!no_hole_writer.open(no_hole_spool_bundle)) {
+      std::cerr << "failed to open asset-spool-no-hole bundle\n";
+      return 1;
+    }
+    no_hole_writer.write_metadata({apitrace::trace::ApiKind::D3D12, 1, "asset-spool-no-hole-test", false});
+    std::vector<std::uint8_t> failed_bytes(96 * 1024, 0x66);
+    apitrace::trace::AssetRecord failed_asset;
+    failed_asset.blob_id = 915;
+    failed_asset.kind = apitrace::trace::AssetKind::Buffer;
+    failed_asset.debug_name = "d3d12-resource-unmap";
+    failed_asset.payload_bytes = failed_bytes;
+    failed_asset = no_hole_writer.register_asset(std::move(failed_asset));
+
+    std::vector<std::uint8_t> later_bytes(96 * 1024, 0x77);
+    apitrace::trace::AssetRecord later_asset;
+    later_asset.blob_id = 916;
+    later_asset.kind = apitrace::trace::AssetKind::Buffer;
+    later_asset.debug_name = "d3d12-resource-unmap";
+    later_asset.payload_bytes = later_bytes;
+    later_asset = no_hole_writer.register_asset(std::move(later_asset));
+    no_hole_writer.seal_checkpoint();
+    const auto published_offset =
+        apitrace::trace::TraceBundleWriter::TestHooks::spool_published_offset_for_test(no_hole_writer);
+    if (published_offset != 0) {
+      std::cerr << "published spool watermark advanced past a terminal failure\n";
+      return 1;
+    }
+    no_hole_writer.close();
+  }
+  unset_env_var("APITRACE_TEST_ASSET_SPOOL_TERMINAL_FAILURE_ONCE");
+  unset_env_var("APITRACE_ASYNC_ASSET_WORKERS");
+  const auto no_hole_assets_json = read_text(no_hole_spool_bundle / "assets.json");
+  const auto no_hole_incomplete_json = read_text(no_hole_spool_bundle / "capture-incomplete.json");
+  if (contains_json_u64_field(no_hole_assets_json, "blob_id", 915) ||
+      contains_json_u64_field(no_hole_assets_json, "blob_id", 916) ||
+      !contains_json_u64_field(no_hole_incomplete_json, "blob_id", 915) ||
+      std::filesystem::is_regular_file(no_hole_spool_bundle / "seal-checkpoint-primary.ready")) {
+    std::cerr << "later spooled asset must not publish while an earlier spooled write failed\n";
     return 1;
   }
 

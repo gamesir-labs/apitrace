@@ -75,6 +75,9 @@ public:
     static bool write_payload_direct_for_test(
         std::ofstream &output,
         const std::vector<std::uint8_t> &payload);
+    static bool hash_and_write_payload_sparse_for_test(
+        std::ofstream &output,
+        const std::vector<std::uint8_t> &payload);
     static std::uint64_t spool_reserved_offset_for_test(const TraceBundleWriter &writer);
     static std::uint64_t spool_published_offset_for_test(const TraceBundleWriter &writer);
   };

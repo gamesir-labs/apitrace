@@ -2702,6 +2702,11 @@ public:
     test_terminal_failure_ = enabled;
   }
 
+  void set_test_terminal_failure_once(bool enabled)
+  {
+    test_terminal_failure_once_ = enabled;
+  }
+
   void set_test_write_delay(std::chrono::milliseconds delay)
   {
     test_write_delay_ = delay;
@@ -3045,8 +3050,10 @@ private:
   SparseWriteResult write_spooled_payload(const Job &job)
   {
     SparseWriteResult result;
-    if (test_terminal_failure_)
+    if (test_terminal_failure_ || test_terminal_failure_once_) {
+      test_terminal_failure_once_ = false;
       return sparse_write_failure("injected terminal spool write failure", EIO, false);
+    }
     if (job.attempt < test_failures_before_success_)
       return sparse_write_failure("injected retryable spool write failure", EIO, true);
     if (test_write_delay_.count() > 0)
@@ -3482,6 +3489,7 @@ private:
   bool integrity_enabled_ = true;
   std::size_t test_failures_before_success_ = 0;
   bool test_terminal_failure_ = false;
+  bool test_terminal_failure_once_ = false;
   std::chrono::milliseconds test_write_delay_{0};
   std::atomic_uint64_t spool_next_offset_{0};
 	  std::size_t pending_bytes_ = 0;
@@ -5429,13 +5437,13 @@ struct TraceBundleWriter::Impl {
       asset_snapshot = assets;
       metal_asset_snapshot = metal_assets;
     }
-	    {
-	      TimedWriterLock lock(asset_mutex, writer_stats ? &asset_lock_stats : nullptr);
-	      known_file_digests_snapshot = known_file_digests;
-	      known_file_sizes_snapshot = known_file_sizes;
-	    }
-	    if (full_scan)
-	      write_writer_stats_for_checkpoint(known_file_digests_snapshot);
+		    {
+		      TimedWriterLock lock(asset_mutex, writer_stats ? &asset_lock_stats : nullptr);
+		      known_file_digests_snapshot = known_file_digests;
+		      known_file_sizes_snapshot = known_file_sizes;
+		    }
+		    if (full_scan)
+		      write_writer_stats_for_checkpoint(known_file_digests_snapshot);
 	    if (callstream_snapshot.valid) {
       known_file_digests_snapshot[kCallstreamFileName] = callstream_snapshot.digest;
       known_file_sizes_snapshot[kCallstreamFileName] = callstream_snapshot.byte_size;
@@ -5472,29 +5480,25 @@ struct TraceBundleWriter::Impl {
           known_file_sizes_snapshot.erase(entry.first);
         }
       }
-      const auto sideband_asset_index = asset_index_json(
-          asset_snapshot,
-          metal_asset_snapshot,
-          layout.root_path,
-          async_path_aliases,
-          known_file_digests_snapshot,
-	          known_file_sizes_snapshot);
-	      write_text_atomic(layout.analysis_directory_path / kSidebandAssetShardFileName, sideband_asset_index);
-      mark_spool_checkpoint_published(completed_spool_checkpoint_offset());
-	    if (open_mode == TraceBundleOpenMode::SidebandOnly) {
-	      checkpoint_signal_events.store(0, std::memory_order_relaxed);
-	      checkpoint_signal_asset_bytes.store(0, std::memory_order_relaxed);
-	      return;
-	    }
-
-    if (open_mode == TraceBundleOpenMode::Primary &&
-        should_write_asset_index(layout.asset_index_path, asset_snapshot, metal_asset_snapshot)) {
-      std::unordered_map<std::string, std::string> async_path_aliases;
+      std::unordered_map<std::uint64_t, std::uint64_t> blob_remap;
+      std::uint64_t full_scan_committed_spool_offset = completed_spool_checkpoint_offset();
+      const bool capture_failed = has_capture_failures();
       if (full_scan) {
-        const auto blob_remap = merge_sideband_asset_shard(
+        blob_remap = merge_sideband_asset_shard(
             layout.analysis_directory_path / kSidebandAssetShardFileName,
             asset_snapshot,
             metal_asset_snapshot);
+        full_scan_committed_spool_offset = completed_spool_checkpoint_offset();
+        if (capture_failed) {
+          retain_checkpointable_assets(
+              asset_snapshot,
+              known_file_sizes_snapshot,
+              full_scan_committed_spool_offset);
+          retain_checkpointable_assets(
+              metal_asset_snapshot,
+              known_file_sizes_snapshot,
+              full_scan_committed_spool_offset);
+        }
         if (const auto rewritten = rewrite_metal_callstream_blob_refs(
                 layout,
                 blob_remap,
@@ -5518,6 +5522,24 @@ struct TraceBundleWriter::Impl {
           known_file_sizes_snapshot.erase(entry.first);
         }
       }
+      const auto sideband_asset_index = asset_index_json(
+          asset_snapshot,
+          metal_asset_snapshot,
+          layout.root_path,
+          async_path_aliases,
+          known_file_digests_snapshot,
+          known_file_sizes_snapshot);
+      write_text_atomic(layout.analysis_directory_path / kSidebandAssetShardFileName, sideband_asset_index);
+      mark_spool_checkpoint_published(full_scan_committed_spool_offset);
+      if (open_mode == TraceBundleOpenMode::SidebandOnly) {
+        checkpoint_signal_events.store(0, std::memory_order_relaxed);
+        checkpoint_signal_asset_bytes.store(0, std::memory_order_relaxed);
+        return;
+      }
+
+      if (open_mode == TraceBundleOpenMode::Primary &&
+          (capture_failed ||
+           should_write_asset_index(layout.asset_index_path, asset_snapshot, metal_asset_snapshot))) {
       const auto asset_index = asset_index_json(
           asset_snapshot,
           metal_asset_snapshot,
@@ -5528,7 +5550,7 @@ struct TraceBundleWriter::Impl {
       write_text_atomic(layout.asset_index_path, asset_index);
       known_file_digests_snapshot[kAssetIndexFileName] =
           content_hash_bytes(asset_index.data(), asset_index.size());
-      mark_spool_checkpoint_published(completed_spool_checkpoint_offset());
+	      mark_spool_checkpoint_published(completed_spool_checkpoint_offset());
     }
 
     auto relative_paths = full_scan
@@ -5716,6 +5738,8 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
       env_size_or_default("APITRACE_TEST_ASSET_SPOOL_FAIL_BEFORE_SUCCESS", 0));
   impl_->asset_writer.set_test_terminal_failure(
       env_flag_enabled("APITRACE_TEST_ASSET_SPOOL_TERMINAL_FAILURE"));
+  impl_->asset_writer.set_test_terminal_failure_once(
+      env_flag_enabled("APITRACE_TEST_ASSET_SPOOL_TERMINAL_FAILURE_ONCE"));
   impl_->asset_writer.set_test_write_delay(std::chrono::milliseconds(
       env_size_or_default("APITRACE_TEST_ASSET_WRITE_DELAY_MS", 0)));
 	  if (impl_->writer_stats) {
@@ -6709,6 +6733,13 @@ bool TraceBundleWriter::TestHooks::write_payload_direct_for_test(
   return write_payload_direct(output, payload).ok;
 }
 
+bool TraceBundleWriter::TestHooks::hash_and_write_payload_sparse_for_test(
+    std::ofstream &output,
+    const std::vector<std::uint8_t> &payload)
+{
+  return hash_and_write_payload_sparse(output, payload).sparse.ok;
+}
+
 std::uint64_t TraceBundleWriter::TestHooks::spool_reserved_offset_for_test(
     const TraceBundleWriter &writer)
 {
@@ -6885,25 +6916,50 @@ void TraceBundleWriter::close()
     known_file_digests = impl_->known_file_digests;
     known_file_sizes = impl_->known_file_sizes;
   }
+  std::vector<AssetRecord> close_asset_snapshot;
+  std::vector<AssetRecord> close_metal_asset_snapshot;
+  {
+    TimedWriterLock lock(impl_->asset_record_mutex, impl_->writer_stats ? &impl_->asset_record_lock_stats : nullptr);
+    close_asset_snapshot = impl_->assets;
+    close_metal_asset_snapshot = impl_->metal_assets;
+  }
   if (impl_->open_mode == TraceBundleOpenMode::Primary) {
     TimedWriterPhase phase(impl_->writer_stats ? &impl_->close_phase_asset_index : nullptr);
-    std::vector<AssetRecord> assets;
-    std::vector<AssetRecord> metal_assets;
-    {
-      TimedWriterLock lock(impl_->asset_record_mutex, impl_->writer_stats ? &impl_->asset_record_lock_stats : nullptr);
-      assets = impl_->assets;
-      metal_assets = impl_->metal_assets;
-    }
-    if (should_write_asset_index(impl_->layout.asset_index_path, assets, metal_assets)) {
-      const auto blob_remap = merge_sideband_asset_shard(
-          impl_->layout.analysis_directory_path / kSidebandAssetShardFileName,
-          assets,
-          metal_assets);
+	    const auto blob_remap = merge_sideband_asset_shard(
+	        impl_->layout.analysis_directory_path / kSidebandAssetShardFileName,
+	        close_asset_snapshot,
+	        close_metal_asset_snapshot);
+	    const auto close_committed_spool_offset = impl_->completed_spool_checkpoint_offset();
+	    const bool capture_failed = impl_->has_capture_failures();
+	    if (capture_failed) {
+	      impl_->retain_checkpointable_assets(
+	          close_asset_snapshot,
+	          known_file_sizes,
+	          close_committed_spool_offset);
+	      impl_->retain_checkpointable_assets(
+	          close_metal_asset_snapshot,
+	          known_file_sizes,
+	          close_committed_spool_offset);
+	    }
+	    if (capture_failed ||
+	        should_write_asset_index(impl_->layout.asset_index_path, close_asset_snapshot, close_metal_asset_snapshot)) {
+	      if (capture_failed) {
+	        const auto filtered_sideband_asset_index = asset_index_json(
+	            close_asset_snapshot,
+	            close_metal_asset_snapshot,
+	            impl_->layout.root_path,
+	            async_path_aliases,
+	            known_file_digests,
+	            known_file_sizes);
+	        write_text_atomic(
+	            impl_->layout.analysis_directory_path / kSidebandAssetShardFileName,
+	            filtered_sideband_asset_index);
+	      }
       if (const auto rewritten = rewrite_metal_callstream_blob_refs(
               impl_->layout,
               blob_remap,
-              assets,
-              metal_assets)) {
+              close_asset_snapshot,
+              close_metal_asset_snapshot)) {
         known_file_digests[kMetalCallstreamFileName] = rewritten->first;
         known_file_sizes[kMetalCallstreamFileName] = rewritten->second;
         TimedWriterLock lock(impl_->asset_mutex, impl_->writer_stats ? &impl_->asset_lock_stats : nullptr);
@@ -6911,8 +6967,8 @@ void TraceBundleWriter::close()
         impl_->known_file_sizes[kMetalCallstreamFileName] = rewritten->second;
       }
       const auto asset_index = asset_index_json(
-          assets,
-          metal_assets,
+          close_asset_snapshot,
+          close_metal_asset_snapshot,
           impl_->layout.root_path,
           async_path_aliases,
           known_file_digests,
@@ -6972,11 +7028,10 @@ void TraceBundleWriter::close()
 		      add_checksum_candidate(relative_paths, seen, asset.relative_path);
       }
 		  };
-	  {
-	    TimedWriterLock lock(impl_->asset_record_mutex, impl_->writer_stats ? &impl_->asset_record_lock_stats : nullptr);
-	    add_asset_paths(impl_->assets);
-	    add_asset_paths(impl_->metal_assets);
-	  }
+		  {
+		    add_asset_paths(close_asset_snapshot);
+		    add_asset_paths(close_metal_asset_snapshot);
+		  }
 	  add_asset_index_paths(relative_paths, seen, impl_->layout.asset_index_path);
 	  for (const auto &entry : async_path_aliases)
 	    add_checksum_candidate(relative_paths, seen, std::filesystem::path(entry.second));
