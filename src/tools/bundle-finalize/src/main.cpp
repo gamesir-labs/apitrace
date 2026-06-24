@@ -565,6 +565,11 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
 
   for (const auto &decoded_event : decoded.events) {
     if (decoded_event.passthrough) {
+      for (const auto &asset : decoded_event.assets) {
+        auto registered = writer.register_asset(asset);
+        ++stats.raw_to_final_assets;
+        stats.raw_to_final_asset_bytes += registered.byte_size;
+      }
       writer.append_callstream_json_line(decoded_event.passthrough_jsonl_record);
       ++stats.raw_to_final_events;
       continue;

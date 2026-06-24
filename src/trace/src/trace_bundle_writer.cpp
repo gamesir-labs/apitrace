@@ -4247,6 +4247,7 @@ struct TraceBundleWriter::Impl {
   std::unordered_map<std::uint64_t, std::string> reserved_blob_paths;
   std::unordered_map<std::string, std::vector<std::size_t>> asset_record_indices_by_path;
   std::unordered_map<std::string, std::vector<std::size_t>> metal_asset_record_indices_by_path;
+  std::unordered_map<std::uint64_t, RegisteredAssetPayload> registered_asset_payloads_by_blob_id;
 		  std::mutex asset_record_mutex;
 	  std::mutex asset_mutex;
 	  AsyncAssetWriter asset_writer;
@@ -4778,6 +4779,30 @@ struct TraceBundleWriter::Impl {
     asset_record_indices_by_path[asset.relative_path.generic_string()].push_back(index);
 	    return asset;
 	  }
+
+  void remember_registered_asset_payload(AssetRecord asset, std::shared_ptr<const std::vector<std::uint8_t>> payload)
+  {
+    if (asset.blob_id == 0 || !payload)
+      return;
+    TimedWriterLock lock(asset_record_mutex, writer_stats ? &asset_record_lock_stats : nullptr);
+    registered_asset_payloads_by_blob_id[static_cast<std::uint64_t>(asset.blob_id)] =
+        RegisteredAssetPayload{std::move(asset), std::move(payload)};
+  }
+
+  std::vector<RegisteredAssetPayload> registered_asset_payloads_for_blob_refs(
+      const std::vector<BlobId> &blob_refs)
+  {
+    std::vector<RegisteredAssetPayload> payloads;
+    payloads.reserve(blob_refs.size());
+    TimedWriterLock lock(asset_record_mutex, writer_stats ? &asset_record_lock_stats : nullptr);
+    for (const auto blob_ref : blob_refs) {
+      const auto found = registered_asset_payloads_by_blob_id.find(static_cast<std::uint64_t>(blob_ref));
+      if (found != registered_asset_payloads_by_blob_id.end()) {
+        payloads.push_back(found->second);
+      }
+    }
+    return payloads;
+  }
 
   AssetRecord publish_metal_asset(AssetRecord asset)
   {
@@ -6110,6 +6135,7 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
 	      ++impl_->asset_completed_cache_hits;
 	      finalized = alias_asset_record(std::move(finalized), *cached.asset);
 	      finalized = impl_->publish_asset(std::move(finalized));
+      impl_->remember_registered_asset_payload(finalized, payload);
 	      return finalized;
 	    }
 	  }
@@ -6187,6 +6213,7 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
 	      ++impl_->asset_async_enqueued;
 	      if (hash_only_if_final_exists)
 	        ++impl_->asset_async_hash_only_candidates;
+      impl_->remember_registered_asset_payload(finalized, payload);
 	  finalized.payload_bytes.clear();
 	  return finalized;
 	}
@@ -6206,6 +6233,7 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
       ++impl_->asset_hash_dedup_hits;
       finalized = alias_asset_record(std::move(finalized), existing->second);
       finalized = impl_->publish_asset(std::move(finalized));
+      impl_->remember_registered_asset_payload(finalized, payload);
       return finalized;
     }
     if (!fingerprint_key.empty())
@@ -6249,6 +6277,7 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
     }
     if (enqueued) {
       ++impl_->asset_async_enqueued;
+      impl_->remember_registered_asset_payload(finalized, payload);
 	  bool may_reference_alias = false;
 	  {
 	    TimedWriterPhase phase(impl_->writer_stats ? &impl_->asset_register_phase_alias_scan : nullptr);
@@ -6329,7 +6358,17 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
     impl_->known_file_sizes[finalized.relative_path.generic_string()] = finalized.byte_size;
   }
   finalized.payload_bytes.clear();
+  impl_->remember_registered_asset_payload(finalized, payload);
   return finalized;
+}
+
+std::vector<TraceBundleWriter::RegisteredAssetPayload> TraceBundleWriter::registered_asset_payloads_for_blob_refs(
+    const std::vector<BlobId> &blob_refs)
+{
+  if (!impl_) {
+    return {};
+  }
+  return impl_->registered_asset_payloads_for_blob_refs(blob_refs);
 }
 
 AssetRecord TraceBundleWriter::register_metal_asset(MetalAssetKind kind, const AssetRecord &asset)

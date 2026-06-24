@@ -204,6 +204,60 @@ bool write_passthrough_mixed_raw_capture(
   return true;
 }
 
+bool write_passthrough_with_blob_raw_capture(
+    const std::filesystem::path &bundle,
+    const std::string &passthrough_blob_line,
+    const std::string &passthrough_non_blob_line)
+{
+  using namespace apitrace::trace::raw;
+
+  std::filesystem::remove_all(bundle);
+  RawCaptureWriter writer;
+  if (!expect(writer.open(bundle), "failed to open passthrough-with-blob raw writer")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  const std::vector<std::uint8_t> buffer_blob = {0xaa, 0xbb, 0xcc, 0xdd};
+  const auto buffer_raw_id = writer.append_blob(
+      buffer_blob.data(),
+      buffer_blob.size(),
+      static_cast<std::uint32_t>(RawBlobKind::Buffer),
+      1);
+  if (!expect(buffer_raw_id != kInvalidRawBlobId, "failed to append passthrough-with-blob bytes")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  PassthroughBlobDescriptor descriptor;
+  descriptor.provisional_asset_path = "buffers/asset-000000000000004d.buffer";
+  descriptor.final_blob_id = 77;
+  descriptor.raw_blob_id = buffer_raw_id;
+  descriptor.raw_blob_kind = static_cast<std::uint32_t>(RawBlobKind::Buffer);
+  descriptor.debug_name = "d3d12-resource-unmap";
+
+  if (!append_raw_event(
+          writer,
+          1,
+          RawEventOpcode::PassthroughWithBlob,
+          encode_passthrough_with_blob_payload(passthrough_blob_line, {descriptor})) ||
+      !append_raw_event(
+          writer,
+          2,
+          RawEventOpcode::Passthrough,
+          encode_passthrough_final_json_payload(passthrough_non_blob_line))) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  if (!expect(writer.flush_commit(), "failed to commit passthrough-with-blob raw capture")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+  writer.close();
+  return true;
+}
+
 bool validate_final_bundle(const std::filesystem::path &bundle)
 {
   const auto records = read_jsonl(bundle / "callstream.jsonl");
@@ -322,6 +376,57 @@ bool validate_passthrough_mixed_bundle(
   return true;
 }
 
+bool validate_passthrough_with_blob_bundle(
+    const std::filesystem::path &bundle,
+    const std::string &passthrough_blob_line,
+    const std::string &passthrough_non_blob_line)
+{
+  (void)passthrough_blob_line;
+  const auto lines = read_lines(bundle / "callstream.jsonl");
+  if (!expect(lines.size() == 3, "unexpected passthrough-with-blob callstream line count")) {
+    return false;
+  }
+  if (!expect(lines[2] == passthrough_non_blob_line, "non-blob passthrough line was not preserved verbatim")) {
+    return false;
+  }
+
+  const auto records = read_jsonl(bundle / "callstream.jsonl");
+  if (!expect(records.size() == 3, "unexpected passthrough-with-blob JSONL record count")) {
+    return false;
+  }
+  const auto &unmap = records[1];
+  if (!expect(unmap.value("function", "") == "ID3D12Resource::Unmap", "blob passthrough function mismatch") ||
+      !expect(unmap["blob_refs"].is_array() && unmap["blob_refs"].size() == 1, "blob passthrough missing blob_refs") ||
+      !expect(unmap["blob_refs"][0].get<std::uint64_t>() == 77, "blob passthrough blob id changed")) {
+    return false;
+  }
+  const auto final_payload_path = unmap["payload"].value("buffer_path", std::string());
+  if (!expect(final_payload_path.rfind("buffers/", 0) == 0 &&
+                  final_payload_path.find("asset-") == std::string::npos,
+              "blob passthrough buffer path was not canonicalized")) {
+    return false;
+  }
+
+  const auto assets_json = json::parse(std::ifstream(bundle / "assets.json"), nullptr, false);
+  if (!expect(!assets_json.is_discarded() && assets_json.contains("assets"), "passthrough-with-blob assets.json missing")) {
+    return false;
+  }
+  std::string buffer_path;
+  for (const auto &asset : assets_json["assets"]) {
+    if (asset.value("blob_id", 0ull) == 77) {
+      buffer_path = asset.value("path", std::string());
+    }
+  }
+  if (!expect(buffer_path.rfind("buffers/", 0) == 0, "passthrough-with-blob asset not indexed")) {
+    return false;
+  }
+  if (!expect(read_file_bytes(bundle / buffer_path) == std::vector<std::uint8_t>({0xaa, 0xbb, 0xcc, 0xdd}),
+              "passthrough-with-blob asset bytes mismatch")) {
+    return false;
+  }
+  return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -338,10 +443,15 @@ int main(int argc, char **argv)
   const auto work_dir = unique_work_dir();
   const auto bundle = work_dir / "synthetic-raw.apitrace";
   const auto passthrough_bundle = work_dir / "synthetic-passthrough-raw.apitrace";
+  const auto passthrough_blob_bundle = work_dir / "synthetic-passthrough-with-blob-raw.apitrace";
   const std::string passthrough_before =
       "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12GraphicsCommandList::SetPipelineState\",\"result_code\":0,\"object_refs\":[500,700],\"payload\":{\"state\":\"passthrough-before\",\"spacing\":\"kept exactly\"}}";
   const std::string passthrough_after =
       "{\"record_kind\":\"boundary\",\"sequence\":3,\"time_ns\":1003,\"elapsed_ns\":0,\"boundary\":\"DebugMarker\",\"payload\":{\"label\":\"passthrough-after\",\"nested\":{\"value\":42}}}";
+  const std::string passthrough_blob_line =
+      "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12Resource::Unmap\",\"result_code\":0,\"blob_refs\":[77],\"payload\":{\"buffer_path\":\"buffers/asset-000000000000004d.buffer\",\"written_range\":{\"begin\":0,\"end\":4}}}";
+  const std::string passthrough_non_blob_line =
+      "{\"record_kind\":\"call\",\"sequence\":2,\"time_ns\":1002,\"elapsed_ns\":0,\"function\":\"ID3D12GraphicsCommandList::DrawInstanced\",\"result_code\":0,\"object_refs\":[500],\"payload\":{\"vertex_count_per_instance\":3,\"instance_count\":1,\"start_vertex_location\":0,\"start_instance_location\":0}}";
   std::filesystem::remove_all(work_dir);
   std::filesystem::create_directories(work_dir);
 
@@ -353,7 +463,11 @@ int main(int argc, char **argv)
       write_passthrough_mixed_raw_capture(passthrough_bundle, passthrough_before, passthrough_after) &&
       run_command(quote_arg(argv[1]) + " --raw-format --no-progress " + quote_arg(passthrough_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(passthrough_bundle)) &&
-      validate_passthrough_mixed_bundle(passthrough_bundle, passthrough_before, passthrough_after);
+      validate_passthrough_mixed_bundle(passthrough_bundle, passthrough_before, passthrough_after) &&
+      write_passthrough_with_blob_raw_capture(passthrough_blob_bundle, passthrough_blob_line, passthrough_non_blob_line) &&
+      run_command(quote_arg(argv[1]) + " --raw-format --no-progress " + quote_arg(passthrough_blob_bundle)) &&
+      run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(passthrough_blob_bundle)) &&
+      validate_passthrough_with_blob_bundle(passthrough_blob_bundle, passthrough_blob_line, passthrough_non_blob_line);
 
   std::filesystem::remove_all(work_dir);
   if (!ok) {

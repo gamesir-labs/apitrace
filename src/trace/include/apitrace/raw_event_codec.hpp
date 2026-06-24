@@ -15,6 +15,7 @@ constexpr std::uint32_t kRawEventContractVersion = 1;
 enum class RawEventOpcode : std::uint32_t {
   Passthrough = 0x0001,
   PassthroughFinalJson = Passthrough,
+  PassthroughWithBlob = 0x0002,
   ResourceCreate = 0x0101,
   ResourceUnmap = 0x0102,
   GraphicsPipelineCreate = 0x0201,
@@ -39,6 +40,14 @@ struct DecodedRawEvent {
   std::vector<AssetRecord> assets;
   bool passthrough = false;
   std::string passthrough_jsonl_record;
+};
+
+struct PassthroughBlobDescriptor {
+  std::string provisional_asset_path;
+  std::uint64_t final_blob_id = 0;
+  std::uint64_t raw_blob_id = kInvalidRawBlobId;
+  std::uint32_t raw_blob_kind = 0;
+  std::string debug_name;
 };
 
 struct RawDecodeResult {
@@ -101,6 +110,10 @@ std::vector<std::uint8_t> encode_present_payload(
 std::vector<std::uint8_t> encode_frame_boundary_payload(std::uint64_t frame_index);
 
 std::vector<std::uint8_t> encode_passthrough_final_json_payload(std::string_view final_jsonl_record);
+
+std::vector<std::uint8_t> encode_passthrough_with_blob_payload(
+    std::string_view final_jsonl_record,
+    const std::vector<PassthroughBlobDescriptor> &blobs);
 
 RawDecodeResult decode_raw_events(
     const RawCaptureReader &reader,

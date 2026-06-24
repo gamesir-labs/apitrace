@@ -72,7 +72,18 @@ bool run_passthrough_test(const std::filesystem::path &bundle)
     apitrace::TraceSession session(trace_options(bundle, true));
     session.begin();
     session.append_call_event(make_event(11, "ID3D12GraphicsCommandList::DrawInstanced", "{\"vertex_count\":3}"));
-    session.append_call_event(make_event(12, "ID3D12Resource::Unmap", "{\"blob_id\":77}", {77}));
+
+    apitrace::trace::AssetRecord asset;
+    asset.blob_id = 77;
+    asset.kind = apitrace::trace::AssetKind::Buffer;
+    asset.debug_name = "d3d12-resource-unmap";
+    asset.payload_bytes = {0x01, 0x02, 0x03, 0x04};
+    asset = session.register_asset(std::move(asset));
+    session.append_call_event(make_event(
+        12,
+        "ID3D12Resource::Unmap",
+        "{\"buffer_path\":\"" + asset.relative_path.generic_string() + "\",\"written_range\":{\"begin\":0,\"end\":4}}",
+        {asset.blob_id}));
     session.end();
   }
 
@@ -87,12 +98,33 @@ bool run_passthrough_test(const std::filesystem::path &bundle)
     return false;
   }
   const auto records = reader.read_events();
-  if (!expect(records.size() == 1, "expected one passthrough raw event")) {
+  if (!expect(records.size() == 2, "expected one passthrough and one blob passthrough raw event")) {
     return false;
   }
   if (!expect(records[0].header.sequence == 11, "passthrough sequence mismatch") ||
       !expect(records[0].header.opcode == static_cast<std::uint32_t>(RawEventOpcode::PassthroughFinalJson),
               "passthrough opcode mismatch")) {
+    return false;
+  }
+  if (!expect(records[1].header.sequence == 12, "blob passthrough sequence mismatch") ||
+      !expect(records[1].header.opcode == static_cast<std::uint32_t>(RawEventOpcode::PassthroughWithBlob),
+              "blob passthrough opcode mismatch")) {
+    return false;
+  }
+
+  const auto decoded = apitrace::trace::raw::decode_raw_events(reader, records);
+  if (!expect(decoded.error.empty(), "failed to decode raw passthrough events")) {
+    std::cerr << decoded.error << "\n";
+    return false;
+  }
+  if (!expect(decoded.events.size() == 2 &&
+                  decoded.events[1].passthrough &&
+                  decoded.events[1].assets.size() == 1,
+              "blob passthrough did not decode one materialized asset")) {
+    return false;
+  }
+  if (!expect(decoded.events[1].assets[0].payload_bytes == std::vector<std::uint8_t>({0x01, 0x02, 0x03, 0x04}),
+              "blob passthrough materialized wrong raw bytes")) {
     return false;
   }
 

@@ -18,6 +18,22 @@ bool event_references_captured_blob(const trace::EventRecord &event)
          event.payload.find("asset-") != std::string::npos;
 }
 
+trace::raw::RawBlobKind raw_blob_kind_for_asset_kind(trace::AssetKind kind)
+{
+  switch (kind) {
+  case trace::AssetKind::Buffer:
+    return trace::raw::RawBlobKind::Buffer;
+  case trace::AssetKind::ShaderDxbc:
+    return trace::raw::RawBlobKind::ShaderDxbc;
+  case trace::AssetKind::ShaderDxil:
+    return trace::raw::RawBlobKind::ShaderDxil;
+  case trace::AssetKind::RootSignature:
+    return trace::raw::RawBlobKind::RootSignature;
+  default:
+    return trace::raw::RawBlobKind::Unknown;
+  }
+}
+
 void append_passthrough_raw_event(
     trace::raw::RawCaptureWriter &writer,
     const trace::EventRecord &event,
@@ -30,6 +46,54 @@ void append_passthrough_raw_event(
   header.result_or_flags = static_cast<std::uint32_t>(event.callsite.result_code);
   header.payload_len = final_jsonl_record.size();
   writer.append_event(header, final_jsonl_record.data(), final_jsonl_record.size());
+}
+
+bool append_passthrough_with_blob_raw_event(
+    trace::raw::RawCaptureWriter &raw_writer,
+    trace::TraceBundleWriter &bundle_writer,
+    const trace::EventRecord &event,
+    std::string_view final_jsonl_record)
+{
+  const auto assets = bundle_writer.registered_asset_payloads_for_blob_refs(event.blob_refs);
+  if (assets.size() != event.blob_refs.size()) {
+    return false;
+  }
+
+  std::vector<trace::raw::PassthroughBlobDescriptor> descriptors;
+  descriptors.reserve(assets.size());
+  for (const auto &entry : assets) {
+    if (entry.asset.blob_id == 0 ||
+        entry.asset.relative_path.empty() ||
+        !entry.payload) {
+      return false;
+    }
+    const auto raw_kind = raw_blob_kind_for_asset_kind(entry.asset.kind);
+    const auto raw_blob_id = raw_writer.append_blob(
+        entry.payload->empty() ? nullptr : entry.payload->data(),
+        static_cast<std::uint64_t>(entry.payload->size()),
+        static_cast<std::uint32_t>(raw_kind),
+        event.callsite.sequence);
+    if (raw_blob_id == trace::raw::kInvalidRawBlobId) {
+      return false;
+    }
+
+    trace::raw::PassthroughBlobDescriptor descriptor;
+    descriptor.provisional_asset_path = entry.asset.relative_path.generic_string();
+    descriptor.final_blob_id = entry.asset.blob_id;
+    descriptor.raw_blob_id = raw_blob_id;
+    descriptor.raw_blob_kind = static_cast<std::uint32_t>(raw_kind);
+    descriptor.debug_name = entry.asset.debug_name;
+    descriptors.push_back(std::move(descriptor));
+  }
+
+  const auto payload = trace::raw::encode_passthrough_with_blob_payload(final_jsonl_record, descriptors);
+  trace::raw::RawEventHeader header;
+  header.sequence = event.callsite.sequence;
+  header.timestamp_or_monotonic_counter = event.time_ns;
+  header.opcode = static_cast<std::uint32_t>(trace::raw::RawEventOpcode::PassthroughWithBlob);
+  header.result_or_flags = static_cast<std::uint32_t>(event.callsite.result_code);
+  header.payload_len = payload.size();
+  return raw_writer.append_event(header, payload.data(), payload.size());
 }
 
 } // namespace
@@ -183,8 +247,9 @@ void TraceSessionState::append_call_event(trace::EventRecord &&event)
     append_passthrough_raw_event(*raw_writer_, event, final_jsonl_record);
     writer.append_prepared_call_event(std::move(event), final_jsonl_record);
   } else {
-    // TODO(Phase 2a-4): encode blob-bearing events through typed raw opcodes and append raw blobs.
-    writer.append_prepared_call_event(std::move(event));
+    const auto final_jsonl_record = trace::event_record_json(event);
+    append_passthrough_with_blob_raw_event(*raw_writer_, writer, event, final_jsonl_record);
+    writer.append_prepared_call_event(std::move(event), final_jsonl_record);
   }
 }
 

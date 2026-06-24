@@ -243,6 +243,8 @@ bool materialize_raw_blob(
     std::uint64_t raw_blob_id,
     AssetKind expected_kind,
     std::string debug_name,
+    std::uint64_t preferred_blob_id,
+    std::filesystem::path preferred_relative_path,
     AssetRecord &asset,
     std::string &error)
 {
@@ -274,19 +276,45 @@ bool materialize_raw_blob(
     return false;
   }
 
-  const auto [it, inserted] = context.final_blob_by_raw_blob.emplace(raw_blob_id, context.next_blob_id);
-  if (inserted) {
-    ++context.next_blob_id;
+  auto final_blob_id = preferred_blob_id;
+  if (final_blob_id == 0) {
+    const auto [it, inserted] = context.final_blob_by_raw_blob.emplace(raw_blob_id, context.next_blob_id);
+    if (inserted) {
+      ++context.next_blob_id;
+    }
+    final_blob_id = it->second;
   }
 
-  asset.blob_id = it->second;
+  asset.blob_id = final_blob_id;
   asset.kind = kind;
   asset.debug_name = std::move(debug_name);
   asset.byte_size = static_cast<std::uint64_t>(bytes.size());
   asset.binary_payload = true;
   asset.payload_bytes = std::move(bytes);
-  asset.relative_path = generated_asset_relative_path(asset.kind, asset.blob_id);
+  asset.relative_path = std::move(preferred_relative_path);
+  if (asset.relative_path.empty()) {
+    asset.relative_path = generated_asset_relative_path(asset.kind, asset.blob_id);
+  }
   return true;
+}
+
+bool materialize_raw_blob(
+    DecodeContext &context,
+    std::uint64_t raw_blob_id,
+    AssetKind expected_kind,
+    std::string debug_name,
+    AssetRecord &asset,
+    std::string &error)
+{
+  return materialize_raw_blob(
+      context,
+      raw_blob_id,
+      expected_kind,
+      std::move(debug_name),
+      0,
+      {},
+      asset,
+      error);
 }
 
 void stamp_common(EventRecord &event, const RawEventRecord &record)
@@ -642,6 +670,60 @@ bool decode_passthrough_final_json(
   return true;
 }
 
+bool decode_passthrough_with_blob(
+    DecodeContext &context,
+    const RawEventRecord &record,
+    DecodedRawEvent &decoded,
+    std::string &error)
+{
+  PayloadCursor cursor(record.payload);
+  std::string final_jsonl_record;
+  std::uint32_t blob_count = 0;
+  if (!cursor.string(final_jsonl_record) || !cursor.u32(blob_count)) {
+    error = "malformed PassthroughWithBlob payload";
+    return false;
+  }
+
+  decoded.assets.reserve(blob_count);
+  for (std::uint32_t index = 0; index < blob_count; ++index) {
+    PassthroughBlobDescriptor descriptor;
+    if (!cursor.string(descriptor.provisional_asset_path) ||
+        !cursor.u64(descriptor.final_blob_id) ||
+        !cursor.u64(descriptor.raw_blob_id) ||
+        !cursor.u32(descriptor.raw_blob_kind) ||
+        !cursor.string(descriptor.debug_name)) {
+      error = "malformed PassthroughWithBlob blob descriptor";
+      return false;
+    }
+    if (descriptor.provisional_asset_path.empty() || descriptor.final_blob_id == 0) {
+      error = "PassthroughWithBlob descriptor is missing provisional asset path or final blob id";
+      return false;
+    }
+
+    AssetRecord asset;
+    if (!materialize_raw_blob(
+            context,
+            descriptor.raw_blob_id,
+            asset_kind_from_raw_blob_kind(descriptor.raw_blob_kind),
+            std::move(descriptor.debug_name),
+            descriptor.final_blob_id,
+            std::filesystem::path(descriptor.provisional_asset_path),
+            asset,
+            error)) {
+      return false;
+    }
+    decoded.assets.push_back(std::move(asset));
+  }
+  if (!cursor.done()) {
+    error = "malformed PassthroughWithBlob trailing payload bytes";
+    return false;
+  }
+
+  decoded.passthrough = true;
+  decoded.passthrough_jsonl_record = std::move(final_jsonl_record);
+  return true;
+}
+
 } // namespace
 
 std::string raw_event_contract_markdown()
@@ -658,7 +740,8 @@ std::string raw_event_contract_markdown()
       "- Dispatch 0x0302: u64 command_list_object_id, u32 thread_group_count_x, u32 thread_group_count_y, u32 thread_group_count_z.\n"
       "- PresentCall 0x0401 / PresentBoundary 0x0404: u64 swap_chain_object_id, u64 frame_index, u32 sync_interval, u32 flags.\n"
       "- FrameBegin 0x0402 / FrameEnd 0x0403: u64 frame_index. Final payloads include label=FrameBegin or label=FrameEnd for existing tail-consistency checks.\n"
-      "- Passthrough 0x0001: opaque final_jsonl_record bytes. Payload is the exact UTF-8 final callstream JSON line, without a length prefix or trailing newline. Finalization writes this opaque callstream JSON line unchanged for events not covered by the binary subset. Passthrough records do not declare raw blob ids; producers that need raw blob canonicalization must use a binary opcode for the blob-bearing event.\n";
+      "- Passthrough 0x0001: opaque final_jsonl_record bytes. Payload is the exact UTF-8 final callstream JSON line, without a length prefix or trailing newline. Finalization writes this opaque callstream JSON line unchanged for events not covered by the binary subset and not referencing assets.\n"
+      "- PassthroughWithBlob 0x0002: str final_jsonl_record, u32 blob_count, repeated descriptor {str provisional_asset_path, u64 final_blob_id, u64 raw_blob_id, u32 raw_blob_kind, str debug_name}. The JSON line is still opaque and byte-identical to the live final callstream line. Finalization materializes each raw blob to provisional_asset_path using final_blob_id, writes the JSON line unchanged, then existing bundle finalize stages hash, dedup, canonicalize, and rewrite references.\n";
 }
 
 std::vector<std::uint8_t> encode_resource_create_payload(
@@ -787,6 +870,23 @@ std::vector<std::uint8_t> encode_passthrough_final_json_payload(std::string_view
   return bytes;
 }
 
+std::vector<std::uint8_t> encode_passthrough_with_blob_payload(
+    std::string_view final_jsonl_record,
+    const std::vector<PassthroughBlobDescriptor> &blobs)
+{
+  std::vector<std::uint8_t> bytes;
+  put_string(bytes, std::string(final_jsonl_record));
+  put_u32(bytes, static_cast<std::uint32_t>(blobs.size()));
+  for (const auto &blob : blobs) {
+    put_string(bytes, blob.provisional_asset_path);
+    put_u64(bytes, blob.final_blob_id);
+    put_u64(bytes, blob.raw_blob_id);
+    put_u32(bytes, blob.raw_blob_kind);
+    put_string(bytes, blob.debug_name);
+  }
+  return bytes;
+}
+
 RawDecodeResult decode_raw_events(
     const RawCaptureReader &reader,
     const std::vector<RawEventRecord> &records)
@@ -801,6 +901,9 @@ RawDecodeResult decode_raw_events(
     switch (static_cast<RawEventOpcode>(record.header.opcode)) {
     case RawEventOpcode::Passthrough:
       ok = decode_passthrough_final_json(record, decoded, result.error);
+      break;
+    case RawEventOpcode::PassthroughWithBlob:
+      ok = decode_passthrough_with_blob(context, record, decoded, result.error);
       break;
     case RawEventOpcode::ResourceCreate:
       ok = decode_resource_create(record, decoded, result.error);

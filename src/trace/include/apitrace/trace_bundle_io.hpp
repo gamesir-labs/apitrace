@@ -37,6 +37,11 @@ enum class TraceBundleOpenMode {
 
 class TraceBundleWriter {
 public:
+  struct RegisteredAssetPayload {
+    AssetRecord asset;
+    std::shared_ptr<const std::vector<std::uint8_t>> payload;
+  };
+
   TraceBundleWriter();
   ~TraceBundleWriter();
 
@@ -57,6 +62,8 @@ public:
   void append_metal_event(const MetalEventRecord &event);
   AssetRecord register_asset(const AssetRecord &asset);
   AssetRecord register_asset(AssetRecord &&asset);
+  std::vector<RegisteredAssetPayload> registered_asset_payloads_for_blob_refs(
+      const std::vector<BlobId> &blob_refs);
   AssetRecord register_metal_asset(MetalAssetKind kind, const AssetRecord &asset);
   AssetRecord register_metal_asset(MetalAssetKind kind, AssetRecord &&asset);
   void write_object_index(const std::vector<ObjectRecord> &objects);
