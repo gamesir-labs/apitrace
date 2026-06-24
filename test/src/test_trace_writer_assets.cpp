@@ -1745,6 +1745,83 @@ int main(int argc, char **argv)
   }
   unset_env_var("APITRACE_CHECKPOINT_ASSET_BYTES");
 
+  {
+    std::ofstream unopened_output;
+    const auto unopened_sparse_result =
+        apitrace::trace::TraceBundleWriter::TestHooks::write_payload_sparse_for_test(unopened_output, small_bytes);
+    const auto unopened_direct_result =
+        apitrace::trace::TraceBundleWriter::TestHooks::write_payload_direct_for_test(unopened_output, small_bytes);
+    if (unopened_sparse_result || unopened_direct_result) {
+      std::cerr << "unopened asset output streams must report write failure\n";
+      return 1;
+    }
+  }
+
+  const auto retry_spool_bundle =
+      bundle.parent_path() / (bundle.filename().generic_string() + "-asset-spool-retry");
+  std::filesystem::remove_all(retry_spool_bundle);
+  set_env_var("APITRACE_TEST_ASSET_SPOOL_FAIL_BEFORE_SUCCESS", "1");
+  {
+    apitrace::trace::TraceBundleWriter retry_writer;
+    if (!retry_writer.open(retry_spool_bundle)) {
+      std::cerr << "failed to open asset-spool-retry bundle\n";
+      return 1;
+    }
+    retry_writer.write_metadata({apitrace::trace::ApiKind::D3D12, 1, "asset-spool-retry-test", false});
+    std::vector<std::uint8_t> retry_bytes(96 * 1024, 0x44);
+    apitrace::trace::AssetRecord retry_asset;
+    retry_asset.blob_id = 913;
+    retry_asset.kind = apitrace::trace::AssetKind::Buffer;
+    retry_asset.debug_name = "d3d12-resource-unmap";
+    retry_asset.payload_bytes = retry_bytes;
+    retry_asset = retry_writer.register_asset(std::move(retry_asset));
+    retry_writer.seal_checkpoint();
+    retry_writer.close();
+  }
+  unset_env_var("APITRACE_TEST_ASSET_SPOOL_FAIL_BEFORE_SUCCESS");
+  const auto retry_assets_json = read_text(retry_spool_bundle / "assets.json");
+  if (!contains_json_u64_field(retry_assets_json, "blob_id", 913) ||
+      retry_assets_json.find("\"payload_path\"") == std::string::npos ||
+      !std::filesystem::is_regular_file(retry_spool_bundle / "spool" / "asset-payloads.bin") ||
+      std::filesystem::is_regular_file(retry_spool_bundle / "capture-incomplete.json") ||
+      !std::filesystem::is_regular_file(retry_spool_bundle / "seal-checkpoint-primary.ready")) {
+    std::cerr << "retryable spooled asset write should retry and publish durable completion\n";
+    return 1;
+  }
+
+  const auto terminal_spool_bundle =
+      bundle.parent_path() / (bundle.filename().generic_string() + "-asset-spool-terminal-failure");
+  std::filesystem::remove_all(terminal_spool_bundle);
+  set_env_var("APITRACE_TEST_ASSET_SPOOL_TERMINAL_FAILURE", "1");
+  {
+    apitrace::trace::TraceBundleWriter terminal_writer;
+    if (!terminal_writer.open(terminal_spool_bundle)) {
+      std::cerr << "failed to open asset-spool-terminal-failure bundle\n";
+      return 1;
+    }
+    terminal_writer.write_metadata({apitrace::trace::ApiKind::D3D12, 1, "asset-spool-terminal-test", false});
+    std::vector<std::uint8_t> terminal_bytes(96 * 1024, 0x55);
+    apitrace::trace::AssetRecord terminal_asset;
+    terminal_asset.blob_id = 914;
+    terminal_asset.kind = apitrace::trace::AssetKind::Buffer;
+    terminal_asset.debug_name = "d3d12-resource-unmap";
+    terminal_asset.payload_bytes = terminal_bytes;
+    terminal_asset = terminal_writer.register_asset(std::move(terminal_asset));
+    terminal_writer.seal_checkpoint();
+    terminal_writer.close();
+  }
+  unset_env_var("APITRACE_TEST_ASSET_SPOOL_TERMINAL_FAILURE");
+  const auto terminal_assets_json = read_text(terminal_spool_bundle / "assets.json");
+  const auto terminal_incomplete_json = read_text(terminal_spool_bundle / "capture-incomplete.json");
+  if (contains_json_u64_field(terminal_assets_json, "blob_id", 914) ||
+      terminal_incomplete_json.find("\"status\": \"incomplete\"") == std::string::npos ||
+      !contains_json_u64_field(terminal_incomplete_json, "blob_id", 914) ||
+      terminal_incomplete_json.find("injected terminal spool write failure") == std::string::npos ||
+      std::filesystem::is_regular_file(terminal_spool_bundle / "seal-checkpoint-primary.ready")) {
+    std::cerr << "terminal spooled asset write should make the capture loudly incomplete without ready marker\n";
+    return 1;
+  }
+
   if (!bundle_finalize.empty()) {
     const auto middle_missing_blob_bundle =
         bundle.parent_path() / (bundle.filename().generic_string() + "-middle-missing-blob");

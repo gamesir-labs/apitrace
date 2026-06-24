@@ -23,6 +23,7 @@
 #include <optional>
 #include <sstream>
 #include <system_error>
+#include <cerrno>
 #include <thread>
 #include <string_view>
 #include <unordered_map>
@@ -1701,6 +1702,9 @@ std::size_t env_size_or_default(const char *name, std::size_t default_value)
 
 struct SparseWriteResult {
   bool ok = true;
+  bool retryable = false;
+  int error_code = 0;
+  std::string reason;
   std::uint64_t zero_run_count = 0;
   std::uint64_t zero_bytes_skipped = 0;
 };
@@ -1716,6 +1720,43 @@ struct SparseIoStats {
 };
 
 constexpr std::size_t kSparseZeroRunBytes = 64ull * 1024ull;
+
+SparseWriteResult sparse_write_failure(
+    std::string reason,
+    int error_code = 0,
+    bool retryable = false)
+{
+  SparseWriteResult result;
+  result.ok = false;
+  result.retryable = retryable;
+  result.error_code = error_code;
+  result.reason = std::move(reason);
+  return result;
+}
+
+void merge_sparse_write_stats(SparseWriteResult &target, const SparseWriteResult &source)
+{
+  target.zero_run_count += source.zero_run_count;
+  target.zero_bytes_skipped += source.zero_bytes_skipped;
+}
+
+SparseWriteResult close_payload_stream(
+    std::ofstream &output,
+    const SparseIoStats *stats = nullptr)
+{
+  if (!output.is_open())
+    return {};
+  {
+    TimedAtomicWriterPhase phase(stats ? stats->close : nullptr);
+    output.flush();
+    if (!output.good())
+      return sparse_write_failure("output stream flush failed");
+    output.close();
+  }
+  if (!output.good())
+    return sparse_write_failure("output stream close failed");
+  return {};
+}
 
 bool is_zero_range(const std::uint8_t *data, std::size_t size)
 {
@@ -1778,7 +1819,7 @@ SparseWriteResult write_payload_sparse(
 {
   SparseWriteResult result;
   if (!output.is_open()) {
-    return result;
+    return sparse_write_failure("output stream is not open");
   }
 
   auto write_range = [&output, &payload, stats](std::size_t offset, std::size_t size) {
@@ -1804,6 +1845,7 @@ SparseWriteResult write_payload_sparse(
       break;
     if (!write_range(segment_start, zero_start - segment_start)) {
       result.ok = false;
+      result.reason = "output stream write failed";
       return result;
     }
     const auto run_size = zero_end - zero_start;
@@ -1813,6 +1855,7 @@ SparseWriteResult write_payload_sparse(
     }
     if (!output.good()) {
       result.ok = false;
+      result.reason = "output stream seek failed";
       return result;
     }
     ++result.zero_run_count;
@@ -1822,6 +1865,7 @@ SparseWriteResult write_payload_sparse(
 
   if (!write_range(segment_start, payload.size() - segment_start)) {
     result.ok = false;
+    result.reason = "output stream write failed";
     return result;
   }
 
@@ -1832,6 +1876,8 @@ SparseWriteResult write_payload_sparse(
     output.write(&last_byte, 1);
   }
   result.ok = output.good();
+  if (!result.ok)
+    result.reason = "output stream final write failed";
   return result;
 }
 
@@ -1847,7 +1893,7 @@ SparseWriteResult write_payload_direct(
 {
   SparseWriteResult result;
   if (!output.is_open()) {
-    return result;
+    return sparse_write_failure("output stream is not open");
   }
   {
     TimedAtomicWriterPhase phase(stats ? stats->stream_write : nullptr);
@@ -1856,6 +1902,8 @@ SparseWriteResult write_payload_direct(
         static_cast<std::streamsize>(payload.size()));
   }
   result.ok = output.good();
+  if (!result.ok)
+    result.reason = "output stream write failed";
   return result;
 }
 
@@ -1883,6 +1931,7 @@ HashedSparseWriteResult hash_and_write_payload_sparse(
     TimedAtomicWriterPhase phase(stats ? stats->hash_update : nullptr);
     sha256.update(payload.data(), payload.size());
     result.digest = sha256.final_hex();
+    result.sparse = sparse_write_failure("output stream is not open");
     return result;
   }
 
@@ -1935,6 +1984,7 @@ HashedSparseWriteResult hash_and_write_payload_sparse(
     hash_segment_start = zero_end;
     if (!write_range(segment_start, zero_start - segment_start)) {
       result.sparse.ok = false;
+      result.sparse.reason = "output stream write failed";
       result.digest = finish_digest();
       return result;
     }
@@ -1944,6 +1994,7 @@ HashedSparseWriteResult hash_and_write_payload_sparse(
     }
     if (!output.good()) {
       result.sparse.ok = false;
+      result.sparse.reason = "output stream seek failed";
       result.digest = finish_digest();
       return result;
     }
@@ -1956,6 +2007,7 @@ HashedSparseWriteResult hash_and_write_payload_sparse(
 
   if (!write_range(segment_start, payload.size() - segment_start)) {
     result.sparse.ok = false;
+    result.sparse.reason = "output stream write failed";
     result.digest = digest;
     return result;
   }
@@ -1967,6 +2019,8 @@ HashedSparseWriteResult hash_and_write_payload_sparse(
     output.write(&last_byte, 1);
   }
   result.sparse.ok = output.good();
+  if (!result.sparse.ok)
+    result.sparse.reason = "output stream final write failed";
   result.digest = digest;
   return result;
 }
@@ -2571,6 +2625,12 @@ private:
 
 class AsyncAssetWriter {
 public:
+  enum class CompletionStatus {
+    Durable,
+    RetryableFailure,
+    TerminalFailure,
+  };
+
   AsyncAssetWriter() = default;
   AsyncAssetWriter(const AsyncAssetWriter &) = delete;
   AsyncAssetWriter &operator=(const AsyncAssetWriter &) = delete;
@@ -2607,6 +2667,11 @@ public:
     spool_write_enabled_ = enabled;
   }
 
+  void set_integrity_enabled(bool enabled)
+  {
+    integrity_enabled_ = enabled;
+  }
+
   void set_spool_path(std::filesystem::path path)
   {
     spool_path_ = std::move(path);
@@ -2616,6 +2681,16 @@ public:
       if (!error)
         spool_next_offset_.store(existing_size, std::memory_order_relaxed);
     }
+  }
+
+  void set_test_failures_before_success(std::size_t count)
+  {
+    test_failures_before_success_ = count;
+  }
+
+  void set_test_terminal_failure(bool enabled)
+  {
+    test_terminal_failure_ = enabled;
   }
 
   std::uint64_t reserve_spool_range(std::uint64_t byte_size)
@@ -2681,8 +2756,12 @@ public:
 	    bool hash_only_candidate = false;
 	    bool hash_only_avoided_write = false;
 	    std::uint64_t hash_only_write_bytes_avoided = 0;
-	    bool existing_hash_size_mismatch = false;
-	    bool deferred_content_hash = false;
+    bool existing_hash_size_mismatch = false;
+    bool deferred_content_hash = false;
+    CompletionStatus status = CompletionStatus::Durable;
+    std::string failure_reason;
+    int failure_error_code = 0;
+    std::size_t attempt = 0;
 	  };
 
   void set_completion_callback(std::function<void(const Completion &)> callback)
@@ -2939,11 +3018,18 @@ private:
 	    bool defer_content_hash = false;
 	    std::uint64_t fingerprint_order = 0;
 	    bool bulk_layer = false;
+	    std::size_t attempt = 0;
 	  };
+
+  static constexpr std::size_t kDefaultMaxWriteAttempts = 3;
 
   SparseWriteResult write_spooled_payload(const Job &job)
   {
     SparseWriteResult result;
+    if (test_terminal_failure_)
+      return sparse_write_failure("injected terminal spool write failure", EIO, false);
+    if (job.attempt < test_failures_before_success_)
+      return sparse_write_failure("injected retryable spool write failure", EIO, true);
 #ifndef _WIN32
     {
       TimedAtomicWriterPhase phase(lock_stats_ ? &file_open_stats_ : nullptr);
@@ -2953,8 +3039,7 @@ private:
         spool_fd_ = ::open(spool_path_.c_str(), O_CREAT | O_WRONLY, 0644);
       }
       if (spool_fd_ < 0) {
-        result.ok = false;
-        return result;
+        return sparse_write_failure("spool file open failed", errno, true);
       }
     }
 
@@ -2972,15 +3057,15 @@ private:
       if (written < 0) {
         if (errno == EINTR)
           continue;
-        result.ok = false;
-        return result;
+        return sparse_write_failure("spool pwrite failed", errno, true);
       }
       if (written == 0) {
-        result.ok = false;
-        return result;
+        return sparse_write_failure("spool pwrite made no progress", 0, true);
       }
       written_total += static_cast<std::size_t>(written);
     }
+    if (::fsync(spool_fd_) != 0)
+      return sparse_write_failure("spool fsync failed", errno, true);
 #else
     std::lock_guard<std::mutex> spool_lock(spool_mutex_);
     {
@@ -3004,9 +3089,13 @@ private:
       spool_stream_.write(
           reinterpret_cast<const char *>(job.payload->data()),
           static_cast<std::streamsize>(job.payload->size()));
-      result.ok = spool_stream_.good();
+      if (!spool_stream_.good())
+        return sparse_write_failure("spool stream write failed", 0, true);
+      spool_stream_.flush();
+      if (!spool_stream_.good())
+        return sparse_write_failure("spool stream flush failed", 0, true);
     } else {
-      result.ok = false;
+      return sparse_write_failure("spool stream open failed", 0, true);
     }
 #endif
     return result;
@@ -3081,6 +3170,77 @@ private:
       if (job.hash_only_if_final_exists)
         wait_for_fingerprint_turn();
 
+      auto advance_fingerprint_order = [&]() {
+        if (job.fingerprint_key.empty() || job.fingerprint_order == 0)
+          return;
+        TimedWriterLock lock(mutex_, lock_stats_);
+        fingerprint_completed_counts_[job.fingerprint_key] = std::max(
+            fingerprint_completed_counts_[job.fingerprint_key],
+            job.fingerprint_order);
+        const auto enqueued = fingerprint_enqueued_counts_.find(job.fingerprint_key);
+        const auto completed = fingerprint_completed_counts_.find(job.fingerprint_key);
+        if (enqueued != fingerprint_enqueued_counts_.end() &&
+            completed != fingerprint_completed_counts_.end() &&
+            completed->second >= enqueued->second) {
+          fingerprint_enqueued_counts_.erase(enqueued);
+          fingerprint_completed_counts_.erase(completed);
+        }
+      };
+
+      auto requeue_retry = [&]() {
+        ++job.attempt;
+        TimedWriterLock lock(mutex_, lock_stats_);
+        queue_.push_front(std::move(job));
+        writing_ = false;
+      };
+
+      auto finish_accounting = [&](std::uint64_t payload_size) {
+        TimedAtomicWriterPhase phase(lock_stats_ ? &completion_lock_stats_ : nullptr);
+        TimedWriterLock lock(mutex_, lock_stats_);
+        pending_bytes_ = payload_size > pending_bytes_ ? 0 : pending_bytes_ - payload_size;
+        if (job.bulk_layer) {
+          bulk_pending_bytes_ = payload_size > bulk_pending_bytes_ ? 0 : bulk_pending_bytes_ - payload_size;
+        } else {
+          regular_pending_bytes_ = payload_size > regular_pending_bytes_ ? 0 : regular_pending_bytes_ - payload_size;
+        }
+        writing_ = false;
+      };
+
+      auto emit_completion = [&](CompletionStatus status,
+                                 const std::filesystem::path &final_relative_path,
+                                 const std::string &completion_digest,
+                                 const SparseWriteResult &sparse_result,
+                                 bool completion_hash_only_avoided_write,
+                                 bool completion_existing_hash_size_mismatch,
+                                 std::uint64_t payload_size) {
+        if (!completion_callback_)
+          return;
+        TimedAtomicWriterPhase phase(lock_stats_ ? &completion_callback_stats_ : nullptr);
+        completion_callback_(Completion{
+            job.asset,
+            job.relative_path,
+            final_relative_path,
+            completion_digest,
+            job.content_key,
+            job.fingerprint_key,
+            job.payload,
+            sparse_result.zero_run_count,
+            sparse_result.zero_bytes_skipped,
+            job.metal_kind,
+            job.metal,
+            job.spooled_payload,
+            job.hash_only_if_final_exists,
+            completion_hash_only_avoided_write,
+            completion_hash_only_avoided_write ? payload_size : 0,
+            completion_existing_hash_size_mismatch,
+            job.defer_content_hash,
+            status,
+            sparse_result.reason,
+            sparse_result.error_code,
+            job.attempt + 1,
+        });
+      };
+
       std::ofstream output;
       HashedSparseWriteResult hashed_write;
       if (digest.empty() && !can_hash_address && !job.asset.content_hash.empty()) {
@@ -3101,7 +3261,7 @@ private:
         }
         existing_hash_size_mismatch = size_mismatch;
       }
-      if (digest.empty() && write_to_spool) {
+      if (write_to_spool) {
         hashed_write.sparse = write_spooled_payload(job);
         if (!hashed_write.sparse.ok) {
 #ifdef _WIN32
@@ -3113,11 +3273,6 @@ private:
           // Keep the descriptor open until shutdown; another async worker may
           // already be issuing a positional write against it.
 #endif
-          job.asset.payload_path.clear();
-          job.asset.payload_offset = 0;
-          write_to_spool = false;
-          std::filesystem::create_directories(job.target_path.parent_path());
-          output.open(job.target_path, std::ios::binary | std::ios::trunc);
         }
       } else if (digest.empty()) {
         TimedAtomicWriterPhase phase(lock_stats_ ? &file_open_stats_ : nullptr);
@@ -3131,6 +3286,7 @@ private:
 	          sparse_stats.stream_write = &sparse_stream_write_stats_;
 	          sparse_stats.seek = &sparse_seek_stats_;
 	          sparse_stats.final_touch = &sparse_final_touch_stats_;
+            sparse_stats.close = &file_close_stats_;
 	        }
 	        if (job.defer_content_hash) {
 	          TimedAtomicWriterPhase phase(lock_stats_ ? &write_without_hash_stats_ : nullptr);
@@ -3144,18 +3300,15 @@ private:
 	        }
 	      }
       auto sparse_result = hashed_write.sparse;
-      if (!sparse_result.ok) {
-        TimedAtomicWriterPhase phase(lock_stats_ ? &file_close_stats_ : nullptr);
-        output.close();
-      }
       if (output.is_open()) {
-        TimedAtomicWriterPhase phase(lock_stats_ ? &file_close_stats_ : nullptr);
-        output.close();
+        const auto close_result = close_payload_stream(output);
+        if (sparse_result.ok && !close_result.ok)
+          sparse_result = close_result;
       }
 
       auto final_relative_path = job.relative_path;
       auto final_path = job.target_path;
-	      if (!digest.empty() && can_hash_address) {
+	      if (sparse_result.ok && !digest.empty() && can_hash_address) {
         final_relative_path = job.hashed_directory_relative_path / (digest + job.hashed_extension);
         final_path = job.hashed_directory_path / (digest + job.hashed_extension);
         std::filesystem::create_directories(final_path.parent_path());
@@ -3197,19 +3350,20 @@ private:
               sparse_stats.stream_write = &sparse_stream_write_stats_;
               sparse_stats.seek = &sparse_seek_stats_;
               sparse_stats.final_touch = &sparse_final_touch_stats_;
+              sparse_stats.close = &file_close_stats_;
             }
 	            const auto late_sparse_result = sparse_write_enabled_
 	                                                ? write_payload_sparse(late_output, *job.payload, &sparse_stats)
 	                                                : write_payload_direct(late_output, *job.payload, &sparse_stats);
-            if (late_output.is_open()) {
-              TimedAtomicWriterPhase close_phase(lock_stats_ ? &file_close_stats_ : nullptr);
-              late_output.close();
-            }
-            sparse_result.zero_run_count += late_sparse_result.zero_run_count;
-            sparse_result.zero_bytes_skipped += late_sparse_result.zero_bytes_skipped;
+            auto late_result = late_sparse_result;
+            const auto close_result = close_payload_stream(late_output);
+            if (late_result.ok && !close_result.ok)
+              late_result = close_result;
+            merge_sparse_write_stats(sparse_result, late_result);
             if (!late_sparse_result.ok) {
               final_relative_path = job.relative_path;
               final_path = job.target_path;
+              sparse_result = late_result;
             }
           }
           if (std::filesystem::exists(job.target_path) && final_path != job.target_path) {
@@ -3235,6 +3389,30 @@ private:
       }
 
       const auto payload_size = job.payload->size();
+      if (!sparse_result.ok && integrity_enabled_) {
+        const bool retryable = sparse_result.retryable &&
+                               job.attempt + 1 < kDefaultMaxWriteAttempts;
+        if (retryable) {
+          requeue_retry();
+          cv_work_.notify_all();
+          cv_fingerprint_.notify_all();
+          continue;
+        }
+        advance_fingerprint_order();
+        cv_fingerprint_.notify_all();
+        emit_completion(
+            CompletionStatus::TerminalFailure,
+            final_relative_path,
+            digest,
+            sparse_result,
+            hash_only_avoided_write,
+            existing_hash_size_mismatch,
+            payload_size);
+        finish_accounting(payload_size);
+        cv_work_.notify_all();
+        continue;
+      }
+
       const auto temporary_key = job.relative_path.generic_string();
       const auto digest_key = final_relative_path.generic_string();
       const bool hash_addressed = can_hash_address && temporary_key != digest_key;
@@ -3244,54 +3422,18 @@ private:
         if (hash_addressed) {
           completed_path_aliases_[temporary_key] = digest_key;
         }
-        if (!job.fingerprint_key.empty() && job.fingerprint_order != 0) {
-          fingerprint_completed_counts_[job.fingerprint_key] = std::max(
-              fingerprint_completed_counts_[job.fingerprint_key],
-              job.fingerprint_order);
-          const auto enqueued = fingerprint_enqueued_counts_.find(job.fingerprint_key);
-          const auto completed = fingerprint_completed_counts_.find(job.fingerprint_key);
-          if (enqueued != fingerprint_enqueued_counts_.end() &&
-              completed != fingerprint_completed_counts_.end() &&
-              completed->second >= enqueued->second) {
-            fingerprint_enqueued_counts_.erase(enqueued);
-            fingerprint_completed_counts_.erase(completed);
-          }
-        }
       }
+      advance_fingerprint_order();
       cv_fingerprint_.notify_all();
-      if (completion_callback_) {
-	        TimedAtomicWriterPhase phase(lock_stats_ ? &completion_callback_stats_ : nullptr);
-	        completion_callback_(Completion{
-	            job.asset,
-	            job.relative_path,
-	            final_relative_path,
-	            digest,
-	            std::move(job.content_key),
-            std::move(job.fingerprint_key),
-            job.payload,
-            sparse_result.zero_run_count,
-            sparse_result.zero_bytes_skipped,
-	            job.metal_kind,
-	            job.metal,
-            job.spooled_payload,
-	            job.hash_only_if_final_exists,
-	            hash_only_avoided_write,
-	            hash_only_avoided_write ? payload_size : 0,
-	            existing_hash_size_mismatch,
-	            job.defer_content_hash,
-	        });
-	      }
-      {
-        TimedAtomicWriterPhase phase(lock_stats_ ? &completion_lock_stats_ : nullptr);
-        TimedWriterLock lock(mutex_, lock_stats_);
-        pending_bytes_ -= payload_size;
-        if (job.bulk_layer) {
-          bulk_pending_bytes_ = payload_size > bulk_pending_bytes_ ? 0 : bulk_pending_bytes_ - payload_size;
-        } else {
-          regular_pending_bytes_ = payload_size > regular_pending_bytes_ ? 0 : regular_pending_bytes_ - payload_size;
-        }
-        writing_ = false;
-      }
+      emit_completion(
+          CompletionStatus::Durable,
+          final_relative_path,
+          digest,
+          sparse_result,
+          hash_only_avoided_write,
+          existing_hash_size_mismatch,
+          payload_size);
+      finish_accounting(payload_size);
       cv_work_.notify_all();
     }
   }
@@ -3316,6 +3458,9 @@ private:
 	  std::size_t worker_count_ = default_async_asset_worker_count();
 	  bool sparse_write_enabled_ = false;
   bool spool_write_enabled_ = false;
+  bool integrity_enabled_ = true;
+  std::size_t test_failures_before_success_ = 0;
+  bool test_terminal_failure_ = false;
   std::atomic_uint64_t spool_next_offset_{0};
 	  std::size_t pending_bytes_ = 0;
   std::size_t regular_pending_bytes_ = 0;
@@ -4014,6 +4159,17 @@ std::string fast_fingerprint_bytes(const void *data, std::size_t size)
   return output.str();
 }
 
+struct CaptureFailureRecord {
+  BlobId blob_id = 0;
+  std::filesystem::path relative_path;
+  std::filesystem::path payload_path;
+  std::uint64_t payload_offset = 0;
+  std::uint64_t byte_size = 0;
+  int error_code = 0;
+  std::size_t attempts = 0;
+  std::string reason;
+};
+
 struct TraceBundleWriter::Impl {
   BundleLayout layout;
   TraceMetadata metadata;
@@ -4061,6 +4217,7 @@ struct TraceBundleWriter::Impl {
   std::mutex spool_checkpoint_mutex;
   std::map<std::uint64_t, std::uint64_t> completed_spool_ranges;
   std::uint64_t spool_checkpoint_committed_offset = 0;
+  std::vector<CaptureFailureRecord> asset_write_failures;
 	  std::atomic_uint64_t next_asset_id{1};
   std::size_t async_asset_threshold = 1024ull * 1024ull;
   std::size_t exact_dedup_compare_threshold = 1ull * 1024ull * 1024ull;
@@ -4577,7 +4734,7 @@ struct TraceBundleWriter::Impl {
 	    return asset;
 	  }
 
-	  AssetRecord publish_metal_asset(AssetRecord asset)
+  AssetRecord publish_metal_asset(AssetRecord asset)
   {
     TimedWriterLock lock(asset_record_mutex, writer_stats ? &asset_record_lock_stats : nullptr);
     asset = reserve_blob_id_locked(std::move(asset));
@@ -4586,15 +4743,6 @@ struct TraceBundleWriter::Impl {
     metal_asset_record_indices_by_path[asset.relative_path.generic_string()].push_back(index);
 	    return asset;
 	  }
-
-			  void publish_queued_asset_for_async_write(AssetRecord asset, bool metal)
-				  {
-				    if (metal) {
-				      publish_metal_asset(std::move(asset));
-				    } else {
-				      publish_asset(std::move(asset));
-				    }
-					  }
 
   void mark_spooled_payload_complete(const AssetRecord &asset)
   {
@@ -4638,6 +4786,82 @@ struct TraceBundleWriter::Impl {
   {
     std::lock_guard lock(spool_checkpoint_mutex);
     return spool_checkpoint_committed_offset;
+  }
+
+  std::string capture_incomplete_json() const
+  {
+    std::ostringstream output;
+    output << "{\n  \"status\": \"incomplete\",\n  \"asset_write_failures\": [";
+    for (std::size_t index = 0; index < asset_write_failures.size(); ++index) {
+      const auto &failure = asset_write_failures[index];
+      if (index != 0)
+        output << ",";
+      output << "\n    {"
+             << "\"blob_id\":" << failure.blob_id
+             << ",\"path\":\"" << json_escape(failure.relative_path.generic_string()) << "\""
+             << ",\"payload_path\":\"" << json_escape(failure.payload_path.generic_string()) << "\""
+             << ",\"payload_offset\":" << failure.payload_offset
+             << ",\"byte_size\":" << failure.byte_size
+             << ",\"error_code\":" << failure.error_code
+             << ",\"attempts\":" << failure.attempts
+             << ",\"reason\":\"" << json_escape(failure.reason) << "\""
+             << "}";
+    }
+    if (!asset_write_failures.empty())
+      output << "\n  ";
+    output << "]\n}\n";
+    return output.str();
+  }
+
+  bool has_capture_failures()
+  {
+    TimedWriterLock lock(asset_mutex, writer_stats ? &asset_lock_stats : nullptr);
+    return !asset_write_failures.empty();
+  }
+
+  bool write_capture_incomplete_file()
+  {
+    std::string incomplete_json;
+    {
+      TimedWriterLock lock(asset_mutex, writer_stats ? &asset_lock_stats : nullptr);
+      if (asset_write_failures.empty())
+        return false;
+      incomplete_json = capture_incomplete_json();
+    }
+    write_text_atomic(layout.root_path / "capture-incomplete.json", incomplete_json);
+    TimedWriterLock lock(asset_mutex, writer_stats ? &asset_lock_stats : nullptr);
+    known_file_digests["capture-incomplete.json"] =
+        content_hash_bytes(incomplete_json.data(), incomplete_json.size());
+    known_file_sizes["capture-incomplete.json"] = incomplete_json.size();
+    return true;
+  }
+
+  void record_asset_write_failure(const AsyncAssetWriter::Completion &completion)
+  {
+    TimedWriterLock lock(asset_mutex, writer_stats ? &asset_lock_stats : nullptr);
+    asset_write_failures.push_back(CaptureFailureRecord{
+        completion.asset.blob_id,
+        completion.asset.relative_path,
+        completion.asset.payload_path,
+        completion.asset.payload_offset,
+        completion.asset.byte_size,
+        completion.failure_error_code,
+        completion.attempt,
+        completion.failure_reason.empty() ? "asset write failed" : completion.failure_reason,
+    });
+    if (!completion.fingerprint_key.empty()) {
+      if (completion.metal) {
+        remove_pending_asset(
+            pending_metal_assets_by_fast_fingerprint,
+            completion.fingerprint_key,
+            completion.relative_path);
+      } else {
+        remove_pending_asset(
+            pending_assets_by_fast_fingerprint,
+            completion.fingerprint_key,
+            completion.relative_path);
+      }
+    }
   }
 
   bool asset_checkpointable(
@@ -4689,6 +4913,10 @@ struct TraceBundleWriter::Impl {
 
 		  void process_asset_completion(const AsyncAssetWriter::Completion &completion)
 		  {
+        if (completion.status != AsyncAssetWriter::CompletionStatus::Durable) {
+          record_asset_write_failure(completion);
+          return;
+        }
 		    const auto completed_byte_size = completion.asset.byte_size;
 			    auto finalized = completion.asset;
 			    if (!completion.digest.empty())
@@ -4798,13 +5026,17 @@ struct TraceBundleWriter::Impl {
 	    }
 	    if (!completion.fingerprint_key.empty()) {
 	      TimedWriterLock lock(fingerprint_hash_mutex, writer_stats ? &asset_lock_stats : nullptr);
-	      if (completion.metal) {
-	        metal_content_hash_by_fast_fingerprint[completion.fingerprint_key] = completion.digest;
-	      } else {
-	        content_hash_by_fast_fingerprint[completion.fingerprint_key] = completion.digest;
-	      }
+        if (completion.metal) {
+          metal_content_hash_by_fast_fingerprint[completion.fingerprint_key] = completion.digest;
+        } else {
+          content_hash_by_fast_fingerprint[completion.fingerprint_key] = completion.digest;
+        }
 	    }
-	    update_published_asset_record(finalized, completion.metal, completion.asset.relative_path);
+      if (completion.metal) {
+        finalized = publish_metal_asset(std::move(finalized));
+      } else {
+        finalized = publish_asset(std::move(finalized));
+      }
     if (completion.spooled_payload)
       mark_spooled_payload_complete(finalized);
 	    signal_checkpoint_work(0, completed_byte_size);
@@ -5378,8 +5610,13 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
 	  impl_->asset_writer.set_bulk_threshold(env_size_or_default("APITRACE_ASYNC_ASSET_BULK_THRESHOLD", impl_->async_asset_threshold));
 	  impl_->asset_writer.set_worker_count(
         env_size_or_default("APITRACE_ASYNC_ASSET_WORKERS", default_async_asset_worker_count()));
-	  impl_->asset_writer.set_sparse_write_enabled(env_flag_enabled("APITRACE_ASSET_SPARSE_WRITE"));
+  impl_->asset_writer.set_sparse_write_enabled(env_flag_enabled("APITRACE_ASSET_SPARSE_WRITE"));
   impl_->asset_writer.set_spool_write_enabled(impl_->asset_spool_write);
+  impl_->asset_writer.set_integrity_enabled(!env_flag_enabled("DXMT_CAPTURE_FAST_UNSAFE"));
+  impl_->asset_writer.set_test_failures_before_success(
+      env_size_or_default("APITRACE_TEST_ASSET_SPOOL_FAIL_BEFORE_SUCCESS", 0));
+  impl_->asset_writer.set_test_terminal_failure(
+      env_flag_enabled("APITRACE_TEST_ASSET_SPOOL_TERMINAL_FAILURE"));
 	  if (impl_->writer_stats) {
     impl_->callstream_stream.set_lock_stats(&impl_->callstream_lock_stats);
     impl_->metal_callstream_stream.set_lock_stats(&impl_->metal_callstream_lock_stats);
@@ -5766,7 +6003,6 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
 		                    finalized,
 		                    payload);
 		              }
-		              impl->publish_queued_asset_for_async_write(finalized, false);
 		            });
 	    }
 	    if (enqueued) {
@@ -5831,7 +6067,6 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
 		                    finalized,
 		                    payload);
 		              }
-		              impl->publish_queued_asset_for_async_write(finalized, false);
 		            });
     }
     if (enqueued) {
@@ -5845,10 +6080,6 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
 	    TimedWriterLock lock(impl_->asset_mutex, impl_->writer_stats ? &impl_->asset_lock_stats : nullptr);
 	    impl_->asset_payloads_may_reference_alias.insert(finalized.relative_path.generic_string());
 	  }
-      {
-        TimedWriterLock lock(impl_->asset_mutex, impl_->writer_stats ? &impl_->asset_lock_stats : nullptr);
-        impl_->assets_by_content_hash.emplace(content_key, finalized);
-      }
       return finalized;
     }
     ++impl_->asset_async_queue_rejected;
@@ -5886,9 +6117,26 @@ AssetRecord TraceBundleWriter::register_asset(AssetRecord &&asset)
     {
       TimedWriterPhase phase(impl_->writer_stats ? &impl_->asset_register_phase_sync_write : nullptr);
       std::ofstream output(target_path, std::ios::binary | std::ios::trunc);
-      const auto sparse_result = write_payload_sparse(output, *payload);
+      auto sparse_result = write_payload_sparse(output, *payload);
+      const auto close_result = close_payload_stream(output);
+      if (sparse_result.ok && !close_result.ok)
+        sparse_result = close_result;
       impl_->asset_sparse_zero_run_count += sparse_result.zero_run_count;
       impl_->asset_sparse_zero_bytes_skipped += sparse_result.zero_bytes_skipped;
+      if (!sparse_result.ok) {
+        impl_->asset_write_failures.push_back(CaptureFailureRecord{
+            finalized.blob_id,
+            finalized.relative_path,
+            finalized.payload_path,
+            finalized.payload_offset,
+            finalized.byte_size,
+            sparse_result.error_code,
+            1,
+            sparse_result.reason.empty() ? "asset sync write failed" : sparse_result.reason,
+        });
+        finalized.payload_bytes.clear();
+        return finalized;
+      }
     }
   }
 
@@ -6093,7 +6341,6 @@ AssetRecord TraceBundleWriter::register_metal_asset(MetalAssetKind kind, AssetRe
 		                    finalized,
 		                    payload);
 		              }
-		              impl->publish_queued_asset_for_async_write(finalized, true);
 		            })) {
 	      ++impl_->asset_async_enqueued;
 	      if (hash_only_if_final_exists)
@@ -6147,16 +6394,11 @@ AssetRecord TraceBundleWriter::register_metal_asset(MetalAssetKind kind, AssetRe
 		                    finalized,
 		                    payload);
 		              }
-		              impl->publish_queued_asset_for_async_write(finalized, true);
 		            })) {
       ++impl_->asset_async_enqueued;
       if (payload_may_reference_asset_alias(finalized.relative_path, *payload)) {
         TimedWriterLock lock(impl_->asset_mutex, impl_->writer_stats ? &impl_->asset_lock_stats : nullptr);
         impl_->asset_payloads_may_reference_alias.insert(finalized.relative_path.generic_string());
-      }
-      {
-        TimedWriterLock lock(impl_->asset_mutex, impl_->writer_stats ? &impl_->asset_lock_stats : nullptr);
-        impl_->metal_assets_by_content_hash.emplace(content_key, finalized);
       }
       return finalized;
     }
@@ -6181,9 +6423,26 @@ AssetRecord TraceBundleWriter::register_metal_asset(MetalAssetKind kind, AssetRe
       ++impl_->asset_existing_hash_size_mismatches;
     ++impl_->asset_sync_writes;
     std::ofstream output(target_path, std::ios::binary | std::ios::trunc);
-    const auto sparse_result = write_payload_sparse(output, *payload);
+    auto sparse_result = write_payload_sparse(output, *payload);
+    const auto close_result = close_payload_stream(output);
+    if (sparse_result.ok && !close_result.ok)
+      sparse_result = close_result;
     impl_->asset_sparse_zero_run_count += sparse_result.zero_run_count;
     impl_->asset_sparse_zero_bytes_skipped += sparse_result.zero_bytes_skipped;
+    if (!sparse_result.ok) {
+      impl_->asset_write_failures.push_back(CaptureFailureRecord{
+          finalized.blob_id,
+          finalized.relative_path,
+          finalized.payload_path,
+          finalized.payload_offset,
+          finalized.byte_size,
+          sparse_result.error_code,
+          1,
+          sparse_result.reason.empty() ? "metal asset sync write failed" : sparse_result.reason,
+      });
+      finalized.payload_bytes.clear();
+      return finalized;
+    }
   }
 
   finalized = impl_->publish_metal_asset(std::move(finalized));
@@ -6330,6 +6589,20 @@ void TraceBundleWriter::write_checksum_index(const ChecksumIndex &checksums)
   impl_->checksums = checksums;
 }
 
+bool TraceBundleWriter::TestHooks::write_payload_sparse_for_test(
+    std::ofstream &output,
+    const std::vector<std::uint8_t> &payload)
+{
+  return write_payload_sparse(output, payload).ok;
+}
+
+bool TraceBundleWriter::TestHooks::write_payload_direct_for_test(
+    std::ofstream &output,
+    const std::vector<std::uint8_t> &payload)
+{
+  return write_payload_direct(output, payload).ok;
+}
+
 void TraceBundleWriter::flush()
 {
   if (!impl_ || !impl_->open) {
@@ -6352,7 +6625,10 @@ void TraceBundleWriter::seal_checkpoint()
   }
   TimedWriterLock lock(impl_->event_mutex, impl_->writer_stats ? &impl_->event_lock_stats : nullptr);
   impl_->drain_async_work_for_checkpoint();
+  const bool incomplete = impl_->write_capture_incomplete_file();
   impl_->checkpoint_once(true);
+  if (incomplete || impl_->has_capture_failures())
+    return;
   const auto marker_name = impl_->open_mode == TraceBundleOpenMode::SidebandOnly
                                ? "seal-checkpoint-sideband.ready"
                                : "seal-checkpoint-primary.ready";
@@ -6444,6 +6720,7 @@ void TraceBundleWriter::close()
 	    impl_->drain_asset_completion_events();
 	    impl_->asset_writer_stats = impl_->asset_writer.stats();
 	  }
+  impl_->write_capture_incomplete_file();
   const auto async_path_aliases = impl_->completed_asset_path_aliases();
   impl_->async_path_aliases = async_path_aliases.size();
   if (!async_path_aliases.empty()) {

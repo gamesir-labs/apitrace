@@ -9,6 +9,7 @@
 #include "apitrace/object_types.hpp"
 
 #include <cstdint>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -66,6 +67,15 @@ public:
   bool is_open() const noexcept;
   std::uint64_t initial_call_sequence() const noexcept;
   const BundleLayout &layout() const noexcept;
+
+  struct TestHooks {
+    static bool write_payload_sparse_for_test(
+        std::ofstream &output,
+        const std::vector<std::uint8_t> &payload);
+    static bool write_payload_direct_for_test(
+        std::ofstream &output,
+        const std::vector<std::uint8_t> &payload);
+  };
 
 private:
   // TODO: split readable index emission from raw asset emission once bundle writing is implemented.
