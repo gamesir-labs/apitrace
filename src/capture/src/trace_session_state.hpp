@@ -7,7 +7,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
+#include <mutex>
+#include <vector>
 #include <string_view>
 #include <unordered_map>
 
@@ -62,6 +65,7 @@ public:
   void append_analysis_line(std::string_view stream_name, std::string_view json_line);
   trace::AssetRecord register_asset(const trace::AssetRecord &asset);
   trace::AssetRecord register_asset(trace::AssetRecord &&asset);
+  trace::AssetRecord stage_raw_asset(trace::AssetRecord &&asset);
   void record_object(const trace::ObjectRecord &object);
 
   bool active() const noexcept;
@@ -78,7 +82,10 @@ private:
   RuntimeBootstrap runtime_bootstrap_;
   std::unique_ptr<trace::raw::RawCaptureWriter> raw_writer_;
   std::unordered_map<trace::ObjectId, trace::ObjectRecord> objects_;
+  std::unordered_map<trace::BlobId, trace::AssetRecord> raw_staged_assets_;
+  std::mutex raw_staged_assets_mutex_;
   std::uint64_t raw_commit_cadence_bytes_ = 0;
+  trace::BlobId next_raw_staged_blob_id_ = 1;
   bool active_ = false;
 
   // TODO: separate session planning from session execution once preflight validation exists.

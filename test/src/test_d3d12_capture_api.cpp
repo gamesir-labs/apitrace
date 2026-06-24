@@ -64,6 +64,15 @@ bool set_raw_format_env(bool enabled)
 #endif
 }
 
+bool set_raw_only_format_env()
+{
+#ifdef _WIN32
+  return _putenv_s("DXMT_CAPTURE_RAW_FORMAT", "2") == 0;
+#else
+  return setenv("DXMT_CAPTURE_RAW_FORMAT", "2", 1) == 0;
+#endif
+}
+
 bool has_call(const apitrace::trace::TraceBundleReader &reader, std::string_view function_name)
 {
   for (const auto &event : reader.events()) {
@@ -226,6 +235,136 @@ bool run_dual_write_capture_smoke(const char *argv0, const std::filesystem::path
       records_text.find("\"function\":\"ID3D12Resource::Unmap\"") == std::string::npos ||
       records_text.find("\"function\":\"ID3D12GraphicsCommandList::DrawInstanced\"") == std::string::npos) {
     std::cerr << "raw-to-final output did not preserve passthrough dual-write calls\n";
+    return false;
+  }
+  return true;
+}
+
+bool verify_bundle_check(const char *argv0, const std::filesystem::path &bundle)
+{
+  std::filesystem::path check = "bundle-check";
+  const auto self = std::filesystem::path(argv0 ? argv0 : "");
+  if (self.has_parent_path()) {
+    const auto sibling = self.parent_path() / "bundle-check";
+    if (std::filesystem::exists(sibling)) {
+      check = sibling;
+    }
+  }
+  const auto command = shell_quote_path(check) + " --verify-hashes " + shell_quote_path(bundle);
+  return std::system(command.c_str()) == 0;
+}
+
+bool run_raw_only_passthrough_smoke(const char *argv0, const std::filesystem::path &base_bundle)
+{
+  using namespace apitrace::trace::raw;
+
+  const auto raw_bundle = base_bundle.parent_path() / (base_bundle.filename().string() + "-raw-only.apitrace");
+  apitrace::runtime::shutdown_process_trace_session();
+  std::filesystem::remove_all(raw_bundle);
+  if (!set_raw_only_format_env() || !set_trace_bundle_env(raw_bundle)) {
+    std::cerr << "failed to configure raw-only capture smoke\n";
+    return false;
+  }
+
+  auto *device = fake_object(0x17000);
+  auto *root_signature = fake_object(0x17100);
+  auto *resource = fake_object(0x17300);
+  auto *command_list = fake_object(0x17400);
+  apitrace::d3d12::record_d3d12_create_device(device);
+  apitrace::d3d12::record_object_create(
+      root_signature,
+      apitrace::d3d12::CaptureObjectKind::RootSignature,
+      device,
+      "ID3D12RootSignature");
+  apitrace::d3d12::record_object_create(
+      resource,
+      apitrace::d3d12::CaptureObjectKind::Resource,
+      device,
+      "ID3D12Resource");
+  std::uint8_t root_signature_bytes[] = {0x52, 0x53, 0x49, 0x47};
+  apitrace::d3d12::record_create_root_signature(
+      static_cast<ID3D12Device *>(device),
+      0,
+      root_signature_bytes,
+      sizeof(root_signature_bytes),
+      root_signature,
+      0);
+  std::uint8_t unmap_bytes[] = {0x10, 0x20, 0x30, 0x40};
+  apitrace::d3d12::record_resource_unmap(resource, 0, 0, sizeof(unmap_bytes), unmap_bytes, sizeof(unmap_bytes));
+  apitrace::d3d12::record_object_create(
+      command_list,
+      apitrace::d3d12::CaptureObjectKind::CommandList,
+      device,
+      "ID3D12GraphicsCommandList");
+  apitrace::d3d12::record_draw_instanced(command_list, 3, 1, 0, 0);
+  apitrace::runtime::shutdown_process_trace_session();
+  clear_trace_bundle_env();
+  set_raw_format_env(false);
+
+  if (read_text(raw_bundle / "assets.json").find("\"blob_id\"") != std::string::npos ||
+      std::filesystem::exists(raw_bundle / "spool" / "asset-payloads.bin")) {
+    std::cerr << "raw-only unexpectedly registered old-path assets or wrote spool before finalize\n";
+    return false;
+  }
+
+  RawCaptureReader raw_reader;
+  if (!raw_reader.open(raw_bundle)) {
+    std::cerr << "failed to read raw-only bundle: " << raw_reader.last_error() << "\n";
+    return false;
+  }
+  const auto raw_events = raw_reader.read_events();
+  bool saw_non_blob_passthrough = false;
+  bool saw_blob_passthrough = false;
+  bool saw_unmap_binary = false;
+  bool saw_double_unmap_passthrough = false;
+  for (const auto &event : raw_events) {
+    const auto opcode = static_cast<RawEventOpcode>(event.header.opcode);
+    if (opcode == RawEventOpcode::ResourceUnmap) {
+      saw_unmap_binary = true;
+      continue;
+    }
+    if (opcode == RawEventOpcode::PassthroughFinalJson) {
+      const std::string payload(
+          reinterpret_cast<const char *>(event.payload.data()),
+          reinterpret_cast<const char *>(event.payload.data() + event.payload.size()));
+      saw_non_blob_passthrough =
+          saw_non_blob_passthrough || payload.find("\"function\":\"D3D12CreateDevice\"") != std::string::npos;
+      saw_double_unmap_passthrough =
+          saw_double_unmap_passthrough || payload.find("\"function\":\"ID3D12Resource::Unmap\"") != std::string::npos;
+    } else if (opcode == RawEventOpcode::PassthroughWithBlob) {
+      saw_blob_passthrough = true;
+      const auto decoded = decode_raw_events(raw_reader, {event});
+      if (!decoded.error.empty() ||
+          decoded.events.empty() ||
+          decoded.events[0].passthrough_jsonl_record.find("\"function\":\"ID3D12Device::CreateRootSignature\"") ==
+              std::string::npos ||
+          decoded.events[0].assets.size() != 1 ||
+          decoded.events[0].assets[0].payload_bytes !=
+              std::vector<std::uint8_t>(std::begin(root_signature_bytes), std::end(root_signature_bytes))) {
+        std::cerr << "raw-only blob passthrough did not preserve staged root signature bytes\n";
+        return false;
+      }
+    }
+  }
+  if (!saw_non_blob_passthrough || !saw_blob_passthrough || !saw_unmap_binary || saw_double_unmap_passthrough) {
+    std::cerr << "raw-only did not emit expected passthrough/blob/binary mix\n";
+    return false;
+  }
+
+  if (!finalize_raw_bundle(argv0, raw_bundle)) {
+    std::cerr << "bundle-finalize --raw-format failed for raw-only smoke bundle\n";
+    return false;
+  }
+  if (!verify_bundle_check(argv0, raw_bundle)) {
+    std::cerr << "bundle-check --verify-hashes failed for raw-only smoke bundle\n";
+    return false;
+  }
+  const auto records_text = read_text(raw_bundle / apitrace::trace::kCallstreamFileName);
+  if (records_text.find("\"function\":\"D3D12CreateDevice\"") == std::string::npos ||
+      records_text.find("\"function\":\"ID3D12Device::CreateRootSignature\"") == std::string::npos ||
+      records_text.find("\"function\":\"ID3D12Resource::Unmap\"") == std::string::npos ||
+      records_text.find("\"function\":\"ID3D12GraphicsCommandList::DrawInstanced\"") == std::string::npos) {
+    std::cerr << "raw-only raw-to-final output did not preserve all events\n";
     return false;
   }
   return true;
@@ -1231,6 +1370,9 @@ int main(int argc, char **argv)
   }
 
   if (!run_dual_write_capture_smoke(argv[0], bundle)) {
+    return 1;
+  }
+  if (!run_raw_only_passthrough_smoke(argv[0], bundle)) {
     return 1;
   }
 

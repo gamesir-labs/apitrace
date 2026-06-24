@@ -2458,12 +2458,16 @@ trace::AssetRecord register_asset_bytes(
   asset.debug_name = debug_name ? debug_name : "";
 
   if (!data || size == 0) {
-    return session->register_asset(std::move(asset));
+    return session->capture_raw_mode() == runtime::CaptureOptions::CaptureRawMode::RawOnly
+        ? session->stage_raw_asset(std::move(asset))
+        : session->register_asset(std::move(asset));
   }
 
   const auto *bytes = static_cast<const std::uint8_t *>(data);
   asset.payload_bytes.assign(bytes, bytes + size);
-  return session->register_asset(std::move(asset));
+  return session->capture_raw_mode() == runtime::CaptureOptions::CaptureRawMode::RawOnly
+      ? session->stage_raw_asset(std::move(asset))
+      : session->register_asset(std::move(asset));
 }
 
 trace::AssetRecord register_shader_asset_bytes(

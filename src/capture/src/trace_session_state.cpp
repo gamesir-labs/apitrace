@@ -5,8 +5,12 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdint>
+#include <chrono>
+#include <filesystem>
+#include <iomanip>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -60,6 +64,80 @@ trace::raw::RawBlobKind raw_blob_kind_for_asset_kind(trace::AssetKind kind)
   }
 }
 
+const char *raw_asset_directory_name(trace::AssetKind kind)
+{
+  switch (kind) {
+  case trace::AssetKind::ShaderDxbc:
+  case trace::AssetKind::ShaderDxil:
+  case trace::AssetKind::RootSignature:
+    return "shaders";
+  case trace::AssetKind::Texture:
+    return "textures";
+  case trace::AssetKind::Buffer:
+    return "buffers";
+  case trace::AssetKind::Pipeline:
+    return "pipelines";
+  case trace::AssetKind::ObjectIndex:
+    return "objects";
+  case trace::AssetKind::Analysis:
+    return "analysis";
+  case trace::AssetKind::Unknown:
+  default:
+    return ".";
+  }
+}
+
+const char *raw_asset_extension(trace::AssetKind kind)
+{
+  switch (kind) {
+  case trace::AssetKind::ShaderDxbc:
+    return ".dxbc";
+  case trace::AssetKind::ShaderDxil:
+    return ".dxil";
+  case trace::AssetKind::RootSignature:
+    return ".rootsig";
+  case trace::AssetKind::Texture:
+    return ".texture";
+  case trace::AssetKind::Buffer:
+    return ".buffer";
+  case trace::AssetKind::Pipeline:
+    return ".pipeline.json";
+  case trace::AssetKind::ObjectIndex:
+    return ".json";
+  case trace::AssetKind::Analysis:
+    return ".jsonl";
+  case trace::AssetKind::Unknown:
+  default:
+    return ".bin";
+  }
+}
+
+std::filesystem::path raw_asset_relative_path(trace::AssetKind kind, trace::BlobId blob_id)
+{
+  std::ostringstream filename;
+  filename << "asset-" << std::setw(16) << std::setfill('0') << blob_id << raw_asset_extension(kind);
+  const std::string directory = raw_asset_directory_name(kind);
+  if (directory == ".") {
+    return filename.str();
+  }
+  return std::filesystem::path(directory) / filename.str();
+}
+
+std::uint64_t wall_clock_nanoseconds()
+{
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+
+void stamp_rawonly_event(trace::EventRecord &event)
+{
+  if (event.time_ns == 0) {
+    event.time_ns = wall_clock_nanoseconds();
+  }
+}
+
 bool append_passthrough_raw_event(
     trace::raw::RawCaptureWriter &writer,
     const trace::EventRecord &event,
@@ -76,11 +154,10 @@ bool append_passthrough_raw_event(
 
 bool append_passthrough_with_blob_raw_event(
     trace::raw::RawCaptureWriter &raw_writer,
-    trace::TraceBundleWriter &bundle_writer,
     const trace::EventRecord &event,
-    std::string_view final_jsonl_record)
+    std::string_view final_jsonl_record,
+    const std::vector<trace::TraceBundleWriter::RegisteredAssetPayload> &assets)
 {
-  const auto assets = bundle_writer.registered_asset_payloads_for_blob_refs(event.blob_refs);
   if (assets.size() != event.blob_refs.size()) {
     return false;
   }
@@ -275,6 +352,34 @@ void TraceSessionState::append_call_event(trace::EventRecord &&event)
   }
 
   if (options_.capture.raw_mode == runtime::CaptureOptions::CaptureRawMode::RawOnly) {
+    stamp_rawonly_event(event);
+    const auto final_jsonl_record = trace::event_record_json(event);
+    bool raw_appended = false;
+    if (event.blob_refs.empty()) {
+      raw_appended = append_passthrough_raw_event(*raw_writer_, event, final_jsonl_record);
+    } else {
+      std::vector<trace::TraceBundleWriter::RegisteredAssetPayload> assets;
+      assets.reserve(event.blob_refs.size());
+      {
+        std::lock_guard lock(raw_staged_assets_mutex_);
+        for (const auto blob_ref : event.blob_refs) {
+          const auto found = raw_staged_assets_.find(blob_ref);
+          if (found == raw_staged_assets_.end()) {
+            return;
+          }
+          auto payload = std::make_shared<const std::vector<std::uint8_t>>(found->second.payload_bytes);
+          assets.push_back(trace::TraceBundleWriter::RegisteredAssetPayload{found->second, std::move(payload)});
+        }
+      }
+      raw_appended = append_passthrough_with_blob_raw_event(
+          *raw_writer_,
+          event,
+          final_jsonl_record,
+          assets);
+    }
+    if (raw_appended) {
+      raw_writer_->flush_commit_if_needed(raw_commit_cadence_bytes_);
+    }
     return;
   }
 
@@ -288,7 +393,11 @@ void TraceSessionState::append_call_event(trace::EventRecord &&event)
     writer.append_prepared_call_event(std::move(event), final_jsonl_record);
   } else {
     const auto final_jsonl_record = trace::event_record_json(event);
-    const bool raw_appended = append_passthrough_with_blob_raw_event(*raw_writer_, writer, event, final_jsonl_record);
+    const bool raw_appended = append_passthrough_with_blob_raw_event(
+        *raw_writer_,
+        event,
+        final_jsonl_record,
+        writer.registered_asset_payloads_for_blob_refs(event.blob_refs));
     if (raw_appended) {
       raw_writer_->flush_commit_if_needed(raw_commit_cadence_bytes_);
     }
@@ -309,6 +418,28 @@ trace::AssetRecord TraceSessionState::register_asset(const trace::AssetRecord &a
 trace::AssetRecord TraceSessionState::register_asset(trace::AssetRecord &&asset)
 {
   return bundle_sink_.writer().register_asset(std::move(asset));
+}
+
+trace::AssetRecord TraceSessionState::stage_raw_asset(trace::AssetRecord &&asset)
+{
+  if (options_.capture.raw_mode != runtime::CaptureOptions::CaptureRawMode::RawOnly) {
+    return register_asset(std::move(asset));
+  }
+  if (asset.blob_id == 0) {
+    asset.blob_id = next_raw_staged_blob_id_++;
+  } else {
+    next_raw_staged_blob_id_ = std::max(next_raw_staged_blob_id_, asset.blob_id + 1);
+  }
+  if (asset.relative_path.empty()) {
+    asset.relative_path = raw_asset_relative_path(asset.kind, asset.blob_id);
+  }
+  if (asset.byte_size == 0) {
+    asset.byte_size = static_cast<std::uint64_t>(asset.payload_bytes.size());
+  }
+  asset.binary_payload = true;
+  std::lock_guard lock(raw_staged_assets_mutex_);
+  raw_staged_assets_[asset.blob_id] = asset;
+  return asset;
 }
 
 void TraceSessionState::record_object(const trace::ObjectRecord &object)

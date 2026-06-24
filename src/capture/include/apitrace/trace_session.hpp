@@ -23,6 +23,7 @@ public:
   void append_analysis_line(std::string_view stream_name, std::string_view json_line);
   trace::AssetRecord register_asset(const trace::AssetRecord &asset);
   trace::AssetRecord register_asset(trace::AssetRecord &&asset);
+  trace::AssetRecord stage_raw_asset(trace::AssetRecord &&asset);
   void record_object(const trace::ObjectRecord &object);
 
   bool active() const noexcept;

@@ -65,6 +65,11 @@ trace::AssetRecord TraceSession::register_asset(trace::AssetRecord &&asset)
   return impl_->state.register_asset(std::move(asset));
 }
 
+trace::AssetRecord TraceSession::stage_raw_asset(trace::AssetRecord &&asset)
+{
+  return impl_->state.stage_raw_asset(std::move(asset));
+}
+
 void TraceSession::record_object(const trace::ObjectRecord &object)
 {
   impl_->state.record_object(object);
