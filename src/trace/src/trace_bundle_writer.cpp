@@ -2692,6 +2692,7 @@ public:
     }
   }
 
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
   void set_test_failures_before_success(std::size_t count)
   {
     test_failures_before_success_ = count;
@@ -2711,6 +2712,7 @@ public:
   {
     test_write_delay_ = delay;
   }
+#endif
 
   std::uint64_t reserve_spool_range(std::uint64_t byte_size)
   {
@@ -3050,6 +3052,7 @@ private:
   SparseWriteResult write_spooled_payload(const Job &job)
   {
     SparseWriteResult result;
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
     if (test_terminal_failure_ || test_terminal_failure_once_) {
       test_terminal_failure_once_ = false;
       return sparse_write_failure("injected terminal spool write failure", EIO, false);
@@ -3058,6 +3061,7 @@ private:
       return sparse_write_failure("injected retryable spool write failure", EIO, true);
     if (test_write_delay_.count() > 0)
       std::this_thread::sleep_for(test_write_delay_);
+#endif
 #ifndef _WIN32
     {
       TimedAtomicWriterPhase phase(lock_stats_ ? &file_open_stats_ : nullptr);
@@ -3487,10 +3491,12 @@ private:
 	  bool sparse_write_enabled_ = false;
   bool spool_write_enabled_ = false;
   bool integrity_enabled_ = true;
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
   std::size_t test_failures_before_success_ = 0;
   bool test_terminal_failure_ = false;
   bool test_terminal_failure_once_ = false;
   std::chrono::milliseconds test_write_delay_{0};
+#endif
   std::atomic_uint64_t spool_next_offset_{0};
 	  std::size_t pending_bytes_ = 0;
   std::size_t regular_pending_bytes_ = 0;
@@ -5734,6 +5740,7 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
   impl_->asset_writer.set_sparse_write_enabled(env_flag_enabled("APITRACE_ASSET_SPARSE_WRITE"));
   impl_->asset_writer.set_spool_write_enabled(impl_->asset_spool_write);
   impl_->asset_writer.set_integrity_enabled(impl_->capture_integrity_enabled);
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
   impl_->asset_writer.set_test_failures_before_success(
       env_size_or_default("APITRACE_TEST_ASSET_SPOOL_FAIL_BEFORE_SUCCESS", 0));
   impl_->asset_writer.set_test_terminal_failure(
@@ -5742,7 +5749,8 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
       env_flag_enabled("APITRACE_TEST_ASSET_SPOOL_TERMINAL_FAILURE_ONCE"));
   impl_->asset_writer.set_test_write_delay(std::chrono::milliseconds(
       env_size_or_default("APITRACE_TEST_ASSET_WRITE_DELAY_MS", 0)));
-	  if (impl_->writer_stats) {
+#endif
+		  if (impl_->writer_stats) {
     impl_->callstream_stream.set_lock_stats(&impl_->callstream_lock_stats);
     impl_->metal_callstream_stream.set_lock_stats(&impl_->metal_callstream_lock_stats);
     impl_->asset_writer.set_lock_stats(&impl_->async_asset_lock_stats);
@@ -6719,6 +6727,7 @@ void TraceBundleWriter::write_checksum_index(const ChecksumIndex &checksums)
   impl_->checksums = checksums;
 }
 
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
 bool TraceBundleWriter::TestHooks::write_payload_sparse_for_test(
     std::ofstream &output,
     const std::vector<std::uint8_t> &payload)
@@ -6751,6 +6760,7 @@ std::uint64_t TraceBundleWriter::TestHooks::spool_published_offset_for_test(
 {
   return writer.impl_ ? writer.impl_->published_spool_checkpoint_offset() : 0;
 }
+#endif
 
 void TraceBundleWriter::flush()
 {

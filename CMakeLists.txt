@@ -110,32 +110,39 @@ if(APPLE AND APITRACE_BUILD_METAL_BACKEND)
     )
 endif()
 
-add_library(apitrace_core ${APITRACE_CORE_SOURCES})
-
-target_include_directories(apitrace_core
-    PUBLIC
-        ${APITRACE_PUBLIC_INCLUDE_DIRS}
-    PRIVATE
-        ${APITRACE_PRIVATE_INCLUDE_DIRS}
-)
-
-target_compile_features(apitrace_core PUBLIC cxx_std_17)
-target_link_libraries(apitrace_core PRIVATE apitrace_nlohmann_json apitrace_d3d_headers)
-
-if(WIN32)
-    target_compile_definitions(apitrace_core PUBLIC APITRACE_HAS_D3D_NATIVE=1)
-endif()
-
-if(APITRACE_BUILD_D3D_NATIVE_RETRACE)
-    target_compile_definitions(apitrace_core PUBLIC APITRACE_HAS_D3D_NATIVE=1)
-    target_link_libraries(apitrace_core PUBLIC
-        apitrace_d3d_headers
-        apitrace_dxmt::winemetal
-        apitrace_dxmt::dxgi
-        apitrace_dxmt::d3d11
-        apitrace_dxmt::d3d12
+function(configure_apitrace_core_target target_name)
+    target_include_directories(${target_name}
+        PUBLIC
+            ${APITRACE_PUBLIC_INCLUDE_DIRS}
+        PRIVATE
+            ${APITRACE_PRIVATE_INCLUDE_DIRS}
     )
-endif()
+
+    target_compile_features(${target_name} PUBLIC cxx_std_17)
+    target_link_libraries(${target_name} PRIVATE apitrace_nlohmann_json apitrace_d3d_headers)
+
+    if(WIN32)
+        target_compile_definitions(${target_name} PUBLIC APITRACE_HAS_D3D_NATIVE=1)
+    endif()
+
+    if(APITRACE_BUILD_D3D_NATIVE_RETRACE)
+        target_compile_definitions(${target_name} PUBLIC APITRACE_HAS_D3D_NATIVE=1)
+        target_link_libraries(${target_name} PUBLIC
+            apitrace_d3d_headers
+            apitrace_dxmt::winemetal
+            apitrace_dxmt::dxgi
+            apitrace_dxmt::d3d11
+            apitrace_dxmt::d3d12
+        )
+    endif()
+
+    if(APPLE AND APITRACE_BUILD_METAL_BACKEND)
+        target_compile_definitions(${target_name} PRIVATE APITRACE_HAVE_METAL_BACKEND=1)
+    endif()
+endfunction()
+
+add_library(apitrace_core ${APITRACE_CORE_SOURCES})
+configure_apitrace_core_target(apitrace_core)
 
 if(APITRACE_BUILD_PE_CAPTURE_STATIC)
     add_library(apitrace_platform_windows_d3d11 STATIC
@@ -264,7 +271,6 @@ endif()
 
 if(APPLE AND APITRACE_BUILD_METAL_BACKEND)
     enable_language(OBJCXX)
-    target_compile_definitions(apitrace_core PRIVATE APITRACE_HAVE_METAL_BACKEND=1)
     target_sources(apitrace_platform_apple_metal PRIVATE
         src/metal/src/metal_replay_native.mm
     )
@@ -359,12 +365,18 @@ if(APITRACE_BUILD_TOOLS AND APITRACE_BUILD_BUNDLE_FINALIZE AND NOT APITRACE_BUIL
 endif()
 
 if(NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
+    add_library(apitrace_core_test_hooks ${APITRACE_CORE_SOURCES})
+    configure_apitrace_core_target(apitrace_core_test_hooks)
+    target_compile_definitions(apitrace_core_test_hooks PRIVATE APITRACE_ENABLE_TEST_HOOKS)
+
     add_executable(apitrace_test_trace_writer_assets test/src/test_trace_writer_assets.cpp)
-    target_link_libraries(apitrace_test_trace_writer_assets PRIVATE apitrace_core)
+    target_link_libraries(apitrace_test_trace_writer_assets PRIVATE apitrace_core_test_hooks)
+    target_compile_definitions(apitrace_test_trace_writer_assets PRIVATE APITRACE_ENABLE_TEST_HOOKS)
     target_compile_features(apitrace_test_trace_writer_assets PRIVATE cxx_std_17)
 
     add_executable(apitrace_test_bundle_finalize_integrity test/src/test_bundle_finalize_integrity.cpp)
-    target_link_libraries(apitrace_test_bundle_finalize_integrity PRIVATE apitrace_core)
+    target_link_libraries(apitrace_test_bundle_finalize_integrity PRIVATE apitrace_core_test_hooks)
+    target_compile_definitions(apitrace_test_bundle_finalize_integrity PRIVATE APITRACE_ENABLE_TEST_HOOKS)
     target_compile_features(apitrace_test_bundle_finalize_integrity PRIVATE cxx_std_17)
 
     add_executable(apitrace_test_payload_object_refs test/src/test_payload_object_refs.cpp)
@@ -455,6 +467,9 @@ if(WIN32)
         # at its final link step, so do not redeclare those imports here.
     else()
         target_link_libraries(apitrace_core PRIVATE d3d11 d3d12 dxgi user32)
+        if(TARGET apitrace_core_test_hooks)
+            target_link_libraries(apitrace_core_test_hooks PRIVATE d3d11 d3d12 dxgi user32)
+        endif()
         target_link_libraries(apitrace_platform_windows_d3d12 PRIVATE uuid)
     endif()
 endif()

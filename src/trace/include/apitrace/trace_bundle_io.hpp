@@ -68,6 +68,7 @@ public:
   std::uint64_t initial_call_sequence() const noexcept;
   const BundleLayout &layout() const noexcept;
 
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
   struct TestHooks {
     static bool write_payload_sparse_for_test(
         std::ofstream &output,
@@ -81,6 +82,7 @@ public:
     static std::uint64_t spool_reserved_offset_for_test(const TraceBundleWriter &writer);
     static std::uint64_t spool_published_offset_for_test(const TraceBundleWriter &writer);
   };
+#endif
 
 private:
   // TODO: split readable index emission from raw asset emission once bundle writing is implemented.
