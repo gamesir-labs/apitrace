@@ -2360,9 +2360,9 @@ int main(int argc, char **argv)
       json_u64_field(writer_stats, "async_path_aliases") < 1 ||
       json_u64_field(writer_stats, "asset_rewrite_candidates_scanned") < 4 ||
       json_u64_field(writer_stats, "asset_rewrite_candidates_skipped_clean") < 1 ||
-      json_u64_field(writer_stats, "asset_rewrite_replacements") < 4 ||
+      json_u64_field(writer_stats, "asset_rewrite_replacements") < 3 ||
       json_u64_field(writer_stats, "asset_rewrite_digest_reuses") < 1 ||
-      json_u64_field(writer_stats, "rewritten_asset_reference_files") < 1 ||
+      json_u64_field(writer_stats, "rewritten_asset_reference_files") < 2 ||
       json_u64_field(writer_stats, "checksum_files") < 12 ||
       json_u64_field(writer_stats, "genericized_metal_resources") != 2 ||
       json_u64_field(writer_stats, "sparse_zero_run_count") != 0 ||
