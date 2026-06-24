@@ -27,9 +27,14 @@ struct CaptureOptions {
   bool follow_child_processes = true;
   bool hook_dynamic_modules = true;
   bool capture_initial_resources = true;
-  // Enables D3D capture dual-write into raw/events.bin + raw/blobs.bin when
-  // DXMT_CAPTURE_RAW_FORMAT is set. Default OFF leaves the live path unchanged.
-  bool raw_format_reserved = false;
+  enum class CaptureRawMode {
+    Off,
+    DualWrite,
+    RawOnly,
+  };
+  // DXMT_CAPTURE_RAW_FORMAT:
+  // unset/0 -> Off, 1/dual/dual-write -> DualWrite, 2/raw-only -> RawOnly.
+  CaptureRawMode raw_mode = CaptureRawMode::Off;
 };
 
 } // namespace apitrace::runtime

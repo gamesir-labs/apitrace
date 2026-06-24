@@ -11,6 +11,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #ifdef _WIN32
@@ -63,10 +64,24 @@ std::filesystem::path resolve_bundle_root(trace::ApiKind api)
   return std::filesystem::current_path() / name.str();
 }
 
-bool env_flag_enabled(const char *name)
+CaptureOptions::CaptureRawMode parse_capture_raw_mode()
 {
-  const char *value = std::getenv(name);
-  return value && *value != '\0' && *value != '0';
+  const char *value = std::getenv("DXMT_CAPTURE_RAW_FORMAT");
+  if (!value || *value == '\0') {
+    return CaptureOptions::CaptureRawMode::Off;
+  }
+
+  const std::string_view text(value);
+  if (text == "0") {
+    return CaptureOptions::CaptureRawMode::Off;
+  }
+  if (text == "1" || text == "dual" || text == "dual-write") {
+    return CaptureOptions::CaptureRawMode::DualWrite;
+  }
+  if (text == "2" || text == "raw-only") {
+    return CaptureOptions::CaptureRawMode::RawOnly;
+  }
+  return CaptureOptions::CaptureRawMode::Off;
 }
 
 void shutdown_process_capture_impl()
@@ -212,7 +227,7 @@ TraceSession *ensure_process_trace_session(trace::ApiKind api)
     TraceOptions options;
     options.api = api;
     options.capture.mode = CaptureMode::ProxyDll;
-    options.capture.raw_format_reserved = env_flag_enabled("DXMT_CAPTURE_RAW_FORMAT");
+    options.capture.raw_mode = parse_capture_raw_mode();
     options.bundle_root = resolve_bundle_root(api);
     session = std::make_unique<TraceSession>(std::move(options));
     session->begin();

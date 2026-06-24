@@ -106,7 +106,7 @@ apitrace::TraceOptions trace_options(const std::filesystem::path &bundle)
   apitrace::TraceOptions options;
   options.api = apitrace::trace::ApiKind::D3D12;
   options.bundle_root = bundle;
-  options.capture.raw_format_reserved = true;
+  options.capture.raw_mode = apitrace::runtime::CaptureOptions::CaptureRawMode::DualWrite;
   return options;
 }
 
@@ -215,6 +215,10 @@ bool write_no_end_periodic_commit_capture(const std::filesystem::path &bundle)
   {
     apitrace::TraceSession session(trace_options(bundle));
     session.begin();
+    if (!expect(session.raw_commit_cadence_bytes() == 512,
+                "periodic raw commit test did not configure raw commit cadence")) {
+      return false;
+    }
     for (std::uint64_t index = 0; index < 8; ++index) {
       const std::string padding(96, static_cast<char>('a' + index));
       session.append_call_event(make_call_event(

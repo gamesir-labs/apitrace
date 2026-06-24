@@ -85,6 +85,11 @@ const TraceOptions &TraceSession::options() const noexcept
   return impl_->state.options();
 }
 
+runtime::CaptureOptions::CaptureRawMode TraceSession::capture_raw_mode() const noexcept
+{
+  return impl_ ? impl_->state.capture_raw_mode() : runtime::CaptureOptions::CaptureRawMode::Off;
+}
+
 trace::raw::RawCaptureWriter *TraceSession::raw_capture_writer() noexcept
 {
   return impl_ ? impl_->state.raw_capture_writer() : nullptr;
@@ -93,6 +98,11 @@ trace::raw::RawCaptureWriter *TraceSession::raw_capture_writer() noexcept
 const trace::raw::RawCaptureWriter *TraceSession::raw_capture_writer() const noexcept
 {
   return impl_ ? impl_->state.raw_capture_writer() : nullptr;
+}
+
+std::uint64_t TraceSession::raw_commit_cadence_bytes() const noexcept
+{
+  return impl_ ? impl_->state.raw_commit_cadence_bytes() : 0;
 }
 
 } // namespace apitrace

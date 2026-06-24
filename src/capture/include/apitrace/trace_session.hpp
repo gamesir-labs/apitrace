@@ -28,8 +28,10 @@ public:
   bool active() const noexcept;
   std::uint64_t initial_call_sequence() const noexcept;
   const TraceOptions &options() const noexcept;
+  runtime::CaptureOptions::CaptureRawMode capture_raw_mode() const noexcept;
   trace::raw::RawCaptureWriter *raw_capture_writer() noexcept;
   const trace::raw::RawCaptureWriter *raw_capture_writer() const noexcept;
+  std::uint64_t raw_commit_cadence_bytes() const noexcept;
 
 private:
   struct Impl;

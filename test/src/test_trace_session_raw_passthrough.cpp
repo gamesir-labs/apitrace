@@ -43,7 +43,9 @@ apitrace::TraceOptions trace_options(const std::filesystem::path &bundle, bool r
   apitrace::TraceOptions options;
   options.api = apitrace::trace::ApiKind::D3D12;
   options.bundle_root = bundle;
-  options.capture.raw_format_reserved = raw_enabled;
+  options.capture.raw_mode = raw_enabled
+      ? apitrace::runtime::CaptureOptions::CaptureRawMode::DualWrite
+      : apitrace::runtime::CaptureOptions::CaptureRawMode::Off;
   return options;
 }
 
@@ -92,7 +94,7 @@ bool run_passthrough_test(const std::filesystem::path &bundle)
     return false;
   }
 
-  RawCaptureReader reader;
+  apitrace::trace::raw::RawCaptureReader reader;
   if (!expect(reader.open(bundle), "failed to open raw capture")) {
     std::cerr << reader.last_error() << "\n";
     return false;
@@ -147,13 +149,44 @@ bool run_flag_off_test(const std::filesystem::path &bundle)
   return expect(!std::filesystem::exists(bundle / "raw" / "events.bin"), "raw events file exists when flag is off");
 }
 
+bool run_raw_only_unwired_test(const std::filesystem::path &bundle)
+{
+  std::filesystem::remove_all(bundle);
+  {
+    apitrace::TraceOptions options = trace_options(bundle, false);
+    options.capture.raw_mode = apitrace::runtime::CaptureOptions::CaptureRawMode::RawOnly;
+    apitrace::TraceSession session(std::move(options));
+    session.begin();
+    if (!expect(session.capture_raw_mode() == apitrace::runtime::CaptureOptions::CaptureRawMode::RawOnly,
+                "session did not report raw-only mode") ||
+        !expect(session.raw_capture_writer() != nullptr, "raw-only mode did not create raw writer")) {
+      return false;
+    }
+    session.append_call_event(make_event(31, "ID3D12CommandQueue::Signal", "{\"value\":2}"));
+    session.end();
+  }
+
+  const auto callstream_lines = read_lines(bundle / "callstream.jsonl");
+  if (!expect(callstream_lines.size() == 1, "raw-only unwired path should only write metadata")) {
+    return false;
+  }
+
+  apitrace::trace::raw::RawCaptureReader reader;
+  if (!expect(reader.open(bundle), "failed to open raw-only raw capture")) {
+    std::cerr << reader.last_error() << "\n";
+    return false;
+  }
+  return expect(reader.read_events().empty(), "raw-only unwired path should not emit passthrough events");
+}
+
 } // namespace
 
 int main()
 {
   const auto root = unique_work_dir();
   const bool ok = run_passthrough_test(root / "raw-on.apitrace") &&
-                  run_flag_off_test(root / "raw-off.apitrace");
+                  run_flag_off_test(root / "raw-off.apitrace") &&
+                  run_raw_only_unwired_test(root / "raw-only.apitrace");
   std::filesystem::remove_all(root);
   return ok ? 0 : 1;
 }

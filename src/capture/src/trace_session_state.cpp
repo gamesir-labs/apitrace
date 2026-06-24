@@ -36,7 +36,7 @@ std::uint64_t env_u64_or_default(const char *name, std::uint64_t fallback)
   return static_cast<std::uint64_t>(parsed);
 }
 
-std::uint64_t raw_commit_cadence_bytes()
+std::uint64_t configured_raw_commit_cadence_bytes()
 {
   constexpr std::uint64_t kDefaultRawCommitCadenceBytes = 16ull * 1024ull * 1024ull;
   return env_u64_or_default(
@@ -120,6 +120,12 @@ bool append_passthrough_with_blob_raw_event(
   header.result_or_flags = static_cast<std::uint32_t>(event.callsite.result_code);
   header.payload_len = payload.size();
   return raw_writer.append_event(header, payload.data(), payload.size());
+}
+
+bool capture_raw_mode_writes_raw(runtime::CaptureOptions::CaptureRawMode mode)
+{
+  return mode == runtime::CaptureOptions::CaptureRawMode::DualWrite ||
+         mode == runtime::CaptureOptions::CaptureRawMode::RawOnly;
 }
 
 } // namespace
@@ -215,10 +221,10 @@ TraceSessionState::TraceSessionState(TraceOptions options)
 void TraceSessionState::begin()
 {
   bundle_sink_.open_bundle();
-  if (options_.capture.raw_format_reserved) {
+  if (capture_raw_mode_writes_raw(options_.capture.raw_mode)) {
     raw_writer_ = std::make_unique<trace::raw::RawCaptureWriter>();
     raw_writer_->open(options_.bundle_root);
-    raw_commit_cadence_bytes_ = raw_commit_cadence_bytes();
+    raw_commit_cadence_bytes_ = configured_raw_commit_cadence_bytes();
   }
   bundle_sink_.write_initial_metadata();
   runtime_bootstrap_.install_entry_hooks();
@@ -265,6 +271,10 @@ void TraceSessionState::append_call_event(trace::EventRecord &&event)
   auto &writer = bundle_sink_.writer();
   if (!raw_writer_) {
     writer.append_call_event(std::move(event));
+    return;
+  }
+
+  if (options_.capture.raw_mode == runtime::CaptureOptions::CaptureRawMode::RawOnly) {
     return;
   }
 
@@ -324,6 +334,11 @@ const TraceOptions &TraceSessionState::options() const noexcept
   return options_;
 }
 
+runtime::CaptureOptions::CaptureRawMode TraceSessionState::capture_raw_mode() const noexcept
+{
+  return options_.capture.raw_mode;
+}
+
 trace::raw::RawCaptureWriter *TraceSessionState::raw_capture_writer() noexcept
 {
   return raw_writer_.get();
@@ -332,6 +347,11 @@ trace::raw::RawCaptureWriter *TraceSessionState::raw_capture_writer() noexcept
 const trace::raw::RawCaptureWriter *TraceSessionState::raw_capture_writer() const noexcept
 {
   return raw_writer_.get();
+}
+
+std::uint64_t TraceSessionState::raw_commit_cadence_bytes() const noexcept
+{
+  return raw_commit_cadence_bytes_;
 }
 
 } // namespace apitrace::capture::internal

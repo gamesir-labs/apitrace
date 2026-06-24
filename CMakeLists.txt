@@ -84,6 +84,7 @@ set(APITRACE_CORE_SOURCES
     src/d3d11/src/d3d11_replay.cpp
     src/d3d11/src/d3d11_state.cpp
     src/d3d12/src/d3d12_capture.cpp
+    src/d3d12/src/d3d12_raw_sink.cpp
     src/d3d12/src/d3d12_replay.cpp
     src/d3d12/src/d3d12_state.cpp
     src/d3d12/src/d3d12_submission.cpp
@@ -390,6 +391,11 @@ if(NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
     target_link_libraries(apitrace_test_raw_to_final PRIVATE apitrace_core_test_hooks apitrace_nlohmann_json)
     target_compile_definitions(apitrace_test_raw_to_final PRIVATE APITRACE_ENABLE_TEST_HOOKS)
     target_compile_features(apitrace_test_raw_to_final PRIVATE cxx_std_17)
+
+    add_executable(apitrace_test_d3d12_raw_sink test/src/test_d3d12_raw_sink.cpp)
+    target_link_libraries(apitrace_test_d3d12_raw_sink PRIVATE apitrace_core_test_hooks)
+    target_compile_definitions(apitrace_test_d3d12_raw_sink PRIVATE APITRACE_ENABLE_TEST_HOOKS)
+    target_compile_features(apitrace_test_d3d12_raw_sink PRIVATE cxx_std_17)
 
     add_executable(apitrace_test_trace_session_raw_passthrough test/src/test_trace_session_raw_passthrough.cpp)
     target_link_libraries(apitrace_test_trace_session_raw_passthrough PRIVATE apitrace_core_test_hooks)
