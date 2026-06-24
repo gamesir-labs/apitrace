@@ -196,6 +196,16 @@ void record_resource_unmap(
     std::uint64_t written_end,
     const void *written_data,
     std::size_t written_size);
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
+struct RawUnmapFastPathCounters {
+  std::uint64_t unmap_candidates = 0;
+  std::uint64_t unchanged_skipped = 0;
+  std::uint64_t emitted_blob_bytes = 0;
+  std::uint64_t raw_write_failures = 0;
+};
+void reset_raw_unmap_fast_path_for_test();
+RawUnmapFastPathCounters raw_unmap_fast_path_counters_for_test();
+#endif
 void record_resource_bytes_snapshot(
     trace::ObjectId resource_object_id,
     std::uint64_t begin,

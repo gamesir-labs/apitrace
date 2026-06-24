@@ -397,6 +397,11 @@ if(NOT APITRACE_BUILD_PE_CAPTURE_STATIC)
     target_compile_definitions(apitrace_test_d3d12_raw_sink PRIVATE APITRACE_ENABLE_TEST_HOOKS)
     target_compile_features(apitrace_test_d3d12_raw_sink PRIVATE cxx_std_17)
 
+    add_executable(apitrace_test_d3d12_rawonly_unmap_fast_path test/src/test_d3d12_rawonly_unmap_fast_path.cpp)
+    target_link_libraries(apitrace_test_d3d12_rawonly_unmap_fast_path PRIVATE apitrace_core_test_hooks apitrace_d3d_headers)
+    target_compile_definitions(apitrace_test_d3d12_rawonly_unmap_fast_path PRIVATE APITRACE_ENABLE_TEST_HOOKS)
+    target_compile_features(apitrace_test_d3d12_rawonly_unmap_fast_path PRIVATE cxx_std_17)
+
     add_executable(apitrace_test_trace_session_raw_passthrough test/src/test_trace_session_raw_passthrough.cpp)
     target_link_libraries(apitrace_test_trace_session_raw_passthrough PRIVATE apitrace_core_test_hooks)
     target_compile_definitions(apitrace_test_trace_session_raw_passthrough PRIVATE APITRACE_ENABLE_TEST_HOOKS)

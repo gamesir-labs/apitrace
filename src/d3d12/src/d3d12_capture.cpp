@@ -2,7 +2,9 @@
 
 #include "apitrace/asset_index.hpp"
 #include "apitrace/capture_runtime.hpp"
+#include "apitrace/d3d12_raw_sink.hpp"
 #include "apitrace/event_types.hpp"
+#include "apitrace/raw_event_codec.hpp"
 #include "apitrace/trace_session.hpp"
 
 #ifndef CINTERFACE
@@ -91,6 +93,7 @@ std::unordered_map<const void *, trace::ObjectKind> g_object_kinds;
 constexpr std::uint64_t kRootConstantBufferSnapshotBytes =
     std::uint64_t{D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT} * 4u * sizeof(std::uint32_t);
 constexpr std::uint64_t kMappedUseSnapshotChunkBytes = 4u * 1024u;
+constexpr std::uint64_t kRawUnmapCommitCadenceBytes = 4ull * 1024ull * 1024ull;
 
 struct ResourceGpuVirtualAddressState {
   trace::ObjectId object_id = 0;
@@ -161,6 +164,75 @@ struct CapturedMappedRange {
   std::uint64_t end = 0;
   std::uint64_t hash = 0;
 };
+
+struct FastHash128 {
+  std::uint64_t low = 0;
+  std::uint64_t high = 0;
+
+  bool operator==(const FastHash128 &other) const noexcept
+  {
+    return low == other.low && high == other.high;
+  }
+};
+
+struct RawUnmapSignatureKey {
+  const void *resource = nullptr;
+  std::uint32_t subresource = 0;
+  std::uint64_t begin = 0;
+  std::uint64_t end = 0;
+
+  bool operator==(const RawUnmapSignatureKey &other) const noexcept
+  {
+    return resource == other.resource &&
+           subresource == other.subresource &&
+           begin == other.begin &&
+           end == other.end;
+  }
+};
+
+struct RawUnmapSignatureKeyHash {
+  std::size_t operator()(const RawUnmapSignatureKey &key) const noexcept
+  {
+    std::uint64_t hash = reinterpret_cast<std::uintptr_t>(key.resource);
+    hash ^= (static_cast<std::uint64_t>(key.subresource) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2));
+    hash ^= (key.begin + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2));
+    hash ^= (key.end + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2));
+    return static_cast<std::size_t>(hash);
+  }
+};
+
+struct RawUnmapCounters {
+  std::uint64_t unmap_candidates = 0;
+  std::uint64_t unchanged_skipped = 0;
+  std::uint64_t emitted_blob_bytes = 0;
+  std::uint64_t raw_write_failures = 0;
+};
+
+std::mutex g_raw_unmap_mutex;
+TraceSession *g_raw_unmap_signature_session = nullptr;
+std::filesystem::path g_raw_unmap_signature_bundle_root;
+std::uint64_t g_raw_unmap_signature_initial_sequence = 0;
+std::unordered_map<RawUnmapSignatureKey, FastHash128, RawUnmapSignatureKeyHash> g_raw_unmap_signatures;
+RawUnmapCounters g_raw_unmap_counters;
+
+void reset_raw_unmap_signatures_if_needed(TraceSession *session)
+{
+  if (!session) {
+    return;
+  }
+  const auto initial_sequence = session->initial_call_sequence();
+  const auto &bundle_root = session->options().bundle_root;
+  std::lock_guard lock(g_raw_unmap_mutex);
+  if (g_raw_unmap_signature_session == session &&
+      g_raw_unmap_signature_initial_sequence == initial_sequence &&
+      g_raw_unmap_signature_bundle_root == bundle_root) {
+    return;
+  }
+  g_raw_unmap_signature_session = session;
+  g_raw_unmap_signature_bundle_root = bundle_root;
+  g_raw_unmap_signature_initial_sequence = initial_sequence;
+  g_raw_unmap_signatures.clear();
+}
 
 struct MappedResourceState {
   const void *data = nullptr;
@@ -701,6 +773,7 @@ TraceSession *session_for(trace::ApiKind api)
   auto *session = runtime::ensure_process_trace_session(api);
   if (session && api == trace::ApiKind::D3D12) {
     const auto initial_sequence = session->initial_call_sequence();
+    reset_raw_unmap_signatures_if_needed(session);
     reset_shader_asset_memo_if_needed(session);
     auto current = g_sequence.load(std::memory_order_relaxed);
     while (current < initial_sequence &&
@@ -848,6 +921,229 @@ std::uint64_t fnv1a64_bytes(const void *data, std::size_t size)
   return hash;
 }
 
+std::uint64_t rotl64(std::uint64_t value, int bits) noexcept
+{
+  return (value << bits) | (value >> (64 - bits));
+}
+
+std::uint64_t read_le64_unaligned(const std::uint8_t *bytes) noexcept
+{
+  std::uint64_t value = 0;
+  std::memcpy(&value, bytes, sizeof(value));
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  value = ((value & 0x00000000000000ffull) << 56) |
+          ((value & 0x000000000000ff00ull) << 40) |
+          ((value & 0x0000000000ff0000ull) << 24) |
+          ((value & 0x00000000ff000000ull) << 8) |
+          ((value & 0x000000ff00000000ull) >> 8) |
+          ((value & 0x0000ff0000000000ull) >> 24) |
+          ((value & 0x00ff000000000000ull) >> 40) |
+          ((value & 0xff00000000000000ull) >> 56);
+#endif
+  return value;
+}
+
+std::uint64_t fmix64(std::uint64_t value) noexcept
+{
+  value ^= value >> 33;
+  value *= 0xff51afd7ed558ccdull;
+  value ^= value >> 33;
+  value *= 0xc4ceb9fe1a85ec53ull;
+  value ^= value >> 33;
+  return value;
+}
+
+FastHash128 fast_hash128_bytes(const void *data, std::size_t size) noexcept
+{
+  constexpr std::uint64_t kC1 = 0x87c37b91114253d5ull;
+  constexpr std::uint64_t kC2 = 0x4cf5ad432745937full;
+  auto h1 = 0x9368e53c2f6af274ull ^ static_cast<std::uint64_t>(size);
+  auto h2 = 0x586dcd208f7cd3fdull ^ (static_cast<std::uint64_t>(size) << 1);
+  const auto *bytes = static_cast<const std::uint8_t *>(data);
+  const auto block_count = size / 16;
+  for (std::size_t block = 0; block < block_count; ++block) {
+    auto k1 = read_le64_unaligned(bytes + block * 16);
+    auto k2 = read_le64_unaligned(bytes + block * 16 + 8);
+    k1 *= kC1;
+    k1 = rotl64(k1, 31);
+    k1 *= kC2;
+    h1 ^= k1;
+    h1 = rotl64(h1, 27);
+    h1 += h2;
+    h1 = h1 * 5 + 0x52dce729;
+
+    k2 *= kC2;
+    k2 = rotl64(k2, 33);
+    k2 *= kC1;
+    h2 ^= k2;
+    h2 = rotl64(h2, 31);
+    h2 += h1;
+    h2 = h2 * 5 + 0x38495ab5;
+  }
+
+  auto k1 = std::uint64_t{0};
+  auto k2 = std::uint64_t{0};
+  const auto *tail = bytes + block_count * 16;
+  switch (size & 15u) {
+  case 15:
+    k2 ^= static_cast<std::uint64_t>(tail[14]) << 48;
+    [[fallthrough]];
+  case 14:
+    k2 ^= static_cast<std::uint64_t>(tail[13]) << 40;
+    [[fallthrough]];
+  case 13:
+    k2 ^= static_cast<std::uint64_t>(tail[12]) << 32;
+    [[fallthrough]];
+  case 12:
+    k2 ^= static_cast<std::uint64_t>(tail[11]) << 24;
+    [[fallthrough]];
+  case 11:
+    k2 ^= static_cast<std::uint64_t>(tail[10]) << 16;
+    [[fallthrough]];
+  case 10:
+    k2 ^= static_cast<std::uint64_t>(tail[9]) << 8;
+    [[fallthrough]];
+  case 9:
+    k2 ^= static_cast<std::uint64_t>(tail[8]);
+    k2 *= kC2;
+    k2 = rotl64(k2, 33);
+    k2 *= kC1;
+    h2 ^= k2;
+    [[fallthrough]];
+  case 8:
+    k1 ^= static_cast<std::uint64_t>(tail[7]) << 56;
+    [[fallthrough]];
+  case 7:
+    k1 ^= static_cast<std::uint64_t>(tail[6]) << 48;
+    [[fallthrough]];
+  case 6:
+    k1 ^= static_cast<std::uint64_t>(tail[5]) << 40;
+    [[fallthrough]];
+  case 5:
+    k1 ^= static_cast<std::uint64_t>(tail[4]) << 32;
+    [[fallthrough]];
+  case 4:
+    k1 ^= static_cast<std::uint64_t>(tail[3]) << 24;
+    [[fallthrough]];
+  case 3:
+    k1 ^= static_cast<std::uint64_t>(tail[2]) << 16;
+    [[fallthrough]];
+  case 2:
+    k1 ^= static_cast<std::uint64_t>(tail[1]) << 8;
+    [[fallthrough]];
+  case 1:
+    k1 ^= static_cast<std::uint64_t>(tail[0]);
+    k1 *= kC1;
+    k1 = rotl64(k1, 31);
+    k1 *= kC2;
+    h1 ^= k1;
+    break;
+  case 0:
+  default:
+    break;
+  }
+
+  h1 ^= static_cast<std::uint64_t>(size);
+  h2 ^= static_cast<std::uint64_t>(size);
+  h1 += h2;
+  h2 += h1;
+  h1 = fmix64(h1);
+  h2 = fmix64(h2);
+  h1 += h2;
+  h2 += h1;
+  return {h1, h2};
+}
+
+bool raw_unmap_signature_unchanged(
+    const RawUnmapSignatureKey &key,
+    const FastHash128 &signature)
+{
+  std::lock_guard lock(g_raw_unmap_mutex);
+  ++g_raw_unmap_counters.unmap_candidates;
+  const auto found = g_raw_unmap_signatures.find(key);
+  if (found != g_raw_unmap_signatures.end() && found->second == signature) {
+    ++g_raw_unmap_counters.unchanged_skipped;
+    return true;
+  }
+  return false;
+}
+
+void mark_raw_unmap_signature(
+    const RawUnmapSignatureKey &key,
+    const FastHash128 &signature,
+    std::uint64_t emitted_bytes)
+{
+  std::lock_guard lock(g_raw_unmap_mutex);
+  g_raw_unmap_signatures[key] = signature;
+  g_raw_unmap_counters.emitted_blob_bytes += emitted_bytes;
+}
+
+void note_raw_unmap_write_failure()
+{
+  std::lock_guard lock(g_raw_unmap_mutex);
+  ++g_raw_unmap_counters.raw_write_failures;
+}
+
+bool record_rawonly_resource_unmap(
+    TraceSession *session,
+    const void *resource,
+    trace::ObjectId resource_object_id,
+    std::uint32_t subresource,
+    std::uint64_t written_begin,
+    std::uint64_t written_end,
+    const void *written_data,
+    std::size_t written_size)
+{
+  if (!session ||
+      session->capture_raw_mode() != runtime::CaptureOptions::CaptureRawMode::RawOnly ||
+      !session->raw_capture_writer() ||
+      !resource ||
+      resource_object_id == 0 ||
+      !written_data ||
+      written_size == 0 ||
+      written_end <= written_begin) {
+    return false;
+  }
+
+  const auto size64 = written_end - written_begin;
+  if (size64 != static_cast<std::uint64_t>(written_size)) {
+    return false;
+  }
+
+  const auto key = RawUnmapSignatureKey{resource, subresource, written_begin, written_end};
+  const auto signature = fast_hash128_bytes(written_data, written_size);
+  if (raw_unmap_signature_unchanged(key, signature)) {
+    return true;
+  }
+
+  const auto sequence = g_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  const auto *source_bytes = static_cast<const std::uint8_t *>(written_data);
+  std::vector<std::uint8_t> copied_bytes(source_bytes, source_bytes + written_size);
+  RawSink sink(session->raw_capture_writer(), kRawUnmapCommitCadenceBytes);
+  const auto raw_blob_id = sink.append_blob_for_event(
+      copied_bytes.data(),
+      static_cast<std::uint64_t>(copied_bytes.size()),
+      trace::raw::RawBlobKind::Buffer,
+      sequence);
+  if (raw_blob_id == trace::raw::kInvalidRawBlobId) {
+    note_raw_unmap_write_failure();
+    return true;
+  }
+
+  const auto payload = trace::raw::encode_resource_unmap_payload(
+      resource_object_id,
+      raw_blob_id,
+      written_begin,
+      written_end);
+  if (!sink.append_binary_event(sequence, trace::raw::RawEventOpcode::ResourceUnmap, payload)) {
+    note_raw_unmap_write_failure();
+    return true;
+  }
+
+  mark_raw_unmap_signature(key, signature, static_cast<std::uint64_t>(written_size));
+  return true;
+}
+
 bool mapped_range_captured(const MappedResourceState &mapped, std::uint64_t begin, std::uint64_t end, std::uint64_t hash)
 {
   for (const auto &range : mapped.captured_ranges) {
@@ -903,6 +1199,20 @@ void record_mapped_resource_range_update_unbatched(
 
   const auto size = static_cast<std::size_t>(size64);
   const auto *bytes = static_cast<const std::uint8_t *>(mapped.data) + static_cast<std::size_t>(begin);
+  if (auto *session = session_for(trace::ApiKind::D3D12);
+      session && session->capture_raw_mode() == runtime::CaptureOptions::CaptureRawMode::RawOnly) {
+    record_rawonly_resource_unmap(
+        session,
+        resource,
+        resource_object_id,
+        mapped.subresource,
+        begin,
+        end,
+        bytes,
+        size);
+    return;
+  }
+
   const auto hash = fnv1a64_bytes(bytes, size);
   if (mapped_range_captured(mapped, begin, end, hash)) {
     return;
@@ -3913,6 +4223,23 @@ void record_resource_unmap(
   if (!resource || !written_data || written_size == 0 || written_end <= written_begin) {
     return;
   }
+
+  if (auto *session = session_for(trace::ApiKind::D3D12);
+      session && session->capture_raw_mode() == runtime::CaptureOptions::CaptureRawMode::RawOnly) {
+    const auto resource_object_id = object_id(resource);
+    std::lock_guard event_lock(g_event_order_mutex);
+    record_rawonly_resource_unmap(
+        session,
+        resource,
+        resource_object_id,
+        subresource,
+        written_begin,
+        written_end,
+        written_data,
+        written_size);
+    return;
+  }
+
   const auto written_hash = fnv1a64_bytes(written_data, written_size);
 
   const auto asset = register_asset_bytes(
@@ -3957,6 +4284,28 @@ void record_resource_unmap(
     }
   }
 }
+
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
+void reset_raw_unmap_fast_path_for_test()
+{
+  std::lock_guard lock(g_raw_unmap_mutex);
+  g_raw_unmap_signature_session = nullptr;
+  g_raw_unmap_signature_bundle_root.clear();
+  g_raw_unmap_signature_initial_sequence = 0;
+  g_raw_unmap_signatures.clear();
+  g_raw_unmap_counters = RawUnmapCounters{};
+}
+
+RawUnmapFastPathCounters raw_unmap_fast_path_counters_for_test()
+{
+  std::lock_guard lock(g_raw_unmap_mutex);
+  return RawUnmapFastPathCounters{
+      g_raw_unmap_counters.unmap_candidates,
+      g_raw_unmap_counters.unchanged_skipped,
+      g_raw_unmap_counters.emitted_blob_bytes,
+      g_raw_unmap_counters.raw_write_failures};
+}
+#endif
 
 void record_resource_bytes_snapshot(
     trace::ObjectId resource_object_id,
