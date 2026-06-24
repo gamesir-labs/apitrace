@@ -1,9 +1,12 @@
 #pragma once
 
 #include "apitrace/capture_runtime.hpp"
+#include "apitrace/raw_capture_io.hpp"
 #include "apitrace/trace_bundle_io.hpp"
 #include "apitrace/trace_session.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <string_view>
 #include <unordered_map>
 
@@ -65,9 +68,14 @@ public:
   const TraceOptions &options() const noexcept;
 
 private:
+  void append_raw_dual_event(const trace::EventRecord &event);
+  std::uint64_t append_raw_blob_for_asset(const trace::AssetRecord &asset, std::uint64_t producing_sequence);
+
   TraceOptions options_;
   BundleCaptureSink bundle_sink_;
   RuntimeBootstrap runtime_bootstrap_;
+  trace::raw::RawCaptureWriter raw_writer_;
+  std::unordered_map<trace::BlobId, std::uint64_t> raw_blob_ids_by_asset_;
   std::unordered_map<trace::ObjectId, trace::ObjectRecord> objects_;
   bool active_ = false;
 

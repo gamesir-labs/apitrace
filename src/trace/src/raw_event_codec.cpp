@@ -3,6 +3,7 @@
 #include <array>
 #include <limits>
 #include <sstream>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -624,6 +625,22 @@ bool decode_frame_boundary(
   return true;
 }
 
+bool decode_passthrough_final_json(
+    const RawEventRecord &record,
+    DecodedRawEvent &decoded,
+    std::string &error)
+{
+  PayloadCursor cursor(record.payload);
+  std::string json_record;
+  if (!cursor.string(json_record) || !cursor.done()) {
+    error = "malformed PassthroughFinalJson payload";
+    return false;
+  }
+
+  decoded.passthrough_jsonl_record = std::move(json_record);
+  return true;
+}
+
 } // namespace
 
 std::string raw_event_contract_markdown()
@@ -639,7 +656,8 @@ std::string raw_event_contract_markdown()
       "- DrawInstanced 0x0301: u64 command_list_object_id, u32 vertex_count_per_instance, u32 instance_count, u32 start_vertex_location, u32 start_instance_location.\n"
       "- Dispatch 0x0302: u64 command_list_object_id, u32 thread_group_count_x, u32 thread_group_count_y, u32 thread_group_count_z.\n"
       "- PresentCall 0x0401 / PresentBoundary 0x0404: u64 swap_chain_object_id, u64 frame_index, u32 sync_interval, u32 flags.\n"
-      "- FrameBegin 0x0402 / FrameEnd 0x0403: u64 frame_index. Final payloads include label=FrameBegin or label=FrameEnd for existing tail-consistency checks.\n";
+      "- FrameBegin 0x0402 / FrameEnd 0x0403: u64 frame_index. Final payloads include label=FrameBegin or label=FrameEnd for existing tail-consistency checks.\n"
+      "- PassthroughFinalJson 0x0001: str final_jsonl_record. Finalization writes this opaque callstream JSON line unchanged for events not covered by the binary subset.\n";
 }
 
 std::vector<std::uint8_t> encode_resource_create_payload(
@@ -761,6 +779,14 @@ std::vector<std::uint8_t> encode_frame_boundary_payload(std::uint64_t frame_inde
   return bytes;
 }
 
+std::vector<std::uint8_t> encode_passthrough_final_json_payload(std::string_view final_jsonl_record)
+{
+  std::vector<std::uint8_t> bytes;
+  put_u32(bytes, static_cast<std::uint32_t>(final_jsonl_record.size()));
+  bytes.insert(bytes.end(), final_jsonl_record.begin(), final_jsonl_record.end());
+  return bytes;
+}
+
 RawDecodeResult decode_raw_events(
     const RawCaptureReader &reader,
     const std::vector<RawEventRecord> &records)
@@ -773,6 +799,9 @@ RawDecodeResult decode_raw_events(
     DecodedRawEvent decoded;
     bool ok = false;
     switch (static_cast<RawEventOpcode>(record.header.opcode)) {
+    case RawEventOpcode::PassthroughFinalJson:
+      ok = decode_passthrough_final_json(record, decoded, result.error);
+      break;
     case RawEventOpcode::ResourceCreate:
       ok = decode_resource_create(record, decoded, result.error);
       break;

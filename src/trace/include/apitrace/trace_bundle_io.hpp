@@ -20,6 +20,8 @@ namespace apitrace::trace {
 
 struct TranslationLinkRecord;
 
+std::string event_record_json(const EventRecord &event);
+
 struct AnalysisRecord {
   std::string stream_name;
   std::string record_type;
@@ -46,8 +48,11 @@ public:
   // semantic assets, expensive hashing, deduplication, and crash-tail repair are
   // finalized offline by the bundle tools so API threads do not wait on publish
   // work.
+  EventRecord prepare_call_event(EventRecord event) const;
+  void append_prepared_call_event(EventRecord &&event);
   void append_call_event(const EventRecord &event);
   void append_call_event(EventRecord &&event);
+  void append_callstream_json_line(std::string_view json_line);
   void append_metal_event(const MetalEventRecord &event);
   AssetRecord register_asset(const AssetRecord &asset);
   AssetRecord register_asset(AssetRecord &&asset);

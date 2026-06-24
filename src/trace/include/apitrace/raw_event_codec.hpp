@@ -13,6 +13,7 @@ namespace apitrace::trace::raw {
 constexpr std::uint32_t kRawEventContractVersion = 1;
 
 enum class RawEventOpcode : std::uint32_t {
+  PassthroughFinalJson = 0x0001,
   ResourceCreate = 0x0101,
   ResourceUnmap = 0x0102,
   GraphicsPipelineCreate = 0x0201,
@@ -35,6 +36,7 @@ enum class RawBlobKind : std::uint32_t {
 struct DecodedRawEvent {
   EventRecord event;
   std::vector<AssetRecord> assets;
+  std::string passthrough_jsonl_record;
 };
 
 struct RawDecodeResult {
@@ -95,6 +97,8 @@ std::vector<std::uint8_t> encode_present_payload(
     std::uint32_t flags);
 
 std::vector<std::uint8_t> encode_frame_boundary_payload(std::uint64_t frame_index);
+
+std::vector<std::uint8_t> encode_passthrough_final_json_payload(std::string_view final_jsonl_record);
 
 RawDecodeResult decode_raw_events(
     const RawCaptureReader &reader,

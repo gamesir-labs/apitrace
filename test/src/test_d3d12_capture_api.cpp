@@ -1,5 +1,7 @@
 #include "apitrace/capture_runtime.hpp"
 #include "apitrace/d3d12_capture.hpp"
+#include "apitrace/raw_capture_io.hpp"
+#include "apitrace/raw_event_codec.hpp"
 #include "apitrace/trace_bundle_io.hpp"
 
 #include <cstdint>
@@ -49,6 +51,16 @@ bool clear_trace_bundle_env()
   return _putenv_s("APITRACE_TRACE_BUNDLE", "") == 0;
 #else
   return unsetenv("APITRACE_TRACE_BUNDLE") == 0;
+#endif
+}
+
+bool set_raw_format_env(bool enabled)
+{
+#ifdef _WIN32
+  return _putenv_s("DXMT_CAPTURE_RAW_FORMAT", enabled ? "1" : "") == 0;
+#else
+  return enabled ? setenv("DXMT_CAPTURE_RAW_FORMAT", "1", 1) == 0
+                 : unsetenv("DXMT_CAPTURE_RAW_FORMAT") == 0;
 #endif
 }
 
@@ -113,6 +125,103 @@ bool finalize_bundle(const char *argv0, const std::filesystem::path &bundle)
   }
   const auto command = shell_quote_path(finalize) + " --jobs 1 " + shell_quote_path(bundle);
   return std::system(command.c_str()) == 0;
+}
+
+bool finalize_raw_bundle(const char *argv0, const std::filesystem::path &bundle)
+{
+  std::filesystem::path finalize = "bundle-finalize";
+  const auto self = std::filesystem::path(argv0 ? argv0 : "");
+  if (self.has_parent_path()) {
+    const auto sibling = self.parent_path() / "bundle-finalize";
+    if (std::filesystem::exists(sibling)) {
+      finalize = sibling;
+    }
+  }
+  const auto command = shell_quote_path(finalize) + " --raw-format --jobs 1 " + shell_quote_path(bundle);
+  return std::system(command.c_str()) == 0;
+}
+
+bool run_dual_write_capture_smoke(const char *argv0, const std::filesystem::path &base_bundle)
+{
+  const auto off_bundle = base_bundle.parent_path() / (base_bundle.filename().string() + "-raw-off.apitrace");
+  apitrace::runtime::shutdown_process_trace_session();
+  std::filesystem::remove_all(off_bundle);
+  if (!set_raw_format_env(false) || !set_trace_bundle_env(off_bundle)) {
+    std::cerr << "failed to configure raw-off capture smoke\n";
+    return false;
+  }
+  auto *device = fake_object(0x12000);
+  apitrace::d3d12::record_d3d12_create_device(device);
+  apitrace::runtime::shutdown_process_trace_session();
+  clear_trace_bundle_env();
+  if (std::filesystem::exists(off_bundle / "raw")) {
+    std::cerr << "raw writer should not create files when DXMT_CAPTURE_RAW_FORMAT is off\n";
+    return false;
+  }
+
+  const auto raw_bundle = base_bundle.parent_path() / (base_bundle.filename().string() + "-raw-on.apitrace");
+  apitrace::runtime::shutdown_process_trace_session();
+  std::filesystem::remove_all(raw_bundle);
+  if (!set_raw_format_env(true) || !set_trace_bundle_env(raw_bundle)) {
+    std::cerr << "failed to configure raw-on capture smoke\n";
+    return false;
+  }
+
+  auto *raw_device = fake_object(0x13000);
+  auto *raw_resource = fake_object(0x14000);
+  auto *raw_command_list = fake_object(0x15000);
+  auto *raw_swapchain = fake_object(0x16000);
+  apitrace::d3d12::record_d3d12_create_device(raw_device);
+  apitrace::d3d12::record_object_create(
+      raw_resource,
+      apitrace::d3d12::CaptureObjectKind::Resource,
+      raw_device,
+      "ID3D12Resource");
+  std::uint8_t bytes[] = {1, 2, 3, 4};
+  apitrace::d3d12::record_resource_unmap(raw_resource, 0, 0, sizeof(bytes), bytes, sizeof(bytes));
+  apitrace::d3d12::record_object_create(
+      raw_command_list,
+      apitrace::d3d12::CaptureObjectKind::CommandList,
+      raw_device,
+      "ID3D12GraphicsCommandList");
+  apitrace::d3d12::record_draw_instanced(raw_command_list, 3, 1, 0, 0);
+  apitrace::d3d12::record_present(raw_swapchain, 1, 0, 0, true);
+  apitrace::runtime::shutdown_process_trace_session();
+  clear_trace_bundle_env();
+  set_raw_format_env(false);
+
+  apitrace::trace::raw::RawCaptureReader raw_reader;
+  if (!raw_reader.open(raw_bundle)) {
+    std::cerr << "failed to read raw dual-write bundle: " << raw_reader.last_error() << "\n";
+    return false;
+  }
+  const auto raw_events = raw_reader.read_events();
+  bool saw_passthrough = false;
+  bool saw_unmap = false;
+  bool saw_draw = false;
+  for (const auto &event : raw_events) {
+    const auto opcode = static_cast<apitrace::trace::raw::RawEventOpcode>(event.header.opcode);
+    saw_passthrough = saw_passthrough || opcode == apitrace::trace::raw::RawEventOpcode::PassthroughFinalJson;
+    saw_unmap = saw_unmap || opcode == apitrace::trace::raw::RawEventOpcode::ResourceUnmap;
+    saw_draw = saw_draw || opcode == apitrace::trace::raw::RawEventOpcode::DrawInstanced;
+  }
+  if (!saw_passthrough || !saw_unmap || !saw_draw || raw_reader.blob_extents().empty()) {
+    std::cerr << "raw dual-write did not include passthrough, binary subset, and blob records\n";
+    return false;
+  }
+
+  if (!finalize_raw_bundle(argv0, raw_bundle)) {
+    std::cerr << "bundle-finalize --raw-format failed for dual-write smoke bundle\n";
+    return false;
+  }
+  const auto records_text = read_text(raw_bundle / apitrace::trace::kCallstreamFileName);
+  if (records_text.find("\"function\":\"D3D12CreateDevice\"") == std::string::npos ||
+      records_text.find("\"function\":\"ID3D12Resource::Unmap\"") == std::string::npos ||
+      records_text.find("\"function\":\"ID3D12GraphicsCommandList::DrawInstanced\"") == std::string::npos) {
+    std::cerr << "raw-to-final output did not preserve passthrough and binary subset calls\n";
+    return false;
+  }
+  return true;
 }
 
 bool verify_raw_pipeline_capture(const std::filesystem::path &bundle)
@@ -310,6 +419,7 @@ int main(int argc, char **argv)
 
   const std::filesystem::path bundle = argv[1];
   apitrace::runtime::shutdown_process_trace_session();
+  set_raw_format_env(false);
   std::filesystem::remove_all(bundle);
 
   if (!set_trace_bundle_env(bundle)) {
@@ -728,6 +838,7 @@ int main(int argc, char **argv)
 
   apitrace::runtime::shutdown_process_trace_session();
   clear_trace_bundle_env();
+  set_raw_format_env(false);
 
   if (!verify_raw_pipeline_capture(bundle)) {
     return 1;
@@ -1109,6 +1220,10 @@ int main(int argc, char **argv)
   }
   if (present_call_count != 3 || present_test_count != 1 || expected_present_frame_index != 2) {
     std::cerr << "capture api did not preserve test Present while keeping frame indexes real-present only\n";
+    return 1;
+  }
+
+  if (!run_dual_write_capture_smoke(argv[0], bundle)) {
     return 1;
   }
 

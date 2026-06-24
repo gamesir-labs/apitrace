@@ -564,6 +564,11 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
   writer.write_metadata({apitrace::trace::ApiKind::D3D12, apitrace::trace::kFormatVersion, "raw-to-final", false});
 
   for (const auto &decoded_event : decoded.events) {
+    if (!decoded_event.passthrough_jsonl_record.empty()) {
+      writer.append_callstream_json_line(decoded_event.passthrough_jsonl_record);
+      ++stats.raw_to_final_events;
+      continue;
+    }
     auto event = decoded_event.event;
     for (const auto &asset : decoded_event.assets) {
       const auto input_blob_id = asset.blob_id;

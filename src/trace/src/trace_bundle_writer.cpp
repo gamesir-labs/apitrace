@@ -1069,6 +1069,8 @@ void write_text_atomic(const std::filesystem::path &path, std::string_view text)
   std::filesystem::remove(temporary_path, remove_error);
 }
 
+} // namespace
+
 std::string event_record_json(const EventRecord &event)
 {
   std::ostringstream output;
@@ -1124,6 +1126,8 @@ std::string event_record_json(const EventRecord &event)
          << "}";
   return output.str();
 }
+
+namespace {
 
 std::string checksum_index_json(const ChecksumIndex &checksums)
 {
@@ -5870,9 +5874,20 @@ void TraceBundleWriter::append_call_event(const EventRecord &event)
   append_call_event(std::move(copy));
 }
 
-void TraceBundleWriter::append_call_event(EventRecord &&event)
+EventRecord TraceBundleWriter::prepare_call_event(EventRecord event) const
 {
   stamp_event_timing(event, impl_->monotonic_origin_ns);
+  return event;
+}
+
+void TraceBundleWriter::append_call_event(EventRecord &&event)
+{
+  event = prepare_call_event(std::move(event));
+  append_prepared_call_event(std::move(event));
+}
+
+void TraceBundleWriter::append_prepared_call_event(EventRecord &&event)
+{
   if (impl_->cache_events) {
     TimedWriterLock lock(impl_->event_mutex, impl_->writer_stats ? &impl_->event_lock_stats : nullptr);
     impl_->events.push_back(event);
@@ -5893,6 +5908,18 @@ void TraceBundleWriter::append_call_event(EventRecord &&event)
   } else {
     impl_->callstream_stream.write_line(event_record_json(event));
   }
+  impl_->signal_checkpoint_work(1, 0);
+}
+
+void TraceBundleWriter::append_callstream_json_line(std::string_view json_line)
+{
+  if (!impl_->open || !impl_->callstream_stream.is_open()) {
+    return;
+  }
+  if (!impl_->metadata_written.load(std::memory_order_acquire)) {
+    write_metadata(impl_->metadata);
+  }
+  impl_->callstream_stream.write_line(std::string(json_line));
   impl_->signal_checkpoint_work(1, 0);
 }
 
