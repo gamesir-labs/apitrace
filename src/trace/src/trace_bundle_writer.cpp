@@ -84,6 +84,7 @@ std::uint64_t default_spool_asset_checkpoint_bytes()
 
 #if defined(APITRACE_ENABLE_TEST_HOOKS)
 std::atomic<void (*)()> seal_checkpoint_heavy_phase_hook_for_test{nullptr};
+std::atomic_uint64_t g_blob_id_scan_count_for_test{0};
 #endif
 
 template <typename Event>
@@ -1353,59 +1354,62 @@ void merge_asset_record(std::vector<AssetRecord> &records, const AssetRecord &as
   records.push_back(asset);
 }
 
-std::uint64_t max_blob_id(const std::vector<AssetRecord> &assets, const std::vector<AssetRecord> &metal_assets)
-{
-  std::uint64_t max_id = 0;
-  for (const auto &asset : assets)
-    max_id = std::max(max_id, static_cast<std::uint64_t>(asset.blob_id));
-  for (const auto &asset : metal_assets)
-    max_id = std::max(max_id, static_cast<std::uint64_t>(asset.blob_id));
-  return max_id;
-}
+class BlobIdAllocator {
+public:
+  BlobIdAllocator(const std::vector<AssetRecord> &assets, const std::vector<AssetRecord> &metal_assets)
+  {
+    add_records(assets);
+    add_records(metal_assets);
+    next_blob_id_ = high_water_blob_id_ + 1;
+    if (next_blob_id_ == 0) {
+      next_blob_id_ = 1;
+    }
+  }
 
-bool blob_id_maps_to_path(
-    const std::vector<AssetRecord> &assets,
-    const std::vector<AssetRecord> &metal_assets,
-    std::uint64_t blob_id,
-    const std::filesystem::path &relative_path)
-{
-  for (const auto &asset : assets) {
-    if (asset.blob_id == blob_id)
-      return asset.relative_path == relative_path;
+  bool maps_to_path(std::uint64_t blob_id, const std::filesystem::path &relative_path) const
+  {
+    const auto found = paths_by_blob_id_.find(blob_id);
+    return found != paths_by_blob_id_.end() && found->second == relative_path.generic_string();
   }
-  for (const auto &asset : metal_assets) {
-    if (asset.blob_id == blob_id)
-      return asset.relative_path == relative_path;
-  }
-  return false;
-}
 
-bool blob_id_is_used(
-    const std::vector<AssetRecord> &assets,
-    const std::vector<AssetRecord> &metal_assets,
-    std::uint64_t blob_id)
-{
-  for (const auto &asset : assets) {
-    if (asset.blob_id == blob_id)
-      return true;
+  bool used(std::uint64_t blob_id) const
+  {
+    return paths_by_blob_id_.find(blob_id) != paths_by_blob_id_.end();
   }
-  for (const auto &asset : metal_assets) {
-    if (asset.blob_id == blob_id)
-      return true;
-  }
-  return false;
-}
 
-std::uint64_t allocate_unique_blob_id(
-    const std::vector<AssetRecord> &assets,
-    const std::vector<AssetRecord> &metal_assets,
-    std::uint64_t &next_blob_id)
-{
-  do {
-    ++next_blob_id;
-  } while (next_blob_id == 0 || blob_id_is_used(assets, metal_assets, next_blob_id));
-  return next_blob_id;
-}
+  std::uint64_t allocate()
+  {
+    while (next_blob_id_ == 0 || used(next_blob_id_)) {
+      ++next_blob_id_;
+    }
+    return next_blob_id_++;
+  }
+
+  void note(const AssetRecord &asset)
+  {
+    if (asset.blob_id == 0 || asset.relative_path.empty()) {
+      return;
+    }
+    const auto blob_id = static_cast<std::uint64_t>(asset.blob_id);
+    paths_by_blob_id_.emplace(blob_id, asset.relative_path.generic_string());
+  }
+
+private:
+  void add_records(const std::vector<AssetRecord> &records)
+  {
+#if defined(APITRACE_ENABLE_TEST_HOOKS)
+    g_blob_id_scan_count_for_test.fetch_add(records.size(), std::memory_order_relaxed);
+#endif
+    for (const auto &asset : records) {
+      high_water_blob_id_ = std::max(high_water_blob_id_, static_cast<std::uint64_t>(asset.blob_id));
+      note(asset);
+    }
+  }
+
+  std::unordered_map<std::uint64_t, std::string> paths_by_blob_id_;
+  std::uint64_t high_water_blob_id_ = 0;
+  std::uint64_t next_blob_id_ = 1;
+};
 
 std::unordered_map<std::uint64_t, std::uint64_t> merge_sideband_asset_shard(
     const std::filesystem::path &path,
@@ -1427,18 +1431,19 @@ std::unordered_map<std::uint64_t, std::uint64_t> merge_sideband_asset_shard(
     return blob_remap;
   }
 
-  auto next_blob_id = max_blob_id(assets, metal_assets);
+  BlobIdAllocator blob_ids(assets, metal_assets);
   for (const auto &entry : *list) {
     auto asset = asset_record_from_json(entry);
     if (!asset) {
       continue;
     }
     const auto original_blob_id = static_cast<std::uint64_t>(asset->blob_id);
-    if (blob_id_is_used(assets, metal_assets, original_blob_id) &&
-        !blob_id_maps_to_path(assets, metal_assets, original_blob_id, asset->relative_path)) {
-      asset->blob_id = allocate_unique_blob_id(assets, metal_assets, next_blob_id);
+    if (blob_ids.used(original_blob_id) &&
+        !blob_ids.maps_to_path(original_blob_id, asset->relative_path)) {
+      asset->blob_id = blob_ids.allocate();
       blob_remap.emplace(original_blob_id, static_cast<std::uint64_t>(asset->blob_id));
     }
+    blob_ids.note(*asset);
     if (entry.value("metal", false)) {
       merge_asset_record(metal_assets, *asset);
     } else {
@@ -4249,6 +4254,8 @@ struct TraceBundleWriter::Impl {
   std::unordered_map<std::string, std::uint64_t> known_file_sizes;
   std::unordered_map<std::string, std::string> completed_path_aliases;
   std::unordered_map<std::uint64_t, std::string> reserved_blob_paths;
+  std::unordered_set<std::uint64_t> reserved_blob_ids;
+  std::uint64_t next_published_blob_id = 1;
   std::unordered_map<std::string, std::vector<std::size_t>> asset_record_indices_by_path;
   std::unordered_map<std::string, std::vector<std::size_t>> metal_asset_record_indices_by_path;
   std::unordered_map<std::uint64_t, RegisteredAssetPayload> registered_asset_payloads_by_blob_id;
@@ -4755,17 +4762,32 @@ struct TraceBundleWriter::Impl {
       return asset;
 
     const auto path_key = asset.relative_path.generic_string();
-    auto current = reserved_blob_paths.find(asset.blob_id);
+    auto current = reserved_blob_paths.find(static_cast<std::uint64_t>(asset.blob_id));
     if (current != reserved_blob_paths.end() && current->second != path_key) {
-      auto next_blob_id = max_blob_id(assets, metal_assets);
       do {
-        ++next_blob_id;
-        current = reserved_blob_paths.find(next_blob_id);
-      } while (next_blob_id == 0 || current != reserved_blob_paths.end());
-      asset.blob_id = next_blob_id;
+        if (next_published_blob_id == 0) {
+          next_published_blob_id = 1;
+        }
+        if (reserved_blob_ids.find(next_published_blob_id) == reserved_blob_ids.end()) {
+          asset.blob_id = next_published_blob_id++;
+          break;
+        }
+        ++next_published_blob_id;
+      } while (true);
     }
-    reserved_blob_paths.emplace(static_cast<std::uint64_t>(asset.blob_id), path_key);
+    const auto blob_id = static_cast<std::uint64_t>(asset.blob_id);
+    reserved_blob_paths.emplace(blob_id, path_key);
+    reserved_blob_ids.insert(blob_id);
     return asset;
+  }
+
+  void note_published_blob_id_locked(BlobId blob_id)
+  {
+    if (blob_id == 0)
+      return;
+    const auto next = static_cast<std::uint64_t>(blob_id) + 1;
+    if (next > next_published_blob_id || next == 0)
+      next_published_blob_id = next == 0 ? 1 : next;
   }
 
   AssetRecord reserve_blob_id(AssetRecord asset)
@@ -4781,6 +4803,7 @@ struct TraceBundleWriter::Impl {
     const auto index = assets.size();
 	    assets.push_back(asset);
     asset_record_indices_by_path[asset.relative_path.generic_string()].push_back(index);
+    note_published_blob_id_locked(asset.blob_id);
 	    return asset;
 	  }
 
@@ -4815,6 +4838,7 @@ struct TraceBundleWriter::Impl {
     const auto index = metal_assets.size();
 	    metal_assets.push_back(asset);
     metal_asset_record_indices_by_path[asset.relative_path.generic_string()].push_back(index);
+    note_published_blob_id_locked(asset.blob_id);
 	    return asset;
 	  }
 
@@ -5235,7 +5259,10 @@ struct TraceBundleWriter::Impl {
 	        const auto published_blob_id = record.blob_id;
 	        record = finalized;
 	        record.blob_id = published_blob_id;
-	        reserved_blob_paths[static_cast<std::uint64_t>(record.blob_id)] = record.relative_path.generic_string();
+	        const auto blob_id = static_cast<std::uint64_t>(record.blob_id);
+	        reserved_blob_paths[blob_id] = record.relative_path.generic_string();
+	        reserved_blob_ids.insert(blob_id);
+	        note_published_blob_id_locked(record.blob_id);
     };
     std::vector<std::size_t> updated_indices;
 
@@ -6855,6 +6882,19 @@ std::uint64_t TraceBundleWriter::TestHooks::spool_published_offset_for_test(
     const TraceBundleWriter &writer)
 {
   return writer.impl_ ? writer.impl_->published_spool_checkpoint_offset() : 0;
+}
+
+AssetRecord TraceBundleWriter::TestHooks::reserve_blob_id_for_test(
+    TraceBundleWriter &writer,
+    AssetRecord asset)
+{
+  return writer.impl_ ? writer.impl_->reserve_blob_id(std::move(asset)) : std::move(asset);
+}
+
+std::uint64_t TraceBundleWriter::TestHooks::blob_id_scan_count_for_test(
+    const TraceBundleWriter &)
+{
+  return g_blob_id_scan_count_for_test.load(std::memory_order_relaxed);
 }
 
 void TraceBundleWriter::TestHooks::set_seal_checkpoint_heavy_phase_hook_for_test(void (*hook)())

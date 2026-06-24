@@ -945,6 +945,77 @@ bool write_primary_blob_id_conflict_bundle(const std::filesystem::path &bundle)
          refresh_bundle_hash(bundle);
 }
 
+bool blob_id_allocator_preserves_old_conflict_sequence(const std::filesystem::path &bundle)
+{
+  std::filesystem::remove_all(bundle);
+  apitrace::trace::TraceBundleWriter writer;
+  if (!writer.open(bundle)) {
+    return false;
+  }
+
+  auto publish_empty_asset = [&](std::uint64_t blob_id, std::string path) {
+    apitrace::trace::AssetRecord asset;
+    asset.blob_id = blob_id;
+    asset.kind = apitrace::trace::AssetKind::Buffer;
+    asset.relative_path = std::filesystem::path(path);
+    asset.debug_name = path;
+    return writer.register_asset(std::move(asset));
+  };
+  auto reserve = [&](std::uint64_t blob_id, std::string path) {
+    apitrace::trace::AssetRecord asset;
+    asset.blob_id = blob_id;
+    asset.kind = apitrace::trace::AssetKind::Buffer;
+    asset.relative_path = std::filesystem::path(path);
+    asset.debug_name = path;
+    return apitrace::trace::TraceBundleWriter::TestHooks::reserve_blob_id_for_test(writer, std::move(asset));
+  };
+
+  const auto published_5 = publish_empty_asset(5, "buffers/published-5.buffer");
+  const auto published_7 = publish_empty_asset(7, "buffers/published-7.buffer");
+  const auto first_conflict = reserve(5, "buffers/conflict-first.buffer");
+  const auto second_conflict = reserve(7, "buffers/conflict-second.buffer");
+  if (published_5.blob_id != 5 || published_7.blob_id != 7 ||
+      first_conflict.blob_id != 8 || second_conflict.blob_id != 9) {
+    std::cerr << "blob-id conflict allocation diverged from old max+increment sequence: got "
+              << first_conflict.blob_id << ", " << second_conflict.blob_id << "\n";
+    return false;
+  }
+
+  const auto external_high = publish_empty_asset(25, "buffers/published-25.buffer");
+  const auto high_conflict = reserve(5, "buffers/conflict-after-high.buffer");
+  if (external_high.blob_id != 25 || high_conflict.blob_id != 26) {
+    std::cerr << "externally supplied high blob id did not advance deterministic high-water allocation\n";
+    return false;
+  }
+
+  const auto same_path = reserve(5, "buffers/published-5.buffer");
+  if (same_path.blob_id != 5) {
+    std::cerr << "same-path blob id reuse should preserve the original blob id\n";
+    return false;
+  }
+
+  const auto scan_count_before = apitrace::trace::TraceBundleWriter::TestHooks::blob_id_scan_count_for_test(writer);
+  constexpr std::uint64_t kConflictCount = 50000;
+  for (std::uint64_t index = 0; index < kConflictCount; ++index) {
+    const auto allocated = reserve(5, "buffers/repeated-conflict-" + std::to_string(index) + ".buffer");
+    const auto expected = 27 + index;
+    if (allocated.blob_id != expected) {
+      std::cerr << "repeated conflict allocated blob id " << allocated.blob_id
+                << ", expected " << expected << "\n";
+      return false;
+    }
+  }
+  const auto scan_count_after = apitrace::trace::TraceBundleWriter::TestHooks::blob_id_scan_count_for_test(writer);
+  if (scan_count_after != scan_count_before) {
+    std::cerr << "reserve_blob_id performed " << (scan_count_after - scan_count_before)
+              << " asset-vector scan steps during repeated conflict allocation\n";
+    return false;
+  }
+
+  writer.close();
+  return true;
+}
+
 bool write_d3d_graphics_pipeline_bundle(const std::filesystem::path &bundle, bool shuffled_blob_refs = false)
 {
   std::filesystem::remove_all(bundle);
@@ -1286,6 +1357,12 @@ int main(int argc, char **argv)
       bundle.parent_path() / (bundle.filename().generic_string() + "-slow-spool-backpressure");
   if (!slow_spool_backpressure_stays_bounded(slow_spool_bundle)) {
     std::cerr << "slow spool capture should block and keep published asset prefix bounded\n";
+    return 1;
+  }
+  const auto blob_id_allocator_bundle =
+      bundle.parent_path() / (bundle.filename().generic_string() + "-blob-id-allocator");
+  if (!blob_id_allocator_preserves_old_conflict_sequence(blob_id_allocator_bundle)) {
+    std::cerr << "blob-id allocator should preserve old conflict ids without vector rescans\n";
     return 1;
   }
   const auto seal_concurrency_bundle =

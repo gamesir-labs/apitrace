@@ -95,6 +95,8 @@ public:
         const std::vector<std::uint8_t> &payload);
     static std::uint64_t spool_reserved_offset_for_test(const TraceBundleWriter &writer);
     static std::uint64_t spool_published_offset_for_test(const TraceBundleWriter &writer);
+    static AssetRecord reserve_blob_id_for_test(TraceBundleWriter &writer, AssetRecord asset);
+    static std::uint64_t blob_id_scan_count_for_test(const TraceBundleWriter &writer);
     static void set_seal_checkpoint_heavy_phase_hook_for_test(void (*hook)());
   };
 #endif
