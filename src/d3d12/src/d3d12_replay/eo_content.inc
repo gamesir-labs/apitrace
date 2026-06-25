@@ -230,12 +230,23 @@
     next_descriptor_copy_index_ = descriptor_copy_timeline_.size();
   }
 
-  bool event_ordered_copy_belongs_to_event(
-      const D3D12ReplayBackend::CopyDescriptorSemanticState &copy,
-      const trace::EventRecord &event) const
+  void event_ordered_index_descriptor_copies()
+  {
+    while (event_ordered_descriptor_copy_index_cursor_ < backend_.descriptor_copies_.size()) {
+      const auto &copy = backend_.descriptor_copies_[event_ordered_descriptor_copy_index_cursor_];
+      event_ordered_descriptor_copy_indices_by_sequence_[copy.create_sequence].push_back(
+          event_ordered_descriptor_copy_index_cursor_);
+      ++event_ordered_descriptor_copy_index_cursor_;
+    }
+  }
+
+  bool event_ordered_descriptor_copy_sequences_for_event(
+      const trace::EventRecord &event,
+      std::vector<std::uint64_t> &sequences) const
   {
     if (event.callsite.function_name != "ID3D12Device::CopyDescriptorsBatch") {
-      return copy.create_sequence == event.callsite.sequence;
+      sequences.push_back(event.callsite.sequence);
+      return true;
     }
 
     json payload;
@@ -248,11 +259,12 @@
       return false;
     }
     for (const auto &op : *ops) {
-      if (op.is_array() && !op.empty() && json_u64(op[0]) == copy.create_sequence) {
-        return true;
+      if (!op.is_array() || op.empty()) {
+        return false;
       }
+      sequences.push_back(json_u64(op[0], event.callsite.sequence));
     }
-    return false;
+    return true;
   }
 
   static std::string event_ordered_descriptor_copy_key(
@@ -268,24 +280,41 @@
 
   void event_ordered_apply_copy_descriptors(const trace::EventRecord &event)
   {
+    event_ordered_index_descriptor_copies();
+    std::vector<std::uint64_t> copy_sequences;
+    if (!event_ordered_descriptor_copy_sequences_for_event(event, copy_sequences)) {
+      event_ordered_report_content_error(
+          event,
+          "copy-descriptors",
+          "CopyDescriptors event payload could not be matched to semantic copies");
+      return;
+    }
+
     bool applied_any = false;
-    for (const auto &copy : backend_.descriptor_copies_) {
-      if (!event_ordered_copy_belongs_to_event(copy, event)) {
+    for (const auto sequence : copy_sequences) {
+      const auto index_it = event_ordered_descriptor_copy_indices_by_sequence_.find(sequence);
+      if (index_it == event_ordered_descriptor_copy_indices_by_sequence_.end()) {
         continue;
       }
-      const auto key = event_ordered_descriptor_copy_key(copy);
-      if (!event_ordered_copy_descriptors_applied_keys_.insert(key).second) {
-        continue;
+      for (const auto copy_index : index_it->second) {
+        if (copy_index >= backend_.descriptor_copies_.size()) {
+          continue;
+        }
+        const auto &copy = backend_.descriptor_copies_[copy_index];
+        const auto key = event_ordered_descriptor_copy_key(copy);
+        if (!event_ordered_copy_descriptors_applied_keys_.insert(key).second) {
+          continue;
+        }
+        std::string error;
+        if (!apply_descriptor_copy(copy, error)) {
+          event_ordered_copy_descriptors_applied_keys_.erase(key);
+          event_ordered_report_content_error(event, "copy-descriptors", std::move(error));
+          continue;
+        }
+        event_ordered_remember_descriptor_copy_history(copy);
+        ++event_ordered_copy_descriptors_applied_;
+        applied_any = true;
       }
-      std::string error;
-      if (!apply_descriptor_copy(copy, error)) {
-        event_ordered_copy_descriptors_applied_keys_.erase(key);
-        event_ordered_report_content_error(event, "copy-descriptors", std::move(error));
-        continue;
-      }
-      event_ordered_remember_descriptor_copy_history(copy);
-      ++event_ordered_copy_descriptors_applied_;
-      applied_any = true;
     }
     if (applied_any) {
       event_ordered_refresh_descriptor_copy_state();

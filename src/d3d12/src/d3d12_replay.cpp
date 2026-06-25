@@ -126,6 +126,40 @@ private:
   bool active_ = true;
 };
 
+class ScopedUsAccumulator {
+public:
+  explicit ScopedUsAccumulator(std::uint64_t &target, bool enabled = true)
+      : target_(target), enabled_(enabled)
+  {
+    if (enabled_) {
+      begin_ = std::chrono::steady_clock::now();
+    }
+  }
+
+  ~ScopedUsAccumulator()
+  {
+    stop();
+  }
+
+  void stop()
+  {
+    if (!active_ || !enabled_) {
+      return;
+    }
+    target_ += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - begin_)
+            .count());
+    active_ = false;
+  }
+
+private:
+  std::uint64_t &target_;
+  std::chrono::steady_clock::time_point begin_;
+  bool enabled_ = true;
+  bool active_ = true;
+};
+
 bool env_enabled(const char *name, bool fallback)
 {
   const char *value = std::getenv(name);
@@ -165,7 +199,156 @@ std::uint64_t env_u64(const char *name, std::uint64_t fallback = 0)
   return static_cast<std::uint64_t>(parsed);
 }
 
+std::uint64_t g_event_ordered_profile_decode_us = 0;
+std::uint64_t g_event_ordered_profile_dispatch_us = 0;
+std::uint64_t g_event_ordered_profile_events = 0;
+
 #if defined(APITRACE_HAS_D3D_NATIVE)
+
+#define EVENT_ORDERED_DISPATCH_PROFILE_KIND_LIST(X) \
+  X(D3D12CreateDevice, "D3D12CreateDevice") \
+  X(IDXGIFactory_CreateSwapChain, "IDXGIFactory::CreateSwapChain") \
+  X(ID3D12Device_QueryInterface, "ID3D12Device::QueryInterface") \
+  X(ID3D12Device_CreateCommandQueue, "ID3D12Device::CreateCommandQueue") \
+  X(ID3D12Device9_CreateCommandQueue1, "ID3D12Device9::CreateCommandQueue1") \
+  X(ID3D12Device_CreateCommandAllocator, "ID3D12Device::CreateCommandAllocator") \
+  X(ID3D12Device_CreateCommandList, "ID3D12Device::CreateCommandList") \
+  X(ID3D12Device_CreateCommandList1, "ID3D12Device::CreateCommandList1") \
+  X(ID3D12Device_CreateCommandSignature, "ID3D12Device::CreateCommandSignature") \
+  X(ID3D12Device_CreateDescriptorHeap, "ID3D12Device::CreateDescriptorHeap") \
+  X(ID3D12Device_CreateQueryHeap, "ID3D12Device::CreateQueryHeap") \
+  X(ID3D12Device_CreateRootSignature, "ID3D12Device::CreateRootSignature") \
+  X(ID3D12Device_CreateGraphicsPipelineState, "ID3D12Device::CreateGraphicsPipelineState") \
+  X(ID3D12Device_CreateComputePipelineState, "ID3D12Device::CreateComputePipelineState") \
+  X(ID3D12Device2_CreatePipelineState, "ID3D12Device2::CreatePipelineState") \
+  X(ID3D12Device6_SetBackgroundProcessingMode, "ID3D12Device6::SetBackgroundProcessingMode") \
+  X(ID3D12Device7_AddToStateObject, "ID3D12Device7::AddToStateObject") \
+  X(ID3D12Device7_CreateProtectedResourceSession1, "ID3D12Device7::CreateProtectedResourceSession1") \
+  X(ID3D12Device_CreateCommittedResource, "ID3D12Device::CreateCommittedResource") \
+  X(ID3D12Device8_CreateCommittedResource2, "ID3D12Device8::CreateCommittedResource2") \
+  X(ID3D12Device_CreateReservedResource, "ID3D12Device::CreateReservedResource") \
+  X(ID3D12Device_CreateHeap, "ID3D12Device::CreateHeap") \
+  X(ID3D12Device_OpenExistingHeap, "ID3D12Device::OpenExistingHeap") \
+  X(ID3D12Device3_OpenExistingHeapFromAddress, "ID3D12Device3::OpenExistingHeapFromAddress") \
+  X(ID3D12Device4_CreateHeap1, "ID3D12Device4::CreateHeap1") \
+  X(ID3D12Device_CreatePlacedResource, "ID3D12Device::CreatePlacedResource") \
+  X(ID3D12Device8_CreatePlacedResource1, "ID3D12Device8::CreatePlacedResource1") \
+  X(ID3D12Device9_CreateShaderCacheSession, "ID3D12Device9::CreateShaderCacheSession") \
+  X(ID3D12Device9_ShaderCacheControl, "ID3D12Device9::ShaderCacheControl") \
+  X(ID3D12Device_GetResourceTiling, "ID3D12Device::GetResourceTiling") \
+  X(ID3D12Device_CreateFence, "ID3D12Device::CreateFence") \
+  X(ID3D12Device_CreateConstantBufferView, "ID3D12Device::CreateConstantBufferView") \
+  X(ID3D12Device_CreateShaderResourceView, "ID3D12Device::CreateShaderResourceView") \
+  X(ID3D12Device_CreateUnorderedAccessView, "ID3D12Device::CreateUnorderedAccessView") \
+  X(ID3D12Device_CreateRenderTargetView, "ID3D12Device::CreateRenderTargetView") \
+  X(ID3D12Device_CreateDepthStencilView, "ID3D12Device::CreateDepthStencilView") \
+  X(ID3D12Device_CreateDescriptorViewBatch, "ID3D12Device::CreateDescriptorViewBatch") \
+  X(ID3D12Device_CreateSampler, "ID3D12Device::CreateSampler") \
+  X(ID3D12Device_CopyDescriptorsBatch, "ID3D12Device::CopyDescriptorsBatch") \
+  X(ID3D12Device_CopyDescriptors, "ID3D12Device::CopyDescriptors") \
+  X(ID3D12Device_CopyDescriptorsSimple, "ID3D12Device::CopyDescriptorsSimple") \
+  X(DXMT_FenceDependencyBatch, "DXMT::FenceDependencyBatch") \
+  X(DXMT_SparseTextureMappingOps, "DXMT::SparseTextureMappingOps") \
+  X(ID3D12CommandAllocator_Reset, "ID3D12CommandAllocator::Reset") \
+  X(ID3D12CommandQueue_ExecuteCommandLists, "ID3D12CommandQueue::ExecuteCommandLists") \
+  X(ID3D12CommandQueue_UpdateTileMappings, "ID3D12CommandQueue::UpdateTileMappings") \
+  X(ID3D12CommandQueue_Signal, "ID3D12CommandQueue::Signal") \
+  X(ID3D12CommandQueue_Wait, "ID3D12CommandQueue::Wait") \
+  X(ID3D12GraphicsCommandList_QueryInterface, "ID3D12GraphicsCommandList::QueryInterface") \
+  X(ID3D12GraphicsCommandList_Close, "ID3D12GraphicsCommandList::Close") \
+  X(ID3D12GraphicsCommandList_Reset, "ID3D12GraphicsCommandList::Reset") \
+  X(ID3D12GraphicsCommandList_SetPipelineState, "ID3D12GraphicsCommandList::SetPipelineState") \
+  X(ID3D12GraphicsCommandList_SetGraphicsRootSignature, "ID3D12GraphicsCommandList::SetGraphicsRootSignature") \
+  X(ID3D12GraphicsCommandList_SetComputeRootSignature, "ID3D12GraphicsCommandList::SetComputeRootSignature") \
+  X(ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable, "ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable") \
+  X(ID3D12GraphicsCommandList_SetComputeRootDescriptorTable, "ID3D12GraphicsCommandList::SetComputeRootDescriptorTable") \
+  X(ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstant, "ID3D12GraphicsCommandList::SetGraphicsRoot32BitConstant") \
+  X(ID3D12GraphicsCommandList_SetComputeRoot32BitConstant, "ID3D12GraphicsCommandList::SetComputeRoot32BitConstant") \
+  X(ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants, "ID3D12GraphicsCommandList::SetGraphicsRoot32BitConstants") \
+  X(ID3D12GraphicsCommandList_SetComputeRoot32BitConstants, "ID3D12GraphicsCommandList::SetComputeRoot32BitConstants") \
+  X(ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView, "ID3D12GraphicsCommandList::SetGraphicsRootConstantBufferView") \
+  X(ID3D12GraphicsCommandList_SetComputeRootConstantBufferView, "ID3D12GraphicsCommandList::SetComputeRootConstantBufferView") \
+  X(ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView, "ID3D12GraphicsCommandList::SetGraphicsRootShaderResourceView") \
+  X(ID3D12GraphicsCommandList_SetComputeRootShaderResourceView, "ID3D12GraphicsCommandList::SetComputeRootShaderResourceView") \
+  X(ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView, "ID3D12GraphicsCommandList::SetGraphicsRootUnorderedAccessView") \
+  X(ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView, "ID3D12GraphicsCommandList::SetComputeRootUnorderedAccessView") \
+  X(ID3D12GraphicsCommandList_RSSetViewports, "ID3D12GraphicsCommandList::RSSetViewports") \
+  X(ID3D12GraphicsCommandList_RSSetScissorRects, "ID3D12GraphicsCommandList::RSSetScissorRects") \
+  X(ID3D12GraphicsCommandList_ClearState, "ID3D12GraphicsCommandList::ClearState") \
+  X(ID3D12GraphicsCommandList_OMSetBlendFactor, "ID3D12GraphicsCommandList::OMSetBlendFactor") \
+  X(ID3D12GraphicsCommandList_OMSetStencilRef, "ID3D12GraphicsCommandList::OMSetStencilRef") \
+  X(ID3D12GraphicsCommandList_OMSetRenderTargets, "ID3D12GraphicsCommandList::OMSetRenderTargets") \
+  X(ID3D12GraphicsCommandList_ClearRenderTargetView, "ID3D12GraphicsCommandList::ClearRenderTargetView") \
+  X(ID3D12GraphicsCommandList_ClearDepthStencilView, "ID3D12GraphicsCommandList::ClearDepthStencilView") \
+  X(ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint, "ID3D12GraphicsCommandList::ClearUnorderedAccessViewUint") \
+  X(ID3D12GraphicsCommandList_ClearUnorderedAccessViewFloat, "ID3D12GraphicsCommandList::ClearUnorderedAccessViewFloat") \
+  X(ID3D12GraphicsCommandList_DiscardResource, "ID3D12GraphicsCommandList::DiscardResource") \
+  X(ID3D12GraphicsCommandList_IASetPrimitiveTopology, "ID3D12GraphicsCommandList::IASetPrimitiveTopology") \
+  X(ID3D12GraphicsCommandList_IASetVertexBuffers, "ID3D12GraphicsCommandList::IASetVertexBuffers") \
+  X(ID3D12GraphicsCommandList_IASetIndexBuffer, "ID3D12GraphicsCommandList::IASetIndexBuffer") \
+  X(ID3D12GraphicsCommandList_ResourceBarrier, "ID3D12GraphicsCommandList::ResourceBarrier") \
+  X(ID3D12GraphicsCommandList_ResourceBarrierBatch, "ID3D12GraphicsCommandList::ResourceBarrierBatch") \
+  X(ID3D12GraphicsCommandList_SetDescriptorHeaps, "ID3D12GraphicsCommandList::SetDescriptorHeaps") \
+  X(ID3D12GraphicsCommandList_DrawInstanced, "ID3D12GraphicsCommandList::DrawInstanced") \
+  X(ID3D12GraphicsCommandList_DrawIndexedInstanced, "ID3D12GraphicsCommandList::DrawIndexedInstanced") \
+  X(ID3D12GraphicsCommandList_Dispatch, "ID3D12GraphicsCommandList::Dispatch") \
+  X(ID3D12GraphicsCommandList_ExecuteIndirect, "ID3D12GraphicsCommandList::ExecuteIndirect") \
+  X(ID3D12GraphicsCommandList_ExecuteBundle, "ID3D12GraphicsCommandList::ExecuteBundle") \
+  X(ID3D12GraphicsCommandList_CopyBufferRegion, "ID3D12GraphicsCommandList::CopyBufferRegion") \
+  X(ID3D12GraphicsCommandList_CopyBufferRegionBatch, "ID3D12GraphicsCommandList::CopyBufferRegionBatch") \
+  X(ID3D12GraphicsCommandList_CopyTextureRegion, "ID3D12GraphicsCommandList::CopyTextureRegion") \
+  X(ID3D12GraphicsCommandList_CopyTextureRegionBatch, "ID3D12GraphicsCommandList::CopyTextureRegionBatch") \
+  X(ID3D12GraphicsCommandList_CopyResource, "ID3D12GraphicsCommandList::CopyResource") \
+  X(ID3D12GraphicsCommandList_ResolveSubresource, "ID3D12GraphicsCommandList::ResolveSubresource") \
+  X(ID3D12GraphicsCommandList_BeginQuery, "ID3D12GraphicsCommandList::BeginQuery") \
+  X(ID3D12GraphicsCommandList_EndQuery, "ID3D12GraphicsCommandList::EndQuery") \
+  X(ID3D12GraphicsCommandList_ResolveQueryData, "ID3D12GraphicsCommandList::ResolveQueryData") \
+  X(ID3D12GraphicsCommandList_ResolveQueryDataResult, "ID3D12GraphicsCommandList::ResolveQueryDataResult") \
+  X(ID3D12GraphicsCommandList_SetPredication, "ID3D12GraphicsCommandList::SetPredication") \
+  X(ID3D12GraphicsCommandList_ResolveSubresourceRegion, "ID3D12GraphicsCommandList::ResolveSubresourceRegion") \
+  X(ID3D12GraphicsCommandList2_WriteBufferImmediate, "ID3D12GraphicsCommandList2::WriteBufferImmediate") \
+  X(ID3D12GraphicsCommandList4_BeginRenderPass, "ID3D12GraphicsCommandList4::BeginRenderPass") \
+  X(ID3D12GraphicsCommandList4_EndRenderPass, "ID3D12GraphicsCommandList4::EndRenderPass") \
+  X(ID3D12GraphicsCommandListExt_TemporalUpscale, "ID3D12GraphicsCommandListExt::TemporalUpscale") \
+  X(ID3D12GraphicsCommandList4_DispatchRays, "ID3D12GraphicsCommandList4::DispatchRays") \
+  X(ID3D12GraphicsCommandList6_DispatchMesh, "ID3D12GraphicsCommandList6::DispatchMesh") \
+  X(ID3D12Resource_Map, "ID3D12Resource::Map") \
+  X(ID3D12Resource_Unmap, "ID3D12Resource::Unmap") \
+  X(IDXGISwapChain_Present, "IDXGISwapChain::Present") \
+  X(ID3D12Fence_SetEventOnCompletion, "ID3D12Fence::SetEventOnCompletion") \
+  X(ID3D12Fence_GetCompletedValue, "ID3D12Fence::GetCompletedValue") \
+  X(ID3D12Fence_Signal, "ID3D12Fence::Signal") \
+  X(Boundary_Frame, "Boundary::Frame") \
+  X(Boundary_CommandList, "Boundary::CommandList") \
+  X(Boundary_Submit, "Boundary::Submit") \
+  X(Boundary_Present, "Boundary::Present") \
+  X(Boundary_Fence, "Boundary::Fence") \
+  X(Boundary_Barrier, "Boundary::Barrier") \
+  X(Boundary_DebugMarker, "Boundary::DebugMarker") \
+  X(Other, "Other")
+
+enum class EventOrderedDispatchProfileKind : std::size_t {
+#define EVENT_ORDERED_DISPATCH_PROFILE_KIND_ENUM(name, label) name,
+  EVENT_ORDERED_DISPATCH_PROFILE_KIND_LIST(EVENT_ORDERED_DISPATCH_PROFILE_KIND_ENUM)
+#undef EVENT_ORDERED_DISPATCH_PROFILE_KIND_ENUM
+  Count,
+};
+
+constexpr std::size_t kEventOrderedDispatchProfileKindCount =
+    static_cast<std::size_t>(EventOrderedDispatchProfileKind::Count);
+
+constexpr std::array<std::string_view, kEventOrderedDispatchProfileKindCount>
+    kEventOrderedDispatchProfileKindNames = {
+#define EVENT_ORDERED_DISPATCH_PROFILE_KIND_NAME(name, label) std::string_view(label),
+        EVENT_ORDERED_DISPATCH_PROFILE_KIND_LIST(EVENT_ORDERED_DISPATCH_PROFILE_KIND_NAME)
+#undef EVENT_ORDERED_DISPATCH_PROFILE_KIND_NAME
+};
+
+constexpr std::size_t event_ordered_dispatch_profile_index(
+    EventOrderedDispatchProfileKind kind)
+{
+  return static_cast<std::size_t>(kind);
+}
 
 template <typename T>
 class ComPtr {

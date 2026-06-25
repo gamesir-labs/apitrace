@@ -1867,6 +1867,16 @@ private:
     return handle;
   }
 
+  std::uint64_t descriptor_stride_for_binding(
+      const D3D12ReplayBackend::DescriptorBinding &binding) const
+  {
+    const auto heap_it = descriptor_heaps_.find(binding.heap_object_id);
+    if (heap_it == descriptor_heaps_.end()) {
+      return 0;
+    }
+    return heap_it->second.descriptor_size;
+  }
+
   D3D12_GPU_DESCRIPTOR_HANDLE relocated_gpu_descriptor(const D3D12ReplayBackend::DescriptorBinding &binding) const
   {
     D3D12_GPU_DESCRIPTOR_HANDLE handle{};
@@ -2296,6 +2306,15 @@ private:
     if (semantic.descriptors.empty()) {
       return true;
     }
+    struct ResolvedDescriptorCopy {
+      D3D12_CPU_DESCRIPTOR_HANDLE dst{};
+      D3D12_CPU_DESCRIPTOR_HANDLE src{};
+      std::uint64_t dst_stride = 0;
+      std::uint64_t src_stride = 0;
+    };
+
+    std::vector<ResolvedDescriptorCopy> resolved;
+    resolved.reserve(semantic.descriptors.size());
     for (const auto &descriptor : semantic.descriptors) {
       D3D12ReplayBackend::DescriptorBinding dst_binding;
       if (!backend_.resolve_descriptor_binding_at(
@@ -2320,7 +2339,48 @@ private:
       if (dst.ptr == 0 || src.ptr == 0) {
         return fail(error, "CopyDescriptors descriptor cannot be relocated");
       }
-      device_->CopyDescriptorsSimple(1, dst, src, static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(semantic.descriptor_heap_type));
+      const auto dst_stride = descriptor_stride_for_binding(dst_binding);
+      const auto src_stride = descriptor_stride_for_binding(src_binding);
+      if (dst_stride == 0 || src_stride == 0) {
+        return fail(error, "CopyDescriptors descriptor stride cannot be resolved");
+      }
+      resolved.push_back(ResolvedDescriptorCopy{dst, src, dst_stride, src_stride});
+    }
+
+    const auto heap_type = static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(semantic.descriptor_heap_type);
+    std::size_t run_begin = 0;
+    while (run_begin < resolved.size()) {
+      std::size_t run_end = run_begin + 1;
+      while (run_end < resolved.size() &&
+             resolved[run_end].dst_stride == resolved[run_begin].dst_stride &&
+             resolved[run_end].src_stride == resolved[run_begin].src_stride &&
+             resolved[run_end].dst.ptr == resolved[run_end - 1].dst.ptr + resolved[run_begin].dst_stride &&
+             resolved[run_end].src.ptr == resolved[run_end - 1].src.ptr + resolved[run_begin].src_stride) {
+        ++run_end;
+      }
+
+      bool overlaps = false;
+      for (std::size_t lhs = run_begin; lhs < run_end && !overlaps; ++lhs) {
+        for (std::size_t rhs = run_begin; rhs < run_end; ++rhs) {
+          if (resolved[lhs].dst.ptr == resolved[rhs].src.ptr) {
+            overlaps = true;
+            break;
+          }
+        }
+      }
+
+      if (!overlaps && run_end - run_begin > 1) {
+        device_->CopyDescriptorsSimple(
+            static_cast<UINT>(run_end - run_begin),
+            resolved[run_begin].dst,
+            resolved[run_begin].src,
+            heap_type);
+      } else {
+        for (std::size_t index = run_begin; index < run_end; ++index) {
+          device_->CopyDescriptorsSimple(1, resolved[index].dst, resolved[index].src, heap_type);
+        }
+      }
+      run_begin = run_end;
     }
     return true;
   }
@@ -7286,6 +7346,13 @@ private:
   double frame_timing_frame_waited_ms_ = 0.0;
   double frame_timing_total_waited_ms_ = 0.0;
   std::uint64_t frame_timing_total_frames_ = 0;
+  const char *event_ordered_profile_file_ = std::getenv("DXMT_RETRACE_PROFILE_FILE");
+  bool event_ordered_profile_enabled_ =
+      event_ordered_profile_file_ != nullptr && *event_ordered_profile_file_ != '\0';
+  std::array<std::uint64_t, kEventOrderedDispatchProfileKindCount>
+      event_ordered_profile_dispatch_kind_counts_{};
+  std::array<std::uint64_t, kEventOrderedDispatchProfileKindCount>
+      event_ordered_profile_dispatch_kind_us_{};
   bool event_ordered_present_timing_active_ = false;
   bool event_ordered_first_present_seen_ = false;
   std::chrono::steady_clock::time_point event_ordered_present_timing_begin_{};
@@ -7382,6 +7449,9 @@ private:
   std::unordered_set<std::uint64_t> event_ordered_presented_frames_;
   std::unordered_set<std::string> event_ordered_resource_updates_applied_keys_;
   std::unordered_set<std::string> event_ordered_copy_descriptors_applied_keys_;
+  std::size_t event_ordered_descriptor_copy_index_cursor_ = 0;
+  std::unordered_map<std::uint64_t, std::vector<std::size_t>>
+      event_ordered_descriptor_copy_indices_by_sequence_;
 #if !defined(_WIN32)
   std::unique_ptr<trace::TraceBundleWriter> capture_writer_;
   std::uint64_t capture_sequence_ = 0;

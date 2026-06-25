@@ -29,6 +29,11 @@
     event_ordered_cpu_waits_ = 0;
     event_ordered_cpu_wait_timeouts_ = 0;
     event_ordered_stop_requested_ = false;
+    g_event_ordered_profile_decode_us = 0;
+    g_event_ordered_profile_dispatch_us = 0;
+    g_event_ordered_profile_events = 0;
+    event_ordered_profile_dispatch_kind_counts_.fill(0);
+    event_ordered_profile_dispatch_kind_us_.fill(0);
     event_ordered_presented_frames_.clear();
     resource_update_timeline_.clear();
     descriptor_copy_timeline_.clear();
@@ -41,6 +46,8 @@
     event_ordered_copied_descriptor_storage_.clear();
     event_ordered_resource_updates_applied_keys_.clear();
     event_ordered_copy_descriptors_applied_keys_.clear();
+    event_ordered_descriptor_copy_index_cursor_ = 0;
+    event_ordered_descriptor_copy_indices_by_sequence_.clear();
     backend_.event_ordered_counters_.clear();
     backend_.event_ordered_perf_breakdown_.clear();
     backend_.event_ordered_replay_timing_ = {};
@@ -86,6 +93,9 @@
       }
       const std::uint64_t event_sequence = event.callsite.sequence;
       {
+        ScopedUsAccumulator profile_timer(
+            g_event_ordered_profile_decode_us,
+            event_ordered_profile_enabled_);
         std::chrono::steady_clock::time_point _t0;
         if (perf_diag) {
           _t0 = std::chrono::steady_clock::now();
@@ -109,6 +119,9 @@
 
       ++event_count;
       {
+        ScopedUsAccumulator profile_timer(
+            g_event_ordered_profile_decode_us,
+            event_ordered_profile_enabled_);
         std::chrono::steady_clock::time_point _t0;
         if (perf_diag) {
           _t0 = std::chrono::steady_clock::now();
@@ -120,23 +133,45 @@
               std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _t0).count();
         }
       }
-      if (!event_ordered_maybe_bootstrap_swapchain(event, swapchain_ready, error)) {
-        return false;
+      {
+        ScopedUsAccumulator profile_timer(
+            g_event_ordered_profile_decode_us,
+            event_ordered_profile_enabled_);
+        if (!event_ordered_maybe_bootstrap_swapchain(event, swapchain_ready, error)) {
+          return false;
+        }
       }
 
       const auto dispatch_category = event_ordered_dispatch_category(event);
+      const auto dispatch_profile_kind = event_ordered_dispatch_profile_kind(event);
       {
         std::chrono::steady_clock::time_point _t0;
         if (perf_diag) {
           _t0 = std::chrono::steady_clock::now();
         }
+        std::chrono::steady_clock::time_point profile_t0;
+        if (event_ordered_profile_enabled_) {
+          profile_t0 = std::chrono::steady_clock::now();
+        }
         ScopedMsAccumulator timer(event_ordered_dispatch_timing_bucket(dispatch_category));
         dispatch_live(event);
+        if (event_ordered_profile_enabled_) {
+          const std::uint64_t dispatch_us = static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - profile_t0)
+                  .count());
+          g_event_ordered_profile_dispatch_us += dispatch_us;
+          const std::size_t kind_index = event_ordered_dispatch_profile_index(dispatch_profile_kind);
+          ++event_ordered_profile_dispatch_kind_counts_[kind_index];
+          event_ordered_profile_dispatch_kind_us_[kind_index] += dispatch_us;
+        }
         if (perf_diag) {
           backend_.event_ordered_replay_timing_.us_dispatch +=
               std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _t0).count();
         }
       }
+      ++g_event_ordered_profile_events;
+      event_ordered_profile_maybe_emit(false);
       if (perf_diag) {
         backend_.event_ordered_replay_timing_.us_iter_total +=
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _iter_t0).count();
@@ -160,11 +195,73 @@
       backend_.event_ordered_perf_breakdown_ = event_ordered_perf_breakdown_summary();
       event_ordered_log(backend_.event_ordered_counters_);
     }
+    event_ordered_profile_maybe_emit(true);
     replay_milestone("[event-ordered] replay:done");
     return true;
   }
 
 private:
+  void event_ordered_profile_maybe_emit(bool force)
+  {
+    if (!event_ordered_profile_enabled_) {
+      return;
+    }
+    if (!force && (g_event_ordered_profile_events % 10000) != 0) {
+      return;
+    }
+    FILE *out = std::fopen(event_ordered_profile_file_, "a");
+    if (!out) {
+      return;
+    }
+    std::fprintf(
+        out,
+        "RETRACE replayProfile events=%llu decodeUs=%llu dispatchUs=%llu\n",
+        static_cast<unsigned long long>(g_event_ordered_profile_events),
+        static_cast<unsigned long long>(g_event_ordered_profile_decode_us),
+        static_cast<unsigned long long>(g_event_ordered_profile_dispatch_us));
+    event_ordered_profile_emit_dispatch_by_kind(out);
+    std::fclose(out);
+  }
+
+  void event_ordered_profile_emit_dispatch_by_kind(FILE *out) const
+  {
+    std::array<std::size_t, kEventOrderedDispatchProfileKindCount> order{};
+    for (std::size_t index = 0; index < order.size(); ++index) {
+      order[index] = index;
+    }
+    std::sort(order.begin(), order.end(), [&](std::size_t lhs, std::size_t rhs) {
+      if (event_ordered_profile_dispatch_kind_us_[lhs] !=
+          event_ordered_profile_dispatch_kind_us_[rhs]) {
+        return event_ordered_profile_dispatch_kind_us_[lhs] >
+               event_ordered_profile_dispatch_kind_us_[rhs];
+      }
+      if (event_ordered_profile_dispatch_kind_counts_[lhs] !=
+          event_ordered_profile_dispatch_kind_counts_[rhs]) {
+        return event_ordered_profile_dispatch_kind_counts_[lhs] >
+               event_ordered_profile_dispatch_kind_counts_[rhs];
+      }
+      return kEventOrderedDispatchProfileKindNames[lhs] <
+             kEventOrderedDispatchProfileKindNames[rhs];
+    });
+
+    std::size_t emitted = 0;
+    for (const std::size_t index : order) {
+      if (event_ordered_profile_dispatch_kind_counts_[index] == 0) {
+        continue;
+      }
+      std::fprintf(
+          out,
+          "RETRACE dispatchByKind kind=%.*s count=%llu dispatchUs=%llu\n",
+          static_cast<int>(kEventOrderedDispatchProfileKindNames[index].size()),
+          kEventOrderedDispatchProfileKindNames[index].data(),
+          static_cast<unsigned long long>(event_ordered_profile_dispatch_kind_counts_[index]),
+          static_cast<unsigned long long>(event_ordered_profile_dispatch_kind_us_[index]));
+      if (++emitted >= 20) {
+        break;
+      }
+    }
+  }
+
   bool event_ordered_swapchain_bootstrap_ready() const
   {
     UINT width = 0;
@@ -345,6 +442,37 @@ private:
       return EventOrderedDispatchCategory::Record;
     }
     return EventOrderedDispatchCategory::Create;
+  }
+
+  static EventOrderedDispatchProfileKind event_ordered_dispatch_profile_kind(
+      const trace::EventRecord &event)
+  {
+    if (event.kind == trace::EventKind::Boundary) {
+      switch (event.boundary) {
+      case trace::BoundaryKind::Frame:
+        return EventOrderedDispatchProfileKind::Boundary_Frame;
+      case trace::BoundaryKind::CommandList:
+        return EventOrderedDispatchProfileKind::Boundary_CommandList;
+      case trace::BoundaryKind::Submit:
+        return EventOrderedDispatchProfileKind::Boundary_Submit;
+      case trace::BoundaryKind::Present:
+        return EventOrderedDispatchProfileKind::Boundary_Present;
+      case trace::BoundaryKind::Fence:
+        return EventOrderedDispatchProfileKind::Boundary_Fence;
+      case trace::BoundaryKind::Barrier:
+        return EventOrderedDispatchProfileKind::Boundary_Barrier;
+      case trace::BoundaryKind::DebugMarker:
+        return EventOrderedDispatchProfileKind::Boundary_DebugMarker;
+      }
+    }
+    const std::string_view function_name(event.callsite.function_name);
+#define EVENT_ORDERED_DISPATCH_PROFILE_KIND_MATCH(name, label) \
+    if (function_name == std::string_view(label)) { \
+      return EventOrderedDispatchProfileKind::name; \
+    }
+    EVENT_ORDERED_DISPATCH_PROFILE_KIND_LIST(EVENT_ORDERED_DISPATCH_PROFILE_KIND_MATCH)
+#undef EVENT_ORDERED_DISPATCH_PROFILE_KIND_MATCH
+    return EventOrderedDispatchProfileKind::Other;
   }
 
   std::uint64_t &event_ordered_dispatch_timing_bucket(EventOrderedDispatchCategory category)
