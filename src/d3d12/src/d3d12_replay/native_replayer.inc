@@ -110,6 +110,7 @@ public:
         !log_stage("create_command_signatures", [&] { return create_command_signatures(error); }) ||
         !log_stage("prepare_chronological_state", [&] { return prepare_chronological_state(error); }) ||
         !log_stage("create_command_objects", [&] { return create_command_objects(error); }) ||
+        !log_stage("restore_checkpoint", [&] { return restore_checkpoint_if_loaded(error); }) ||
         !log_stage("replay_submissions", [&] { return replay_submissions(error); })) {
       // Guarantee a non-empty error even if a deep return-false path forgot to set one (e.g. a GPU
       // device-removed fault surfaced asynchronously). Without this, the retrace CLI falls back to a
@@ -266,16 +267,73 @@ public:
   }
 
 private:
+  struct ReadbackCommandObjects;
+
+  struct ResourceVersionKey {
+    trace::ObjectId resource_object_id = 0;
+    std::uint64_t create_sequence = 0;
+
+    bool operator==(const ResourceVersionKey &other) const noexcept
+    {
+      return resource_object_id == other.resource_object_id &&
+             create_sequence == other.create_sequence;
+    }
+  };
+
+  struct ResourceVersionKeyHash {
+    std::size_t operator()(const ResourceVersionKey &key) const noexcept
+    {
+      return std::hash<trace::ObjectId>{}(key.resource_object_id) ^
+             (std::hash<std::uint64_t>{}(key.create_sequence) + 0x9e3779b97f4a7c15ull +
+              (std::hash<trace::ObjectId>{}(key.resource_object_id) << 6) +
+              (std::hash<trace::ObjectId>{}(key.resource_object_id) >> 2));
+    }
+  };
+
+  struct TrackedResourceState {
+    std::uint32_t current_state = 0;
+    std::unordered_map<std::uint32_t, std::uint32_t> subresource_states;
+  };
+
+  struct CheckpointSubresourceSnapshot {
+    std::uint32_t subresource = 0;
+    std::uint32_t state = 0;
+    std::uint64_t blob_offset = 0;
+    std::uint64_t blob_size = 0;
+    std::uint64_t copy_size = 0;
+    std::uint64_t row_size = 0;
+    std::uint32_t row_count = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+  };
+
+  struct CheckpointResourceSnapshot {
+    trace::ObjectId resource_object_id = 0;
+    std::uint64_t create_sequence = 0;
+    std::uint32_t heap_type = 0;
+    std::uint32_t dimension = 0;
+    bool swapchain_back_buffer = false;
+    std::vector<std::uint32_t> subresource_states;
+    std::vector<CheckpointSubresourceSnapshot> subresources;
+  };
+
   struct ReplayCheckpoint {
-    std::uint64_t schema_version = 1;
+    std::uint64_t schema_version = 2;
     std::uint64_t start_frame = 0;
     std::uint64_t next_batch_index = 0;
     std::uint64_t checkpoint_sequence = 0;
+    std::uint32_t headless_back_buffer_index = 0;
     bool runtime_state_complete = false;
     std::string bundle_root;
+    std::filesystem::path file_path;
+    std::uint64_t blob_file_offset = 0;
+    std::vector<CheckpointResourceSnapshot> resources;
   };
 
-  static constexpr std::uint64_t kCheckpointSchemaVersion = 1;
+  static constexpr std::uint64_t kCheckpointSchemaVersion = 2;
+  static constexpr std::uint64_t kLegacyCheckpointSchemaVersion = 1;
+  static constexpr const char *kCheckpointBinaryMagic = "APITRACE_D3D12_CHECKPOINT_V2";
+  static constexpr std::uint32_t kAllSubresources = 0xffffffffu;
+  static constexpr std::uint64_t kCheckpointIoChunkBytes = 64ull * 1024ull * 1024ull;
 
   bool checkpoint_output_requested() const
   {
@@ -289,14 +347,12 @@ private:
     return replay_options_ && !replay_options_->checkpoint_in.empty();
   }
 
-  bool read_checkpoint_file(const std::filesystem::path &path, ReplayCheckpoint &checkpoint, std::string &error) const
+  bool parse_checkpoint_json(
+      const json &doc,
+      ReplayCheckpoint &checkpoint,
+      const std::filesystem::path &path,
+      std::string &error) const
   {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) {
-      error = "failed to open D3D12 replay checkpoint: " + path.string();
-      return false;
-    }
-    json doc = json::parse(input, nullptr, false);
     if (doc.is_discarded() || !doc.is_object()) {
       error = "D3D12 replay checkpoint is not valid JSON: " + path.string();
       return false;
@@ -309,9 +365,14 @@ private:
     checkpoint.start_frame = json_u64(doc.value("start_frame", json(nullptr)));
     checkpoint.next_batch_index = json_u64(doc.value("next_batch_index", json(nullptr)));
     checkpoint.checkpoint_sequence = json_u64(doc.value("checkpoint_sequence", json(nullptr)));
+    checkpoint.headless_back_buffer_index = static_cast<std::uint32_t>(
+        json_u64(doc.value("headless_back_buffer_index", json(0))));
     checkpoint.runtime_state_complete = doc.value("runtime_state_complete", false);
     checkpoint.bundle_root = doc.value("bundle_root", std::string());
-    if (checkpoint.schema_version != kCheckpointSchemaVersion) {
+    checkpoint.file_path = path;
+    checkpoint.resources.clear();
+    if (checkpoint.schema_version != kCheckpointSchemaVersion &&
+        checkpoint.schema_version != kLegacyCheckpointSchemaVersion) {
       error = "unsupported D3D12 replay checkpoint schema: " +
               std::to_string(checkpoint.schema_version);
       return false;
@@ -320,10 +381,194 @@ private:
       error = "D3D12 replay checkpoint missing start_frame";
       return false;
     }
+    if (checkpoint.schema_version == kLegacyCheckpointSchemaVersion) {
+      return true;
+    }
+    const auto resources_json = doc.find("resources");
+    if (resources_json != doc.end()) {
+      if (!resources_json->is_array()) {
+        error = "D3D12 replay checkpoint resources must be an array";
+        return false;
+      }
+      checkpoint.resources.reserve(resources_json->size());
+      for (const auto &resource_json : *resources_json) {
+        if (!resource_json.is_object()) {
+          error = "D3D12 replay checkpoint resource entry must be an object";
+          return false;
+        }
+        CheckpointResourceSnapshot resource;
+        resource.resource_object_id = json_object_id(resource_json.value("resource_object_id", json(0)));
+        resource.create_sequence = json_u64(resource_json.value("create_sequence", json(0)));
+        resource.heap_type = static_cast<std::uint32_t>(json_u64(resource_json.value("heap_type", json(0))));
+        resource.dimension = static_cast<std::uint32_t>(json_u64(resource_json.value("dimension", json(0))));
+        resource.swapchain_back_buffer = resource_json.value("swapchain_back_buffer", false);
+        const auto states_json = resource_json.find("subresource_states");
+        if (states_json != resource_json.end()) {
+          if (!states_json->is_array()) {
+            error = "D3D12 replay checkpoint subresource_states must be an array";
+            return false;
+          }
+          resource.subresource_states.reserve(states_json->size());
+          for (const auto &state_json : *states_json) {
+            resource.subresource_states.push_back(static_cast<std::uint32_t>(json_u64(state_json)));
+          }
+        }
+        const auto subresources_json = resource_json.find("subresources");
+        if (subresources_json != resource_json.end()) {
+          if (!subresources_json->is_array()) {
+            error = "D3D12 replay checkpoint subresources must be an array";
+            return false;
+          }
+          resource.subresources.reserve(subresources_json->size());
+          for (const auto &subresource_json : *subresources_json) {
+            CheckpointSubresourceSnapshot subresource;
+            subresource.subresource =
+                static_cast<std::uint32_t>(json_u64(subresource_json.value("subresource", json(0))));
+            subresource.state =
+                static_cast<std::uint32_t>(json_u64(subresource_json.value("state", json(0))));
+            subresource.blob_offset = json_u64(subresource_json.value("blob_offset", json(0)));
+            subresource.blob_size = json_u64(subresource_json.value("blob_size", json(0)));
+            subresource.copy_size = json_u64(subresource_json.value("copy_size", json(0)));
+            subresource.row_size = json_u64(subresource_json.value("row_size", json(0)));
+            subresource.row_count =
+                static_cast<std::uint32_t>(json_u64(subresource_json.value("row_count", json(0))));
+            subresource.footprint.Offset = json_u64(subresource_json.value("footprint_offset", json(0)));
+            subresource.footprint.Footprint.Format =
+                static_cast<DXGI_FORMAT>(json_u64(subresource_json.value("footprint_format", json(0))));
+            subresource.footprint.Footprint.Width =
+                static_cast<UINT>(json_u64(subresource_json.value("footprint_width", json(0))));
+            subresource.footprint.Footprint.Height =
+                static_cast<UINT>(json_u64(subresource_json.value("footprint_height", json(0))));
+            subresource.footprint.Footprint.Depth =
+                static_cast<UINT>(json_u64(subresource_json.value("footprint_depth", json(0))));
+            subresource.footprint.Footprint.RowPitch =
+                static_cast<UINT>(json_u64(subresource_json.value("footprint_row_pitch", json(0))));
+            resource.subresources.push_back(subresource);
+          }
+        }
+        checkpoint.resources.push_back(std::move(resource));
+      }
+    }
     return true;
   }
 
-  bool write_checkpoint_file(const std::filesystem::path &path, const ReplayCheckpoint &checkpoint, std::string &error) const
+  bool read_checkpoint_file(const std::filesystem::path &path, ReplayCheckpoint &checkpoint, std::string &error) const
+  {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+      error = "failed to open D3D12 replay checkpoint: " + path.string();
+      return false;
+    }
+    char first = 0;
+    input.get(first);
+    if (!input) {
+      error = "D3D12 replay checkpoint is empty: " + path.string();
+      return false;
+    }
+    input.clear();
+    input.seekg(0);
+    if (first == '{') {
+      json doc = json::parse(input, nullptr, false);
+      return parse_checkpoint_json(doc, checkpoint, path, error);
+    }
+
+    std::string magic;
+    std::getline(input, magic);
+    if (magic != kCheckpointBinaryMagic) {
+      error = "D3D12 replay checkpoint magic mismatch: " + path.string();
+      return false;
+    }
+    std::uint64_t json_size = 0;
+    input.read(reinterpret_cast<char *>(&json_size), sizeof(json_size));
+    if (!input || json_size == 0 || json_size > (512ull * 1024ull * 1024ull)) {
+      error = "D3D12 replay checkpoint JSON header has an invalid size";
+      return false;
+    }
+    std::string text(static_cast<std::size_t>(json_size), '\0');
+    input.read(text.data(), static_cast<std::streamsize>(text.size()));
+    if (!input) {
+      error = "failed to read D3D12 replay checkpoint JSON header";
+      return false;
+    }
+    checkpoint.blob_file_offset = static_cast<std::uint64_t>(input.tellg());
+    json doc = json::parse(text, nullptr, false);
+    return parse_checkpoint_json(doc, checkpoint, path, error);
+  }
+
+  static json checkpoint_to_json(const ReplayCheckpoint &checkpoint)
+  {
+    json doc;
+    doc["magic"] = "apitrace.d3d12.replay-checkpoint";
+    doc["schema_version"] = checkpoint.schema_version;
+    doc["start_frame"] = checkpoint.start_frame;
+    doc["next_batch_index"] = checkpoint.next_batch_index;
+    doc["checkpoint_sequence"] = checkpoint.checkpoint_sequence;
+    doc["headless_back_buffer_index"] = checkpoint.headless_back_buffer_index;
+    doc["runtime_state_complete"] = checkpoint.runtime_state_complete;
+    doc["bundle_root"] = checkpoint.bundle_root;
+    doc["resources"] = json::array();
+    for (const auto &resource : checkpoint.resources) {
+      json resource_json;
+      resource_json["resource_object_id"] = resource.resource_object_id;
+      resource_json["create_sequence"] = resource.create_sequence;
+      resource_json["heap_type"] = resource.heap_type;
+      resource_json["dimension"] = resource.dimension;
+      resource_json["swapchain_back_buffer"] = resource.swapchain_back_buffer;
+      resource_json["subresource_states"] = resource.subresource_states;
+      resource_json["subresources"] = json::array();
+      for (const auto &subresource : resource.subresources) {
+        json subresource_json;
+        subresource_json["subresource"] = subresource.subresource;
+        subresource_json["state"] = subresource.state;
+        subresource_json["blob_offset"] = subresource.blob_offset;
+        subresource_json["blob_size"] = subresource.blob_size;
+        subresource_json["copy_size"] = subresource.copy_size;
+        subresource_json["row_size"] = subresource.row_size;
+        subresource_json["row_count"] = subresource.row_count;
+        subresource_json["footprint_offset"] = subresource.footprint.Offset;
+        subresource_json["footprint_format"] =
+            static_cast<std::uint32_t>(subresource.footprint.Footprint.Format);
+        subresource_json["footprint_width"] = subresource.footprint.Footprint.Width;
+        subresource_json["footprint_height"] = subresource.footprint.Footprint.Height;
+        subresource_json["footprint_depth"] = subresource.footprint.Footprint.Depth;
+        subresource_json["footprint_row_pitch"] = subresource.footprint.Footprint.RowPitch;
+        resource_json["subresources"].push_back(std::move(subresource_json));
+      }
+      doc["resources"].push_back(std::move(resource_json));
+    }
+    return doc;
+  }
+
+  static bool copy_file_into_stream(
+      const std::filesystem::path &source,
+      std::ofstream &output,
+      std::string &error)
+  {
+    std::ifstream input(source, std::ios::binary);
+    if (!input) {
+      error = "failed to open checkpoint blob staging file: " + source.string();
+      return false;
+    }
+    std::vector<char> buffer(static_cast<std::size_t>(kCheckpointIoChunkBytes));
+    while (input) {
+      input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+      const std::streamsize got = input.gcount();
+      if (got > 0) {
+        output.write(buffer.data(), got);
+        if (!output) {
+          error = "failed to append checkpoint blob staging file";
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  bool write_checkpoint_file(
+      const std::filesystem::path &path,
+      const ReplayCheckpoint &checkpoint,
+      const std::filesystem::path &blob_staging_path,
+      std::string &error) const
   {
     std::error_code ec;
     if (path.has_parent_path()) {
@@ -333,26 +578,35 @@ private:
         return false;
       }
     }
-    json doc;
-    doc["magic"] = "apitrace.d3d12.replay-checkpoint";
-    doc["schema_version"] = checkpoint.schema_version;
-    doc["start_frame"] = checkpoint.start_frame;
-    doc["next_batch_index"] = checkpoint.next_batch_index;
-    doc["checkpoint_sequence"] = checkpoint.checkpoint_sequence;
-    doc["runtime_state_complete"] = checkpoint.runtime_state_complete;
-    doc["bundle_root"] = checkpoint.bundle_root;
-    doc["note"] =
-        "This checkpoint records a semantic replay cursor only. Runtime GPU resource snapshots are "
-        "not serialized yet, so checkpoint resume must refuse it to preserve D3D12 semantics.";
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    const std::filesystem::path temp_path(path.string() + ".tmp");
+    std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
     if (!output) {
-      error = "failed to open D3D12 replay checkpoint for write: " + path.string();
+      error = "failed to open D3D12 replay checkpoint for write: " + temp_path.string();
       return false;
     }
-    output << doc.dump(2) << "\n";
+    const auto doc = checkpoint_to_json(checkpoint);
+    const std::string text = doc.dump();
+    const std::uint64_t json_size = text.size();
+    output << kCheckpointBinaryMagic << "\n";
+    output.write(reinterpret_cast<const char *>(&json_size), sizeof(json_size));
+    output.write(text.data(), static_cast<std::streamsize>(text.size()));
+    if (!copy_file_into_stream(blob_staging_path, output, error)) {
+      return false;
+    }
     if (!output) {
       error = "failed to write D3D12 replay checkpoint: " + path.string();
       return false;
+    }
+    output.close();
+    std::filesystem::rename(temp_path, path, ec);
+    if (ec) {
+      std::filesystem::remove(path, ec);
+      ec.clear();
+      std::filesystem::rename(temp_path, path, ec);
+      if (ec) {
+        error = "failed to install D3D12 replay checkpoint: " + ec.message();
+        return false;
+      }
     }
     return true;
   }
@@ -384,12 +638,781 @@ private:
           "refusing checkpoint resume because skipping earlier D3D12 submissions would change replay semantics";
       return false;
     }
-    const auto restore_begin = std::chrono::steady_clock::now();
-    error = "D3D12 replay checkpoint restore is not implemented for runtime-complete checkpoints";
-    if (replay_stats_) {
-      replay_stats_->checkpoint_restore_ms = elapsed_ms(restore_begin);
+    loaded_checkpoint_ = std::move(checkpoint);
+    checkpoint_loaded_ = true;
+    return true;
+  }
+
+  static D3D12_RESOURCE_BARRIER checkpoint_transition_barrier(
+      ID3D12Resource *resource,
+      D3D12_RESOURCE_STATES before,
+      D3D12_RESOURCE_STATES after,
+      std::uint32_t subresource)
+  {
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.Subresource = subresource;
+    barrier.Transition.StateBefore = before;
+    barrier.Transition.StateAfter = after;
+    return barrier;
+  }
+
+  static std::uint64_t checkpoint_subresource_count(
+      const D3D12ReplayBackend::ResourceSemanticState &resource)
+  {
+    const auto dimension = static_cast<D3D12_RESOURCE_DIMENSION>(resource.dimension);
+    if (dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+      return 1;
     }
-    return false;
+    const std::uint64_t mip_count = resource.mip_levels != 0
+                                        ? resource.mip_levels
+                                        : (resource.recorded_mip_levels != 0 ? resource.recorded_mip_levels : 1);
+    if (dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+      return mip_count;
+    }
+    const std::uint64_t array_or_depth =
+        resource.depth_or_array_size != 0 ? resource.depth_or_array_size : 1;
+    return mip_count * array_or_depth;
+  }
+
+  static bool append_blob_bytes(
+      std::ofstream &blob,
+      const void *data,
+      std::uint64_t size,
+      std::string &error)
+  {
+    const auto *bytes = static_cast<const char *>(data);
+    std::uint64_t remaining = size;
+    while (remaining != 0) {
+      const std::uint64_t chunk = std::min<std::uint64_t>(remaining, kCheckpointIoChunkBytes);
+      blob.write(bytes, static_cast<std::streamsize>(chunk));
+      if (!blob) {
+        error = "failed to write D3D12 checkpoint blob data";
+        return false;
+      }
+      bytes += chunk;
+      remaining -= chunk;
+    }
+    return true;
+  }
+
+  static bool read_blob_bytes(
+      std::ifstream &input,
+      std::uint64_t absolute_offset,
+      void *data,
+      std::uint64_t size,
+      std::string &error)
+  {
+    input.clear();
+    input.seekg(static_cast<std::streamoff>(absolute_offset), std::ios::beg);
+    if (!input) {
+      error = "failed to seek D3D12 checkpoint blob data";
+      return false;
+    }
+    auto *bytes = static_cast<char *>(data);
+    std::uint64_t remaining = size;
+    while (remaining != 0) {
+      const std::uint64_t chunk = std::min<std::uint64_t>(remaining, kCheckpointIoChunkBytes);
+      input.read(bytes, static_cast<std::streamsize>(chunk));
+      if (!input) {
+        error = "failed to read D3D12 checkpoint blob data";
+        return false;
+      }
+      bytes += chunk;
+      remaining -= chunk;
+    }
+    return true;
+  }
+
+  std::vector<std::uint32_t> checkpoint_resource_states_at(
+      const D3D12ReplayBackend::ResourceSemanticState &resource,
+      std::uint64_t sequence) const
+  {
+    const std::uint64_t subresource_count = checkpoint_subresource_count(resource);
+    std::vector<std::uint32_t> states(
+        static_cast<std::size_t>(subresource_count),
+        resource.initial_state);
+    for (const auto &transition : resource.transitions) {
+      if (transition.sequence > sequence) {
+        continue;
+      }
+      if (transition.subresource == kAllSubresources) {
+        std::fill(states.begin(), states.end(), transition.after);
+      } else if (transition.subresource < states.size()) {
+        states[transition.subresource] = transition.after;
+      }
+    }
+    return states;
+  }
+
+  ResourceVersionKey resource_version_key(
+      const D3D12ReplayBackend::ResourceSemanticState &resource) const
+  {
+    return ResourceVersionKey{resource.resource_object_id, resource.create_sequence};
+  }
+
+  void initialize_tracked_resource_state(
+      const D3D12ReplayBackend::ResourceSemanticState &resource)
+  {
+    auto &tracked = tracked_resource_states_[resource_version_key(resource)];
+    tracked.current_state = resource.initial_state;
+    tracked.subresource_states.clear();
+  }
+
+  bool update_tracked_resource_state(
+      trace::ObjectId object_id,
+      std::uint64_t sequence,
+      std::uint32_t subresource,
+      std::uint32_t after,
+      std::string &error)
+  {
+    const auto *resource = recorded_resource_at(object_id, sequence);
+    if (!resource) {
+      error = "ResourceBarrier references an unknown resource while updating checkpoint state";
+      return false;
+    }
+    auto &tracked = tracked_resource_states_[resource_version_key(*resource)];
+    if (subresource == kAllSubresources) {
+      tracked.current_state = after;
+      tracked.subresource_states.clear();
+    } else {
+      tracked.subresource_states[subresource] = after;
+    }
+    return true;
+  }
+
+  std::vector<std::uint32_t> checkpoint_tracked_resource_states(
+      const D3D12ReplayBackend::ResourceSemanticState &resource,
+      std::uint64_t sequence) const
+  {
+    const auto key = resource_version_key(resource);
+    const auto it = tracked_resource_states_.find(key);
+    if (it == tracked_resource_states_.end()) {
+      return checkpoint_resource_states_at(resource, sequence);
+    }
+    const std::uint64_t subresource_count = checkpoint_subresource_count(resource);
+    std::vector<std::uint32_t> states(
+        static_cast<std::size_t>(subresource_count),
+        it->second.current_state);
+    for (const auto &[subresource, state] : it->second.subresource_states) {
+      if (subresource < states.size()) {
+        states[subresource] = state;
+      }
+    }
+    return states;
+  }
+
+  void set_checkpoint_tracked_resource_states(
+      const CheckpointResourceSnapshot &snapshot)
+  {
+    auto &tracked = tracked_resource_states_[ResourceVersionKey{
+        snapshot.resource_object_id,
+        snapshot.create_sequence}];
+    tracked.current_state = snapshot.subresource_states.empty()
+                                ? 0
+                                : snapshot.subresource_states.front();
+    tracked.subresource_states.clear();
+    for (std::size_t index = 0; index < snapshot.subresource_states.size(); ++index) {
+      if (snapshot.subresource_states[index] != tracked.current_state) {
+        tracked.subresource_states[static_cast<std::uint32_t>(index)] =
+            snapshot.subresource_states[index];
+      }
+    }
+  }
+
+  std::vector<const D3D12ReplayBackend::ResourceSemanticState *> checkpoint_live_resources(
+      std::uint64_t sequence) const
+  {
+    std::unordered_map<trace::ObjectId, const D3D12ReplayBackend::ResourceSemanticState *> latest;
+    for (const auto &resource : backend_.resource_versions_) {
+      if (resource.create_sequence > sequence) {
+        continue;
+      }
+      auto &slot = latest[resource.resource_object_id];
+      if (slot == nullptr || slot->create_sequence < resource.create_sequence) {
+        slot = &resource;
+      }
+    }
+    for (const auto &[object_id, resource] : backend_.resources_) {
+      if (latest.find(object_id) == latest.end() && resource.create_sequence <= sequence) {
+        latest.emplace(object_id, &resource);
+      }
+    }
+    std::vector<const D3D12ReplayBackend::ResourceSemanticState *> out;
+    out.reserve(latest.size());
+    for (const auto &[object_id, resource] : latest) {
+      (void)object_id;
+      if (resource != nullptr) {
+        out.push_back(resource);
+      }
+    }
+    std::stable_sort(
+        out.begin(),
+        out.end(),
+        [](const auto *lhs, const auto *rhs) {
+          if (lhs->create_sequence != rhs->create_sequence) {
+            return lhs->create_sequence < rhs->create_sequence;
+          }
+          return lhs->resource_object_id < rhs->resource_object_id;
+        });
+    return out;
+  }
+
+  ID3D12Resource *resource_for_checkpoint_snapshot(
+      trace::ObjectId object_id,
+      std::uint64_t create_sequence,
+      std::string &error) const
+  {
+    const auto ver_it = resource_version_natives_.find(object_id);
+    if (ver_it != resource_version_natives_.end()) {
+      for (const auto &[seq, native] : ver_it->second) {
+        if (seq == create_sequence && native.resource) {
+          return native.resource.get();
+        }
+      }
+      error = "checkpoint references an unknown resource version";
+      return nullptr;
+    }
+    const auto it = resources_.find(object_id);
+    if (it == resources_.end() || !it->second.resource) {
+      error = "checkpoint references an unknown resource";
+      return nullptr;
+    }
+    return it->second.resource.get();
+  }
+
+  bool create_checkpoint_buffer(
+      D3D12_HEAP_TYPE heap_type,
+      D3D12_RESOURCE_STATES initial_state,
+      std::uint64_t size,
+      ComPtr<ID3D12Resource> &resource,
+      std::string &error)
+  {
+    D3D12_HEAP_PROPERTIES heap = heap_properties(static_cast<std::uint32_t>(heap_type));
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    HRESULT hr = device_->CreateCommittedResource(
+        &heap,
+        D3D12_HEAP_FLAG_NONE,
+        &desc,
+        initial_state,
+        nullptr,
+        IID_PPV_ARGS(resource.put()));
+    if (FAILED(hr)) {
+      error = hresult_error("CreateCommittedResource(checkpoint buffer)", hr);
+      return false;
+    }
+    return true;
+  }
+
+  bool create_checkpoint_command_objects(ReadbackCommandObjects &commands, std::string &error)
+  {
+    HRESULT hr = device_->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        IID_PPV_ARGS(commands.allocator.put()));
+    if (FAILED(hr)) {
+      error = hresult_error("CreateCommandAllocator(checkpoint)", hr);
+      return false;
+    }
+    hr = device_->CreateCommandList(
+        0,
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        commands.allocator.get(),
+        nullptr,
+        IID_PPV_ARGS(commands.list.put()));
+    if (FAILED(hr)) {
+      error = hresult_error("CreateCommandList(checkpoint)", hr);
+      return false;
+    }
+    return true;
+  }
+
+  bool execute_checkpoint_command_objects(ReadbackCommandObjects &commands, std::string &error)
+  {
+    HRESULT hr = commands.list->Close();
+    if (FAILED(hr)) {
+      error = hresult_error("ID3D12GraphicsCommandList::Close(checkpoint)", hr);
+      return false;
+    }
+    ID3D12CommandList *lists[] = {commands.list.get()};
+    queue_->ExecuteCommandLists(1, lists);
+    wait_for_gpu();
+    const std::string removed = device_removed_detail();
+    if (!removed.empty()) {
+      error = "checkpoint GPU copy failed: " + removed;
+      return false;
+    }
+    return true;
+  }
+
+  static bool checkpoint_cpu_mappable_buffer(
+      const D3D12ReplayBackend::ResourceSemanticState &semantic,
+      const D3D12_RESOURCE_DESC &desc)
+  {
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+      return false;
+    }
+    return semantic.heap_type == D3D12_HEAP_TYPE_UPLOAD ||
+           semantic.heap_type == D3D12_HEAP_TYPE_READBACK;
+  }
+
+  bool save_mapped_checkpoint_buffer(
+      ID3D12Resource *resource,
+      std::uint64_t size,
+      std::ofstream &blob,
+      CheckpointSubresourceSnapshot &subresource,
+      std::string &error)
+  {
+    void *mapped = nullptr;
+    D3D12_RANGE read_range{0, static_cast<SIZE_T>(size)};
+    HRESULT hr = resource->Map(0, &read_range, &mapped);
+    if (FAILED(hr) || !mapped) {
+      error = hresult_error("Map(checkpoint CPU buffer)", hr);
+      return false;
+    }
+    subresource.blob_offset = static_cast<std::uint64_t>(blob.tellp());
+    subresource.blob_size = size;
+    subresource.copy_size = size;
+    const bool ok = append_blob_bytes(blob, mapped, size, error);
+    D3D12_RANGE written_range{0, 0};
+    resource->Unmap(0, &written_range);
+    return ok;
+  }
+
+  bool save_gpu_checkpoint_subresource(
+      ID3D12Resource *resource,
+      const D3D12_RESOURCE_DESC &desc,
+      CheckpointSubresourceSnapshot &subresource,
+      std::ofstream &blob,
+      std::string &error)
+  {
+    UINT num_rows = 0;
+    UINT64 row_size = 0;
+    UINT64 copy_size = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+      copy_size = desc.Width;
+    } else {
+      device_->GetCopyableFootprints(
+          &desc,
+          subresource.subresource,
+          1,
+          0,
+          &footprint,
+          &num_rows,
+          &row_size,
+          &copy_size);
+      if (copy_size == 0 || num_rows == 0) {
+        return fail(error, "checkpoint texture subresource has an invalid copy footprint");
+      }
+      subresource.footprint = footprint;
+      subresource.row_count = num_rows;
+      subresource.row_size = row_size;
+    }
+    if (copy_size == 0) {
+      return true;
+    }
+    ComPtr<ID3D12Resource> readback;
+    if (!create_checkpoint_buffer(
+            D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            copy_size,
+            readback,
+            error)) {
+      return false;
+    }
+    ReadbackCommandObjects commands;
+    if (!create_checkpoint_command_objects(commands, error)) {
+      return false;
+    }
+    const auto before = static_cast<D3D12_RESOURCE_STATES>(subresource.state);
+    if (before != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+      const auto barrier = checkpoint_transition_barrier(
+          resource,
+          before,
+          D3D12_RESOURCE_STATE_COPY_SOURCE,
+          desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? kAllSubresources : subresource.subresource);
+      commands.list->ResourceBarrier(1, &barrier);
+    }
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+      commands.list->CopyBufferRegion(readback.get(), 0, resource, 0, copy_size);
+    } else {
+      D3D12_TEXTURE_COPY_LOCATION dst{};
+      dst.pResource = readback.get();
+      dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      dst.PlacedFootprint = subresource.footprint;
+      D3D12_TEXTURE_COPY_LOCATION src{};
+      src.pResource = resource;
+      src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      src.SubresourceIndex = subresource.subresource;
+      commands.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    if (before != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+      const auto barrier = checkpoint_transition_barrier(
+          resource,
+          D3D12_RESOURCE_STATE_COPY_SOURCE,
+          before,
+          desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? kAllSubresources : subresource.subresource);
+      commands.list->ResourceBarrier(1, &barrier);
+    }
+    if (!execute_checkpoint_command_objects(commands, error)) {
+      return false;
+    }
+    void *mapped = nullptr;
+    D3D12_RANGE read_range{0, static_cast<SIZE_T>(copy_size)};
+    HRESULT hr = readback->Map(0, &read_range, &mapped);
+    if (FAILED(hr) || !mapped) {
+      error = hresult_error("Map(checkpoint readback)", hr);
+      return false;
+    }
+    subresource.blob_offset = static_cast<std::uint64_t>(blob.tellp());
+    subresource.blob_size = copy_size;
+    subresource.copy_size = copy_size;
+    const bool ok = append_blob_bytes(blob, mapped, copy_size, error);
+    D3D12_RANGE written_range{0, 0};
+    readback->Unmap(0, &written_range);
+    return ok;
+  }
+
+  bool save_checkpoint_resources(
+      ReplayCheckpoint &checkpoint,
+      const std::filesystem::path &blob_staging_path,
+      std::string &error)
+  {
+    std::ofstream blob(blob_staging_path, std::ios::binary | std::ios::trunc);
+    if (!blob) {
+      error = "failed to open D3D12 checkpoint blob staging file: " + blob_staging_path.string();
+      return false;
+    }
+    const auto resources = checkpoint_live_resources(checkpoint.checkpoint_sequence);
+    const auto begin = std::chrono::steady_clock::now();
+    auto last_progress = begin;
+    std::uint64_t total_blob_bytes = 0;
+    checkpoint.resources.clear();
+    checkpoint.resources.reserve(resources.size());
+    replay_milestone((std::string("checkpoint:snapshot-begin resources=") +
+                      std::to_string(resources.size())).c_str());
+    const ReplaySequenceScope sequence_scope(this, checkpoint.checkpoint_sequence);
+    for (std::size_t resource_index = 0; resource_index < resources.size(); ++resource_index) {
+      const auto &semantic = *resources[resource_index];
+      ID3D12Resource *native = resource_for_checkpoint_snapshot(
+          semantic.resource_object_id,
+          semantic.create_sequence,
+          error);
+      if (!native) {
+        return false;
+      }
+      const auto desc = native->GetDesc();
+      CheckpointResourceSnapshot snapshot;
+      snapshot.resource_object_id = semantic.resource_object_id;
+      snapshot.create_sequence = semantic.create_sequence;
+      snapshot.heap_type = semantic.heap_type;
+      snapshot.dimension = static_cast<std::uint32_t>(desc.Dimension);
+      snapshot.swapchain_back_buffer = semantic.swapchain_back_buffer;
+      snapshot.subresource_states = checkpoint_tracked_resource_states(
+          semantic,
+          checkpoint.checkpoint_sequence);
+      const std::uint64_t subresource_count =
+          desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+              ? 1
+              : static_cast<std::uint64_t>(snapshot.subresource_states.size());
+      snapshot.subresources.reserve(static_cast<std::size_t>(subresource_count));
+      for (std::uint64_t subresource_index = 0; subresource_index < subresource_count; ++subresource_index) {
+        CheckpointSubresourceSnapshot subresource;
+        subresource.subresource = static_cast<std::uint32_t>(subresource_index);
+        subresource.state = subresource.subresource < snapshot.subresource_states.size()
+                                ? snapshot.subresource_states[subresource.subresource]
+                                : semantic.initial_state;
+        if (checkpoint_cpu_mappable_buffer(semantic, desc)) {
+          if (!save_mapped_checkpoint_buffer(native, desc.Width, blob, subresource, error)) {
+            return false;
+          }
+        } else if (!save_gpu_checkpoint_subresource(native, desc, subresource, blob, error)) {
+          if (error.empty()) {
+            error = "failed to snapshot D3D12 checkpoint resource";
+          }
+          return false;
+        }
+        total_blob_bytes += subresource.blob_size;
+        snapshot.subresources.push_back(subresource);
+      }
+      checkpoint.resources.push_back(std::move(snapshot));
+      const auto now = std::chrono::steady_clock::now();
+      if (resource_index + 1 == resources.size() ||
+          resource_index < 8 ||
+          (resource_index + 1) % 64 == 0 ||
+          std::chrono::duration_cast<std::chrono::seconds>(now - last_progress).count() >= 2) {
+        const double seconds = std::max(
+            0.001,
+            std::chrono::duration<double>(now - begin).count());
+        const double mib = static_cast<double>(total_blob_bytes) / (1024.0 * 1024.0);
+        std::ostringstream line;
+        line << "checkpoint:snapshot-progress resources=" << (resource_index + 1)
+             << "/" << resources.size()
+             << " bytes_mib=" << static_cast<std::uint64_t>(mib)
+             << " speed_mib_s=" << static_cast<std::uint64_t>(mib / seconds);
+        replay_milestone(line.str().c_str());
+        last_progress = now;
+      }
+    }
+    blob.close();
+    if (!blob) {
+      error = "failed to close D3D12 checkpoint blob staging file";
+      return false;
+    }
+    replay_milestone((std::string("checkpoint:snapshot-end resources=") +
+                      std::to_string(checkpoint.resources.size()) +
+                      " bytes=" + std::to_string(total_blob_bytes)).c_str());
+    return true;
+  }
+
+  bool save_runtime_checkpoint(ReplayCheckpoint &checkpoint, std::string &error)
+  {
+    wait_for_gpu();
+    std::filesystem::path blob_staging_path = replay_options_->checkpoint_out;
+    blob_staging_path += ".blob.tmp";
+    std::error_code ec;
+    std::filesystem::remove(blob_staging_path, ec);
+    if (!save_checkpoint_resources(checkpoint, blob_staging_path, error)) {
+      std::filesystem::remove(blob_staging_path, ec);
+      return false;
+    }
+    checkpoint.runtime_state_complete = true;
+    if (!write_checkpoint_file(replay_options_->checkpoint_out, checkpoint, blob_staging_path, error)) {
+      std::filesystem::remove(blob_staging_path, ec);
+      return false;
+    }
+    std::filesystem::remove(blob_staging_path, ec);
+    return true;
+  }
+
+  bool restore_mapped_checkpoint_buffer(
+      std::ifstream &checkpoint_file,
+      const ReplayCheckpoint &checkpoint,
+      ID3D12Resource *resource,
+      const CheckpointSubresourceSnapshot &subresource,
+      std::string &error)
+  {
+    void *mapped = nullptr;
+    D3D12_RANGE read_range{0, 0};
+    HRESULT hr = resource->Map(0, &read_range, &mapped);
+    if (FAILED(hr) || !mapped) {
+      error = hresult_error("Map(checkpoint restore CPU buffer)", hr);
+      return false;
+    }
+    const bool ok = read_blob_bytes(
+        checkpoint_file,
+        checkpoint.blob_file_offset + subresource.blob_offset,
+        mapped,
+        subresource.blob_size,
+        error);
+    D3D12_RANGE written_range{0, static_cast<SIZE_T>(subresource.blob_size)};
+    resource->Unmap(0, ok ? &written_range : nullptr);
+    return ok;
+  }
+
+  bool restore_gpu_checkpoint_subresource(
+      std::ifstream &checkpoint_file,
+      const ReplayCheckpoint &checkpoint,
+      ID3D12Resource *resource,
+      const D3D12ReplayBackend::ResourceSemanticState &semantic,
+      const D3D12_RESOURCE_DESC &desc,
+      const CheckpointSubresourceSnapshot &subresource,
+      std::string &error)
+  {
+    if (subresource.blob_size == 0) {
+      return true;
+    }
+    ComPtr<ID3D12Resource> upload;
+    if (!create_checkpoint_buffer(
+            D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            subresource.blob_size,
+            upload,
+            error)) {
+      return false;
+    }
+    void *mapped = nullptr;
+    D3D12_RANGE read_range{0, 0};
+    HRESULT hr = upload->Map(0, &read_range, &mapped);
+    if (FAILED(hr) || !mapped) {
+      error = hresult_error("Map(checkpoint upload)", hr);
+      return false;
+    }
+    const bool read_ok = read_blob_bytes(
+        checkpoint_file,
+        checkpoint.blob_file_offset + subresource.blob_offset,
+        mapped,
+        subresource.blob_size,
+        error);
+    D3D12_RANGE written_range{0, static_cast<SIZE_T>(subresource.blob_size)};
+    upload->Unmap(0, read_ok ? &written_range : nullptr);
+    if (!read_ok) {
+      return false;
+    }
+
+    ReadbackCommandObjects commands;
+    if (!create_checkpoint_command_objects(commands, error)) {
+      return false;
+    }
+    const auto initial = static_cast<D3D12_RESOURCE_STATES>(semantic.initial_state);
+    const auto final_state = static_cast<D3D12_RESOURCE_STATES>(subresource.state);
+    const UINT barrier_subresource =
+        desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? kAllSubresources : subresource.subresource;
+    if (initial != D3D12_RESOURCE_STATE_COPY_DEST) {
+      const auto barrier = checkpoint_transition_barrier(
+          resource,
+          initial,
+          D3D12_RESOURCE_STATE_COPY_DEST,
+          barrier_subresource);
+      commands.list->ResourceBarrier(1, &barrier);
+    }
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+      commands.list->CopyBufferRegion(
+          resource,
+          0,
+          upload.get(),
+          0,
+          subresource.copy_size != 0 ? subresource.copy_size : subresource.blob_size);
+    } else {
+      D3D12_TEXTURE_COPY_LOCATION src{};
+      src.pResource = upload.get();
+      src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      src.PlacedFootprint = subresource.footprint;
+      D3D12_TEXTURE_COPY_LOCATION dst{};
+      dst.pResource = resource;
+      dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      dst.SubresourceIndex = subresource.subresource;
+      commands.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    if (final_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+      const auto barrier = checkpoint_transition_barrier(
+          resource,
+          D3D12_RESOURCE_STATE_COPY_DEST,
+          final_state,
+          barrier_subresource);
+      commands.list->ResourceBarrier(1, &barrier);
+    }
+    return execute_checkpoint_command_objects(commands, error);
+  }
+
+  bool restore_checkpoint_resource_snapshot(
+      std::ifstream &checkpoint_file,
+      const ReplayCheckpoint &checkpoint,
+      const CheckpointResourceSnapshot &snapshot,
+      std::string &error)
+  {
+    const auto *semantic = recorded_resource_at(snapshot.resource_object_id, snapshot.create_sequence);
+    if (!semantic || semantic->create_sequence != snapshot.create_sequence) {
+      return fail(error, "checkpoint restore references a missing resource semantic version");
+    }
+    ID3D12Resource *native = resource_for_checkpoint_snapshot(
+        snapshot.resource_object_id,
+        snapshot.create_sequence,
+        error);
+    if (!native) {
+      return false;
+    }
+    const auto desc = native->GetDesc();
+    for (const auto &subresource : snapshot.subresources) {
+      if (checkpoint_cpu_mappable_buffer(*semantic, desc)) {
+        if (!restore_mapped_checkpoint_buffer(
+                checkpoint_file,
+                checkpoint,
+                native,
+                subresource,
+                error)) {
+          return false;
+        }
+      } else if (!restore_gpu_checkpoint_subresource(
+                     checkpoint_file,
+                     checkpoint,
+                     native,
+                     *semantic,
+                     desc,
+                     subresource,
+                     error)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void skip_resource_updates_through(std::uint64_t sequence)
+  {
+    while (next_resource_update_index_ < resource_update_timeline_.size() &&
+           resource_update_timeline_[next_resource_update_index_].sequence <= sequence) {
+      ++next_resource_update_index_;
+    }
+  }
+
+  bool restore_checkpoint_if_loaded(std::string &error)
+  {
+    if (!checkpoint_loaded_) {
+      return true;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    const ReplaySequenceScope sequence_scope(this, loaded_checkpoint_.checkpoint_sequence);
+    if (!sync_descriptors_until(loaded_checkpoint_.checkpoint_sequence, error) ||
+        !sync_tile_mapping_updates_until(loaded_checkpoint_.checkpoint_sequence, error)) {
+      if (replay_stats_) {
+        replay_stats_->checkpoint_restore_ms = elapsed_ms(begin);
+      }
+      return false;
+    }
+    skip_resource_updates_through(loaded_checkpoint_.checkpoint_sequence);
+    std::ifstream checkpoint_file(loaded_checkpoint_.file_path, std::ios::binary);
+    if (!checkpoint_file) {
+      error = "failed to reopen D3D12 replay checkpoint for restore: " +
+              loaded_checkpoint_.file_path.string();
+      if (replay_stats_) {
+        replay_stats_->checkpoint_restore_ms = elapsed_ms(begin);
+      }
+      return false;
+    }
+    auto last_progress = std::chrono::steady_clock::now();
+    for (std::size_t index = 0; index < loaded_checkpoint_.resources.size(); ++index) {
+      if (!restore_checkpoint_resource_snapshot(
+              checkpoint_file,
+              loaded_checkpoint_,
+              loaded_checkpoint_.resources[index],
+              error)) {
+        if (replay_stats_) {
+          replay_stats_->checkpoint_restore_ms = elapsed_ms(begin);
+        }
+        return false;
+      }
+      set_checkpoint_tracked_resource_states(loaded_checkpoint_.resources[index]);
+      const auto now = std::chrono::steady_clock::now();
+      if (index + 1 == loaded_checkpoint_.resources.size() ||
+          index < 8 ||
+          (index + 1) % 64 == 0 ||
+          std::chrono::duration_cast<std::chrono::seconds>(now - last_progress).count() >= 2) {
+        replay_milestone((std::string("checkpoint:restore-progress resources=") +
+                          std::to_string(index + 1) +
+                          "/" + std::to_string(loaded_checkpoint_.resources.size())).c_str());
+        last_progress = now;
+      }
+    }
+    replay_batch_index_ = loaded_checkpoint_.next_batch_index;
+    headless_back_buffer_index_ = loaded_checkpoint_.headless_back_buffer_index % kBufferCount;
+    checkpoint_restored_ = true;
+    if (replay_stats_) {
+      replay_stats_->checkpoint_restore_ms = elapsed_ms(begin);
+    }
+    replay_milestone((std::string("checkpoint:restored frame=") +
+                      std::to_string(loaded_checkpoint_.start_frame) +
+                      " next_batch=" + std::to_string(replay_batch_index_) +
+                      " resources=" + std::to_string(loaded_checkpoint_.resources.size())).c_str());
+    return true;
   }
 
   bool maybe_write_checkpoint_after_present(
@@ -403,15 +1426,16 @@ private:
       return true;
     }
     const auto begin = std::chrono::steady_clock::now();
-    wait_for_gpu();
     ReplayCheckpoint checkpoint;
     checkpoint.schema_version = kCheckpointSchemaVersion;
     checkpoint.start_frame = next_frame_index;
     checkpoint.next_batch_index = replay_batch_index_;
     checkpoint.checkpoint_sequence = checkpoint_sequence;
+    checkpoint.headless_back_buffer_index = swap_chain_ ? swap_chain_->GetCurrentBackBufferIndex()
+                                                        : headless_back_buffer_index_;
     checkpoint.runtime_state_complete = false;
     checkpoint.bundle_root = backend_.bundle_root_.generic_string();
-    if (!write_checkpoint_file(replay_options_->checkpoint_out, checkpoint, error)) {
+    if (!save_runtime_checkpoint(checkpoint, error)) {
       if (replay_stats_) {
         replay_stats_->checkpoint_save_ms = elapsed_ms(begin);
       }
@@ -451,9 +1475,13 @@ private:
 
   std::uint64_t frame_timing_start_frame() const
   {
-    return replay_options_ && replay_options_->checkpoint_frame != 0
-        ? replay_options_->checkpoint_frame
-        : 1;
+    if (replay_options_ && replay_options_->checkpoint_frame != 0) {
+      return replay_options_->checkpoint_frame;
+    }
+    if (checkpoint_loaded_ && loaded_checkpoint_.start_frame != 0) {
+      return loaded_checkpoint_.start_frame;
+    }
+    return 1;
   }
 
   void reset_frame_timing_counters()
@@ -1556,6 +2584,7 @@ private:
       if (!make_native_resource(resource, native, error)) {
         return false;
       }
+      initialize_tracked_resource_state(resource);
       resources_.emplace(object_id, std::move(native));
     }
 
@@ -1573,6 +2602,7 @@ private:
       if (!make_native_resource(resource, native, error)) {
         return false;
       }
+      initialize_tracked_resource_state(resource);
       resource_version_natives_[resource.resource_object_id].emplace_back(
           resource.create_sequence, std::move(native));
     }
@@ -3218,7 +4248,9 @@ private:
         return false;
       }
     }
-    for (const auto &batch : backend_.submissions_.completed_batches()) {
+    const auto &completed_batches = backend_.submissions_.completed_batches();
+    for (; replay_batch_index_ < completed_batches.size();) {
+      const auto &batch = completed_batches[replay_batch_index_];
       // Per-batch timing + command-count instrumentation: a batch that takes a long time gets a
       // milestone with how many commands it recorded, so a slow anchor batch is attributable to
       // command volume (json parse / record cost) vs per-binding resolution cost. Cheap (one clock
@@ -7052,6 +8084,17 @@ private:
         barrier.Transition.Subresource = payload_u32(*barrier_json, "subresource");
         barrier.Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(payload_u32(*barrier_json, "before"));
         barrier.Transition.StateAfter = static_cast<D3D12_RESOURCE_STATES>(payload_u32(*barrier_json, "after"));
+        constexpr std::uint32_t begin_only = 0x1;
+        if ((static_cast<std::uint32_t>(barrier.Flags) & begin_only) == 0) {
+          if (!update_tracked_resource_state(
+                  json_object_id((*barrier_json)["resource_object_id"]),
+                  current_replay_sequence_,
+                  barrier.Transition.Subresource,
+                  static_cast<std::uint32_t>(barrier.Transition.StateAfter),
+                  error)) {
+            return false;
+          }
+        }
       } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
         if (!payload_has(*barrier_json, "resource_before_object_id") ||
             !payload_has(*barrier_json, "resource_after_object_id")) {
@@ -7963,6 +9006,9 @@ private:
   UINT64 fence_value_ = 0;
   std::uint64_t replay_batch_index_ = 0;
   bool checkpoint_written_ = false;
+  bool checkpoint_loaded_ = false;
+  bool checkpoint_restored_ = false;
+  ReplayCheckpoint loaded_checkpoint_;
   // Per-command-kind cumulative record time (microseconds) + invocation counts, to attribute a slow
   // batch to a specific command kind. kCommandKindCount covers the ReplayCommandKind enum with slack.
   static constexpr std::size_t kCommandKindCount = 64;
@@ -8006,6 +9052,8 @@ private:
   mutable bool shader_candidate_index_built_ = false;
   mutable std::unordered_map<std::uint64_t, std::vector<std::filesystem::path>> shader_candidate_paths_by_size_;
   std::unordered_map<trace::ObjectId, NativeResource> resources_;
+  std::unordered_map<ResourceVersionKey, TrackedResourceState, ResourceVersionKeyHash>
+      tracked_resource_states_;
   // Per-version native resources for object_ids reused across lifetimes (BUG-20260614-004). Built
   // from backend_.resource_versions_ when more than one version exists for an id. Each entry is a
   // (create_sequence, native resource) sorted by create_sequence; resource_for resolves to the

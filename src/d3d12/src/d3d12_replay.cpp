@@ -1501,8 +1501,16 @@ std::uint32_t normalized_resource_mip_levels(std::uint64_t width, std::uint32_t 
 
 std::uint64_t resource_subresource_count(const D3D12ReplayBackend::ResourceSemanticState &resource)
 {
-  return static_cast<std::uint64_t>(resource.mip_levels) *
-         static_cast<std::uint64_t>(resource.depth_or_array_size);
+  const auto dimension = resource.dimension;
+  const std::uint64_t mip_count = resource.mip_levels != 0 ? resource.mip_levels : 1;
+  if (dimension == 1) {  // D3D12_RESOURCE_DIMENSION_BUFFER
+    return 1;
+  }
+  if (dimension == 4) {  // D3D12_RESOURCE_DIMENSION_TEXTURE3D
+    return mip_count;
+  }
+  const std::uint64_t array_size = resource.depth_or_array_size != 0 ? resource.depth_or_array_size : 1;
+  return mip_count * array_size;
 }
 
 const char *descriptor_kind_for_root_range_type(std::uint32_t type)
