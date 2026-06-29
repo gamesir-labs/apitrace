@@ -7114,10 +7114,12 @@ private:
         }
         return false;
       }
-      if (!update_target_texture_watch_render_targets(native, cmd_ref, payload, error)) {
-        return false;
+      if (watch_this_list) {
+        if (!update_target_texture_watch_render_targets(native, cmd_ref, payload, error)) {
+          return false;
+        }
+        update_target_texture_watch_state(native, cmd_ref, payload);
       }
-      update_target_texture_watch_state(native, cmd_ref, payload);
       if ((target_watch_command || target_watch_focused_sample) &&
           !append_target_texture_watch_readback(
               native, cmd_ref, target_watch_after_phase, target_watch_reason_cstr, error)) {
