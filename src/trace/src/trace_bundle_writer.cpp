@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -17,6 +18,7 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1343,13 +1345,35 @@ std::optional<AssetRecord> asset_record_from_json(const json &entry)
   return asset;
 }
 
-void merge_asset_record(std::vector<AssetRecord> &records, const AssetRecord &asset)
+std::unordered_map<std::uint64_t, std::size_t> build_asset_index_by_blob_id(
+    const std::vector<AssetRecord> &records)
 {
-  for (auto &record : records) {
-    if (record.blob_id == asset.blob_id) {
-      record = asset;
+  std::unordered_map<std::uint64_t, std::size_t> index;
+  index.reserve(records.size());
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    const auto blob_id = static_cast<std::uint64_t>(records[i].blob_id);
+    if (blob_id != 0) {
+      index.emplace(blob_id, i);
+    }
+  }
+  return index;
+}
+
+void merge_asset_record(
+    std::vector<AssetRecord> &records,
+    std::unordered_map<std::uint64_t, std::size_t> &index_by_blob_id,
+    const AssetRecord &asset)
+{
+  const auto blob_id = static_cast<std::uint64_t>(asset.blob_id);
+  if (blob_id != 0) {
+    const auto found = index_by_blob_id.find(blob_id);
+    if (found != index_by_blob_id.end()) {
+      records[found->second] = asset;
       return;
     }
+  }
+  if (blob_id != 0) {
+    index_by_blob_id.emplace(blob_id, records.size());
   }
   records.push_back(asset);
 }
@@ -1432,6 +1456,8 @@ std::unordered_map<std::uint64_t, std::uint64_t> merge_sideband_asset_shard(
   }
 
   BlobIdAllocator blob_ids(assets, metal_assets);
+  auto asset_index_by_blob_id = build_asset_index_by_blob_id(assets);
+  auto metal_asset_index_by_blob_id = build_asset_index_by_blob_id(metal_assets);
   for (const auto &entry : *list) {
     auto asset = asset_record_from_json(entry);
     if (!asset) {
@@ -1445,9 +1471,9 @@ std::unordered_map<std::uint64_t, std::uint64_t> merge_sideband_asset_shard(
     }
     blob_ids.note(*asset);
     if (entry.value("metal", false)) {
-      merge_asset_record(metal_assets, *asset);
+      merge_asset_record(metal_assets, metal_asset_index_by_blob_id, *asset);
     } else {
-      merge_asset_record(assets, *asset);
+      merge_asset_record(assets, asset_index_by_blob_id, *asset);
     }
   }
   return blob_remap;
@@ -1581,11 +1607,197 @@ bool rewrite_json_asset_alias(json &value, std::string_view final_path)
   return changed;
 }
 
-std::optional<std::pair<std::string, std::uint64_t>> rewrite_metal_callstream_blob_refs(
+struct MetalCallstreamRewriteResult {
+  bool changed = false;
+  std::string digest;
+  std::uint64_t byte_size = 0;
+  std::uint64_t lines_scanned = 0;
+  std::uint64_t bytes_scanned = 0;
+  std::uint64_t lines_rewritten = 0;
+  std::uint64_t blob_refs_rewritten = 0;
+  std::uint64_t json_parse_lines = 0;
+};
+
+bool parse_unsigned_decimal(std::string_view text, std::uint64_t &value)
+{
+  if (text.empty())
+    return false;
+  std::uint64_t parsed = 0;
+  for (const char ch : text) {
+    if (ch < '0' || ch > '9')
+      return false;
+    const auto digit = static_cast<std::uint64_t>(ch - '0');
+    if (parsed > (std::numeric_limits<std::uint64_t>::max() - digit) / 10)
+      return false;
+    parsed = parsed * 10 + digit;
+  }
+  value = parsed;
+  return true;
+}
+
+std::optional<std::size_t> find_top_level_json_key_colon(std::string_view line, std::string_view key)
+{
+  bool in_string = false;
+  bool escaped = false;
+  int depth = 0;
+  std::size_t string_begin = std::string_view::npos;
+  for (std::size_t index = 0; index < line.size(); ++index) {
+    const char ch = line[index];
+    if (in_string) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch == '\\') {
+        escaped = true;
+      } else if (ch == '"') {
+        in_string = false;
+        if (depth == 1 && string_begin != std::string_view::npos &&
+            line.substr(string_begin, index - string_begin) == key) {
+          auto colon = index + 1;
+          while (colon < line.size() && std::isspace(static_cast<unsigned char>(line[colon])))
+            ++colon;
+          if (colon < line.size() && line[colon] == ':')
+            return colon;
+        }
+      }
+      continue;
+    }
+
+    if (ch == '"') {
+      in_string = true;
+      string_begin = index + 1;
+    } else if (ch == '{' || ch == '[') {
+      ++depth;
+    } else if (ch == '}' || ch == ']') {
+      --depth;
+    }
+  }
+  return std::nullopt;
+}
+
+bool rewrite_blob_refs_text(
+    std::string_view line,
+    const std::unordered_map<std::uint64_t, std::uint64_t> &blob_remap,
+    std::vector<std::uint64_t> &rewritten_refs,
+    std::string &rewritten_line,
+    std::uint64_t &blob_refs_rewritten)
+{
+  rewritten_refs.clear();
+  rewritten_line.clear();
+  const auto colon = find_top_level_json_key_colon(line, "blob_refs");
+  if (!colon)
+    return true;
+  auto pos = *colon + 1;
+  while (pos < line.size() && std::isspace(static_cast<unsigned char>(line[pos])))
+    ++pos;
+  if (pos >= line.size() || line[pos] != '[')
+    return false;
+
+  rewritten_line.reserve(line.size());
+  rewritten_line.append(line.substr(0, pos + 1));
+  ++pos;
+  bool changed = false;
+  while (pos < line.size()) {
+    auto value_prefix_begin = pos;
+    while (pos < line.size() && std::isspace(static_cast<unsigned char>(line[pos])))
+      ++pos;
+    if (pos >= line.size())
+      return false;
+    if (line[pos] == ']') {
+      rewritten_line.append(line.substr(value_prefix_begin));
+      if (!changed)
+        rewritten_line.clear();
+      return true;
+    }
+
+    const auto value_begin = pos;
+    bool negative = false;
+    if (line[pos] == '-') {
+      negative = true;
+      ++pos;
+    }
+    const auto digits_begin = pos;
+    while (pos < line.size() && line[pos] >= '0' && line[pos] <= '9')
+      ++pos;
+    if (digits_begin == pos)
+      return false;
+    std::uint64_t value = 0;
+    if (!parse_unsigned_decimal(line.substr(digits_begin, pos - digits_begin), value))
+      return false;
+
+    auto rewritten_value = value;
+    if (!negative && value > 0) {
+      if (const auto found = blob_remap.find(value); found != blob_remap.end()) {
+        rewritten_value = found->second;
+        changed = true;
+        ++blob_refs_rewritten;
+      }
+      rewritten_refs.push_back(rewritten_value);
+    }
+
+    rewritten_line.append(line.substr(value_prefix_begin, value_begin - value_prefix_begin));
+    if (changed && !negative && rewritten_value != value) {
+      rewritten_line.append(std::to_string(rewritten_value));
+    } else {
+      rewritten_line.append(line.substr(value_begin, pos - value_begin));
+    }
+
+    const auto value_suffix_begin = pos;
+    while (pos < line.size() && std::isspace(static_cast<unsigned char>(line[pos])))
+      ++pos;
+    if (pos >= line.size())
+      return false;
+    if (line[pos] == ',') {
+      rewritten_line.append(line.substr(value_suffix_begin, pos + 1 - value_suffix_begin));
+      ++pos;
+      continue;
+    }
+    if (line[pos] == ']') {
+      rewritten_line.append(line.substr(value_suffix_begin));
+      if (!changed)
+        rewritten_line.clear();
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+bool rewrite_json_blob_refs(
+    json &record,
+    const std::unordered_map<std::uint64_t, std::uint64_t> &blob_remap,
+    std::vector<std::uint64_t> &rewritten_refs,
+    std::uint64_t &blob_refs_rewritten)
+{
+  bool changed = false;
+  rewritten_refs.clear();
+  auto refs = record.find("blob_refs");
+  if (refs == record.end() || !refs->is_array())
+    return false;
+  for (auto &ref : *refs) {
+    if (!ref.is_number_integer())
+      continue;
+    const auto value = ref.get<std::int64_t>();
+    if (value <= 0)
+      continue;
+    auto rewritten_value = static_cast<std::uint64_t>(value);
+    const auto found = blob_remap.find(static_cast<std::uint64_t>(value));
+    if (found != blob_remap.end()) {
+      rewritten_value = found->second;
+      ref = rewritten_value;
+      changed = true;
+      ++blob_refs_rewritten;
+    }
+    rewritten_refs.push_back(rewritten_value);
+  }
+  return changed;
+}
+
+std::optional<MetalCallstreamRewriteResult> rewrite_metal_callstream_blob_refs(
     const BundleLayout &layout,
     const std::unordered_map<std::uint64_t, std::uint64_t> &blob_remap,
     const std::vector<AssetRecord> &assets,
-    const std::vector<AssetRecord> &metal_assets)
+    const std::vector<AssetRecord> &metal_assets,
+    const TraceBundleWriter::ProgressCallback &progress_callback)
 {
   const auto asset_paths = asset_paths_by_blob_id(assets, metal_assets);
   if (blob_remap.empty() && asset_paths.empty())
@@ -1595,6 +1807,10 @@ std::optional<std::pair<std::string, std::uint64_t>> rewrite_metal_callstream_bl
   if (!std::filesystem::is_regular_file(path))
     return std::nullopt;
 
+  MetalCallstreamRewriteResult result;
+  std::error_code input_size_error;
+  const auto input_byte_size = std::filesystem::file_size(path, input_size_error);
+  const auto byte_count = input_size_error ? 0ull : static_cast<std::uint64_t>(input_byte_size);
   const auto temp_path = layout.root_path / (std::string(kMetalCallstreamFileName) + ".blob-remap.tmp");
   std::ifstream input(path, std::ios::binary);
   std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
@@ -1602,47 +1818,100 @@ std::optional<std::pair<std::string, std::uint64_t>> rewrite_metal_callstream_bl
     return std::nullopt;
 
   std::string line;
-  bool changed = false;
+  std::string text_rewritten_line;
+  std::vector<std::uint64_t> rewritten_refs;
+  auto last_progress = std::chrono::steady_clock::now();
+  std::uint64_t last_progress_bytes = 0;
+  const auto report_progress = [&](bool force) {
+    if (!progress_callback)
+      return;
+    const auto now = std::chrono::steady_clock::now();
+    if (!force &&
+        result.bytes_scanned - last_progress_bytes < 64ull * 1024ull * 1024ull &&
+        now - last_progress < std::chrono::seconds(1)) {
+      return;
+    }
+    progress_callback(
+        "metal_callstream_rewrite",
+        result.lines_scanned,
+        0,
+        result.bytes_scanned,
+        byte_count);
+    last_progress = now;
+    last_progress_bytes = result.bytes_scanned;
+  };
   while (std::getline(input, line)) {
-    auto record = json::parse(line, nullptr, false);
-    if (record.is_discarded() || !record.is_object()) {
-      output << line << "\n";
-      continue;
-    }
-    std::vector<std::uint64_t> rewritten_refs;
-    auto refs = record.find("blob_refs");
-    if (refs != record.end() && refs->is_array()) {
-      for (auto &ref : *refs) {
-        if (!ref.is_number_integer())
-          continue;
-        const auto value = ref.get<std::int64_t>();
-        if (value <= 0)
-          continue;
-        auto rewritten_value = static_cast<std::uint64_t>(value);
-        const auto found = blob_remap.find(static_cast<std::uint64_t>(value));
-        if (found != blob_remap.end()) {
-          rewritten_value = found->second;
-          ref = rewritten_value;
-          changed = true;
+    ++result.lines_scanned;
+    result.bytes_scanned += static_cast<std::uint64_t>(line.size()) + 1;
+
+    bool line_changed = false;
+    bool used_json_fallback = false;
+    const bool text_rewrite_ok = rewrite_blob_refs_text(
+        line,
+        blob_remap,
+        rewritten_refs,
+        text_rewritten_line,
+        result.blob_refs_rewritten);
+    std::string output_line = text_rewritten_line.empty() ? line : text_rewritten_line;
+    line_changed = !text_rewritten_line.empty();
+
+    const auto maybe_rewrite_asset_alias = [&]() -> bool {
+      if (rewritten_refs.size() != 1 || output_line.find("asset-") == std::string::npos)
+        return false;
+      const auto asset_path = asset_paths.find(rewritten_refs.front());
+      if (asset_path == asset_paths.end())
+        return false;
+      auto record = json::parse(output_line, nullptr, false);
+      ++result.json_parse_lines;
+      used_json_fallback = true;
+      if (record.is_discarded() || !record.is_object())
+        return false;
+      if (!rewrite_json_asset_alias(record, asset_path->second))
+        return false;
+      output_line = record.dump();
+      return true;
+    };
+
+    if (!text_rewrite_ok) {
+      auto record = json::parse(line, nullptr, false);
+      ++result.json_parse_lines;
+      used_json_fallback = true;
+      if (!record.is_discarded() && record.is_object()) {
+        line_changed = rewrite_json_blob_refs(
+            record,
+            blob_remap,
+            rewritten_refs,
+            result.blob_refs_rewritten);
+        if (rewritten_refs.size() == 1) {
+          if (const auto asset_path = asset_paths.find(rewritten_refs.front());
+              asset_path != asset_paths.end()) {
+            line_changed = rewrite_json_asset_alias(record, asset_path->second) || line_changed;
+          }
         }
-        rewritten_refs.push_back(rewritten_value);
+        if (line_changed)
+          output_line = record.dump();
       }
     }
-    if (rewritten_refs.size() == 1) {
-      if (const auto asset_path = asset_paths.find(rewritten_refs.front());
-          asset_path != asset_paths.end()) {
-        changed = rewrite_json_asset_alias(record, asset_path->second) || changed;
-      }
+
+    if (!used_json_fallback && maybe_rewrite_asset_alias()) {
+      line_changed = true;
     }
-    output << record.dump() << "\n";
+
+    if (line_changed) {
+      result.changed = true;
+      ++result.lines_rewritten;
+    }
+    output << output_line << "\n";
+    report_progress(false);
   }
   output.close();
   input.close();
+  report_progress(true);
 
-  if (!changed) {
+  if (!result.changed) {
     std::error_code remove_error;
     std::filesystem::remove(temp_path, remove_error);
-    return std::nullopt;
+    return result;
   }
 
   std::error_code rename_error;
@@ -1650,13 +1919,15 @@ std::optional<std::pair<std::string, std::uint64_t>> rewrite_metal_callstream_bl
   if (rename_error) {
     std::error_code remove_error;
     std::filesystem::remove(temp_path, remove_error);
-    return std::nullopt;
+    return result;
   }
 
-  const auto digest = sha256_file(path);
+  result.digest = sha256_file(path);
   std::error_code size_error;
-  const auto byte_size = std::filesystem::file_size(path, size_error);
-  return std::make_pair(digest, size_error ? 0ull : static_cast<std::uint64_t>(byte_size));
+  result.byte_size = std::filesystem::file_size(path, size_error);
+  if (size_error)
+    result.byte_size = 0;
+  return result;
 }
 
 bool should_write_asset_index(
@@ -2080,6 +2351,11 @@ public:
     lock_stats_ = stats;
   }
 
+  void set_serializer_worker_count(std::size_t worker_count)
+  {
+    serializer_worker_count_ = std::max<std::size_t>(1, worker_count);
+  }
+
   bool open(const std::filesystem::path &path, std::ios::openmode mode)
   {
     close();
@@ -2280,7 +2556,11 @@ private:
   void run()
   {
     std::vector<PendingItem> batch;
-    batch.reserve(4096);
+    std::vector<std::string> lines;
+    const auto serializer_workers = std::max<std::size_t>(1, serializer_worker_count_);
+    const std::size_t max_batch_items = serializer_workers > 1 ? 65536 : 4096;
+    batch.reserve(max_batch_items);
+    lines.reserve(max_batch_items);
     std::size_t batch_bytes = 0;
     for (;;) {
       {
@@ -2290,7 +2570,7 @@ private:
           break;
         const auto hold_start_ns = lock_stats_ ? monotonic_nanoseconds() : 0;
         writing_ = true;
-        while (!queue_.empty() && batch.size() < 4096) {
+        while (!queue_.empty() && batch.size() < max_batch_items) {
           batch_bytes += queue_.front().pending_bytes;
           batch.push_back(std::move(queue_.front()));
           queue_.pop_front();
@@ -2299,26 +2579,58 @@ private:
           record_writer_lock_hold(lock_stats_, monotonic_nanoseconds() - hold_start_ns);
       }
 
-      for (auto &item : batch) {
-        std::string serialized_line;
-        std::string *line = &item.line;
+      lines.clear();
+      lines.resize(batch.size());
+      const auto serialize_item = [&](std::size_t item_index) {
+        auto &item = batch[item_index];
         if (item.event) {
           const auto serialize_start_ns = monotonic_nanoseconds();
-          serialized_line = event_record_json(*item.event);
+          auto serialized_line = event_record_json(*item.event);
           serialized_line.push_back('\n');
           const auto serialize_ns = monotonic_nanoseconds() - serialize_start_ns;
           serialize_count_.fetch_add(1, std::memory_order_relaxed);
           serialize_ns_.fetch_add(serialize_ns, std::memory_order_relaxed);
           update_atomic_max(max_serialize_ns_, serialize_ns);
-          line = &serialized_line;
+          lines[item_index] = std::move(serialized_line);
+          return;
         }
+        lines[item_index] = std::move(item.line);
+      };
+
+      const auto active_serializers =
+          std::min<std::size_t>(serializer_workers, std::max<std::size_t>(1, batch.size()));
+      if (active_serializers > 1 && batch.size() >= 1024) {
+        std::atomic_size_t next_item{0};
+        std::vector<std::thread> serializers;
+        serializers.reserve(active_serializers);
+        for (std::size_t worker = 0; worker < active_serializers; ++worker) {
+          serializers.emplace_back([&]() {
+            for (;;) {
+              const auto item_index = next_item.fetch_add(1, std::memory_order_relaxed);
+              if (item_index >= batch.size()) {
+                break;
+              }
+              serialize_item(item_index);
+            }
+          });
+        }
+        for (auto &serializer : serializers) {
+          serializer.join();
+        }
+      } else {
+        for (std::size_t item_index = 0; item_index < batch.size(); ++item_index) {
+          serialize_item(item_index);
+        }
+      }
+
+      for (const auto &line : lines) {
         const auto write_start_ns = monotonic_nanoseconds();
-        stream_.write(line->data(), static_cast<std::streamsize>(line->size()));
+        stream_.write(line.data(), static_cast<std::streamsize>(line.size()));
         if (digest_valid_)
-          digest_.update(reinterpret_cast<const std::uint8_t *>(line->data()), line->size());
+          digest_.update(reinterpret_cast<const std::uint8_t *>(line.data()), line.size());
         const auto write_ns = monotonic_nanoseconds() - write_start_ns;
         write_count_.fetch_add(1, std::memory_order_relaxed);
-        write_bytes_.fetch_add(line->size(), std::memory_order_relaxed);
+        write_bytes_.fetch_add(line.size(), std::memory_order_relaxed);
         write_ns_.fetch_add(write_ns, std::memory_order_relaxed);
         update_atomic_max(max_write_ns_, write_ns);
       }
@@ -2347,6 +2659,7 @@ private:
   std::condition_variable cv_;
   std::deque<PendingItem> queue_;
   std::size_t max_pending_bytes_ = kDefaultMaxPendingBytes;
+  std::size_t serializer_worker_count_ = 1;
   std::size_t pending_bytes_ = 0;
   std::size_t peak_pending_bytes_ = 0;
   std::atomic_uint64_t enqueue_count_{0};
@@ -4359,9 +4672,15 @@ struct TraceBundleWriter::Impl {
   WriterPhaseStats close_phase_metal_callstream_flush;
   WriterPhaseStats close_phase_asset_writer_drain;
   WriterPhaseStats close_phase_alias_rewrite;
+  WriterPhaseStats close_phase_metal_callstream_rewrite;
   WriterPhaseStats close_phase_asset_index;
   WriterPhaseStats close_phase_writer_stats;
   WriterPhaseStats close_phase_checksum;
+  std::uint64_t metal_callstream_rewrite_lines_scanned = 0;
+  std::uint64_t metal_callstream_rewrite_bytes_scanned = 0;
+  std::uint64_t metal_callstream_rewrite_lines_rewritten = 0;
+  std::uint64_t metal_callstream_rewrite_blob_refs_rewritten = 0;
+  std::uint64_t metal_callstream_rewrite_json_parse_lines = 0;
   std::atomic_bool callstream_may_reference_asset_alias{false};
   std::atomic_bool metal_callstream_may_reference_asset_alias{false};
   std::unordered_set<std::string> analysis_streams_may_reference_asset_alias;
@@ -4379,6 +4698,7 @@ struct TraceBundleWriter::Impl {
   bool async_callstream_serialize = true;
   bool asset_spool_write = true;
   bool capture_integrity_enabled = true;
+  TraceBundleWriter::ProgressCallback progress_callback;
   std::size_t capture_max_unpublished_spool_bytes = 128ull * 1024ull * 1024ull;
   std::size_t capture_low_unpublished_spool_bytes = 64ull * 1024ull * 1024ull;
   std::filesystem::path asset_spool_relative_path = std::filesystem::path(kAssetSpoolDirectoryName) / kAssetSpoolFileName;
@@ -4564,6 +4884,7 @@ struct TraceBundleWriter::Impl {
     write_phase(output, "close_metal_callstream_flush", close_phase_metal_callstream_flush);
     write_phase(output, "close_asset_writer_drain", close_phase_asset_writer_drain);
     write_phase(output, "close_alias_rewrite", close_phase_alias_rewrite);
+    write_phase(output, "close_metal_callstream_rewrite", close_phase_metal_callstream_rewrite);
     write_phase(output, "close_asset_index", close_phase_asset_index);
     write_phase(output, "close_writer_stats", close_phase_writer_stats);
     write_phase(output, "close_checksum", close_phase_checksum);
@@ -4588,6 +4909,13 @@ struct TraceBundleWriter::Impl {
            << ",\"metal_callstream_write_bytes\":" << metal_callstream_stats.write_bytes
            << ",\"metal_callstream_write_ns\":" << metal_callstream_stats.write_ns
            << ",\"metal_callstream_max_write_ns\":" << metal_callstream_stats.max_write_ns
+           << ",\"metal_callstream_rewrite_lines_scanned\":" << metal_callstream_rewrite_lines_scanned
+           << ",\"metal_callstream_rewrite_bytes_scanned\":" << metal_callstream_rewrite_bytes_scanned
+           << ",\"metal_callstream_rewrite_lines_rewritten\":" << metal_callstream_rewrite_lines_rewritten
+           << ",\"metal_callstream_rewrite_blob_refs_rewritten\":"
+           << metal_callstream_rewrite_blob_refs_rewritten
+           << ",\"metal_callstream_rewrite_json_parse_lines\":"
+           << metal_callstream_rewrite_json_parse_lines
            << ",\"analysis_enqueue_count\":" << analysis_stream_stats.enqueue_count
            << ",\"analysis_enqueue_bytes\":" << analysis_stream_stats.enqueue_bytes
            << ",\"analysis_wait_count\":" << analysis_stream_stats.wait_count
@@ -5574,9 +5902,17 @@ struct TraceBundleWriter::Impl {
                 layout,
                 blob_remap,
                 asset_snapshot,
-                metal_asset_snapshot)) {
-          known_file_digests_snapshot[kMetalCallstreamFileName] = rewritten->first;
-          known_file_sizes_snapshot[kMetalCallstreamFileName] = rewritten->second;
+                metal_asset_snapshot,
+                nullptr)) {
+          metal_callstream_rewrite_lines_scanned += rewritten->lines_scanned;
+          metal_callstream_rewrite_bytes_scanned += rewritten->bytes_scanned;
+          metal_callstream_rewrite_lines_rewritten += rewritten->lines_rewritten;
+          metal_callstream_rewrite_blob_refs_rewritten += rewritten->blob_refs_rewritten;
+          metal_callstream_rewrite_json_parse_lines += rewritten->json_parse_lines;
+          if (rewritten->changed) {
+            known_file_digests_snapshot[kMetalCallstreamFileName] = rewritten->digest;
+            known_file_sizes_snapshot[kMetalCallstreamFileName] = rewritten->byte_size;
+          }
         }
         async_path_aliases = completed_asset_path_aliases();
         const auto rewrite_result = rewrite_bundle_asset_references(
@@ -5761,6 +6097,21 @@ TraceBundleWriter::~TraceBundleWriter()
   }
 }
 
+void TraceBundleWriter::set_async_asset_worker_count(std::size_t worker_count)
+{
+  async_asset_worker_count_ = worker_count;
+  if (impl_) {
+    impl_->asset_writer.set_worker_count(worker_count == 0 ? default_async_asset_worker_count() : worker_count);
+  }
+}
+
+void TraceBundleWriter::set_progress_callback(ProgressCallback callback)
+{
+  if (impl_) {
+    impl_->progress_callback = std::move(callback);
+  }
+}
+
 bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBundleOpenMode mode)
 {
   impl_ = std::make_unique<Impl>();
@@ -5790,6 +6141,10 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
       impl_->capture_max_unpublished_spool_bytes,
       env_size_or_default("DXMT_CAPTURE_LOW_WATER_BYTES", impl_->capture_max_unpublished_spool_bytes / 2));
   impl_->callstream_stream.set_max_pending_bytes(impl_->async_line_max_pending_bytes);
+  impl_->callstream_stream.set_serializer_worker_count(
+      env_size_or_default(
+          "APITRACE_ASYNC_LINE_SERIALIZERS",
+          async_asset_worker_count_ == 0 ? 1 : async_asset_worker_count_));
   impl_->metal_callstream_stream.set_max_pending_bytes(impl_->async_line_max_pending_bytes);
   const auto default_asset_pending = impl_->capture_integrity_enabled
                                          ? impl_->capture_max_unpublished_spool_bytes
@@ -5800,8 +6155,9 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
 	  impl_->asset_writer.set_max_pending_bytes(env_size_or_default("APITRACE_ASYNC_ASSET_MAX_PENDING", default_asset_pending));
 	  impl_->asset_writer.set_hard_max_pending_bytes(env_size_or_default("APITRACE_ASYNC_ASSET_HARD_MAX_PENDING", default_asset_hard_pending));
 	  impl_->asset_writer.set_bulk_threshold(env_size_or_default("APITRACE_ASYNC_ASSET_BULK_THRESHOLD", impl_->async_asset_threshold));
-	  impl_->asset_writer.set_worker_count(
-        env_size_or_default("APITRACE_ASYNC_ASSET_WORKERS", default_async_asset_worker_count()));
+	  impl_->asset_writer.set_worker_count(async_asset_worker_count_ == 0
+        ? env_size_or_default("APITRACE_ASYNC_ASSET_WORKERS", default_async_asset_worker_count())
+        : async_asset_worker_count_);
   impl_->asset_writer.set_sparse_write_enabled(env_flag_enabled("APITRACE_ASSET_SPARSE_WRITE"));
   impl_->asset_writer.set_spool_write_enabled(impl_->asset_spool_write);
   impl_->asset_writer.set_integrity_enabled(impl_->capture_integrity_enabled);
@@ -7149,16 +7505,28 @@ void TraceBundleWriter::close()
 	            impl_->layout.analysis_directory_path / kSidebandAssetShardFileName,
 	            filtered_sideband_asset_index);
 	      }
-      if (const auto rewritten = rewrite_metal_callstream_blob_refs(
-              impl_->layout,
-              blob_remap,
-              close_asset_snapshot,
-              close_metal_asset_snapshot)) {
-        known_file_digests[kMetalCallstreamFileName] = rewritten->first;
-        known_file_sizes[kMetalCallstreamFileName] = rewritten->second;
-        TimedWriterLock lock(impl_->asset_mutex, impl_->writer_stats ? &impl_->asset_lock_stats : nullptr);
-        impl_->known_file_digests[kMetalCallstreamFileName] = rewritten->first;
-        impl_->known_file_sizes[kMetalCallstreamFileName] = rewritten->second;
+      {
+        TimedWriterPhase rewrite_phase(
+            impl_->writer_stats ? &impl_->close_phase_metal_callstream_rewrite : nullptr);
+        if (const auto rewritten = rewrite_metal_callstream_blob_refs(
+                impl_->layout,
+                blob_remap,
+                close_asset_snapshot,
+                close_metal_asset_snapshot,
+                impl_->progress_callback)) {
+          impl_->metal_callstream_rewrite_lines_scanned += rewritten->lines_scanned;
+          impl_->metal_callstream_rewrite_bytes_scanned += rewritten->bytes_scanned;
+          impl_->metal_callstream_rewrite_lines_rewritten += rewritten->lines_rewritten;
+          impl_->metal_callstream_rewrite_blob_refs_rewritten += rewritten->blob_refs_rewritten;
+          impl_->metal_callstream_rewrite_json_parse_lines += rewritten->json_parse_lines;
+          if (rewritten->changed) {
+            known_file_digests[kMetalCallstreamFileName] = rewritten->digest;
+            known_file_sizes[kMetalCallstreamFileName] = rewritten->byte_size;
+            TimedWriterLock lock(impl_->asset_mutex, impl_->writer_stats ? &impl_->asset_lock_stats : nullptr);
+            impl_->known_file_digests[kMetalCallstreamFileName] = rewritten->digest;
+            impl_->known_file_sizes[kMetalCallstreamFileName] = rewritten->byte_size;
+          }
+        }
       }
       const auto asset_index = asset_index_json(
           close_asset_snapshot,

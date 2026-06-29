@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -48,6 +49,14 @@ public:
   bool open(
       const std::filesystem::path &bundle_root,
       TraceBundleOpenMode mode = TraceBundleOpenMode::Primary);
+  void set_async_asset_worker_count(std::size_t worker_count);
+  using ProgressCallback = std::function<void(
+      std::string_view phase,
+      std::uint64_t items_done,
+      std::uint64_t item_count,
+      std::uint64_t bytes_done,
+      std::uint64_t byte_count)>;
+  void set_progress_callback(ProgressCallback callback);
   void write_metadata(const TraceMetadata &metadata);
   // Runtime capture producers should enqueue raw evidence records only. Derived
   // semantic assets, expensive hashing, deduplication, and crash-tail repair are
@@ -107,6 +116,7 @@ private:
   // TODO: split readable index emission from raw asset emission once bundle writing is implemented.
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  std::size_t async_asset_worker_count_ = 0;
 };
 
 class TraceBundleReader {

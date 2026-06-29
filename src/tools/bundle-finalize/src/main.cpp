@@ -8,16 +8,20 @@
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -45,6 +49,10 @@ constexpr std::uint64_t kDefaultMaxTruncateFrames = 120;
 constexpr std::size_t kFileCopyBufferSize = 8ull * 1024ull * 1024ull;
 constexpr std::uint64_t kJsonlMaxChunkSize = 64ull * 1024ull * 1024ull;
 constexpr std::uint64_t kJsonlMinChunkSize = 64ull * 1024ull;
+constexpr std::uint64_t kRawToFinalAssetFlushMinBytes = 256ull * 1024ull * 1024ull;
+constexpr std::uint64_t kRawToFinalAssetFlushMaxBytes = 2ull * 1024ull * 1024ull * 1024ull;
+constexpr std::uint64_t kRawToFinalAssetFlushBytesPerJob = 64ull * 1024ull * 1024ull;
+constexpr std::size_t kRawToFinalAssetFlushMaxEvents = 4096;
 constexpr const char *kEmptySha256Digest =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -183,6 +191,8 @@ struct Stats {
   std::uint64_t raw_to_final_peak_event_payload_bytes = 0;
   std::uint64_t raw_to_final_peak_decoded_asset_bytes = 0;
   std::size_t raw_to_final_peak_assets_per_event = 0;
+  std::size_t raw_to_final_asset_flushes = 0;
+  std::uint64_t raw_to_final_asset_flush_bytes = 0;
 };
 
 std::unordered_map<std::uint64_t, std::string> build_effective_path_by_blob_id(const std::vector<AssetEntry> &assets);
@@ -397,7 +407,25 @@ std::string format_bytes(std::uint64_t bytes)
 
 class ProgressReporter {
 public:
-  explicit ProgressReporter(bool enabled) : enabled_(enabled) {}
+  struct PhaseProgress {
+    std::string name;
+    std::uint64_t items_done = 0;
+    std::uint64_t item_count = 0;
+    std::uint64_t bytes_done = 0;
+    std::uint64_t byte_count = 0;
+    std::uint64_t last_items_done = 0;
+    std::uint64_t last_bytes_done = 0;
+    double items_per_second = 0.0;
+    double bytes_per_second = 0.0;
+    std::chrono::steady_clock::time_point last_update{};
+    std::chrono::steady_clock::time_point last_sample{};
+  };
+
+  explicit ProgressReporter(bool enabled, bool multiline = false)
+      : enabled_(enabled),
+        multiline_(multiline)
+  {
+  }
 
   void begin_stage(std::size_t stage_index, std::size_t stage_count, const char *name)
   {
@@ -410,7 +438,16 @@ public:
     stage_index_ = stage_index;
     stage_count_ = stage_count;
     stage_name_ = name ? name : "";
-    emit_locked("started", 0, 0, 0, 0, true);
+    phases_.clear();
+    active_phase_.clear();
+    last_items_done_ = 0;
+    last_item_count_ = 0;
+    last_bytes_done_ = 0;
+    last_byte_count_ = 0;
+    rate_sample_time_ = stage_started_;
+    rate_sample_items_ = 0;
+    rate_sample_bytes_ = 0;
+    emit_locked("started", true);
   }
 
   void update(std::uint64_t items_done, std::uint64_t item_count, std::uint64_t bytes_done, std::uint64_t byte_count)
@@ -419,13 +456,41 @@ public:
       return;
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto now = std::chrono::steady_clock::now();
-    if (last_emit_.time_since_epoch().count() != 0 &&
-        now - last_emit_ < std::chrono::milliseconds(500) &&
-        items_done < item_count) {
+    active_phase_.clear();
+    record_stage_progress_locked(items_done, item_count, bytes_done, byte_count);
+    maybe_emit_locked("running", false);
+  }
+
+  void update_detail(
+      std::string_view detail,
+      std::uint64_t items_done,
+      std::uint64_t item_count,
+      std::uint64_t bytes_done,
+      std::uint64_t byte_count)
+  {
+    if (!enabled_) {
       return;
     }
-    emit_locked("running", items_done, item_count, bytes_done, byte_count, false);
+    std::lock_guard<std::mutex> lock(mutex_);
+    active_phase_ = std::string(detail);
+    auto &phase = phases_[active_phase_];
+    if (phase.name.empty()) {
+      phase.name = active_phase_;
+      phase.last_update = stage_started_;
+      phase.last_sample = stage_started_;
+    }
+    update_phase_locked(phase, items_done, item_count, bytes_done, byte_count);
+    record_stage_progress_locked(items_done, item_count, bytes_done, byte_count);
+    maybe_emit_locked("running", false);
+  }
+
+  void heartbeat()
+  {
+    if (!enabled_) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    maybe_emit_locked("running", false);
   }
 
   void end_stage()
@@ -434,8 +499,12 @@ public:
       return;
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    emit_locked("done", 0, 0, 0, 0, true);
-    std::cerr << "\n";
+    emit_locked("done", true);
+    if (multiline_) {
+      emit_summary_locked();
+    } else {
+      std::cerr << "\n";
+    }
     line_active_ = false;
   }
 
@@ -445,57 +514,184 @@ public:
       return;
     }
     std::lock_guard<std::mutex> lock(mutex_);
+    if (multiline_) {
+      line_active_ = false;
+      return;
+    }
     std::cerr << "\r" << std::string(last_line_width_, ' ') << "\r";
     line_active_ = false;
   }
 
 private:
-  void emit_locked(
-      const char *state,
+  void record_stage_progress_locked(
       std::uint64_t items_done,
       std::uint64_t item_count,
       std::uint64_t bytes_done,
-      std::uint64_t byte_count,
-      bool force)
+      std::uint64_t byte_count)
+  {
+    last_items_done_ = items_done;
+    last_item_count_ = item_count;
+    last_bytes_done_ = bytes_done;
+    last_byte_count_ = byte_count;
+  }
+
+  void update_phase_locked(
+      PhaseProgress &phase,
+      std::uint64_t items_done,
+      std::uint64_t item_count,
+      std::uint64_t bytes_done,
+      std::uint64_t byte_count)
   {
     const auto now = std::chrono::steady_clock::now();
-    if (!force &&
-        last_emit_.time_since_epoch().count() != 0 &&
-        now - last_emit_ < std::chrono::milliseconds(500)) {
+    if (phase.last_sample.time_since_epoch().count() == 0) {
+      phase.last_sample = now;
+      phase.last_items_done = items_done;
+      phase.last_bytes_done = bytes_done;
+    } else {
+      const auto elapsed = std::chrono::duration<double>(now - phase.last_sample).count();
+      if (elapsed >= 1.0) {
+        const auto item_delta = items_done >= phase.last_items_done
+                                    ? items_done - phase.last_items_done
+                                    : items_done;
+        const auto byte_delta = bytes_done >= phase.last_bytes_done
+                                    ? bytes_done - phase.last_bytes_done
+                                    : bytes_done;
+        phase.items_per_second = static_cast<double>(item_delta) / elapsed;
+        phase.bytes_per_second = static_cast<double>(byte_delta) / elapsed;
+        phase.last_sample = now;
+        phase.last_items_done = items_done;
+        phase.last_bytes_done = bytes_done;
+      }
+    }
+    phase.items_done = items_done;
+    phase.item_count = item_count;
+    phase.bytes_done = bytes_done;
+    phase.byte_count = byte_count;
+    phase.last_update = now;
+  }
+
+  void maybe_emit_locked(const char *state, bool force)
+  {
+    if (force) {
+      emit_locked(state, true);
       return;
     }
-    last_emit_ = now;
+    const auto now = std::chrono::steady_clock::now();
+    const auto interval = multiline_ ? std::chrono::seconds(5) : std::chrono::milliseconds(500);
+    if (last_emit_.time_since_epoch().count() != 0 && now - last_emit_ < interval) {
+      return;
+    }
+    emit_locked(state, false);
+  }
+
+  void emit_locked(const char *state, bool force)
+  {
+    const auto now = std::chrono::steady_clock::now();
     const auto elapsed = std::chrono::duration<double>(now - stage_started_).count();
+    const auto rate_elapsed =
+        rate_sample_time_.time_since_epoch().count() == 0
+            ? elapsed
+            : std::chrono::duration<double>(now - rate_sample_time_).count();
+    const auto item_delta = last_items_done_ >= rate_sample_items_
+                                ? last_items_done_ - rate_sample_items_
+                                : last_items_done_;
+    const auto byte_delta = last_bytes_done_ >= rate_sample_bytes_
+                                ? last_bytes_done_ - rate_sample_bytes_
+                                : last_bytes_done_;
+    const auto item_rate = rate_elapsed > 0.0 ? static_cast<double>(item_delta) / rate_elapsed : 0.0;
+    const auto byte_rate = rate_elapsed > 0.0 ? static_cast<double>(byte_delta) / rate_elapsed : 0.0;
+    last_emit_ = now;
+    rate_sample_time_ = now;
+    rate_sample_items_ = last_items_done_;
+    rate_sample_bytes_ = last_bytes_done_;
     std::ostringstream line;
     line << "bundle-finalize progress"
          << " stage=" << stage_index_ << "/" << stage_count_
          << " name=" << stage_name_
          << " state=" << state
          << " elapsed_s=" << std::fixed << std::setprecision(1) << elapsed;
-    if (item_count != 0) {
-      line << " items=" << items_done << "/" << item_count;
+    if (!active_phase_.empty()) {
+      line << " active=" << active_phase_;
     }
-    if (byte_count != 0) {
-      line << " bytes=" << format_bytes(bytes_done) << "/" << format_bytes(byte_count);
+    if (last_item_count_ != 0) {
+      line << " items=" << last_items_done_ << "/" << last_item_count_;
+    } else if (last_items_done_ != 0) {
+      line << " items=" << last_items_done_;
     }
-    if (items_done != 0 && item_count != 0 && items_done < item_count && elapsed > 0.0) {
-      const auto rate = static_cast<double>(items_done) / elapsed;
+    if (last_byte_count_ != 0) {
+      line << " bytes=" << format_bytes(last_bytes_done_) << "/" << format_bytes(last_byte_count_);
+    }
+    line << " items_per_s=" << std::fixed << std::setprecision(1) << item_rate;
+    line << " bytes_per_s=" << format_bytes(static_cast<std::uint64_t>(byte_rate));
+    if (last_items_done_ != 0 && last_item_count_ != 0 && last_items_done_ < last_item_count_ && elapsed > 0.0) {
+      const auto rate = static_cast<double>(last_items_done_) / elapsed;
       if (rate > 0.0) {
-        const auto eta = static_cast<double>(item_count - items_done) / rate;
+        const auto eta = static_cast<double>(last_item_count_ - last_items_done_) / rate;
         line << " eta_s=" << std::fixed << std::setprecision(1) << eta;
+      }
+    }
+    if (!phases_.empty()) {
+      line << " phases=";
+      bool first = true;
+      for (const auto &entry : phases_) {
+        const auto &phase = entry.second;
+        if (!first) {
+          line << ",";
+        }
+        first = false;
+        line << phase.name << ":";
+        if (phase.byte_count != 0) {
+          line << format_bytes(phase.bytes_done) << "/" << format_bytes(phase.byte_count);
+        } else if (phase.bytes_done != 0) {
+          line << format_bytes(phase.bytes_done);
+        } else {
+          line << phase.items_done << "items";
+        }
+        if (phase.bytes_per_second > 0.0) {
+          line << "@" << format_bytes(static_cast<std::uint64_t>(phase.bytes_per_second)) << "/s";
+        } else if (phase.items_per_second > 0.0) {
+          line << "@" << std::fixed << std::setprecision(0) << phase.items_per_second << "/s";
+        }
       }
     }
 
     const auto text = line.str();
-    std::cerr << "\r" << text;
-    if (last_line_width_ > text.size()) {
-      std::cerr << std::string(last_line_width_ - text.size(), ' ');
+    if (multiline_) {
+      std::cerr << text << "\n";
+    } else {
+      std::cerr << "\r" << text;
+      if (last_line_width_ > text.size()) {
+        std::cerr << std::string(last_line_width_ - text.size(), ' ');
+      }
     }
     last_line_width_ = text.size();
     line_active_ = true;
   }
 
+  void emit_summary_locked()
+  {
+    if (phases_.empty()) {
+      return;
+    }
+    std::cerr << "bundle-finalize summary"
+              << " stage=" << stage_index_ << "/" << stage_count_
+              << " name=" << stage_name_;
+    for (const auto &entry : phases_) {
+      const auto &phase = entry.second;
+      std::cerr << " " << phase.name << "=";
+      if (phase.byte_count != 0) {
+        std::cerr << format_bytes(phase.bytes_done) << "/" << format_bytes(phase.byte_count);
+      } else if (phase.bytes_done != 0) {
+        std::cerr << format_bytes(phase.bytes_done);
+      } else {
+        std::cerr << phase.items_done << "items";
+      }
+    }
+    std::cerr << "\n";
+  }
+
   bool enabled_ = false;
+  bool multiline_ = false;
   std::mutex mutex_;
   std::chrono::steady_clock::time_point stage_started_{};
   std::chrono::steady_clock::time_point last_emit_{};
@@ -503,6 +699,15 @@ private:
   std::size_t stage_count_ = 0;
   std::size_t last_line_width_ = 0;
   std::string stage_name_;
+  std::string active_phase_;
+  std::map<std::string, PhaseProgress> phases_;
+  std::uint64_t last_items_done_ = 0;
+  std::uint64_t last_item_count_ = 0;
+  std::uint64_t last_bytes_done_ = 0;
+  std::uint64_t last_byte_count_ = 0;
+  std::chrono::steady_clock::time_point rate_sample_time_{};
+  std::uint64_t rate_sample_items_ = 0;
+  std::uint64_t rate_sample_bytes_ = 0;
   bool line_active_ = false;
 };
 
@@ -561,7 +766,269 @@ std::string rewrite_passthrough_blob_refs_copy(
   return record.dump();
 }
 
-bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stats)
+constexpr std::uint64_t kRawFileHeaderBytes = 16;
+constexpr std::uint64_t kRawEventHeaderBytes = 40;
+constexpr std::uint64_t kRawDecodeTargetChunkBytes = 32ull * 1024ull * 1024ull;
+constexpr std::size_t kRawDecodeMaxChunkEvents = 262144;
+
+std::uint32_t read_le_u32(const std::uint8_t *bytes)
+{
+  return static_cast<std::uint32_t>(bytes[0]) |
+         (static_cast<std::uint32_t>(bytes[1]) << 8) |
+         (static_cast<std::uint32_t>(bytes[2]) << 16) |
+         (static_cast<std::uint32_t>(bytes[3]) << 24);
+}
+
+std::uint64_t read_le_u64(const std::uint8_t *bytes)
+{
+  std::uint64_t value = 0;
+  for (std::size_t index = 0; index < sizeof(value); ++index) {
+    value |= static_cast<std::uint64_t>(bytes[index]) << (index * 8);
+  }
+  return value;
+}
+
+bool read_exact_bytes(std::ifstream &input, void *bytes, std::uint64_t size)
+{
+  if (size > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+    return false;
+  }
+  input.read(reinterpret_cast<char *>(bytes), static_cast<std::streamsize>(size));
+  return static_cast<std::uint64_t>(input.gcount()) == size;
+}
+
+apitrace::trace::raw::RawEventHeader read_raw_event_header(
+    const std::array<std::uint8_t, kRawEventHeaderBytes> &bytes)
+{
+  apitrace::trace::raw::RawEventHeader header;
+  header.sequence = read_le_u64(bytes.data());
+  header.thread_id = read_le_u64(bytes.data() + 8);
+  header.timestamp_or_monotonic_counter = read_le_u64(bytes.data() + 16);
+  header.opcode = read_le_u32(bytes.data() + 24);
+  header.result_or_flags = read_le_u32(bytes.data() + 28);
+  header.payload_len = read_le_u64(bytes.data() + 32);
+  return header;
+}
+
+struct RawEventRange {
+  std::uint64_t offset = 0;
+  std::uint64_t byte_size = 0;
+  std::uint64_t sequence = 0;
+  std::uint64_t payload_size = 0;
+};
+
+struct RawDecodeChunk {
+  std::size_t index = 0;
+  std::uint64_t offset = 0;
+  std::uint64_t byte_size = 0;
+  std::vector<RawEventRange> events;
+};
+
+struct RawDecodedChunk {
+  std::size_t index = 0;
+  std::uint64_t byte_size = 0;
+  std::uint64_t peak_event_payload_bytes = 0;
+  std::uint64_t peak_decoded_asset_bytes = 0;
+  std::size_t peak_assets_per_event = 0;
+  std::vector<apitrace::trace::raw::DecodedRawEvent> events;
+  std::string error;
+};
+
+bool scan_raw_event_chunks(
+    const fs::path &bundle_root,
+    std::uint64_t committed_bytes,
+    std::vector<RawDecodeChunk> &chunks,
+    ProgressReporter *progress,
+    std::string &error)
+{
+  chunks.clear();
+  error.clear();
+  const auto events_path = bundle_root / "raw" / "events.bin";
+  std::ifstream input(events_path, std::ios::binary);
+  if (!input.is_open()) {
+    error = "failed to open raw events file";
+    return false;
+  }
+  input.seekg(static_cast<std::streamoff>(kRawFileHeaderBytes), std::ios::beg);
+  if (!input.good()) {
+    error = "failed to seek raw events file";
+    return false;
+  }
+
+  RawDecodeChunk chunk;
+  chunk.index = 0;
+  chunk.offset = kRawFileHeaderBytes;
+  std::uint64_t cursor = kRawFileHeaderBytes;
+  std::uint64_t scanned_events = 0;
+  while (cursor + kRawEventHeaderBytes <= committed_bytes) {
+    std::array<std::uint8_t, kRawEventHeaderBytes> header_bytes{};
+    if (!read_exact_bytes(input, header_bytes.data(), header_bytes.size())) {
+      error = "failed to read raw event header at byte offset " + std::to_string(cursor);
+      return false;
+    }
+    const auto header = read_raw_event_header(header_bytes);
+    const auto event_offset = cursor;
+    cursor += kRawEventHeaderBytes;
+    if (header.payload_len > committed_bytes - cursor ||
+        header.payload_len > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+      error = "invalid raw event payload length at byte offset " + std::to_string(event_offset);
+      return false;
+    }
+    input.seekg(static_cast<std::streamoff>(header.payload_len), std::ios::cur);
+    if (!input.good()) {
+      error = "failed to skip raw event payload at byte offset " + std::to_string(cursor);
+      return false;
+    }
+    cursor += header.payload_len;
+
+    RawEventRange range;
+    range.offset = event_offset;
+    range.byte_size = kRawEventHeaderBytes + header.payload_len;
+    range.sequence = header.sequence;
+    range.payload_size = header.payload_len;
+    if (chunk.events.empty()) {
+      chunk.offset = event_offset;
+    }
+    chunk.byte_size += range.byte_size;
+    chunk.events.push_back(range);
+    ++scanned_events;
+
+    if (chunk.byte_size >= kRawDecodeTargetChunkBytes ||
+        chunk.events.size() >= kRawDecodeMaxChunkEvents) {
+      chunks.push_back(std::move(chunk));
+      chunk = RawDecodeChunk{};
+      chunk.index = chunks.size();
+      chunk.offset = cursor;
+    }
+    if (progress) {
+      progress->update_detail("raw_scan", scanned_events, 0, cursor - kRawFileHeaderBytes,
+                              committed_bytes - kRawFileHeaderBytes);
+    }
+  }
+  if (cursor != committed_bytes) {
+    error = "raw events committed prefix ends inside an event header at byte offset " +
+            std::to_string(cursor);
+    return false;
+  }
+  if (!chunk.events.empty()) {
+    chunks.push_back(std::move(chunk));
+  }
+  return true;
+}
+
+bool read_raw_event_at(
+    std::ifstream &input,
+    const RawEventRange &range,
+    apitrace::trace::raw::RawEventRecord &record,
+    std::string &error)
+{
+  input.clear();
+  input.seekg(static_cast<std::streamoff>(range.offset), std::ios::beg);
+  if (!input.good()) {
+    error = "failed to seek raw event at byte offset " + std::to_string(range.offset);
+    return false;
+  }
+  std::array<std::uint8_t, kRawEventHeaderBytes> header_bytes{};
+  if (!read_exact_bytes(input, header_bytes.data(), header_bytes.size())) {
+    error = "failed to read raw event header at byte offset " + std::to_string(range.offset);
+    return false;
+  }
+  record = apitrace::trace::raw::RawEventRecord{};
+  record.header = read_raw_event_header(header_bytes);
+  if (record.header.payload_len + kRawEventHeaderBytes != range.byte_size ||
+      record.header.payload_len > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    error = "raw event size changed at byte offset " + std::to_string(range.offset);
+    return false;
+  }
+  record.payload.resize(static_cast<std::size_t>(record.header.payload_len));
+  if (!record.payload.empty() &&
+      !read_exact_bytes(input, record.payload.data(), record.payload.size())) {
+    error = "failed to read raw event payload at byte offset " + std::to_string(range.offset);
+    return false;
+  }
+  return true;
+}
+
+bool read_next_raw_event_in_chunk(
+    std::ifstream &input,
+    std::uint64_t &cursor,
+    const RawEventRange &range,
+    apitrace::trace::raw::RawEventRecord &record,
+    std::string &error)
+{
+  if (cursor != range.offset) {
+    error = "raw event chunk cursor mismatch at byte offset " + std::to_string(range.offset);
+    return false;
+  }
+  std::array<std::uint8_t, kRawEventHeaderBytes> header_bytes{};
+  if (!read_exact_bytes(input, header_bytes.data(), header_bytes.size())) {
+    error = "failed to read raw event header at byte offset " + std::to_string(range.offset);
+    return false;
+  }
+  cursor += kRawEventHeaderBytes;
+  record = apitrace::trace::raw::RawEventRecord{};
+  record.header = read_raw_event_header(header_bytes);
+  if (record.header.payload_len + kRawEventHeaderBytes != range.byte_size ||
+      record.header.payload_len > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    error = "raw event size changed at byte offset " + std::to_string(range.offset);
+    return false;
+  }
+  record.payload.resize(static_cast<std::size_t>(record.header.payload_len));
+  if (!record.payload.empty() &&
+      !read_exact_bytes(input, record.payload.data(), record.payload.size())) {
+    error = "failed to read raw event payload at byte offset " + std::to_string(range.offset);
+    return false;
+  }
+  cursor += record.header.payload_len;
+  return true;
+}
+
+RawDecodedChunk decode_raw_chunk(
+    const RawDecodeChunk &chunk,
+    apitrace::trace::raw::RawEventDecoder &decoder,
+    std::ifstream &events_input)
+{
+  RawDecodedChunk result;
+  result.index = chunk.index;
+  result.byte_size = chunk.byte_size;
+  result.events.reserve(chunk.events.size());
+
+  if (!chunk.events.empty()) {
+    events_input.clear();
+    events_input.seekg(static_cast<std::streamoff>(chunk.events.front().offset), std::ios::beg);
+    if (!events_input.good()) {
+      result.error = "failed to seek raw event chunk at byte offset " +
+                     std::to_string(chunk.events.front().offset);
+      return result;
+    }
+  }
+  std::uint64_t cursor = chunk.events.empty() ? chunk.offset : chunk.events.front().offset;
+  for (const auto &range : chunk.events) {
+    apitrace::trace::raw::RawEventRecord record;
+    if (!read_next_raw_event_in_chunk(events_input, cursor, range, record, result.error)) {
+      return result;
+    }
+    result.peak_event_payload_bytes =
+        std::max<std::uint64_t>(result.peak_event_payload_bytes, record.payload.size());
+    apitrace::trace::raw::DecodedRawEvent decoded_event;
+    if (!decoder.decode_event(record, decoded_event)) {
+      result.error = decoder.last_error();
+      return result;
+    }
+    std::uint64_t decoded_asset_bytes = 0;
+    for (const auto &asset : decoded_event.assets) {
+      decoded_asset_bytes += asset.payload_bytes.size();
+    }
+    result.peak_decoded_asset_bytes =
+        std::max(result.peak_decoded_asset_bytes, decoded_asset_bytes);
+    result.peak_assets_per_event =
+        std::max(result.peak_assets_per_event, decoded_event.assets.size());
+    result.events.push_back(std::move(decoded_event));
+  }
+  return result;
+}
+
+bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stats, ProgressReporter *progress)
 {
   if (options.dry_run) {
     std::cerr << "error: --raw-format cannot be combined with --dry-run before materialization exists\n";
@@ -580,6 +1047,17 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     std::getline(existing_callstream, existing_header_line);
   }
   apitrace::trace::TraceBundleWriter writer;
+  writer.set_async_asset_worker_count(options.jobs);
+  if (progress) {
+    writer.set_progress_callback([progress](
+                                     std::string_view phase,
+                                     std::uint64_t items_done,
+                                     std::uint64_t item_count,
+                                     std::uint64_t bytes_done,
+                                     std::uint64_t byte_count) {
+      progress->update_detail(phase, items_done, item_count, bytes_done, byte_count);
+    });
+  }
   if (!writer.open(options.bundle_root)) {
     std::cerr << "error: failed to open final bundle writer for raw materialization\n";
     return false;
@@ -591,7 +1069,6 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     writer.write_metadata({apitrace::trace::ApiKind::D3D12, apitrace::trace::kFormatVersion, "raw-to-final", false});
   }
 
-  apitrace::trace::raw::RawEventDecoder decoder(reader);
   struct ResourceFinalizeState {
     bool known = false;
     bool is_buffer = false;
@@ -721,17 +1198,18 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     return true;
   };
   const auto track_passthrough_context = [&](const std::string &line) -> bool {
+    const auto resource_pos = line.find("Resource");
+    if (resource_pos == std::string::npos) {
+      return true;
+    }
     const bool may_update_object_resource =
-        line.find("\"object_create\"") != std::string::npos &&
-        line.find("\"Resource\"") != std::string::npos;
+        line.find("object_create") != std::string::npos &&
+        line.find("\"object_kind\":\"Resource\"") != std::string::npos;
     const bool may_update_create_resource =
-        (line.find("\"ID3D12Device::CreateCommittedResource\"") != std::string::npos ||
-         line.find("\"ID3D12Device8::CreateCommittedResource2\"") != std::string::npos ||
-         line.find("\"ID3D12Device::CreatePlacedResource\"") != std::string::npos ||
-         line.find("\"ID3D12Device8::CreatePlacedResource1\"") != std::string::npos ||
-         line.find("\"ID3D12Device::CreateReservedResource\"") != std::string::npos);
-    const bool may_update_map =
-        line.find("\"ID3D12Resource::Map\"") != std::string::npos;
+        line.find("CreateCommittedResource") != std::string::npos ||
+        line.find("CreatePlacedResource") != std::string::npos ||
+        line.find("CreateReservedResource") != std::string::npos;
+    const bool may_update_map = line.find("ID3D12Resource::Map") != std::string::npos;
     if (!may_update_object_resource && !may_update_create_resource && !may_update_map) {
       return true;
     }
@@ -855,8 +1333,45 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     return true;
   };
   bool ok = true;
+  const auto flush_threshold_bytes = std::min<std::uint64_t>(
+      kRawToFinalAssetFlushMaxBytes,
+      std::max<std::uint64_t>(
+          kRawToFinalAssetFlushMinBytes,
+          static_cast<std::uint64_t>(std::max<std::size_t>(1, options.jobs)) *
+              kRawToFinalAssetFlushBytesPerJob));
+  std::uint64_t pending_asset_flush_bytes = 0;
+  std::size_t pending_asset_flush_events = 0;
+  const auto raw_committed = reader.committed_prefix();
+  const auto raw_total_event_bytes =
+      raw_committed.events_committed_bytes > kRawFileHeaderBytes
+          ? raw_committed.events_committed_bytes - kRawFileHeaderBytes
+          : 0;
+  const auto remember_asset_flush_pressure = [&](std::uint64_t byte_size) {
+    pending_asset_flush_bytes += byte_size;
+    ++pending_asset_flush_events;
+  };
+  const auto flush_assets_if_needed = [&]() {
+    if (pending_asset_flush_bytes < flush_threshold_bytes &&
+        pending_asset_flush_events < kRawToFinalAssetFlushMaxEvents) {
+      return;
+    }
+    writer.flush_asset_writes();
+    ++stats.raw_to_final_asset_flushes;
+    stats.raw_to_final_asset_flush_bytes += pending_asset_flush_bytes;
+    pending_asset_flush_bytes = 0;
+    pending_asset_flush_events = 0;
+  };
+  const auto flush_remaining_assets = [&]() {
+    if (pending_asset_flush_bytes == 0 && pending_asset_flush_events == 0) {
+      return;
+    }
+    writer.flush_asset_writes();
+    ++stats.raw_to_final_asset_flushes;
+    stats.raw_to_final_asset_flush_bytes += pending_asset_flush_bytes;
+    pending_asset_flush_bytes = 0;
+    pending_asset_flush_events = 0;
+  };
   const auto emit_decoded_event = [&](apitrace::trace::raw::DecodedRawEvent &&decoded_event) {
-    bool wrote_assets = false;
     if (decoded_event.passthrough) {
       std::unordered_map<std::uint64_t, std::uint64_t> blob_id_remap;
       std::unordered_map<std::string, std::string> relative_path_remap;
@@ -864,7 +1379,7 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
         const auto input_blob_id = asset.blob_id;
         const auto input_relative_path = asset.relative_path.generic_string();
         auto registered = writer.register_asset(std::move(asset));
-        wrote_assets = true;
+        remember_asset_flush_pressure(registered.byte_size);
         ++stats.raw_to_final_assets;
         stats.raw_to_final_asset_bytes += registered.byte_size;
         if (registered.blob_id != input_blob_id) {
@@ -885,9 +1400,7 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
       }
       writer.append_callstream_json_line(passthrough_line);
       ++stats.raw_to_final_events;
-      if (wrote_assets) {
-        writer.flush_asset_writes();
-      }
+      flush_assets_if_needed();
       return true;
     }
     auto event = decoded_event.event;
@@ -895,7 +1408,7 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
       const auto input_blob_id = asset.blob_id;
       const auto input_relative_path = asset.relative_path.generic_string();
       auto registered = writer.register_asset(std::move(asset));
-      wrote_assets = true;
+      remember_asset_flush_pressure(registered.byte_size);
       ++stats.raw_to_final_assets;
       stats.raw_to_final_asset_bytes += registered.byte_size;
       if (registered.blob_id != input_blob_id) {
@@ -915,37 +1428,367 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     }
     writer.append_call_event(std::move(event));
     ++stats.raw_to_final_events;
-    if (wrote_assets) {
-      writer.flush_asset_writes();
-    }
+    flush_assets_if_needed();
     return true;
   };
-  const bool streamed = reader.for_each_event([&](apitrace::trace::raw::RawEventRecord &&record) {
-    stats.raw_to_final_peak_event_payload_bytes =
-        std::max<std::uint64_t>(stats.raw_to_final_peak_event_payload_bytes, record.payload.size());
-    apitrace::trace::raw::DecodedRawEvent decoded_event;
-    if (!decoder.decode_event(record, decoded_event)) {
-      std::cerr << "error: failed to decode raw capture: " << decoder.last_error() << "\n";
+  std::atomic_uint64_t scanned_events_done{0};
+  std::atomic_uint64_t scanned_bytes_done{0};
+  std::atomic_uint64_t decoded_events_done{0};
+  std::atomic_uint64_t decoded_bytes_done{0};
+  std::atomic_uint64_t committed_events_visible{0};
+  std::atomic_size_t next_commit_chunk_visible{0};
+  std::atomic_bool scan_done{false};
+  std::atomic_bool scan_failed{false};
+  std::atomic_bool decode_failed{false};
+  std::atomic_size_t workers_done{0};
+  std::mutex pipeline_mutex;
+  std::condition_variable pipeline_cv;
+  std::deque<RawDecodeChunk> pending_chunks;
+  std::map<std::size_t, RawDecodedChunk> decoded_chunks;
+  std::string scan_error;
+  std::string decode_error;
+  const auto worker_count = std::max<std::size_t>(1, options.jobs);
+  const auto max_pending_chunks = std::max<std::size_t>(worker_count * 4, 1);
+  const auto max_buffered_decoded_events =
+      std::max<std::uint64_t>(kRawDecodeMaxChunkEvents, worker_count * kRawDecodeMaxChunkEvents * 2ull);
+  const auto scanned_event_total_for_progress = [&]() -> std::uint64_t {
+    return scan_done.load(std::memory_order_acquire)
+               ? scanned_events_done.load(std::memory_order_relaxed)
+               : 0;
+  };
+  if (ok && progress) {
+    progress->update_detail("raw_scan", 0, 0, 0, raw_total_event_bytes);
+    progress->update_detail("raw_decode", 0, 0, 0, raw_total_event_bytes);
+  }
+
+  std::thread scanner;
+  if (ok) {
+    scanner = std::thread([&]() {
+      const auto events_path = options.bundle_root / "raw" / "events.bin";
+      const auto fail_scan = [&](std::string message) {
+        {
+          std::lock_guard<std::mutex> lock(pipeline_mutex);
+          scan_error = std::move(message);
+          scan_failed.store(true, std::memory_order_release);
+          scan_done.store(true, std::memory_order_release);
+        }
+        pipeline_cv.notify_all();
+      };
+      auto publish_chunk = [&](RawDecodeChunk &&ready_chunk) -> bool {
+        std::unique_lock<std::mutex> lock(pipeline_mutex);
+        pipeline_cv.wait(lock, [&]() {
+          return decode_failed.load(std::memory_order_acquire) ||
+                 scan_failed.load(std::memory_order_acquire) ||
+                 pending_chunks.size() < max_pending_chunks;
+        });
+        if (decode_failed.load(std::memory_order_acquire) ||
+            scan_failed.load(std::memory_order_acquire)) {
+          return false;
+        }
+        pending_chunks.push_back(std::move(ready_chunk));
+        lock.unlock();
+        pipeline_cv.notify_all();
+        return true;
+      };
+
+      std::ifstream input(events_path, std::ios::binary);
+      if (!input.is_open()) {
+        fail_scan("failed to open raw events file");
+        return;
+      }
+      input.seekg(static_cast<std::streamoff>(kRawFileHeaderBytes), std::ios::beg);
+      if (!input.good()) {
+        fail_scan("failed to seek raw events file");
+        return;
+      }
+
+      RawDecodeChunk chunk;
+      std::size_t next_chunk_index = 0;
+      chunk.index = next_chunk_index;
+      chunk.offset = kRawFileHeaderBytes;
+      std::uint64_t cursor = kRawFileHeaderBytes;
+      std::uint64_t scanned_events = 0;
+      while (cursor + kRawEventHeaderBytes <= raw_committed.events_committed_bytes) {
+        std::array<std::uint8_t, kRawEventHeaderBytes> header_bytes{};
+        if (!read_exact_bytes(input, header_bytes.data(), header_bytes.size())) {
+          fail_scan("failed to read raw event header at byte offset " + std::to_string(cursor));
+          return;
+        }
+        const auto header = read_raw_event_header(header_bytes);
+        const auto event_offset = cursor;
+        cursor += kRawEventHeaderBytes;
+        if (header.payload_len > raw_committed.events_committed_bytes - cursor ||
+            header.payload_len > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+          fail_scan("invalid raw event payload length at byte offset " + std::to_string(event_offset));
+          return;
+        }
+        input.seekg(static_cast<std::streamoff>(header.payload_len), std::ios::cur);
+        if (!input.good()) {
+          fail_scan("failed to skip raw event payload at byte offset " + std::to_string(cursor));
+          return;
+        }
+        cursor += header.payload_len;
+
+        RawEventRange range;
+        range.offset = event_offset;
+        range.byte_size = kRawEventHeaderBytes + header.payload_len;
+        range.sequence = header.sequence;
+        range.payload_size = header.payload_len;
+        if (chunk.events.empty()) {
+          chunk.offset = event_offset;
+        }
+        chunk.byte_size += range.byte_size;
+        chunk.events.push_back(range);
+        ++scanned_events;
+        scanned_events_done.store(scanned_events, std::memory_order_relaxed);
+        scanned_bytes_done.store(cursor - kRawFileHeaderBytes, std::memory_order_relaxed);
+
+        if (chunk.byte_size >= kRawDecodeTargetChunkBytes ||
+            chunk.events.size() >= kRawDecodeMaxChunkEvents) {
+          if (!publish_chunk(std::move(chunk))) {
+            return;
+          }
+          ++next_chunk_index;
+          chunk = RawDecodeChunk{};
+          chunk.index = next_chunk_index;
+          chunk.offset = cursor;
+        }
+        if (progress) {
+          progress->update_detail(
+              "raw_scan",
+              scanned_events,
+              0,
+              cursor - kRawFileHeaderBytes,
+              raw_total_event_bytes);
+        }
+      }
+      if (cursor != raw_committed.events_committed_bytes) {
+        fail_scan("raw events committed prefix ends inside an event header at byte offset " +
+                  std::to_string(cursor));
+        return;
+      }
+      if (!chunk.events.empty() && !publish_chunk(std::move(chunk))) {
+        return;
+      }
+      {
+        std::lock_guard<std::mutex> lock(pipeline_mutex);
+        scan_done.store(true, std::memory_order_release);
+      }
+      pipeline_cv.notify_all();
+    });
+  }
+
+  std::vector<std::thread> workers;
+  if (ok) {
+    workers.reserve(worker_count);
+    for (std::size_t worker = 0; worker < worker_count; ++worker) {
+      workers.emplace_back([&, worker]() {
+        (void)worker;
+        apitrace::trace::raw::RawCaptureReader worker_reader;
+        if (!worker_reader.open(options.bundle_root)) {
+          {
+            std::lock_guard<std::mutex> lock(pipeline_mutex);
+            if (decode_error.empty()) {
+              decode_error = "failed to open raw capture in worker: " + worker_reader.last_error();
+            }
+            decode_failed.store(true, std::memory_order_release);
+          }
+          pipeline_cv.notify_all();
+          workers_done.fetch_add(1, std::memory_order_acq_rel);
+          pipeline_cv.notify_all();
+          return;
+        }
+        apitrace::trace::raw::RawEventDecoder decoder(worker_reader);
+        std::ifstream events_input(options.bundle_root / "raw" / "events.bin", std::ios::binary);
+        if (!events_input.is_open()) {
+          {
+            std::lock_guard<std::mutex> lock(pipeline_mutex);
+            if (decode_error.empty()) {
+              decode_error = "failed to open raw events file in worker";
+            }
+            decode_failed.store(true, std::memory_order_release);
+          }
+          pipeline_cv.notify_all();
+          workers_done.fetch_add(1, std::memory_order_acq_rel);
+          pipeline_cv.notify_all();
+          return;
+        }
+
+        for (;;) {
+          RawDecodeChunk chunk;
+          {
+            std::unique_lock<std::mutex> lock(pipeline_mutex);
+            pipeline_cv.wait(lock, [&]() {
+              return decode_failed.load(std::memory_order_acquire) ||
+                     !pending_chunks.empty() ||
+                     scan_done.load(std::memory_order_acquire);
+            });
+            if (decode_failed.load(std::memory_order_acquire)) {
+              break;
+            }
+            if (pending_chunks.empty()) {
+              if (scan_done.load(std::memory_order_acquire)) {
+                break;
+              }
+              continue;
+            }
+            chunk = std::move(pending_chunks.front());
+            pending_chunks.pop_front();
+          }
+          pipeline_cv.notify_all();
+
+          auto decoded = decode_raw_chunk(chunk, decoder, events_input);
+          decoded_events_done.fetch_add(decoded.events.size(), std::memory_order_relaxed);
+          decoded_bytes_done.fetch_add(decoded.byte_size, std::memory_order_relaxed);
+          if (!decoded.error.empty()) {
+            std::lock_guard<std::mutex> lock(pipeline_mutex);
+            if (decode_error.empty()) {
+              decode_error = decoded.error;
+            }
+            decode_failed.store(true, std::memory_order_release);
+          }
+          {
+            std::unique_lock<std::mutex> lock(pipeline_mutex);
+            pipeline_cv.wait(lock, [&]() {
+              return decode_failed.load(std::memory_order_acquire) ||
+                     decoded_events_done.load(std::memory_order_relaxed) <=
+                         committed_events_visible.load(std::memory_order_relaxed) +
+                             max_buffered_decoded_events ||
+                     decoded.index == next_commit_chunk_visible.load(std::memory_order_relaxed);
+            });
+            decoded_chunks.emplace(decoded.index, std::move(decoded));
+          }
+          pipeline_cv.notify_all();
+          if (progress) {
+            progress->update_detail(
+                "raw_decode",
+                decoded_events_done.load(std::memory_order_relaxed),
+                scanned_event_total_for_progress(),
+                decoded_bytes_done.load(std::memory_order_relaxed),
+                raw_total_event_bytes);
+          }
+          if (decode_failed.load(std::memory_order_acquire)) {
+            break;
+          }
+        }
+        workers_done.fetch_add(1, std::memory_order_acq_rel);
+        pipeline_cv.notify_all();
+      });
+    }
+  }
+
+  std::size_t next_commit_chunk = 0;
+  std::uint64_t committed_events_done = 0;
+  std::uint64_t committed_bytes_done = 0;
+  while (ok) {
+    next_commit_chunk_visible.store(next_commit_chunk, std::memory_order_release);
+    RawDecodedChunk decoded;
+    {
+      std::unique_lock<std::mutex> lock(pipeline_mutex);
+      pipeline_cv.wait(lock, [&]() {
+        return decoded_chunks.find(next_commit_chunk) != decoded_chunks.end() ||
+               scan_failed.load(std::memory_order_acquire) ||
+               decode_failed.load(std::memory_order_acquire) ||
+               (scan_done.load(std::memory_order_acquire) &&
+                workers_done.load(std::memory_order_acquire) == worker_count);
+      });
+      if (scan_failed.load(std::memory_order_acquire)) {
+        std::cerr << "error: failed to scan raw capture events: " << scan_error << "\n";
+        ok = false;
+        break;
+      }
+      auto found = decoded_chunks.find(next_commit_chunk);
+      if (found == decoded_chunks.end()) {
+        if (scan_done.load(std::memory_order_acquire) &&
+            workers_done.load(std::memory_order_acquire) == worker_count &&
+            !decode_failed.load(std::memory_order_acquire)) {
+          break;
+        }
+        std::cerr << "error: raw decode worker stopped before chunk "
+                  << next_commit_chunk << " was produced";
+        if (!decode_error.empty()) {
+          std::cerr << ": " << decode_error;
+        }
+        std::cerr << "\n";
+        ok = false;
+        break;
+      }
+      decoded = std::move(found->second);
+      decoded_chunks.erase(found);
+    }
+    pipeline_cv.notify_all();
+    if (!decoded.error.empty()) {
+      std::cerr << "error: failed to decode raw capture chunk " << decoded.index
+                << ": " << decoded.error << "\n";
       ok = false;
-      return false;
+      break;
     }
-    std::uint64_t decoded_asset_bytes = 0;
-    for (const auto &asset : decoded_event.assets) {
-      decoded_asset_bytes += asset.payload_bytes.size();
-    }
+    stats.raw_to_final_peak_event_payload_bytes =
+        std::max(stats.raw_to_final_peak_event_payload_bytes, decoded.peak_event_payload_bytes);
     stats.raw_to_final_peak_decoded_asset_bytes =
-        std::max(stats.raw_to_final_peak_decoded_asset_bytes, decoded_asset_bytes);
+        std::max(stats.raw_to_final_peak_decoded_asset_bytes, decoded.peak_decoded_asset_bytes);
     stats.raw_to_final_peak_assets_per_event =
-        std::max(stats.raw_to_final_peak_assets_per_event, decoded_event.assets.size());
-    ok = emit_decoded_event(std::move(decoded_event));
-    return ok;
-  });
-  if (!streamed && ok) {
-    std::cerr << "error: failed to stream raw capture events";
-    if (!reader.last_error().empty()) {
-      std::cerr << ": " << reader.last_error();
+        std::max(stats.raw_to_final_peak_assets_per_event, decoded.peak_assets_per_event);
+    std::size_t events_since_progress = 0;
+    std::uint64_t chunk_committed_event_bytes = 0;
+    const auto bytes_per_event = decoded.events.empty()
+                                     ? 0
+                                     : decoded.byte_size / decoded.events.size();
+    for (auto &decoded_event : decoded.events) {
+      ok = emit_decoded_event(std::move(decoded_event));
+      if (!ok) {
+        break;
+      }
+      ++committed_events_done;
+      committed_events_visible.store(committed_events_done, std::memory_order_release);
+      ++events_since_progress;
+      chunk_committed_event_bytes += bytes_per_event;
+      if (events_since_progress >= 65536) {
+        if (progress) {
+          progress->update_detail(
+              "raw_commit",
+              committed_events_done,
+              scanned_event_total_for_progress(),
+              committed_bytes_done + std::min(chunk_committed_event_bytes, decoded.byte_size),
+              raw_total_event_bytes);
+        }
+        events_since_progress = 0;
+      }
     }
-    std::cerr << "\n";
+    committed_bytes_done += decoded.byte_size;
+    if (progress) {
+      progress->update_detail(
+          "raw_commit",
+          committed_events_done,
+          scanned_event_total_for_progress(),
+          committed_bytes_done,
+          raw_total_event_bytes);
+    }
+    ++next_commit_chunk;
+    next_commit_chunk_visible.store(next_commit_chunk, std::memory_order_release);
+    pipeline_cv.notify_all();
+  }
+  if (!ok) {
+    decode_failed.store(true, std::memory_order_release);
+    pipeline_cv.notify_all();
+  }
+  if (scanner.joinable()) {
+    scanner.join();
+  }
+  for (auto &worker : workers) {
+    if (worker.joinable()) {
+      worker.join();
+    }
+  }
+  if (decode_failed.load(std::memory_order_acquire) && ok) {
+    std::string error;
+    {
+      std::lock_guard<std::mutex> lock(pipeline_mutex);
+      error = decode_error;
+    }
+    if (!error.empty()) {
+      std::cerr << "error: failed to decode raw capture: " << error << "\n";
+    }
     ok = false;
   }
   if (!ok && !raw_context_error.empty()) {
@@ -956,6 +1799,7 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     writer.close();
     return false;
   }
+  flush_remaining_assets();
   writer.close();
   return true;
 }
@@ -1010,6 +1854,9 @@ std::optional<Options> parse_args(int argc, char **argv)
     print_usage(argv[0]);
     return std::nullopt;
   }
+  if (options.profile) {
+    options.progress = true;
+  }
   return options;
 }
 
@@ -1028,8 +1875,48 @@ void run_stage(
     Func &&func)
 {
   const auto started = std::chrono::steady_clock::now();
-  progress.begin_stage(++stage_index, stage_count, name);
-  func();
+  ++stage_index;
+  if (!options.progress) {
+    func();
+    if (options.profile) {
+      std::cerr << "bundle-finalize-profile stage=" << name
+                << " elapsed_s=" << elapsed_seconds(started) << "\n";
+    }
+    return;
+  }
+
+  progress.begin_stage(stage_index, stage_count, name);
+  std::atomic<bool> heartbeat_stop{false};
+  std::mutex heartbeat_mutex;
+  std::condition_variable heartbeat_cv;
+  std::thread heartbeat_thread([&]() {
+    std::unique_lock<std::mutex> lock(heartbeat_mutex);
+    while (!heartbeat_stop.load(std::memory_order_relaxed)) {
+      if (heartbeat_cv.wait_for(lock, std::chrono::seconds(1), [&]() {
+            return heartbeat_stop.load(std::memory_order_relaxed);
+          })) {
+        break;
+      }
+      lock.unlock();
+      progress.heartbeat();
+      lock.lock();
+    }
+  });
+  const auto stop_heartbeat = [&]() {
+    heartbeat_stop.store(true, std::memory_order_relaxed);
+    heartbeat_cv.notify_all();
+    if (heartbeat_thread.joinable()) {
+      heartbeat_thread.join();
+    }
+  };
+  try {
+    func();
+  } catch (...) {
+    stop_heartbeat();
+    progress.end_stage();
+    throw;
+  }
+  stop_heartbeat();
   progress.end_stage();
   if (options.profile) {
     std::cerr << "bundle-finalize-profile stage=" << name
@@ -8342,7 +9229,7 @@ int run_persist_replay_model_only(const Options &options)
   const auto started = std::chrono::steady_clock::now();
   constexpr std::size_t kStageCount = 3;
   std::size_t stage_index = 0;
-  ProgressReporter progress(options.progress);
+  ProgressReporter progress(options.progress, options.profile || !stderr_is_tty());
   Stats stats;
   FileDigestCache digest_cache;
   bool model_written = false;
@@ -8505,7 +9392,7 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
   const auto started = std::chrono::steady_clock::now();
   constexpr std::size_t kStageCount = 25;
   std::size_t stage_index = 0;
-  ProgressReporter progress(options.progress);
+  ProgressReporter progress(options.progress, options.profile || !stderr_is_tty());
   Stats stats;
   FileDigestCache digest_cache;
   std::vector<AssetEntry> assets;
@@ -8515,7 +9402,7 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
   bool raw_to_final_ok = true;
   run_stage(options, progress, stage_index, kStageCount, "raw_to_final", [&] {
     if (options.raw_format) {
-      raw_to_final_ok = materialize_raw_capture_to_final_bundle(options, stats);
+      raw_to_final_ok = materialize_raw_capture_to_final_bundle(options, stats, &progress);
     }
   });
   if (!raw_to_final_ok) {
@@ -8910,6 +9797,8 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
             << " raw_to_final_peak_event_payload_bytes=" << stats.raw_to_final_peak_event_payload_bytes
             << " raw_to_final_peak_decoded_asset_bytes=" << stats.raw_to_final_peak_decoded_asset_bytes
             << " raw_to_final_peak_assets_per_event=" << stats.raw_to_final_peak_assets_per_event
+            << " raw_to_final_asset_flushes=" << stats.raw_to_final_asset_flushes
+            << " raw_to_final_asset_flush_bytes=" << stats.raw_to_final_asset_flush_bytes
             << " repaired_missing_device_objects=" << stats.repaired_missing_device_objects
             << " sequence_regression_segments=" << stats.sequence_regression_segments
             << " remapped_sequence_records=" << stats.remapped_sequence_records
