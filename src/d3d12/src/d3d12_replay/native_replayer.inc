@@ -267,7 +267,27 @@ public:
   }
 
 private:
-  struct ReadbackCommandObjects;
+  struct ReadbackCommandObjects {
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+  };
+
+  struct CheckpointRestoreBatch {
+    ComPtr<ID3D12Resource> upload;
+    ReadbackCommandObjects commands;
+    void *mapped = nullptr;
+    std::uint64_t capacity = 0;
+    std::uint64_t used = 0;
+    std::uint64_t bytes = 0;
+    std::size_t copy_count = 0;
+
+    ~CheckpointRestoreBatch()
+    {
+      if (mapped && upload) {
+        upload->Unmap(0, nullptr);
+      }
+    }
+  };
 
   struct ResourceVersionKey {
     trace::ObjectId resource_object_id = 0;
@@ -334,6 +354,8 @@ private:
   static constexpr const char *kCheckpointBinaryMagic = "APITRACE_D3D12_CHECKPOINT_V2";
   static constexpr std::uint32_t kAllSubresources = 0xffffffffu;
   static constexpr std::uint64_t kCheckpointIoChunkBytes = 64ull * 1024ull * 1024ull;
+  static constexpr std::uint64_t kCheckpointRestoreUploadBatchBytes = 256ull * 1024ull * 1024ull;
+  static constexpr std::size_t kCheckpointRestoreMaxCopiesPerBatch = 2048;
 
   bool checkpoint_output_requested() const
   {
@@ -724,6 +746,31 @@ private:
       remaining -= chunk;
     }
     return true;
+  }
+
+  static std::uint64_t checkpoint_resource_blob_size(const CheckpointResourceSnapshot &snapshot)
+  {
+    std::uint64_t total = 0;
+    for (const auto &subresource : snapshot.subresources) {
+      if (total > std::numeric_limits<std::uint64_t>::max() - subresource.blob_size) {
+        return std::numeric_limits<std::uint64_t>::max();
+      }
+      total += subresource.blob_size;
+    }
+    return total;
+  }
+
+  static std::uint64_t checkpoint_total_blob_size(const ReplayCheckpoint &checkpoint)
+  {
+    std::uint64_t total = 0;
+    for (const auto &resource : checkpoint.resources) {
+      const std::uint64_t resource_bytes = checkpoint_resource_blob_size(resource);
+      if (total > std::numeric_limits<std::uint64_t>::max() - resource_bytes) {
+        return std::numeric_limits<std::uint64_t>::max();
+      }
+      total += resource_bytes;
+    }
+    return total;
   }
 
   std::vector<std::uint32_t> checkpoint_resource_states_at(
@@ -1219,9 +1266,108 @@ private:
     return ok;
   }
 
+  void close_checkpoint_restore_batch(CheckpointRestoreBatch &batch)
+  {
+    if (batch.mapped && batch.upload) {
+      D3D12_RANGE written_range{0, static_cast<SIZE_T>(batch.used)};
+      batch.upload->Unmap(0, &written_range);
+      batch.mapped = nullptr;
+    }
+  }
+
+  bool execute_checkpoint_restore_batch(CheckpointRestoreBatch &batch, std::string &error)
+  {
+    if (!batch.copy_count) {
+      return true;
+    }
+    close_checkpoint_restore_batch(batch);
+    if (!execute_checkpoint_command_objects(batch.commands, error)) {
+      return false;
+    }
+    batch.upload.reset();
+    batch.commands.allocator.reset();
+    batch.commands.list.reset();
+    batch.capacity = 0;
+    batch.used = 0;
+    batch.bytes = 0;
+    batch.copy_count = 0;
+    return true;
+  }
+
+  bool begin_checkpoint_restore_batch(
+      CheckpointRestoreBatch &batch,
+      std::uint64_t min_capacity,
+      std::string &error)
+  {
+    std::uint64_t capacity = kCheckpointRestoreUploadBatchBytes;
+    if (capacity < min_capacity) {
+      capacity = align_up(min_capacity, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+      if (capacity == 0) {
+        return fail(error, "checkpoint restore upload batch size overflow");
+      }
+    }
+    if (!create_checkpoint_buffer(
+            D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            capacity,
+            batch.upload,
+            error)) {
+      return false;
+    }
+    if (!create_checkpoint_command_objects(batch.commands, error)) {
+      batch.upload.reset();
+      return false;
+    }
+    void *mapped = nullptr;
+    D3D12_RANGE read_range{0, 0};
+    HRESULT hr = batch.upload->Map(0, &read_range, &mapped);
+    if (FAILED(hr) || !mapped) {
+      error = hresult_error("Map(checkpoint restore upload batch)", hr);
+      batch.commands.allocator.reset();
+      batch.commands.list.reset();
+      batch.upload.reset();
+      return false;
+    }
+    batch.mapped = mapped;
+    batch.capacity = capacity;
+    batch.used = 0;
+    batch.bytes = 0;
+    batch.copy_count = 0;
+    return true;
+  }
+
+  bool ensure_checkpoint_restore_batch_space(
+      CheckpointRestoreBatch &batch,
+      std::uint64_t bytes,
+      std::string &error)
+  {
+    if (bytes == 0) {
+      return true;
+    }
+    const std::uint64_t aligned_used = align_up(batch.used, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+    if (aligned_used == 0 && batch.used != 0) {
+      return fail(error, "checkpoint restore upload offset overflow");
+    }
+    const bool needs_new_batch =
+        !batch.upload ||
+        !batch.mapped ||
+        batch.copy_count >= kCheckpointRestoreMaxCopiesPerBatch ||
+        aligned_used > batch.capacity ||
+        bytes > batch.capacity - aligned_used;
+    if (!needs_new_batch) {
+      batch.used = aligned_used;
+      return true;
+    }
+    if (!execute_checkpoint_restore_batch(batch, error)) {
+      return false;
+    }
+    return begin_checkpoint_restore_batch(batch, bytes, error);
+  }
+
   bool restore_gpu_checkpoint_subresource(
       std::ifstream &checkpoint_file,
       const ReplayCheckpoint &checkpoint,
+      CheckpointRestoreBatch &batch,
       ID3D12Resource *resource,
       const D3D12ReplayBackend::ResourceSemanticState &semantic,
       const D3D12_RESOURCE_DESC &desc,
@@ -1231,38 +1377,21 @@ private:
     if (subresource.blob_size == 0) {
       return true;
     }
-    ComPtr<ID3D12Resource> upload;
-    if (!create_checkpoint_buffer(
-            D3D12_HEAP_TYPE_UPLOAD,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
-            subresource.blob_size,
-            upload,
-            error)) {
+    if (!ensure_checkpoint_restore_batch_space(batch, subresource.blob_size, error)) {
       return false;
     }
-    void *mapped = nullptr;
-    D3D12_RANGE read_range{0, 0};
-    HRESULT hr = upload->Map(0, &read_range, &mapped);
-    if (FAILED(hr) || !mapped) {
-      error = hresult_error("Map(checkpoint upload)", hr);
-      return false;
-    }
+    const std::uint64_t upload_offset = batch.used;
+    auto *mapped = static_cast<char *>(batch.mapped) + upload_offset;
     const bool read_ok = read_blob_bytes(
         checkpoint_file,
         checkpoint.blob_file_offset + subresource.blob_offset,
         mapped,
         subresource.blob_size,
         error);
-    D3D12_RANGE written_range{0, static_cast<SIZE_T>(subresource.blob_size)};
-    upload->Unmap(0, read_ok ? &written_range : nullptr);
     if (!read_ok) {
       return false;
     }
 
-    ReadbackCommandObjects commands;
-    if (!create_checkpoint_command_objects(commands, error)) {
-      return false;
-    }
     const auto initial = static_cast<D3D12_RESOURCE_STATES>(semantic.initial_state);
     const auto final_state = static_cast<D3D12_RESOURCE_STATES>(subresource.state);
     const UINT barrier_subresource =
@@ -1273,25 +1402,26 @@ private:
           initial,
           D3D12_RESOURCE_STATE_COPY_DEST,
           barrier_subresource);
-      commands.list->ResourceBarrier(1, &barrier);
+      batch.commands.list->ResourceBarrier(1, &barrier);
     }
     if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-      commands.list->CopyBufferRegion(
+      batch.commands.list->CopyBufferRegion(
           resource,
           0,
-          upload.get(),
-          0,
+          batch.upload.get(),
+          upload_offset,
           subresource.copy_size != 0 ? subresource.copy_size : subresource.blob_size);
     } else {
       D3D12_TEXTURE_COPY_LOCATION src{};
-      src.pResource = upload.get();
+      src.pResource = batch.upload.get();
       src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
       src.PlacedFootprint = subresource.footprint;
+      src.PlacedFootprint.Offset = upload_offset;
       D3D12_TEXTURE_COPY_LOCATION dst{};
       dst.pResource = resource;
       dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
       dst.SubresourceIndex = subresource.subresource;
-      commands.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+      batch.commands.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
     if (final_state != D3D12_RESOURCE_STATE_COPY_DEST) {
       const auto barrier = checkpoint_transition_barrier(
@@ -1299,14 +1429,18 @@ private:
           D3D12_RESOURCE_STATE_COPY_DEST,
           final_state,
           barrier_subresource);
-      commands.list->ResourceBarrier(1, &barrier);
+      batch.commands.list->ResourceBarrier(1, &barrier);
     }
-    return execute_checkpoint_command_objects(commands, error);
+    batch.used = upload_offset + subresource.blob_size;
+    batch.bytes += subresource.blob_size;
+    ++batch.copy_count;
+    return true;
   }
 
   bool restore_checkpoint_resource_snapshot(
       std::ifstream &checkpoint_file,
       const ReplayCheckpoint &checkpoint,
+      CheckpointRestoreBatch &batch,
       const CheckpointResourceSnapshot &snapshot,
       std::string &error)
   {
@@ -1335,6 +1469,7 @@ private:
       } else if (!restore_gpu_checkpoint_subresource(
                      checkpoint_file,
                      checkpoint,
+                     batch,
                      native,
                      *semantic,
                      desc,
@@ -1379,28 +1514,51 @@ private:
       return false;
     }
     auto last_progress = std::chrono::steady_clock::now();
+    const std::uint64_t total_restore_bytes = checkpoint_total_blob_size(loaded_checkpoint_);
+    std::uint64_t restored_bytes = 0;
+    CheckpointRestoreBatch restore_batch;
     for (std::size_t index = 0; index < loaded_checkpoint_.resources.size(); ++index) {
+      const auto &snapshot = loaded_checkpoint_.resources[index];
       if (!restore_checkpoint_resource_snapshot(
               checkpoint_file,
               loaded_checkpoint_,
-              loaded_checkpoint_.resources[index],
+              restore_batch,
+              snapshot,
               error)) {
         if (replay_stats_) {
           replay_stats_->checkpoint_restore_ms = elapsed_ms(begin);
         }
         return false;
       }
-      set_checkpoint_tracked_resource_states(loaded_checkpoint_.resources[index]);
+      set_checkpoint_tracked_resource_states(snapshot);
+      restored_bytes += checkpoint_resource_blob_size(snapshot);
       const auto now = std::chrono::steady_clock::now();
       if (index + 1 == loaded_checkpoint_.resources.size() ||
           index < 8 ||
           (index + 1) % 64 == 0 ||
           std::chrono::duration_cast<std::chrono::seconds>(now - last_progress).count() >= 2) {
-        replay_milestone((std::string("checkpoint:restore-progress resources=") +
-                          std::to_string(index + 1) +
-                          "/" + std::to_string(loaded_checkpoint_.resources.size())).c_str());
+        const double elapsed_s = std::chrono::duration<double>(now - begin).count();
+        const double mib_s =
+            elapsed_s > 0.0 ? (static_cast<double>(restored_bytes) / (1024.0 * 1024.0)) / elapsed_s : 0.0;
+        const double resources_s =
+            elapsed_s > 0.0 ? static_cast<double>(index + 1) / elapsed_s : 0.0;
+        std::ostringstream line;
+        line << "checkpoint:restore-progress resources=" << (index + 1)
+             << "/" << loaded_checkpoint_.resources.size()
+             << " bytes=" << restored_bytes
+             << "/" << total_restore_bytes
+             << " elapsed_ms=" << elapsed_ms(begin)
+             << " mib_s=" << mib_s
+             << " resources_s=" << resources_s;
+        replay_milestone(line.str().c_str());
         last_progress = now;
       }
+    }
+    if (!execute_checkpoint_restore_batch(restore_batch, error)) {
+      if (replay_stats_) {
+        replay_stats_->checkpoint_restore_ms = elapsed_ms(begin);
+      }
+      return false;
     }
     replay_batch_index_ = loaded_checkpoint_.next_batch_index;
     headless_back_buffer_index_ = loaded_checkpoint_.headless_back_buffer_index % kBufferCount;
@@ -1464,12 +1622,17 @@ private:
       return;
     }
     reset_frame_timing_counters();
-    if (frame_timing_start_frame() <= 1) {
+    const std::uint64_t start_frame = frame_timing_start_frame();
+    if (checkpoint_restored_ &&
+        loaded_checkpoint_.start_frame != 0 &&
+        loaded_checkpoint_.start_frame >= start_frame) {
+      start_frame_timing_at_current_point(loaded_checkpoint_.start_frame);
+    } else if (start_frame <= 1) {
       start_frame_timing_at_current_point(1);
     } else {
       frame_timing_active_ = false;
       replay_milestone((std::string("frame-timing:warmup-until frame=") +
-                        std::to_string(frame_timing_start_frame())).c_str());
+                        std::to_string(start_frame)).c_str());
     }
   }
 
@@ -1745,11 +1908,6 @@ private:
     std::vector<TargetTextureWatchReadback> target_watch_readbacks;
     std::vector<TargetTextureWatchOcclusion> target_watch_occlusions;
     std::vector<TargetTextureWatchBufferReadback> target_watch_buffer_readbacks;
-  };
-
-  struct ReadbackCommandObjects {
-    ComPtr<ID3D12CommandAllocator> allocator;
-    ComPtr<ID3D12GraphicsCommandList> list;
   };
 
   struct ReplaySequenceScope {
