@@ -8200,26 +8200,66 @@ private:
     if (barriers_json == payload.end() || !barriers_json->is_array()) {
       return fail(error, "ResourceBarrier missing barrier array");
     }
+    const auto compact_u32 = [](const json &value) -> std::uint32_t {
+      const auto decoded = json_u64(value);
+      return decoded > std::numeric_limits<std::uint32_t>::max()
+                 ? 0u
+                 : static_cast<std::uint32_t>(decoded);
+    };
     std::vector<D3D12_RESOURCE_BARRIER> barriers;
     for (const auto &barrier_entry : *barriers_json) {
-      json compact_barrier_storage;
-      const json *barrier_json = &barrier_entry;
       if (barrier_entry.is_array()) {
         if (barrier_entry.size() < 9) {
           return fail(error, "ResourceBarrierBatch op must be a 9-column array");
         }
-        compact_barrier_storage = {
-            {"type", json_u64(barrier_entry[1])},
-            {"flags", json_u64(barrier_entry[2])},
-            {"resource_object_id", json_u64(barrier_entry[3])},
-            {"before", json_u64(barrier_entry[4])},
-            {"after", json_u64(barrier_entry[5])},
-            {"subresource", json_u64(barrier_entry[6])},
-            {"resource_before_object_id", json_u64(barrier_entry[7])},
-            {"resource_after_object_id", json_u64(barrier_entry[8])},
-        };
-        barrier_json = &compact_barrier_storage;
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = static_cast<D3D12_RESOURCE_BARRIER_TYPE>(compact_u32(barrier_entry[1]));
+        barrier.Flags = static_cast<D3D12_RESOURCE_BARRIER_FLAGS>(compact_u32(barrier_entry[2]));
+        if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+          const auto resource_id = json_object_id(barrier_entry[3]);
+          ID3D12Resource *resource = resource_for(resource_id, error);
+          if (!resource) {
+            return false;
+          }
+          barrier.Transition.pResource = resource;
+          barrier.Transition.Subresource = compact_u32(barrier_entry[6]);
+          barrier.Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(compact_u32(barrier_entry[4]));
+          barrier.Transition.StateAfter = static_cast<D3D12_RESOURCE_STATES>(compact_u32(barrier_entry[5]));
+          constexpr std::uint32_t begin_only = 0x1;
+          if ((static_cast<std::uint32_t>(barrier.Flags) & begin_only) == 0) {
+            if (!update_tracked_resource_state(
+                    resource_id,
+                    current_replay_sequence_,
+                    barrier.Transition.Subresource,
+                    static_cast<std::uint32_t>(barrier.Transition.StateAfter),
+                    error)) {
+              return false;
+            }
+          }
+        } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
+          const auto before_id = json_object_id(barrier_entry[7]);
+          const auto after_id = json_object_id(barrier_entry[8]);
+          barrier.Aliasing.pResourceBefore = before_id == 0 ? nullptr : resource_for(before_id, error);
+          if (before_id != 0 && !barrier.Aliasing.pResourceBefore) {
+            return false;
+          }
+          barrier.Aliasing.pResourceAfter = after_id == 0 ? nullptr : resource_for(after_id, error);
+          if (after_id != 0 && !barrier.Aliasing.pResourceAfter) {
+            return false;
+          }
+        } else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
+          const auto resource_id = json_object_id(barrier_entry[3]);
+          barrier.UAV.pResource = resource_id == 0 ? nullptr : resource_for(resource_id, error);
+          if (resource_id != 0 && !barrier.UAV.pResource) {
+            return false;
+          }
+        } else {
+          return fail(error, "unsupported resource barrier type");
+        }
+        barriers.push_back(barrier);
+        continue;
       }
+      const json *barrier_json = &barrier_entry;
       if (!barrier_json->is_object()) {
         return fail(error, "ResourceBarrier entry must be an object or compact array");
       }
