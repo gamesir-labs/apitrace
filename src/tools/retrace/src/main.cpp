@@ -19,8 +19,8 @@ void print_usage(std::string_view argv0)
   const std::string message =
       "usage: " + std::string(argv0) +
       " [--validate-only] [--finalize-first] [--metal] [--metal-backend <name>]"
-      " [--d3d12-checkpoint-frame <frame>] [--d3d12-checkpoint-out <path>]"
-      " [--d3d12-checkpoint-in <path>] <trace-path>\n";
+      " [--checkpoint-frame <frame>] [--checkpoint-out <path>]"
+      " [--checkpoint-in <path>] <trace-path>\n";
 #ifdef _WIN32
   DWORD written = 0;
   const HANDLE handle = GetStdHandle(STD_ERROR_HANDLE);
@@ -195,7 +195,7 @@ int apitrace::tools::run_retrace(int argc, char **argv)
       options.metal_backend_name = argv[++index];
       continue;
     }
-    if (arg == "--d3d12-checkpoint-frame") {
+    if (arg == "--checkpoint-frame") {
       if (index + 1 >= argc ||
           !parse_u64(argv[++index], options.d3d12_checkpoint_frame)) {
         print_usage(argc > 0 ? argv[0] : "retrace");
@@ -204,7 +204,7 @@ int apitrace::tools::run_retrace(int argc, char **argv)
       options.d3d12_checkpoint_frame_set = true;
       continue;
     }
-    if (arg == "--d3d12-checkpoint-out") {
+    if (arg == "--checkpoint-out") {
       if (index + 1 >= argc) {
         print_usage(argc > 0 ? argv[0] : "retrace");
         return 1;
@@ -212,7 +212,7 @@ int apitrace::tools::run_retrace(int argc, char **argv)
       options.d3d12_checkpoint_out = argv[++index];
       continue;
     }
-    if (arg == "--d3d12-checkpoint-in") {
+    if (arg == "--checkpoint-in") {
       if (index + 1 >= argc) {
         print_usage(argc > 0 ? argv[0] : "retrace");
         return 1;
@@ -234,12 +234,12 @@ int apitrace::tools::run_retrace(int argc, char **argv)
   }
   if (!options.d3d12_checkpoint_out.empty() &&
       (!options.d3d12_checkpoint_frame_set || options.d3d12_checkpoint_frame == 0)) {
-    write_stderr("retrace failed: --d3d12-checkpoint-out requires --d3d12-checkpoint-frame > 0\n");
+    write_stderr("retrace failed: --checkpoint-out requires --checkpoint-frame > 0\n");
     return 1;
   }
   if (!options.d3d12_checkpoint_in.empty() &&
       (!options.d3d12_checkpoint_out.empty() || options.d3d12_checkpoint_frame_set)) {
-    write_stderr("retrace failed: --d3d12-checkpoint-in cannot be combined with checkpoint recording options\n");
+    write_stderr("retrace failed: --checkpoint-in cannot be combined with checkpoint recording options\n");
     return 1;
   }
 
