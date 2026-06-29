@@ -44,21 +44,39 @@ std::string read_text(const std::filesystem::path &path)
   return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
 
-apitrace::TraceOptions trace_options(const std::filesystem::path &bundle, bool raw_enabled)
+bool read_asset_payload(
+    const std::filesystem::path &bundle,
+    const apitrace::trace::AssetRecord &asset,
+    std::vector<std::uint8_t> &bytes)
+{
+  if (!asset.payload_bytes.empty()) {
+    bytes = asset.payload_bytes;
+    return true;
+  }
+  if (asset.payload_path.empty()) {
+    return false;
+  }
+  std::ifstream input(bundle / asset.payload_path, std::ios::binary);
+  if (!input.is_open()) {
+    return false;
+  }
+  input.seekg(static_cast<std::streamoff>(asset.payload_offset), std::ios::beg);
+  if (!input.good()) {
+    return false;
+  }
+  bytes.resize(static_cast<std::size_t>(asset.byte_size));
+  if (!bytes.empty()) {
+    input.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    return static_cast<std::size_t>(input.gcount()) == bytes.size();
+  }
+  return true;
+}
+
+apitrace::TraceOptions trace_options(const std::filesystem::path &bundle)
 {
   apitrace::TraceOptions options;
   options.api = apitrace::trace::ApiKind::D3D12;
   options.bundle_root = bundle;
-  options.capture.raw_mode = raw_enabled
-      ? apitrace::runtime::CaptureOptions::CaptureRawMode::DualWrite
-      : apitrace::runtime::CaptureOptions::CaptureRawMode::Off;
-  return options;
-}
-
-apitrace::TraceOptions raw_only_trace_options(const std::filesystem::path &bundle)
-{
-  apitrace::TraceOptions options = trace_options(bundle, false);
-  options.capture.raw_mode = apitrace::runtime::CaptureOptions::CaptureRawMode::RawOnly;
   return options;
 }
 
@@ -84,7 +102,7 @@ bool run_passthrough_test(const std::filesystem::path &bundle)
 
   std::filesystem::remove_all(bundle);
   {
-    apitrace::TraceSession session(trace_options(bundle, true));
+    apitrace::TraceSession session(trace_options(bundle));
     session.begin();
     session.append_call_event(make_event(11, "ID3D12GraphicsCommandList::DrawInstanced", "{\"vertex_count\":3}"));
 
@@ -93,7 +111,7 @@ bool run_passthrough_test(const std::filesystem::path &bundle)
     asset.kind = apitrace::trace::AssetKind::Buffer;
     asset.debug_name = "d3d12-resource-unmap";
     asset.payload_bytes = {0x01, 0x02, 0x03, 0x04};
-    asset = session.register_asset(std::move(asset));
+    asset = session.stage_raw_asset(std::move(asset));
     session.append_call_event(make_event(
         12,
         "ID3D12Resource::Unmap",
@@ -103,7 +121,7 @@ bool run_passthrough_test(const std::filesystem::path &bundle)
   }
 
   const auto callstream_lines = read_lines(bundle / "callstream.jsonl");
-  if (!expect(callstream_lines.size() == 3, "expected header plus two callstream events")) {
+  if (!expect(callstream_lines.size() == 1, "raw capture should only write the callstream header before finalize")) {
     return false;
   }
 
@@ -138,48 +156,37 @@ bool run_passthrough_test(const std::filesystem::path &bundle)
               "blob passthrough did not decode one materialized asset")) {
     return false;
   }
-  if (!expect(decoded.events[1].assets[0].payload_bytes == std::vector<std::uint8_t>({0x01, 0x02, 0x03, 0x04}),
+  std::vector<std::uint8_t> asset_bytes;
+  if (!expect(decoded.events[1].assets[0].payload_path.generic_string() == "raw/blobs.bin",
+              "blob passthrough asset was not path-backed") ||
+      !expect(read_asset_payload(bundle, decoded.events[1].assets[0], asset_bytes),
+              "blob passthrough failed to read path-backed raw bytes") ||
+      !expect(asset_bytes == std::vector<std::uint8_t>({0x01, 0x02, 0x03, 0x04}),
               "blob passthrough materialized wrong raw bytes")) {
     return false;
   }
 
-  const std::string passthrough(
-      reinterpret_cast<const char *>(records[0].payload.data()),
-      reinterpret_cast<const char *>(records[0].payload.data() + records[0].payload.size()));
-  return expect(passthrough == callstream_lines[1], "passthrough payload did not byte-match callstream line");
+  return expect(decoded.events[0].passthrough_jsonl_record.find(
+                    "\"function\":\"ID3D12GraphicsCommandList::DrawInstanced\"") != std::string::npos,
+                "passthrough payload did not preserve function");
 }
 
-bool run_flag_off_test(const std::filesystem::path &bundle)
-{
-  std::filesystem::remove_all(bundle);
-  {
-    apitrace::TraceSession session(trace_options(bundle, false));
-    session.begin();
-    session.append_call_event(make_event(21, "ID3D12CommandQueue::Signal", "{\"value\":1}"));
-    session.end();
-  }
-
-  return expect(!std::filesystem::exists(bundle / "raw" / "events.bin"), "raw events file exists when flag is off");
-}
-
-bool run_raw_only_passthrough_test(const std::filesystem::path &bundle)
+bool run_raw_passthrough_test(const std::filesystem::path &bundle)
 {
   using namespace apitrace::trace::raw;
 
   std::filesystem::remove_all(bundle);
   {
-    apitrace::TraceSession session(raw_only_trace_options(bundle));
+    apitrace::TraceSession session(trace_options(bundle));
     session.begin();
-    if (!expect(session.capture_raw_mode() == apitrace::runtime::CaptureOptions::CaptureRawMode::RawOnly,
-                "session did not report raw-only mode") ||
-        !expect(session.raw_capture_writer() != nullptr, "raw-only mode did not create raw writer")) {
+    if (!expect(session.raw_capture_writer() != nullptr, "raw capture did not create raw writer")) {
       return false;
     }
     session.append_call_event(make_event(31, "ID3D12CommandQueue::Signal", "{\"value\":2}"));
 
     apitrace::trace::AssetRecord asset;
     asset.kind = apitrace::trace::AssetKind::Buffer;
-    asset.debug_name = "raw-only-staged-buffer";
+    asset.debug_name = "raw-staged-buffer";
     asset.payload_bytes = {0xa0, 0xb1, 0xc2};
     asset = session.stage_raw_asset(std::move(asset));
     session.append_call_event(make_event(
@@ -191,30 +198,30 @@ bool run_raw_only_passthrough_test(const std::filesystem::path &bundle)
   }
 
   const auto callstream_lines = read_lines(bundle / "callstream.jsonl");
-  if (!expect(callstream_lines.size() == 1, "raw-only should not write old-path callstream events") ||
+  if (!expect(callstream_lines.size() == 1, "raw should not write old-path callstream events") ||
       !expect(read_text(bundle / "assets.json").find("\"blob_id\"") == std::string::npos,
-              "raw-only should not register old-path assets") ||
+              "raw should not register old-path assets") ||
       !expect(!std::filesystem::exists(bundle / "spool" / "asset-payloads.bin"),
-              "raw-only should not write old-path asset spool")) {
+              "raw should not write old-path asset spool")) {
     return false;
   }
 
   apitrace::trace::raw::RawCaptureReader reader;
-  if (!expect(reader.open(bundle), "failed to open raw-only raw capture")) {
+  if (!expect(reader.open(bundle), "failed to open raw raw capture")) {
     std::cerr << reader.last_error() << "\n";
     return false;
   }
   const auto records = reader.read_events();
-  if (!expect(records.size() == 2, "raw-only should emit non-blob and blob passthrough events") ||
+  if (!expect(records.size() == 2, "raw should emit non-blob and blob passthrough events") ||
       !expect(records[0].header.opcode == static_cast<std::uint32_t>(RawEventOpcode::PassthroughFinalJson),
-              "raw-only non-blob event was not passthrough") ||
+              "raw non-blob event was not passthrough") ||
       !expect(records[1].header.opcode == static_cast<std::uint32_t>(RawEventOpcode::PassthroughWithBlob),
-              "raw-only blob event was not passthrough-with-blob") ||
-      !expect(reader.blob_extents().size() == 1, "raw-only blob event did not append one raw blob")) {
+              "raw blob event was not passthrough-with-blob") ||
+      !expect(reader.blob_extents().size() == 1, "raw blob event did not append one raw blob")) {
     return false;
   }
   const auto decoded = decode_raw_events(reader, records);
-  if (!expect(decoded.error.empty(), "failed to decode raw-only passthrough events")) {
+  if (!expect(decoded.error.empty(), "failed to decode raw passthrough events")) {
     std::cerr << decoded.error << "\n";
     return false;
   }
@@ -222,16 +229,23 @@ bool run_raw_only_passthrough_test(const std::filesystem::path &bundle)
                   decoded.events[0].passthrough &&
                   decoded.events[1].passthrough &&
                   decoded.events[1].assets.size() == 1,
-              "raw-only passthrough decode shape mismatch") ||
-      !expect(decoded.events[1].assets[0].payload_bytes == std::vector<std::uint8_t>({0xa0, 0xb1, 0xc2}),
-              "raw-only staged blob bytes changed")) {
+              "raw passthrough decode shape mismatch") ||
+      !expect(decoded.events[1].assets[0].payload_path.generic_string() == "raw/blobs.bin",
+              "raw staged blob was not path-backed")) {
+    return false;
+  }
+  std::vector<std::uint8_t> asset_bytes;
+  if (!expect(read_asset_payload(bundle, decoded.events[1].assets[0], asset_bytes),
+              "raw staged blob failed to read path-backed bytes") ||
+      !expect(asset_bytes == std::vector<std::uint8_t>({0xa0, 0xb1, 0xc2}),
+              "raw staged blob bytes changed")) {
     return false;
   }
   return expect(decoded.events[0].passthrough_jsonl_record.find("\"function\":\"ID3D12CommandQueue::Signal\"") !=
                         std::string::npos &&
                     decoded.events[1].passthrough_jsonl_record.find(
                         "\"function\":\"ID3D12Device::CreateCommittedResource\"") != std::string::npos,
-                "raw-only passthrough JSON did not preserve functions");
+                "raw passthrough JSON did not preserve functions");
 }
 
 } // namespace
@@ -240,8 +254,7 @@ int main()
 {
   const auto root = unique_work_dir();
   const bool ok = run_passthrough_test(root / "raw-on.apitrace") &&
-                  run_flag_off_test(root / "raw-off.apitrace") &&
-                  run_raw_only_passthrough_test(root / "raw-only.apitrace");
+                  run_raw_passthrough_test(root / "raw.apitrace");
   std::filesystem::remove_all(root);
   return ok ? 0 : 1;
 }

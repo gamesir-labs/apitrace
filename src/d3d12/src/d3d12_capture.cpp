@@ -159,12 +159,6 @@ void reset_shader_asset_memo_if_needed(TraceSession *session)
   g_shader_asset_memo.clear();
 }
 
-struct CapturedMappedRange {
-  std::uint64_t begin = 0;
-  std::uint64_t end = 0;
-  std::uint64_t hash = 0;
-};
-
 struct FastHash128 {
   std::uint64_t low = 0;
   std::uint64_t high = 0;
@@ -237,7 +231,6 @@ void reset_raw_unmap_signatures_if_needed(TraceSession *session)
 struct MappedResourceState {
   const void *data = nullptr;
   std::uint32_t subresource = 0;
-  std::vector<CapturedMappedRange> captured_ranges;
 };
 
 std::unordered_map<const void *, MappedResourceState> g_mapped_resources;
@@ -908,19 +901,6 @@ void record_call_event_unbatched_with_object_ids(
 void flush_diagnostic_batches();
 void flush_command_list_batches(const void *command_list = nullptr);
 
-std::uint64_t fnv1a64_bytes(const void *data, std::size_t size)
-{
-  constexpr std::uint64_t kOffset = 1469598103934665603ull;
-  constexpr std::uint64_t kPrime = 1099511628211ull;
-  std::uint64_t hash = kOffset;
-  const auto *bytes = static_cast<const std::uint8_t *>(data);
-  for (std::size_t index = 0; index < size; ++index) {
-    hash ^= bytes[index];
-    hash *= kPrime;
-  }
-  return hash;
-}
-
 std::uint64_t rotl64(std::uint64_t value, int bits) noexcept
 {
   return (value << bits) | (value >> (64 - bits));
@@ -1084,7 +1064,7 @@ void note_raw_unmap_write_failure()
   ++g_raw_unmap_counters.raw_write_failures;
 }
 
-bool record_rawonly_resource_unmap(
+bool record_raw_resource_unmap(
     TraceSession *session,
     const void *resource,
     trace::ObjectId resource_object_id,
@@ -1095,7 +1075,6 @@ bool record_rawonly_resource_unmap(
     std::size_t written_size)
 {
   if (!session ||
-      session->capture_raw_mode() != runtime::CaptureOptions::CaptureRawMode::RawOnly ||
       !session->raw_capture_writer() ||
       !resource ||
       resource_object_id == 0 ||
@@ -1144,30 +1123,6 @@ bool record_rawonly_resource_unmap(
   return true;
 }
 
-bool mapped_range_captured(const MappedResourceState &mapped, std::uint64_t begin, std::uint64_t end, std::uint64_t hash)
-{
-  for (const auto &range : mapped.captured_ranges) {
-    if (range.begin == begin && range.end == end && range.hash == hash) {
-      return true;
-    }
-  }
-  return false;
-}
-
-void mark_mapped_range_captured(MappedResourceState &mapped, std::uint64_t begin, std::uint64_t end, std::uint64_t hash)
-{
-  if (end <= begin) {
-    return;
-  }
-  for (auto &range : mapped.captured_ranges) {
-    if (range.begin == begin && range.end == end) {
-      range.hash = hash;
-      return;
-    }
-  }
-  mapped.captured_ranges.push_back(CapturedMappedRange{begin, end, hash});
-}
-
 const void *resource_from_object_id_locked(trace::ObjectId object_id)
 {
   if (object_id == 0) {
@@ -1199,9 +1154,8 @@ void record_mapped_resource_range_update_unbatched(
 
   const auto size = static_cast<std::size_t>(size64);
   const auto *bytes = static_cast<const std::uint8_t *>(mapped.data) + static_cast<std::size_t>(begin);
-  if (auto *session = session_for(trace::ApiKind::D3D12);
-      session && session->capture_raw_mode() == runtime::CaptureOptions::CaptureRawMode::RawOnly) {
-    record_rawonly_resource_unmap(
+  if (auto *session = session_for(trace::ApiKind::D3D12)) {
+    record_raw_resource_unmap(
         session,
         resource,
         resource_object_id,
@@ -1210,49 +1164,7 @@ void record_mapped_resource_range_update_unbatched(
         end,
         bytes,
         size);
-    return;
   }
-
-  const auto hash = fnv1a64_bytes(bytes, size);
-  if (mapped_range_captured(mapped, begin, end, hash)) {
-    return;
-  }
-
-  const auto asset = register_asset_bytes(
-      trace::AssetKind::Buffer,
-      "d3d12-mapped-resource-use",
-      bytes,
-      size);
-  if (asset.blob_id == 0 || asset.relative_path.empty()) {
-    return;
-  }
-
-  const auto buffer_path = asset.relative_path.generic_string();
-  std::string payload;
-  payload.reserve(224 + buffer_path.size());
-  payload += "{\"resource_object_id\":";
-  payload += std::to_string(resource_object_id);
-  payload += ",\"subresource\":";
-  payload += std::to_string(mapped.subresource);
-  payload += ",\"written_begin\":";
-  payload += std::to_string(begin);
-  payload += ",\"written_end\":";
-  payload += std::to_string(end);
-  payload += ",\"written_size\":";
-  payload += std::to_string(size64);
-  payload += ",\"buffer_path\":\"";
-  payload += buffer_path;
-  payload += "\",\"capture_reason\":\"mapped_resource_use\"}";
-  const std::uint64_t blob_id = asset.blob_id;
-  record_call_event_unbatched_with_object_ids(
-      g_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
-      "ID3D12Resource::Unmap",
-      payload.c_str(),
-      {resource_object_id},
-      &blob_id,
-      1,
-      0);
-  mark_mapped_range_captured(mapped, begin, end, hash);
 }
 
 void record_resource_bytes_snapshot_unbatched(
@@ -2458,16 +2370,12 @@ trace::AssetRecord register_asset_bytes(
   asset.debug_name = debug_name ? debug_name : "";
 
   if (!data || size == 0) {
-    return session->capture_raw_mode() == runtime::CaptureOptions::CaptureRawMode::RawOnly
-        ? session->stage_raw_asset(std::move(asset))
-        : session->register_asset(std::move(asset));
+    return session->stage_raw_asset(std::move(asset));
   }
 
   const auto *bytes = static_cast<const std::uint8_t *>(data);
   asset.payload_bytes.assign(bytes, bytes + size);
-  return session->capture_raw_mode() == runtime::CaptureOptions::CaptureRawMode::RawOnly
-      ? session->stage_raw_asset(std::move(asset))
-      : session->register_asset(std::move(asset));
+  return session->stage_raw_asset(std::move(asset));
 }
 
 trace::AssetRecord register_shader_asset_bytes(
@@ -4110,9 +4018,8 @@ std::uint64_t record_present(
     // composite off-screen and the CG never composites. Re-reading the frame's used
     // ranges here, after the frame's CPU writes settle, captures the value the GPU reads;
     // the palette is stable across frames so the next frame's composite reconstructs
-    // correctly. NOTE: must stay bounded - g_mapped_resources.captured_ranges accumulates
-    // for the whole session, so we re-snapshot ONLY this frame's ranges (g_present_recapture
-    // _ranges, cleared every present), never the full history.
+    // correctly. NOTE: must stay bounded: re-snapshot ONLY this frame's ranges
+    // (g_present_recapture_ranges, cleared every present), never a full history.
     maybe_recapture_present_ranges();
 
     const auto present_test = is_present_test(flags);
@@ -4228,11 +4135,10 @@ void record_resource_unmap(
     return;
   }
 
-  if (auto *session = session_for(trace::ApiKind::D3D12);
-      session && session->capture_raw_mode() == runtime::CaptureOptions::CaptureRawMode::RawOnly) {
+  if (auto *session = session_for(trace::ApiKind::D3D12)) {
     const auto resource_object_id = object_id(resource);
     std::lock_guard event_lock(g_event_order_mutex);
-    record_rawonly_resource_unmap(
+    record_raw_resource_unmap(
         session,
         resource,
         resource_object_id,
@@ -4241,51 +4147,6 @@ void record_resource_unmap(
         written_end,
         written_data,
         written_size);
-    return;
-  }
-
-  const auto written_hash = fnv1a64_bytes(written_data, written_size);
-
-  const auto asset = register_asset_bytes(
-      trace::AssetKind::Buffer,
-      "d3d12-resource-unmap",
-      written_data,
-      written_size);
-  if (asset.blob_id == 0 || asset.relative_path.empty()) {
-    return;
-  }
-
-  const auto buffer_path = asset.relative_path.generic_string();
-  std::string payload;
-  payload.reserve(192 + buffer_path.size());
-  payload += "{\"resource_object_id\":";
-  payload += std::to_string(object_id(resource));
-  payload += ",\"subresource\":";
-  payload += std::to_string(subresource);
-  payload += ",\"written_begin\":";
-  payload += std::to_string(written_begin);
-  payload += ",\"written_end\":";
-  payload += std::to_string(written_end);
-  payload += ",\"written_size\":";
-  payload += std::to_string(static_cast<std::uint64_t>(written_size));
-  payload += ",\"buffer_path\":\"";
-  payload += buffer_path;
-  payload += "\"}";
-  const void *refs[] = {resource};
-  const auto blob_id = static_cast<std::uint64_t>(asset.blob_id);
-  record_call(
-      "ID3D12Resource::Unmap",
-      payload.c_str(),
-      refs,
-      1,
-      &blob_id,
-      1);
-  {
-    std::lock_guard lock(g_object_mutex);
-    auto mapped = g_mapped_resources.find(resource);
-    if (mapped != g_mapped_resources.end() && mapped->second.subresource == subresource) {
-      mark_mapped_range_captured(mapped->second, written_begin, written_end, written_hash);
-    }
   }
 }
 

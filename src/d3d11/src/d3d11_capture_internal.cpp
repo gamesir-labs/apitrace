@@ -476,7 +476,7 @@ trace::AssetRecord register_asset_bytes(
   }
 
   if (auto *session = runtime::ensure_process_trace_session(trace::ApiKind::D3D11)) {
-    return session->register_asset(std::move(asset));
+    return session->stage_raw_asset(std::move(asset));
   }
   return asset;
 }

@@ -152,7 +152,6 @@ apitrace::TraceOptions trace_options(const std::filesystem::path &bundle)
   apitrace::TraceOptions options;
   options.api = apitrace::trace::ApiKind::D3D12;
   options.bundle_root = bundle;
-  options.capture.raw_mode = apitrace::runtime::CaptureOptions::CaptureRawMode::DualWrite;
   return options;
 }
 
@@ -174,7 +173,7 @@ apitrace::trace::EventRecord make_call_event(
   return event;
 }
 
-bool write_synthetic_dual_write_capture(const std::filesystem::path &bundle)
+bool write_synthetic_trace_session_capture(const std::filesystem::path &bundle)
 {
   std::filesystem::remove_all(bundle);
   apitrace::TraceSession session(trace_options(bundle));
@@ -190,7 +189,7 @@ bool write_synthetic_dual_write_capture(const std::filesystem::path &bundle)
   buffer.kind = apitrace::trace::AssetKind::Buffer;
   buffer.debug_name = "d3d12-resource-unmap";
   buffer.payload_bytes = {0x01, 0x02, 0x03, 0x04};
-  buffer = session.register_asset(std::move(buffer));
+  buffer = session.stage_raw_asset(std::move(buffer));
   session.append_call_event(make_call_event(
       12,
       "ID3D12Resource::Unmap",
@@ -204,13 +203,13 @@ bool write_synthetic_dual_write_capture(const std::filesystem::path &bundle)
   vs.kind = apitrace::trace::AssetKind::ShaderDxbc;
   vs.debug_name = "raw-vs-bytecode";
   vs.payload_bytes = {'v', 's', '-', 'd', 'x', 'b', 'c'};
-  vs = session.register_asset(std::move(vs));
+  vs = session.stage_raw_asset(std::move(vs));
   apitrace::trace::AssetRecord ps;
   ps.blob_id = 79;
   ps.kind = apitrace::trace::AssetKind::ShaderDxbc;
   ps.debug_name = "raw-ps-bytecode";
   ps.payload_bytes = {'p', 's', '-', 'd', 'x', 'b', 'c'};
-  ps = session.register_asset(std::move(ps));
+  ps = session.stage_raw_asset(std::move(ps));
   const std::string pso_payload =
       "{\"pso_raw_version\":1"
       ",\"pso_kind\":\"graphics\""
@@ -279,7 +278,7 @@ bool write_no_end_periodic_commit_capture(const std::filesystem::path &bundle)
     buffer.kind = apitrace::trace::AssetKind::Buffer;
     buffer.debug_name = "periodic-commit-buffer";
     buffer.payload_bytes.assign(768, 0x5a);
-    buffer = session.register_asset(std::move(buffer));
+    buffer = session.stage_raw_asset(std::move(buffer));
     session.append_call_event(make_call_event(
         200,
         "ID3D12Resource::Unmap",
@@ -1031,7 +1030,7 @@ bool load_asset_payload_bytes_for_legacy_baseline(
 bool validate_final_bundle(const std::filesystem::path &bundle)
 {
   const auto records = read_jsonl(bundle / "callstream.jsonl");
-  if (!expect(records.size() == 10, "unexpected callstream record count")) {
+  if (!expect(records.size() == 5, "unexpected callstream record count")) {
     return false;
   }
   if (!expect(records[0].value("record_kind", "") == "bundle_header", "missing bundle header")) {
@@ -1044,20 +1043,15 @@ bool validate_final_bundle(const std::filesystem::path &bundle)
     kinds.push_back(records[index].value("record_kind", std::string()));
     functions.push_back(records[index].value("function", std::string()));
   }
-  if (!expect(kinds[0] == "boundary" &&
-                  kinds[1] == "object_create" &&
-                  functions[2] == "ID3D12Resource::Unmap" &&
-                  functions[3] == "ID3D12Device::CreateGraphicsPipelineState" &&
-                  functions[4] == "ID3D12GraphicsCommandList::DrawInstanced" &&
-                  functions[5] == "ID3D12GraphicsCommandList::Dispatch" &&
-                  functions[6] == "IDXGISwapChain::Present" &&
-                  kinds[7] == "boundary" &&
-                  kinds[8] == "boundary",
+  if (!expect(functions[0] == "ID3D12GraphicsCommandList::SetPipelineState" &&
+                  functions[1] == "ID3D12Resource::Unmap" &&
+                  functions[2] == "ID3D12Device::CreateGraphicsPipelineState" &&
+                  functions[3] == "ID3D12GraphicsCommandList::DrawInstanced",
               "raw-to-final callstream shape mismatch")) {
     return false;
   }
 
-  const auto &unmap = records[3];
+  const auto &unmap = records[2];
   if (!expect(unmap["blob_refs"].is_array() && unmap["blob_refs"].size() == 1, "Unmap should reference one buffer blob")) {
     return false;
   }
@@ -1070,14 +1064,14 @@ bool validate_final_bundle(const std::filesystem::path &bundle)
   const auto &unmap_payload = unmap["payload"];
   if (!expect(unmap_payload.value("subresource", UINT64_MAX) == 0 &&
                   unmap_payload.value("written_begin", UINT64_MAX) == 0 &&
-                  unmap_payload.value("written_end", 0ull) == 6 &&
-                  unmap_payload.value("written_size", 0ull) == 6 &&
+                  unmap_payload.value("written_end", 0ull) == 4 &&
+                  unmap_payload.value("written_size", 0ull) == 4 &&
                   !unmap_payload.contains("written_range"),
               "Unmap flat payload shape mismatch")) {
     return false;
   }
 
-  const auto &pipeline = records[4];
+  const auto &pipeline = records[3];
   if (!expect(pipeline["blob_refs"].is_array() &&
                   pipeline["blob_refs"].size() >= 3 &&
                   pipeline["payload"].contains("pipeline_path") &&
@@ -1107,7 +1101,7 @@ bool validate_final_bundle(const std::filesystem::path &bundle)
   if (!expect(!buffer_asset_path.empty() && saw_pipeline_asset, "expected assets not indexed")) {
     return false;
   }
-  if (!expect(read_file_bytes(bundle / buffer_asset_path) == std::vector<std::uint8_t>({0x10, 0x20, 0x30, 0x40, 0x50, 0x60}),
+  if (!expect(read_file_bytes(bundle / buffer_asset_path) == std::vector<std::uint8_t>({0x01, 0x02, 0x03, 0x04}),
               "canonical buffer asset bytes mismatch")) {
     return false;
   }
@@ -1460,30 +1454,6 @@ bool run_streaming_equivalence_test(
          compare_finalized_bundles(legacy_bundle, streaming_bundle);
 }
 
-bool run_dual_write_parity_test(
-    const std::filesystem::path &source_bundle,
-    const std::filesystem::path &old_bundle,
-    const std::filesystem::path &raw_bundle,
-    const char *finalize,
-    const char *check,
-    const std::filesystem::path &compare_script)
-{
-  return write_synthetic_dual_write_capture(source_bundle) &&
-         copy_directory(source_bundle, old_bundle) &&
-         copy_directory(source_bundle, raw_bundle) &&
-         run_command(quote_arg(finalize) + " --no-progress --jobs 1 " + quote_arg(old_bundle)) &&
-         run_command(quote_arg(finalize) + " --raw-format --no-progress --jobs 1 " + quote_arg(raw_bundle)) &&
-         run_command(quote_arg(check) + " --verify-hashes " + quote_arg(old_bundle)) &&
-         run_command(quote_arg(check) + " --verify-hashes " + quote_arg(raw_bundle)) &&
-         expect(read_file_bytes(old_bundle / "callstream.jsonl") == read_file_bytes(raw_bundle / "callstream.jsonl"),
-                "dual-write old/raw finalized callstream mismatch") &&
-         run_command("python3 " + quote_arg(compare_script) +
-                     " --bundle-finalize " + quote_arg(finalize) +
-                     " --bundle-check " + quote_arg(check) +
-                     " --work-dir " + quote_arg(source_bundle.parent_path() / "compare-work") +
-                     " --jobs 1 " + quote_arg(source_bundle));
-}
-
 bool write_sequence_regression_bundle(const std::filesystem::path &bundle)
 {
   std::filesystem::remove_all(bundle);
@@ -1648,9 +1618,6 @@ int main(int argc, char **argv)
   const auto passthrough_d3d12_remap_bundle = work_dir / "synthetic-passthrough-d3d12-remap.apitrace";
   const auto passthrough_metal_remap_bundle = work_dir / "synthetic-passthrough-metal-remap.apitrace";
   const auto duplicate_content_bundle = work_dir / "synthetic-duplicate-content-raw.apitrace";
-  const auto dual_write_bundle = work_dir / "synthetic-dual-write.apitrace";
-  const auto dual_write_old_bundle = work_dir / "synthetic-dual-write-old.apitrace";
-  const auto dual_write_raw_bundle = work_dir / "synthetic-dual-write-raw.apitrace";
   const auto no_end_raw_bundle = work_dir / "synthetic-no-end-raw.apitrace";
   const auto texture_unmap_bundle = work_dir / "synthetic-texture-unmap-raw.apitrace";
   const auto texture_unmap_missing_map_bundle = work_dir / "synthetic-texture-unmap-missing-map-raw.apitrace";
@@ -1663,7 +1630,6 @@ int main(int argc, char **argv)
   const auto reference_rewrite_source_bundle = work_dir / "synthetic-reference-rewrite-source.apitrace";
   const auto reference_rewrite_serial_bundle = work_dir / "synthetic-reference-rewrite-serial.apitrace";
   const auto reference_rewrite_parallel_bundle = work_dir / "synthetic-reference-rewrite-parallel.apitrace";
-  const auto compare_script = std::filesystem::current_path() / "scripts" / "compare-raw-parity.py";
   const std::string passthrough_before =
       "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12GraphicsCommandList::SetPipelineState\",\"result_code\":0,\"object_refs\":[500,700],\"payload\":{\"state\":\"passthrough-before\",\"spacing\":\"kept exactly\"}}";
   const std::string passthrough_after =
@@ -1693,7 +1659,7 @@ int main(int argc, char **argv)
   std::filesystem::create_directories(work_dir);
 
   const bool ok =
-      write_synthetic_raw_capture(bundle) &&
+      write_synthetic_trace_session_capture(bundle) &&
       run_command(quote_arg(argv[1]) + " --raw-format --no-progress " + quote_arg(bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(bundle)) &&
       validate_final_bundle(bundle) &&
@@ -1749,13 +1715,6 @@ int main(int argc, char **argv)
           streaming_equivalence_raw_bundle,
           argv[1],
           argv[2]) &&
-      run_dual_write_parity_test(
-          dual_write_bundle,
-          dual_write_old_bundle,
-          dual_write_raw_bundle,
-          argv[1],
-          argv[2],
-          compare_script) &&
       run_sequence_repair_parallel_parity_test(
           sequence_regression_source_bundle,
           sequence_regression_serial_bundle,

@@ -27,14 +27,6 @@ struct CaptureOptions {
   bool follow_child_processes = true;
   bool hook_dynamic_modules = true;
   bool capture_initial_resources = true;
-  enum class CaptureRawMode {
-    Off,
-    DualWrite,
-    RawOnly,
-  };
-  // DXMT_CAPTURE_RAW_FORMAT:
-  // unset/0 -> Off, 1/dual/dual-write -> DualWrite, 2/raw-only -> RawOnly.
-  CaptureRawMode raw_mode = CaptureRawMode::Off;
 };
 
 } // namespace apitrace::runtime

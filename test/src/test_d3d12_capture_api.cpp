@@ -54,25 +54,6 @@ bool clear_trace_bundle_env()
 #endif
 }
 
-bool set_raw_format_env(bool enabled)
-{
-#ifdef _WIN32
-  return _putenv_s("DXMT_CAPTURE_RAW_FORMAT", enabled ? "1" : "") == 0;
-#else
-  return enabled ? setenv("DXMT_CAPTURE_RAW_FORMAT", "1", 1) == 0
-                 : unsetenv("DXMT_CAPTURE_RAW_FORMAT") == 0;
-#endif
-}
-
-bool set_raw_only_format_env()
-{
-#ifdef _WIN32
-  return _putenv_s("DXMT_CAPTURE_RAW_FORMAT", "2") == 0;
-#else
-  return setenv("DXMT_CAPTURE_RAW_FORMAT", "2", 1) == 0;
-#endif
-}
-
 bool has_call(const apitrace::trace::TraceBundleReader &reader, std::string_view function_name)
 {
   for (const auto &event : reader.events()) {
@@ -108,6 +89,34 @@ std::string read_text(const std::filesystem::path &path)
   return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
 
+bool read_asset_payload(
+    const std::filesystem::path &bundle,
+    const apitrace::trace::AssetRecord &asset,
+    std::vector<std::uint8_t> &bytes)
+{
+  if (!asset.payload_bytes.empty()) {
+    bytes = asset.payload_bytes;
+    return true;
+  }
+  if (asset.payload_path.empty()) {
+    return false;
+  }
+  std::ifstream input(bundle / asset.payload_path, std::ios::binary);
+  if (!input.is_open()) {
+    return false;
+  }
+  input.seekg(static_cast<std::streamoff>(asset.payload_offset), std::ios::beg);
+  if (!input.good()) {
+    return false;
+  }
+  bytes.resize(static_cast<std::size_t>(asset.byte_size));
+  if (!bytes.empty()) {
+    input.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    return static_cast<std::size_t>(input.gcount()) == bytes.size();
+  }
+  return true;
+}
+
 std::string shell_quote_path(const std::filesystem::path &path)
 {
   std::string quoted = "'";
@@ -120,20 +129,6 @@ std::string shell_quote_path(const std::filesystem::path &path)
   }
   quoted += "'";
   return quoted;
-}
-
-bool finalize_bundle(const char *argv0, const std::filesystem::path &bundle)
-{
-  std::filesystem::path finalize = "bundle-finalize";
-  const auto self = std::filesystem::path(argv0 ? argv0 : "");
-  if (self.has_parent_path()) {
-    const auto sibling = self.parent_path() / "bundle-finalize";
-    if (std::filesystem::exists(sibling)) {
-      finalize = sibling;
-    }
-  }
-  const auto command = shell_quote_path(finalize) + " --jobs 1 " + shell_quote_path(bundle);
-  return std::system(command.c_str()) == 0;
 }
 
 bool finalize_raw_bundle(const char *argv0, const std::filesystem::path &bundle)
@@ -150,29 +145,13 @@ bool finalize_raw_bundle(const char *argv0, const std::filesystem::path &bundle)
   return std::system(command.c_str()) == 0;
 }
 
-bool run_dual_write_capture_smoke(const char *argv0, const std::filesystem::path &base_bundle)
+bool run_raw_capture_smoke(const char *argv0, const std::filesystem::path &base_bundle)
 {
-  const auto off_bundle = base_bundle.parent_path() / (base_bundle.filename().string() + "-raw-off.apitrace");
-  apitrace::runtime::shutdown_process_trace_session();
-  std::filesystem::remove_all(off_bundle);
-  if (!set_raw_format_env(false) || !set_trace_bundle_env(off_bundle)) {
-    std::cerr << "failed to configure raw-off capture smoke\n";
-    return false;
-  }
-  auto *device = fake_object(0x12000);
-  apitrace::d3d12::record_d3d12_create_device(device);
-  apitrace::runtime::shutdown_process_trace_session();
-  clear_trace_bundle_env();
-  if (std::filesystem::exists(off_bundle / "raw")) {
-    std::cerr << "raw writer should not create files when DXMT_CAPTURE_RAW_FORMAT is off\n";
-    return false;
-  }
-
-  const auto raw_bundle = base_bundle.parent_path() / (base_bundle.filename().string() + "-raw-on.apitrace");
+  const auto raw_bundle = base_bundle.parent_path() / (base_bundle.filename().string() + "-raw.apitrace");
   apitrace::runtime::shutdown_process_trace_session();
   std::filesystem::remove_all(raw_bundle);
-  if (!set_raw_format_env(true) || !set_trace_bundle_env(raw_bundle)) {
-    std::cerr << "failed to configure raw-on capture smoke\n";
+  if (!set_trace_bundle_env(raw_bundle)) {
+    std::cerr << "failed to configure raw capture smoke\n";
     return false;
   }
 
@@ -180,12 +159,32 @@ bool run_dual_write_capture_smoke(const char *argv0, const std::filesystem::path
   auto *raw_resource = fake_object(0x14000);
   auto *raw_command_list = fake_object(0x15000);
   auto *raw_swapchain = fake_object(0x16000);
+  D3D12_HEAP_PROPERTIES raw_upload_heap = {};
+  raw_upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+  D3D12_RESOURCE_DESC raw_buffer_desc = {};
+  raw_buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  raw_buffer_desc.Width = 4096;
+  raw_buffer_desc.Height = 1;
+  raw_buffer_desc.DepthOrArraySize = 1;
+  raw_buffer_desc.MipLevels = 1;
+  raw_buffer_desc.SampleDesc.Count = 1;
+  raw_buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
   apitrace::d3d12::record_d3d12_create_device(raw_device);
-  apitrace::d3d12::record_object_create(
-      raw_resource,
-      apitrace::d3d12::CaptureObjectKind::Resource,
-      raw_device,
-      "ID3D12Resource");
+  if (apitrace::d3d12::record_create_committed_resource(
+          static_cast<ID3D12Device *>(raw_device),
+          &raw_upload_heap,
+          D3D12_HEAP_FLAG_NONE,
+          &raw_buffer_desc,
+          D3D12_RESOURCE_STATE_GENERIC_READ,
+          nullptr,
+          raw_resource,
+          0,
+          S_OK) == 0) {
+    std::cerr << "failed to record raw smoke resource create\n";
+    clear_trace_bundle_env();
+    apitrace::runtime::shutdown_process_trace_session();
+    return false;
+  }
   std::uint8_t bytes[] = {1, 2, 3, 4};
   apitrace::d3d12::record_resource_unmap(raw_resource, 0, 0, sizeof(bytes), bytes, sizeof(bytes));
   apitrace::d3d12::record_object_create(
@@ -197,11 +196,16 @@ bool run_dual_write_capture_smoke(const char *argv0, const std::filesystem::path
   apitrace::d3d12::record_present(raw_swapchain, 1, 0, 0, true);
   apitrace::runtime::shutdown_process_trace_session();
   clear_trace_bundle_env();
-  set_raw_format_env(false);
+
+  if (read_text(raw_bundle / "assets.json").find("\"blob_id\"") != std::string::npos ||
+      std::filesystem::exists(raw_bundle / "spool" / "asset-payloads.bin")) {
+    std::cerr << "raw capture unexpectedly registered old-path assets or wrote old asset spool\n";
+    return false;
+  }
 
   apitrace::trace::raw::RawCaptureReader raw_reader;
   if (!raw_reader.open(raw_bundle)) {
-    std::cerr << "failed to read raw dual-write bundle: " << raw_reader.last_error() << "\n";
+    std::cerr << "failed to read raw capture bundle: " << raw_reader.last_error() << "\n";
     return false;
   }
   const auto raw_events = raw_reader.read_events();
@@ -217,24 +221,28 @@ bool run_dual_write_capture_smoke(const char *argv0, const std::filesystem::path
                         opcode == apitrace::trace::raw::RawEventOpcode::ResourceUnmap ||
                         opcode == apitrace::trace::raw::RawEventOpcode::DrawInstanced;
   }
-  if (!saw_passthrough || !saw_passthrough_with_blob || raw_reader.blob_extents().empty()) {
-    std::cerr << "raw dual-write did not include passthrough, blob passthrough, and blob records\n";
+  if (!saw_passthrough || raw_reader.blob_extents().empty()) {
+    std::cerr << "raw capture did not include passthrough and blob records\n";
     return false;
   }
-  if (saw_binary_subset) {
-    std::cerr << "raw dual-write unexpectedly emitted typed binary subset events\n";
+  if (saw_passthrough_with_blob) {
+    std::cerr << "raw capture should use typed unmap blobs instead of passthrough-with-blob for resource unmaps\n";
+    return false;
+  }
+  if (!saw_binary_subset) {
+    std::cerr << "raw capture did not emit typed binary subset events\n";
     return false;
   }
 
   if (!finalize_raw_bundle(argv0, raw_bundle)) {
-    std::cerr << "bundle-finalize --raw-format failed for dual-write smoke bundle\n";
+    std::cerr << "bundle-finalize --raw-format failed for raw capture smoke bundle\n";
     return false;
   }
   const auto records_text = read_text(raw_bundle / apitrace::trace::kCallstreamFileName);
   if (records_text.find("\"function\":\"D3D12CreateDevice\"") == std::string::npos ||
       records_text.find("\"function\":\"ID3D12Resource::Unmap\"") == std::string::npos ||
       records_text.find("\"function\":\"ID3D12GraphicsCommandList::DrawInstanced\"") == std::string::npos) {
-    std::cerr << "raw-to-final output did not preserve passthrough dual-write calls\n";
+    std::cerr << "raw-to-final output did not preserve raw capture calls\n";
     return false;
   }
   return true;
@@ -254,15 +262,15 @@ bool verify_bundle_check(const char *argv0, const std::filesystem::path &bundle)
   return std::system(command.c_str()) == 0;
 }
 
-bool run_raw_only_passthrough_smoke(const char *argv0, const std::filesystem::path &base_bundle)
+bool run_raw_passthrough_smoke(const char *argv0, const std::filesystem::path &base_bundle)
 {
   using namespace apitrace::trace::raw;
 
-  const auto raw_bundle = base_bundle.parent_path() / (base_bundle.filename().string() + "-raw-only.apitrace");
+  const auto raw_bundle = base_bundle.parent_path() / (base_bundle.filename().string() + "-raw.apitrace");
   apitrace::runtime::shutdown_process_trace_session();
   std::filesystem::remove_all(raw_bundle);
-  if (!set_raw_only_format_env() || !set_trace_bundle_env(raw_bundle)) {
-    std::cerr << "failed to configure raw-only capture smoke\n";
+  if (!set_trace_bundle_env(raw_bundle)) {
+    std::cerr << "failed to configure raw capture smoke\n";
     return false;
   }
 
@@ -270,17 +278,37 @@ bool run_raw_only_passthrough_smoke(const char *argv0, const std::filesystem::pa
   auto *root_signature = fake_object(0x17100);
   auto *resource = fake_object(0x17300);
   auto *command_list = fake_object(0x17400);
+  D3D12_HEAP_PROPERTIES upload_heap = {};
+  upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+  D3D12_RESOURCE_DESC buffer_desc = {};
+  buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer_desc.Width = 4096;
+  buffer_desc.Height = 1;
+  buffer_desc.DepthOrArraySize = 1;
+  buffer_desc.MipLevels = 1;
+  buffer_desc.SampleDesc.Count = 1;
+  buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
   apitrace::d3d12::record_d3d12_create_device(device);
   apitrace::d3d12::record_object_create(
       root_signature,
       apitrace::d3d12::CaptureObjectKind::RootSignature,
       device,
       "ID3D12RootSignature");
-  apitrace::d3d12::record_object_create(
-      resource,
-      apitrace::d3d12::CaptureObjectKind::Resource,
-      device,
-      "ID3D12Resource");
+  if (apitrace::d3d12::record_create_committed_resource(
+          static_cast<ID3D12Device *>(device),
+          &upload_heap,
+          D3D12_HEAP_FLAG_NONE,
+          &buffer_desc,
+          D3D12_RESOURCE_STATE_GENERIC_READ,
+          nullptr,
+          resource,
+          0,
+          S_OK) == 0) {
+    std::cerr << "failed to record raw passthrough smoke resource create\n";
+    clear_trace_bundle_env();
+    apitrace::runtime::shutdown_process_trace_session();
+    return false;
+  }
   std::uint8_t root_signature_bytes[] = {0x52, 0x53, 0x49, 0x47};
   apitrace::d3d12::record_create_root_signature(
       static_cast<ID3D12Device *>(device),
@@ -299,17 +327,16 @@ bool run_raw_only_passthrough_smoke(const char *argv0, const std::filesystem::pa
   apitrace::d3d12::record_draw_instanced(command_list, 3, 1, 0, 0);
   apitrace::runtime::shutdown_process_trace_session();
   clear_trace_bundle_env();
-  set_raw_format_env(false);
 
   if (read_text(raw_bundle / "assets.json").find("\"blob_id\"") != std::string::npos ||
       std::filesystem::exists(raw_bundle / "spool" / "asset-payloads.bin")) {
-    std::cerr << "raw-only unexpectedly registered old-path assets or wrote spool before finalize\n";
+    std::cerr << "raw unexpectedly registered old-path assets or wrote spool before finalize\n";
     return false;
   }
 
   RawCaptureReader raw_reader;
   if (!raw_reader.open(raw_bundle)) {
-    std::cerr << "failed to read raw-only bundle: " << raw_reader.last_error() << "\n";
+    std::cerr << "failed to read raw bundle: " << raw_reader.last_error() << "\n";
     return false;
   }
   const auto raw_events = raw_reader.read_events();
@@ -338,25 +365,29 @@ bool run_raw_only_passthrough_smoke(const char *argv0, const std::filesystem::pa
           decoded.events.empty() ||
           decoded.events[0].passthrough_jsonl_record.find("\"function\":\"ID3D12Device::CreateRootSignature\"") ==
               std::string::npos ||
-          decoded.events[0].assets.size() != 1 ||
-          decoded.events[0].assets[0].payload_bytes !=
-              std::vector<std::uint8_t>(std::begin(root_signature_bytes), std::end(root_signature_bytes))) {
-        std::cerr << "raw-only blob passthrough did not preserve staged root signature bytes\n";
+          decoded.events[0].assets.size() != 1) {
+        std::cerr << "raw blob passthrough did not preserve staged root signature bytes\n";
+        return false;
+      }
+      std::vector<std::uint8_t> root_signature_payload;
+      if (!read_asset_payload(raw_bundle, decoded.events[0].assets[0], root_signature_payload) ||
+          root_signature_payload != std::vector<std::uint8_t>(std::begin(root_signature_bytes), std::end(root_signature_bytes))) {
+        std::cerr << "raw blob passthrough did not preserve staged root signature bytes\n";
         return false;
       }
     }
   }
   if (!saw_non_blob_passthrough || !saw_blob_passthrough || !saw_unmap_binary || saw_double_unmap_passthrough) {
-    std::cerr << "raw-only did not emit expected passthrough/blob/binary mix\n";
+    std::cerr << "raw did not emit expected passthrough/blob/binary mix\n";
     return false;
   }
 
   if (!finalize_raw_bundle(argv0, raw_bundle)) {
-    std::cerr << "bundle-finalize --raw-format failed for raw-only smoke bundle\n";
+    std::cerr << "bundle-finalize --raw-format failed for raw smoke bundle\n";
     return false;
   }
   if (!verify_bundle_check(argv0, raw_bundle)) {
-    std::cerr << "bundle-check --verify-hashes failed for raw-only smoke bundle\n";
+    std::cerr << "bundle-check --verify-hashes failed for raw smoke bundle\n";
     return false;
   }
   const auto records_text = read_text(raw_bundle / apitrace::trace::kCallstreamFileName);
@@ -364,7 +395,7 @@ bool run_raw_only_passthrough_smoke(const char *argv0, const std::filesystem::pa
       records_text.find("\"function\":\"ID3D12Device::CreateRootSignature\"") == std::string::npos ||
       records_text.find("\"function\":\"ID3D12Resource::Unmap\"") == std::string::npos ||
       records_text.find("\"function\":\"ID3D12GraphicsCommandList::DrawInstanced\"") == std::string::npos) {
-    std::cerr << "raw-only raw-to-final output did not preserve all events\n";
+    std::cerr << "raw raw-to-final output did not preserve all events\n";
     return false;
   }
   return true;
@@ -372,19 +403,30 @@ bool run_raw_only_passthrough_smoke(const char *argv0, const std::filesystem::pa
 
 bool verify_raw_pipeline_capture(const std::filesystem::path &bundle)
 {
-  std::ifstream input(bundle / apitrace::trace::kCallstreamFileName, std::ios::binary);
-  if (!input.is_open()) {
-    std::cerr << "raw callstream was not written\n";
+  using namespace apitrace::trace::raw;
+
+  RawCaptureReader reader;
+  if (!reader.open(bundle)) {
+    std::cerr << "failed to read raw capture bundle: " << reader.last_error() << "\n";
     return false;
   }
-  std::string line;
+  const auto records = reader.read_events();
   std::size_t stream_pipeline_calls = 0;
   bool found_compute_stream_pipeline = false;
   bool found_mesh_stream_pipeline = false;
-  while (std::getline(input, line)) {
-    const auto record = nlohmann::json::parse(line, nullptr, false);
-    if (record.is_discarded()) {
+  for (const auto &raw_record : records) {
+    if (raw_record.header.opcode != static_cast<std::uint32_t>(RawEventOpcode::PassthroughWithBlob)) {
       continue;
+    }
+    const auto decoded = decode_raw_events(reader, {raw_record});
+    if (!decoded.error.empty() || decoded.events.empty() || decoded.events[0].assets.size() != 1) {
+      std::cerr << "raw CreatePipelineState stream blob passthrough did not decode\n";
+      return false;
+    }
+    const auto record = nlohmann::json::parse(decoded.events[0].passthrough_jsonl_record, nullptr, false);
+    if (record.is_discarded()) {
+      std::cerr << "raw CreatePipelineState stream passthrough JSON is invalid\n";
+      return false;
     }
     if (record.value("function", std::string()) != "ID3D12Device2::CreatePipelineState") {
       continue;
@@ -399,6 +441,11 @@ bool verify_raw_pipeline_capture(const std::filesystem::path &bundle)
         !payload.contains("stream_metadata") ||
         blob_refs.size() != 1) {
       std::cerr << "raw CreatePipelineState stream payload is incomplete\n";
+      return false;
+    }
+    if (decoded.events[0].assets[0].payload_path.generic_string() != "raw/blobs.bin" ||
+        decoded.events[0].assets[0].byte_size == 0) {
+      std::cerr << "raw CreatePipelineState stream shader blob was not path-backed\n";
       return false;
     }
     const auto blob_id = blob_refs.front().get<std::uint64_t>();
@@ -447,8 +494,7 @@ bool verify_mapped_root_cbv_capture(const std::filesystem::path &bundle)
       continue;
     }
     const auto payload = record.value("payload", nlohmann::json::object());
-    if (!payload.is_object() ||
-        payload.value("capture_reason", std::string()) != "mapped_resource_use") {
+    if (!payload.is_object()) {
       continue;
     }
     found_use_snapshot = seen_root_cbv && !found_draw &&
@@ -487,7 +533,6 @@ bool verify_mapped_descriptor_cbv_capture(const std::filesystem::path &bundle)
     if (function == "ID3D12Resource::Unmap") {
       const auto payload = record.value("payload", nlohmann::json::object());
       if (payload.is_object() &&
-          payload.value("capture_reason", std::string()) == "mapped_resource_use" &&
           payload.value("written_begin", UINT64_MAX) == 0x100 &&
           payload.value("written_end", 0ull) == 0x200 &&
           payload.value("written_size", 0ull) == 0x100 &&
@@ -565,7 +610,6 @@ int main(int argc, char **argv)
 
   const std::filesystem::path bundle = argv[1];
   apitrace::runtime::shutdown_process_trace_session();
-  set_raw_format_env(false);
   std::filesystem::remove_all(bundle);
 
   if (!set_trace_bundle_env(bundle)) {
@@ -984,19 +1028,23 @@ int main(int argc, char **argv)
 
   apitrace::runtime::shutdown_process_trace_session();
   clear_trace_bundle_env();
-  set_raw_format_env(false);
 
+  if (read_text(bundle / "assets.json").find("\"blob_id\"") != std::string::npos ||
+      std::filesystem::exists(bundle / "spool" / "asset-payloads.bin")) {
+    std::cerr << "raw capture unexpectedly registered old-path assets or wrote old asset spool\n";
+    return 1;
+  }
   if (!verify_raw_pipeline_capture(bundle)) {
+    return 1;
+  }
+  if (!finalize_raw_bundle(argv[0], bundle)) {
+    std::cerr << "bundle-finalize --raw-format failed for capture api bundle\n";
     return 1;
   }
   if (!verify_mapped_descriptor_cbv_capture(bundle)) {
     return 1;
   }
   if (!verify_mapped_root_cbv_capture(bundle)) {
-    return 1;
-  }
-  if (!finalize_bundle(argv[0], bundle)) {
-    std::cerr << "bundle-finalize failed for capture api bundle\n";
     return 1;
   }
 
@@ -1369,10 +1417,10 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  if (!run_dual_write_capture_smoke(argv[0], bundle)) {
+  if (!run_raw_capture_smoke(argv[0], bundle)) {
     return 1;
   }
-  if (!run_raw_only_passthrough_smoke(argv[0], bundle)) {
+  if (!run_raw_passthrough_smoke(argv[0], bundle)) {
     return 1;
   }
 

@@ -64,26 +64,6 @@ std::filesystem::path resolve_bundle_root(trace::ApiKind api)
   return std::filesystem::current_path() / name.str();
 }
 
-CaptureOptions::CaptureRawMode parse_capture_raw_mode()
-{
-  const char *value = std::getenv("DXMT_CAPTURE_RAW_FORMAT");
-  if (!value || *value == '\0') {
-    return CaptureOptions::CaptureRawMode::Off;
-  }
-
-  const std::string_view text(value);
-  if (text == "0") {
-    return CaptureOptions::CaptureRawMode::Off;
-  }
-  if (text == "1" || text == "dual" || text == "dual-write") {
-    return CaptureOptions::CaptureRawMode::DualWrite;
-  }
-  if (text == "2" || text == "raw-only") {
-    return CaptureOptions::CaptureRawMode::RawOnly;
-  }
-  return CaptureOptions::CaptureRawMode::Off;
-}
-
 void shutdown_process_capture_impl()
 {
   auto &session = process_capture_session();
@@ -227,7 +207,6 @@ TraceSession *ensure_process_trace_session(trace::ApiKind api)
     TraceOptions options;
     options.api = api;
     options.capture.mode = CaptureMode::ProxyDll;
-    options.capture.raw_mode = parse_capture_raw_mode();
     options.bundle_root = resolve_bundle_root(api);
     session = std::make_unique<TraceSession>(std::move(options));
     session->begin();

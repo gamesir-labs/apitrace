@@ -2466,9 +2466,7 @@ apitrace::trace::AssetRecord register_asset_bytes_locked(
   if (size != 0 && data) {
     std::memcpy(asset.payload_bytes.data(), data, size);
   }
-  return session->capture_raw_mode() == apitrace::runtime::CaptureOptions::CaptureRawMode::RawOnly
-      ? session->stage_raw_asset(std::move(asset))
-      : session->register_asset(std::move(asset));
+  return session->stage_raw_asset(std::move(asset));
 }
 
 apitrace::trace::AssetRecord register_asset_text_locked(

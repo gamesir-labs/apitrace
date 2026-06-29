@@ -18,12 +18,6 @@ namespace apitrace::capture::internal {
 
 namespace {
 
-bool event_references_captured_blob(const trace::EventRecord &event)
-{
-  return !event.blob_refs.empty() ||
-         event.payload.find("asset-") != std::string::npos;
-}
-
 std::uint64_t env_u64_or_default(const char *name, std::uint64_t fallback)
 {
   const char *value = std::getenv(name);
@@ -131,7 +125,7 @@ std::uint64_t wall_clock_nanoseconds()
           .count());
 }
 
-void stamp_rawonly_event(trace::EventRecord &event)
+void stamp_raw_event(trace::EventRecord &event)
 {
   if (event.time_ns == 0) {
     event.time_ns = wall_clock_nanoseconds();
@@ -197,12 +191,6 @@ bool append_passthrough_with_blob_raw_event(
   header.result_or_flags = static_cast<std::uint32_t>(event.callsite.result_code);
   header.payload_len = payload.size();
   return raw_writer.append_event(header, payload.data(), payload.size());
-}
-
-bool capture_raw_mode_writes_raw(runtime::CaptureOptions::CaptureRawMode mode)
-{
-  return mode == runtime::CaptureOptions::CaptureRawMode::DualWrite ||
-         mode == runtime::CaptureOptions::CaptureRawMode::RawOnly;
 }
 
 } // namespace
@@ -298,11 +286,9 @@ TraceSessionState::TraceSessionState(TraceOptions options)
 void TraceSessionState::begin()
 {
   bundle_sink_.open_bundle();
-  if (capture_raw_mode_writes_raw(options_.capture.raw_mode)) {
-    raw_writer_ = std::make_unique<trace::raw::RawCaptureWriter>();
-    raw_writer_->open(options_.bundle_root);
-    raw_commit_cadence_bytes_ = configured_raw_commit_cadence_bytes();
-  }
+  raw_writer_ = std::make_unique<trace::raw::RawCaptureWriter>();
+  raw_writer_->open(options_.bundle_root);
+  raw_commit_cadence_bytes_ = configured_raw_commit_cadence_bytes();
   bundle_sink_.write_initial_metadata();
   runtime_bootstrap_.install_entry_hooks();
 
@@ -345,63 +331,37 @@ void TraceSessionState::append_call_event(const trace::EventRecord &event)
 
 void TraceSessionState::append_call_event(trace::EventRecord &&event)
 {
-  auto &writer = bundle_sink_.writer();
   if (!raw_writer_) {
-    writer.append_call_event(std::move(event));
     return;
   }
 
-  if (options_.capture.raw_mode == runtime::CaptureOptions::CaptureRawMode::RawOnly) {
-    stamp_rawonly_event(event);
-    const auto final_jsonl_record = trace::event_record_json(event);
-    bool raw_appended = false;
-    if (event.blob_refs.empty()) {
-      raw_appended = append_passthrough_raw_event(*raw_writer_, event, final_jsonl_record);
-    } else {
-      std::vector<trace::TraceBundleWriter::RegisteredAssetPayload> assets;
-      assets.reserve(event.blob_refs.size());
-      {
-        std::lock_guard lock(raw_staged_assets_mutex_);
-        for (const auto blob_ref : event.blob_refs) {
-          const auto found = raw_staged_assets_.find(blob_ref);
-          if (found == raw_staged_assets_.end()) {
-            return;
-          }
-          auto payload = std::make_shared<const std::vector<std::uint8_t>>(found->second.payload_bytes);
-          assets.push_back(trace::TraceBundleWriter::RegisteredAssetPayload{found->second, std::move(payload)});
-        }
-      }
-      raw_appended = append_passthrough_with_blob_raw_event(
-          *raw_writer_,
-          event,
-          final_jsonl_record,
-          assets);
-    }
-    if (raw_appended) {
-      raw_writer_->flush_commit_if_needed(raw_commit_cadence_bytes_);
-    }
-    return;
-  }
-
-  event = writer.prepare_call_event(std::move(event));
-  if (!event_references_captured_blob(event)) {
-    const auto final_jsonl_record = trace::event_record_json(event);
-    const bool raw_appended = append_passthrough_raw_event(*raw_writer_, event, final_jsonl_record);
-    if (raw_appended) {
-      raw_writer_->flush_commit_if_needed(raw_commit_cadence_bytes_);
-    }
-    writer.append_prepared_call_event(std::move(event), final_jsonl_record);
+  stamp_raw_event(event);
+  const auto final_jsonl_record = trace::event_record_json(event);
+  bool raw_appended = false;
+  if (event.blob_refs.empty()) {
+    raw_appended = append_passthrough_raw_event(*raw_writer_, event, final_jsonl_record);
   } else {
-    const auto final_jsonl_record = trace::event_record_json(event);
-    const bool raw_appended = append_passthrough_with_blob_raw_event(
+    std::vector<trace::TraceBundleWriter::RegisteredAssetPayload> assets;
+    assets.reserve(event.blob_refs.size());
+    {
+      std::lock_guard lock(raw_staged_assets_mutex_);
+      for (const auto blob_ref : event.blob_refs) {
+        const auto found = raw_staged_assets_.find(blob_ref);
+        if (found == raw_staged_assets_.end()) {
+          return;
+        }
+        auto payload = std::make_shared<const std::vector<std::uint8_t>>(found->second.payload_bytes);
+        assets.push_back(trace::TraceBundleWriter::RegisteredAssetPayload{found->second, std::move(payload)});
+      }
+    }
+    raw_appended = append_passthrough_with_blob_raw_event(
         *raw_writer_,
         event,
         final_jsonl_record,
-        writer.registered_asset_payloads_for_blob_refs(event.blob_refs));
-    if (raw_appended) {
-      raw_writer_->flush_commit_if_needed(raw_commit_cadence_bytes_);
-    }
-    writer.append_prepared_call_event(std::move(event), final_jsonl_record);
+        assets);
+  }
+  if (raw_appended) {
+    raw_writer_->flush_commit_if_needed(raw_commit_cadence_bytes_);
   }
 }
 
@@ -410,21 +370,8 @@ void TraceSessionState::append_analysis_line(std::string_view stream_name, std::
   bundle_sink_.writer().append_analysis_line(stream_name, json_line);
 }
 
-trace::AssetRecord TraceSessionState::register_asset(const trace::AssetRecord &asset)
-{
-  return bundle_sink_.writer().register_asset(asset);
-}
-
-trace::AssetRecord TraceSessionState::register_asset(trace::AssetRecord &&asset)
-{
-  return bundle_sink_.writer().register_asset(std::move(asset));
-}
-
 trace::AssetRecord TraceSessionState::stage_raw_asset(trace::AssetRecord &&asset)
 {
-  if (options_.capture.raw_mode != runtime::CaptureOptions::CaptureRawMode::RawOnly) {
-    return register_asset(std::move(asset));
-  }
   if (asset.blob_id == 0) {
     asset.blob_id = next_raw_staged_blob_id_++;
   } else {
@@ -463,11 +410,6 @@ std::uint64_t TraceSessionState::initial_call_sequence() const noexcept
 const TraceOptions &TraceSessionState::options() const noexcept
 {
   return options_;
-}
-
-runtime::CaptureOptions::CaptureRawMode TraceSessionState::capture_raw_mode() const noexcept
-{
-  return options_.capture.raw_mode;
 }
 
 trace::raw::RawCaptureWriter *TraceSessionState::raw_capture_writer() noexcept

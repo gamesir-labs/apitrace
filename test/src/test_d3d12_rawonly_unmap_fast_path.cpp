@@ -45,19 +45,8 @@ void clear_capture_env()
 {
 #ifdef _WIN32
   _putenv_s("APITRACE_TRACE_BUNDLE", "");
-  _putenv_s("DXMT_CAPTURE_RAW_FORMAT", "");
 #else
   unsetenv("APITRACE_TRACE_BUNDLE");
-  unsetenv("DXMT_CAPTURE_RAW_FORMAT");
-#endif
-}
-
-bool set_rawonly_env()
-{
-#ifdef _WIN32
-  return _putenv_s("DXMT_CAPTURE_RAW_FORMAT", "2") == 0;
-#else
-  return setenv("DXMT_CAPTURE_RAW_FORMAT", "2", 1) == 0;
 #endif
 }
 
@@ -82,8 +71,8 @@ bool run_rawonly_unmap_fast_path(const std::filesystem::path &bundle)
   std::filesystem::remove_all(bundle);
   apitrace::runtime::shutdown_process_trace_session();
   apitrace::d3d12::reset_raw_unmap_fast_path_for_test();
-  if (!set_trace_bundle_env(bundle) || !set_rawonly_env()) {
-    std::cerr << "failed to configure raw-only capture\n";
+  if (!set_trace_bundle_env(bundle)) {
+    std::cerr << "failed to configure raw capture\n";
     return false;
   }
 
@@ -107,15 +96,15 @@ bool run_rawonly_unmap_fast_path(const std::filesystem::path &bundle)
   clear_capture_env();
 
   const auto counters = apitrace::d3d12::raw_unmap_fast_path_counters_for_test();
-  if (!expect(counters.unmap_candidates == 3, "unexpected raw-only unmap candidate count") ||
-      !expect(counters.unchanged_skipped == 1, "unchanged raw-only unmap was not skipped") ||
+  if (!expect(counters.unmap_candidates == 3, "unexpected raw unmap candidate count") ||
+      !expect(counters.unchanged_skipped == 1, "unchanged raw unmap was not skipped") ||
       !expect(counters.emitted_blob_bytes == first.size() + changed.size(), "unexpected emitted blob byte count") ||
-      !expect(counters.raw_write_failures == 0, "raw-only unmap write failure was recorded")) {
+      !expect(counters.raw_write_failures == 0, "raw unmap write failure was recorded")) {
     return false;
   }
 
   RawCaptureReader reader;
-  if (!expect(reader.open(bundle), "failed to open raw-only capture")) {
+  if (!expect(reader.open(bundle), "failed to open raw capture")) {
     std::cerr << reader.last_error() << "\n";
     return false;
   }
@@ -126,8 +115,8 @@ bool run_rawonly_unmap_fast_path(const std::filesystem::path &bundle)
       unmaps.push_back(record);
     }
   }
-  if (!expect(unmaps.size() == 2, "raw-only unchanged unmap emitted an extra event") ||
-      !expect(reader.blob_extents().size() == 2, "raw-only unchanged unmap emitted an extra blob")) {
+  if (!expect(unmaps.size() == 2, "raw unchanged unmap emitted an extra event") ||
+      !expect(reader.blob_extents().size() == 2, "raw unchanged unmap emitted an extra blob")) {
     return false;
   }
 
@@ -137,30 +126,39 @@ bool run_rawonly_unmap_fast_path(const std::filesystem::path &bundle)
   const auto blob1_id = read_le64(unmaps[1].payload, 8);
   if (!expect(read_le64(unmaps[0].payload, 16) == 64 &&
                   read_le64(unmaps[0].payload, 24) == 68,
-              "first raw-only unmap range mismatch") ||
+              "first raw unmap range mismatch") ||
       !expect(read_le64(unmaps[1].payload, 16) == 64 &&
                   read_le64(unmaps[1].payload, 24) == 68,
-              "second raw-only unmap range mismatch") ||
-      !expect(reader.read_blob(blob0_id, blob0), "failed to read first raw-only unmap blob") ||
-      !expect(reader.read_blob(blob1_id, blob1), "failed to read second raw-only unmap blob") ||
-      !expect(blob0 == first, "first raw-only unmap blob mismatch") ||
-      !expect(blob1 == changed, "changed raw-only unmap blob mismatch")) {
+              "second raw unmap range mismatch") ||
+      !expect(reader.read_blob(blob0_id, blob0), "failed to read first raw unmap blob") ||
+      !expect(reader.read_blob(blob1_id, blob1), "failed to read second raw unmap blob") ||
+      !expect(blob0 == first, "first raw unmap blob mismatch") ||
+      !expect(blob1 == changed, "changed raw unmap blob mismatch")) {
     return false;
   }
 
   const auto decoded = decode_raw_events(reader, unmaps);
-  if (!expect(decoded.error.empty(), "raw-only unmap events failed to decode")) {
+  if (!expect(decoded.error.empty(), "raw unmap events failed to decode")) {
     std::cerr << decoded.error << "\n";
     return false;
   }
-  return expect(decoded.events.size() == 2 &&
-                    decoded.events[0].event.callsite.function_name == "ID3D12Resource::Unmap" &&
-                    decoded.events[1].event.callsite.function_name == "ID3D12Resource::Unmap" &&
-                    decoded.events[0].assets.size() == 1 &&
-                    decoded.events[1].assets.size() == 1 &&
-                    decoded.events[0].assets[0].payload_bytes == first &&
-                    decoded.events[1].assets[0].payload_bytes == changed,
-                "decoded raw-only unmap event/blob mismatch");
+  std::vector<std::uint8_t> decoded_blob0;
+  std::vector<std::uint8_t> decoded_blob1;
+  if (!expect(decoded.events.size() == 2 &&
+                  decoded.events[0].event.callsite.function_name == "ID3D12Resource::Unmap" &&
+                  decoded.events[1].event.callsite.function_name == "ID3D12Resource::Unmap" &&
+                  decoded.events[0].assets.size() == 1 &&
+                  decoded.events[1].assets.size() == 1 &&
+                  decoded.events[0].assets[0].payload_path.generic_string() == "raw/blobs.bin" &&
+                  decoded.events[1].assets[0].payload_path.generic_string() == "raw/blobs.bin",
+              "decoded raw unmap event/blob mismatch") ||
+      !expect(reader.read_blob(blob0_id, decoded_blob0), "failed to read decoded first raw unmap blob") ||
+      !expect(reader.read_blob(blob1_id, decoded_blob1), "failed to read decoded second raw unmap blob") ||
+      !expect(decoded_blob0 == first, "decoded first raw unmap blob mismatch") ||
+      !expect(decoded_blob1 == changed, "decoded changed raw unmap blob mismatch")) {
+    return false;
+  }
+  return true;
 }
 
 } // namespace
@@ -181,7 +179,7 @@ int main()
   if (!ok) {
     return 1;
   }
-  std::cout << "d3d12 raw-only unmap fast path passed\n";
+  std::cout << "d3d12 raw unmap fast path passed\n";
   return 0;
 #endif
 }

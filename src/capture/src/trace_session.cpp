@@ -55,16 +55,6 @@ void TraceSession::append_analysis_line(std::string_view stream_name, std::strin
   impl_->state.append_analysis_line(stream_name, json_line);
 }
 
-trace::AssetRecord TraceSession::register_asset(const trace::AssetRecord &asset)
-{
-  return impl_->state.register_asset(asset);
-}
-
-trace::AssetRecord TraceSession::register_asset(trace::AssetRecord &&asset)
-{
-  return impl_->state.register_asset(std::move(asset));
-}
-
 trace::AssetRecord TraceSession::stage_raw_asset(trace::AssetRecord &&asset)
 {
   return impl_->state.stage_raw_asset(std::move(asset));
@@ -88,11 +78,6 @@ std::uint64_t TraceSession::initial_call_sequence() const noexcept
 const TraceOptions &TraceSession::options() const noexcept
 {
   return impl_->state.options();
-}
-
-runtime::CaptureOptions::CaptureRawMode TraceSession::capture_raw_mode() const noexcept
-{
-  return impl_ ? impl_->state.capture_raw_mode() : runtime::CaptureOptions::CaptureRawMode::Off;
 }
 
 trace::raw::RawCaptureWriter *TraceSession::raw_capture_writer() noexcept
