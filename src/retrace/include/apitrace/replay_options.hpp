@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 
@@ -21,6 +22,10 @@ struct ReplayOptions {
   bool enable_metal_present_capture = false;
   bool validate_only = false;
   std::string metal_backend_name = "native";
+  std::filesystem::path d3d12_checkpoint_out;
+  std::filesystem::path d3d12_checkpoint_in;
+  std::uint64_t d3d12_checkpoint_frame = 0;
+  bool d3d12_checkpoint_frame_set = false;
 
   // TODO: split backend selection from replay policy once per-backend settings appear.
   // TODO: separate primary D3D retrace settings from translated Metal debug-retrace settings once both paths are wired.

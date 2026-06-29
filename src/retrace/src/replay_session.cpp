@@ -2612,11 +2612,22 @@ bool ReplaySession::run()
         return false;
       }
     } else {
-      if (!backend.finalize_replay()) {
+      d3d12::D3D12ReplayBackend::NativeReplayOptions native_options;
+      native_options.checkpoint_out = impl_->options.d3d12_checkpoint_out;
+      native_options.checkpoint_in = impl_->options.d3d12_checkpoint_in;
+      native_options.checkpoint_frame = impl_->options.d3d12_checkpoint_frame;
+      d3d12::D3D12ReplayBackend::NativeReplayStats native_stats;
+      if (!backend.finalize_replay(&native_options, &native_stats)) {
         impl_->statistics.finalize_ms = elapsed_ms(finalize_begin);
+        impl_->statistics.checkpoint_load_ms = native_stats.checkpoint_load_ms;
+        impl_->statistics.checkpoint_save_ms = native_stats.checkpoint_save_ms;
+        impl_->statistics.checkpoint_restore_ms = native_stats.checkpoint_restore_ms;
         impl_->last_error = backend.last_error().empty() ? "D3D12 replay finalization failed" : backend.last_error();
         return false;
       }
+      impl_->statistics.checkpoint_load_ms = native_stats.checkpoint_load_ms;
+      impl_->statistics.checkpoint_save_ms = native_stats.checkpoint_save_ms;
+      impl_->statistics.checkpoint_restore_ms = native_stats.checkpoint_restore_ms;
     }
     impl_->statistics.finalize_ms = elapsed_ms(finalize_begin);
     backend.shutdown();

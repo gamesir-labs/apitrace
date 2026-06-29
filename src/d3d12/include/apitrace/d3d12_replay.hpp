@@ -48,6 +48,18 @@ public:
     std::uint64_t us_iter_total = 0;
   };
 
+  struct NativeReplayOptions {
+    std::filesystem::path checkpoint_out;
+    std::filesystem::path checkpoint_in;
+    std::uint64_t checkpoint_frame = 0;
+  };
+
+  struct NativeReplayStats {
+    std::uint64_t checkpoint_load_ms = 0;
+    std::uint64_t checkpoint_save_ms = 0;
+    std::uint64_t checkpoint_restore_ms = 0;
+  };
+
   D3D12ReplayBackend();
   ~D3D12ReplayBackend();
 
@@ -56,7 +68,9 @@ public:
   void set_event_ordered_init(bool enabled) noexcept;
   bool replay_event(const trace::EventRecord &event);
   bool replay_event_ordered(const trace::TraceBundleReader &reader);
-  bool finalize_replay();
+  bool finalize_replay(
+      const NativeReplayOptions *options = nullptr,
+      NativeReplayStats *stats = nullptr);
   bool validate_only();
   void shutdown();
   const std::string &event_ordered_counters() const noexcept;

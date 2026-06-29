@@ -18,7 +18,9 @@ void print_usage(std::string_view argv0)
 {
   const std::string message =
       "usage: " + std::string(argv0) +
-      " [--validate-only] [--finalize-first] [--metal] [--metal-backend <name>] <trace-path>\n";
+      " [--validate-only] [--finalize-first] [--metal] [--metal-backend <name>]"
+      " [--d3d12-checkpoint-frame <frame>] [--d3d12-checkpoint-out <path>]"
+      " [--d3d12-checkpoint-in <path>] <trace-path>\n";
 #ifdef _WIN32
   DWORD written = 0;
   const HANDLE handle = GetStdHandle(STD_ERROR_HANDLE);
@@ -84,6 +86,9 @@ std::string format_statistics(const apitrace::replay::ReplayStatistics &statisti
       "backend_init_ms: " + std::to_string(statistics.backend_init_ms) + "\n" +
       "event_replay_ms: " + std::to_string(statistics.event_replay_ms) + "\n" +
       "finalize_ms: " + std::to_string(statistics.finalize_ms) + "\n" +
+      "checkpoint_load_ms: " + std::to_string(statistics.checkpoint_load_ms) + "\n" +
+      "checkpoint_save_ms: " + std::to_string(statistics.checkpoint_save_ms) + "\n" +
+      "checkpoint_restore_ms: " + std::to_string(statistics.checkpoint_restore_ms) + "\n" +
       (statistics.d3d12_event_ordered_counters.empty()
            ? std::string()
            : "d3d12_event_ordered_counters: " +
@@ -137,6 +142,21 @@ bool finalize_bundle(std::string_view argv0, const std::string &trace_path)
   return std::system(command.c_str()) == 0;
 }
 
+bool parse_u64(std::string_view text, std::uint64_t &value)
+{
+  if (text.empty()) {
+    return false;
+  }
+  std::string owned(text);
+  char *end = nullptr;
+  const unsigned long long parsed = std::strtoull(owned.c_str(), &end, 10);
+  if (end == owned.c_str() || *end != '\0') {
+    return false;
+  }
+  value = static_cast<std::uint64_t>(parsed);
+  return true;
+}
+
 } // namespace
 
 int apitrace::tools::run_retrace(int argc, char **argv)
@@ -175,6 +195,31 @@ int apitrace::tools::run_retrace(int argc, char **argv)
       options.metal_backend_name = argv[++index];
       continue;
     }
+    if (arg == "--d3d12-checkpoint-frame") {
+      if (index + 1 >= argc ||
+          !parse_u64(argv[++index], options.d3d12_checkpoint_frame)) {
+        print_usage(argc > 0 ? argv[0] : "retrace");
+        return 1;
+      }
+      options.d3d12_checkpoint_frame_set = true;
+      continue;
+    }
+    if (arg == "--d3d12-checkpoint-out") {
+      if (index + 1 >= argc) {
+        print_usage(argc > 0 ? argv[0] : "retrace");
+        return 1;
+      }
+      options.d3d12_checkpoint_out = argv[++index];
+      continue;
+    }
+    if (arg == "--d3d12-checkpoint-in") {
+      if (index + 1 >= argc) {
+        print_usage(argc > 0 ? argv[0] : "retrace");
+        return 1;
+      }
+      options.d3d12_checkpoint_in = argv[++index];
+      continue;
+    }
 
     if (!trace_path.empty()) {
       print_usage(argc > 0 ? argv[0] : "retrace");
@@ -185,6 +230,16 @@ int apitrace::tools::run_retrace(int argc, char **argv)
 
   if (trace_path.empty()) {
     print_usage(argc > 0 ? argv[0] : "retrace");
+    return 1;
+  }
+  if (!options.d3d12_checkpoint_out.empty() &&
+      (!options.d3d12_checkpoint_frame_set || options.d3d12_checkpoint_frame == 0)) {
+    write_stderr("retrace failed: --d3d12-checkpoint-out requires --d3d12-checkpoint-frame > 0\n");
+    return 1;
+  }
+  if (!options.d3d12_checkpoint_in.empty() &&
+      (!options.d3d12_checkpoint_out.empty() || options.d3d12_checkpoint_frame_set)) {
+    write_stderr("retrace failed: --d3d12-checkpoint-in cannot be combined with checkpoint recording options\n");
     return 1;
   }
 

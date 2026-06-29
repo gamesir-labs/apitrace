@@ -2563,7 +2563,9 @@ bool D3D12ReplayBackend::validate_native_replay_readiness()
   return true;
 }
 
-bool D3D12ReplayBackend::finalize_replay()
+bool D3D12ReplayBackend::finalize_replay(
+    const NativeReplayOptions *options,
+    NativeReplayStats *stats)
 {
   if (!validate_replay_closure() || !validate_native_replay_readiness()) {
     return false;
@@ -2572,7 +2574,7 @@ bool D3D12ReplayBackend::finalize_replay()
   // per-object_id version indexes once so replay resolves reused object ids by command sequence.
   build_resource_version_index();
   build_pipeline_version_index();
-  D3D12NativeReplayer native_replayer(*this);
+  D3D12NativeReplayer native_replayer(*this, options, stats);
   return native_replayer.replay(last_error_);
 }
 

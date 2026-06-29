@@ -77,7 +77,13 @@ public:
 
 class D3D12NativeReplayer {
 public:
-  explicit D3D12NativeReplayer(D3D12ReplayBackend &backend) : backend_(backend) {}
+  D3D12NativeReplayer(
+      D3D12ReplayBackend &backend,
+      const D3D12ReplayBackend::NativeReplayOptions *options = nullptr,
+      D3D12ReplayBackend::NativeReplayStats *stats = nullptr)
+      : backend_(backend),
+        replay_options_(options),
+        replay_stats_(stats) {}
 
   ~D3D12NativeReplayer()
   {
@@ -91,6 +97,9 @@ public:
       return false;
     }
     replay_milestone("replay:begin");
+    if (!load_checkpoint_if_requested(error)) {
+      return false;
+    }
     if (!log_stage("bootstrap", [&] { return bootstrap(error); }) ||
         !log_stage("create_heaps", [&] { return create_heaps(error); }) ||
         !log_stage("create_resources", [&] { return create_resources(error); }) ||
@@ -172,6 +181,167 @@ public:
   }
 
 private:
+  struct ReplayCheckpoint {
+    std::uint64_t schema_version = 1;
+    std::uint64_t start_frame = 0;
+    std::uint64_t next_batch_index = 0;
+    std::uint64_t checkpoint_sequence = 0;
+    bool runtime_state_complete = false;
+    std::string bundle_root;
+  };
+
+  static constexpr std::uint64_t kCheckpointSchemaVersion = 1;
+
+  bool checkpoint_output_requested() const
+  {
+    return replay_options_ &&
+           !replay_options_->checkpoint_out.empty() &&
+           replay_options_->checkpoint_frame != 0;
+  }
+
+  bool checkpoint_input_requested() const
+  {
+    return replay_options_ && !replay_options_->checkpoint_in.empty();
+  }
+
+  bool read_checkpoint_file(const std::filesystem::path &path, ReplayCheckpoint &checkpoint, std::string &error) const
+  {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+      error = "failed to open D3D12 replay checkpoint: " + path.string();
+      return false;
+    }
+    json doc = json::parse(input, nullptr, false);
+    if (doc.is_discarded() || !doc.is_object()) {
+      error = "D3D12 replay checkpoint is not valid JSON: " + path.string();
+      return false;
+    }
+    if (doc.value("magic", std::string()) != "apitrace.d3d12.replay-checkpoint") {
+      error = "D3D12 replay checkpoint magic mismatch: " + path.string();
+      return false;
+    }
+    checkpoint.schema_version = json_u64(doc.value("schema_version", json(nullptr)));
+    checkpoint.start_frame = json_u64(doc.value("start_frame", json(nullptr)));
+    checkpoint.next_batch_index = json_u64(doc.value("next_batch_index", json(nullptr)));
+    checkpoint.checkpoint_sequence = json_u64(doc.value("checkpoint_sequence", json(nullptr)));
+    checkpoint.runtime_state_complete = doc.value("runtime_state_complete", false);
+    checkpoint.bundle_root = doc.value("bundle_root", std::string());
+    if (checkpoint.schema_version != kCheckpointSchemaVersion) {
+      error = "unsupported D3D12 replay checkpoint schema: " +
+              std::to_string(checkpoint.schema_version);
+      return false;
+    }
+    if (checkpoint.start_frame == 0) {
+      error = "D3D12 replay checkpoint missing start_frame";
+      return false;
+    }
+    return true;
+  }
+
+  bool write_checkpoint_file(const std::filesystem::path &path, const ReplayCheckpoint &checkpoint, std::string &error) const
+  {
+    std::error_code ec;
+    if (path.has_parent_path()) {
+      std::filesystem::create_directories(path.parent_path(), ec);
+      if (ec) {
+        error = "failed to create D3D12 replay checkpoint directory: " + ec.message();
+        return false;
+      }
+    }
+    json doc;
+    doc["magic"] = "apitrace.d3d12.replay-checkpoint";
+    doc["schema_version"] = checkpoint.schema_version;
+    doc["start_frame"] = checkpoint.start_frame;
+    doc["next_batch_index"] = checkpoint.next_batch_index;
+    doc["checkpoint_sequence"] = checkpoint.checkpoint_sequence;
+    doc["runtime_state_complete"] = checkpoint.runtime_state_complete;
+    doc["bundle_root"] = checkpoint.bundle_root;
+    doc["note"] =
+        "This checkpoint records a semantic replay cursor only. Runtime GPU resource snapshots are "
+        "not serialized yet, so checkpoint resume must refuse it to preserve D3D12 semantics.";
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+      error = "failed to open D3D12 replay checkpoint for write: " + path.string();
+      return false;
+    }
+    output << doc.dump(2) << "\n";
+    if (!output) {
+      error = "failed to write D3D12 replay checkpoint: " + path.string();
+      return false;
+    }
+    return true;
+  }
+
+  bool load_checkpoint_if_requested(std::string &error)
+  {
+    if (!checkpoint_input_requested()) {
+      return true;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    ReplayCheckpoint checkpoint;
+    if (!read_checkpoint_file(replay_options_->checkpoint_in, checkpoint, error)) {
+      if (replay_stats_) {
+        replay_stats_->checkpoint_load_ms = elapsed_ms(begin);
+      }
+      return false;
+    }
+    if (replay_stats_) {
+      replay_stats_->checkpoint_load_ms = elapsed_ms(begin);
+    }
+    replay_milestone((std::string("checkpoint:loaded frame=") +
+                      std::to_string(checkpoint.start_frame) +
+                      " next_batch=" + std::to_string(checkpoint.next_batch_index) +
+                      " runtime_state_complete=" +
+                      (checkpoint.runtime_state_complete ? "1" : "0")).c_str());
+    if (!checkpoint.runtime_state_complete) {
+      error =
+          "D3D12 replay checkpoint does not contain a complete runtime GPU state snapshot; "
+          "refusing checkpoint resume because skipping earlier D3D12 submissions would change replay semantics";
+      return false;
+    }
+    const auto restore_begin = std::chrono::steady_clock::now();
+    error = "D3D12 replay checkpoint restore is not implemented for runtime-complete checkpoints";
+    if (replay_stats_) {
+      replay_stats_->checkpoint_restore_ms = elapsed_ms(restore_begin);
+    }
+    return false;
+  }
+
+  bool maybe_write_checkpoint_after_present(
+      std::uint64_t next_frame_index,
+      std::uint64_t checkpoint_sequence,
+      std::string &error)
+  {
+    if (!checkpoint_output_requested() ||
+        checkpoint_written_ ||
+        next_frame_index != replay_options_->checkpoint_frame) {
+      return true;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    wait_for_gpu();
+    ReplayCheckpoint checkpoint;
+    checkpoint.schema_version = kCheckpointSchemaVersion;
+    checkpoint.start_frame = next_frame_index;
+    checkpoint.next_batch_index = replay_batch_index_;
+    checkpoint.checkpoint_sequence = checkpoint_sequence;
+    checkpoint.runtime_state_complete = false;
+    checkpoint.bundle_root = backend_.bundle_root_.generic_string();
+    if (!write_checkpoint_file(replay_options_->checkpoint_out, checkpoint, error)) {
+      if (replay_stats_) {
+        replay_stats_->checkpoint_save_ms = elapsed_ms(begin);
+      }
+      return false;
+    }
+    if (replay_stats_) {
+      replay_stats_->checkpoint_save_ms = elapsed_ms(begin);
+    }
+    checkpoint_written_ = true;
+    replay_milestone((std::string("checkpoint:wrote frame=") +
+                      std::to_string(next_frame_index) +
+                      " path=" + replay_options_->checkpoint_out.string()).c_str());
+    return true;
+  }
+
   void emit_frame_timing_line(const std::string &line) const
   {
     std::fprintf(stderr, "%s\n", line.c_str());
@@ -187,8 +357,19 @@ private:
     frame_timing_active_ = true;
     frame_timing_last_present_ = std::chrono::steady_clock::now();
     frame_timing_frame_batches_ = 0;
+    frame_timing_frame_sync_ms_ = 0.0;
+    frame_timing_frame_record_ms_ = 0.0;
+    frame_timing_frame_execute_ms_ = 0.0;
     frame_timing_frame_waited_ms_ = 0.0;
+    frame_timing_frame_diagnostic_ms_ = 0.0;
+    frame_timing_frame_present_ms_ = 0.0;
+    frame_timing_total_elapsed_ms_ = 0.0;
+    frame_timing_total_sync_ms_ = 0.0;
+    frame_timing_total_record_ms_ = 0.0;
+    frame_timing_total_execute_ms_ = 0.0;
     frame_timing_total_waited_ms_ = 0.0;
+    frame_timing_total_diagnostic_ms_ = 0.0;
+    frame_timing_total_present_ms_ = 0.0;
     frame_timing_total_frames_ = 0;
   }
 
@@ -201,17 +382,53 @@ private:
     const double elapsed_ms =
         std::chrono::duration<double, std::milli>(now - frame_timing_last_present_).count();
     ++frame_timing_total_frames_;
+    frame_timing_total_elapsed_ms_ += elapsed_ms;
+    const double accounted_ms =
+        frame_timing_frame_sync_ms_ +
+        frame_timing_frame_record_ms_ +
+        frame_timing_frame_execute_ms_ +
+        frame_timing_frame_waited_ms_ +
+        frame_timing_frame_diagnostic_ms_ +
+        frame_timing_frame_present_ms_;
+    const double unattributed_ms = elapsed_ms > accounted_ms ? elapsed_ms - accounted_ms : 0.0;
 
     std::ostringstream line;
     line << "frame=" << present_frame_index
          << " elapsed_ms=" << elapsed_ms
          << " batches=" << frame_timing_frame_batches_
-         << " waited_ms=" << frame_timing_frame_waited_ms_;
+         << " retrace_sync_ms=" << frame_timing_frame_sync_ms_
+         << " retrace_record_ms=" << frame_timing_frame_record_ms_
+         << " backend_execute_ms=" << frame_timing_frame_execute_ms_
+         << " backend_wait_ms=" << frame_timing_frame_waited_ms_
+         << " diagnostic_ms=" << frame_timing_frame_diagnostic_ms_
+         << " present_ms=" << frame_timing_frame_present_ms_
+         << " accounted_ms=" << accounted_ms
+         << " unattributed_ms=" << unattributed_ms;
     emit_frame_timing_line(line.str());
 
     frame_timing_last_present_ = now;
     frame_timing_frame_batches_ = 0;
+    frame_timing_frame_sync_ms_ = 0.0;
+    frame_timing_frame_record_ms_ = 0.0;
+    frame_timing_frame_execute_ms_ = 0.0;
     frame_timing_frame_waited_ms_ = 0.0;
+    frame_timing_frame_diagnostic_ms_ = 0.0;
+    frame_timing_frame_present_ms_ = 0.0;
+  }
+
+  void accumulate_frame_duration(
+      double &frame_target,
+      double &total_target,
+      std::chrono::steady_clock::time_point begin)
+  {
+    if (!frame_timing_active_) {
+      return;
+    }
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+            .count();
+    frame_target += elapsed_ms;
+    total_target += elapsed_ms;
   }
 
   void accumulate_submit_wait_timing(std::chrono::steady_clock::time_point wait_begin)
@@ -232,7 +449,26 @@ private:
       return;
     }
     std::ostringstream line;
-    line << "total_wait_ms=" << frame_timing_total_waited_ms_
+    const double accounted_ms =
+        frame_timing_total_sync_ms_ +
+        frame_timing_total_record_ms_ +
+        frame_timing_total_execute_ms_ +
+        frame_timing_total_waited_ms_ +
+        frame_timing_total_diagnostic_ms_ +
+        frame_timing_total_present_ms_;
+    const double unattributed_ms =
+        frame_timing_total_elapsed_ms_ > accounted_ms
+            ? frame_timing_total_elapsed_ms_ - accounted_ms
+            : 0.0;
+    line << "total_elapsed_ms=" << frame_timing_total_elapsed_ms_
+         << " total_retrace_sync_ms=" << frame_timing_total_sync_ms_
+         << " total_retrace_record_ms=" << frame_timing_total_record_ms_
+         << " total_backend_execute_ms=" << frame_timing_total_execute_ms_
+         << " total_backend_wait_ms=" << frame_timing_total_waited_ms_
+         << " total_diagnostic_ms=" << frame_timing_total_diagnostic_ms_
+         << " total_present_ms=" << frame_timing_total_present_ms_
+         << " total_accounted_ms=" << accounted_ms
+         << " total_unattributed_ms=" << unattributed_ms
          << " total_frames=" << frame_timing_total_frames_;
     emit_frame_timing_line(line.str());
     frame_timing_active_ = false;
@@ -2845,6 +3081,15 @@ private:
         }
       }
     } frame_timing_scope{this};
+    if (checkpoint_output_requested() && replay_options_->checkpoint_frame == 1) {
+      if (!maybe_write_checkpoint_after_present(1, 0, error)) {
+        if (error.empty()) {
+          error = "failed to write D3D12 replay checkpoint";
+        }
+        return false;
+      }
+      return true;
+    }
     for (const auto &batch : backend_.submissions_.completed_batches()) {
       // Per-batch timing + command-count instrumentation: a batch that takes a long time gets a
       // milestone with how many commands it recorded, so a slow anchor batch is attributable to
@@ -2862,16 +3107,26 @@ private:
       // the command list is being replay-recorded, so preload execution-time resource data and
       // shader-visible descriptors before recording the lists. CPU descriptors used by commands
       // such as OMSetRenderTargets are still materialized at their command sequence below.
-      if (!sync_resource_data_until(batch.execute_sequence, error) ||
-          !sync_descriptors_until(batch.execute_sequence, error)) {
-        if (error.empty()) {
-          error = "batch pre-record sync failed (batch=" +
-                  std::to_string(replay_batch_index_) +
-                  " seq=" + std::to_string(batch.execute_sequence) + ")";
+      {
+        const auto sync_begin = std::chrono::steady_clock::now();
+        const bool sync_ok =
+            sync_resource_data_until(batch.execute_sequence, error) &&
+            sync_descriptors_until(batch.execute_sequence, error);
+        accumulate_frame_duration(
+            frame_timing_frame_sync_ms_,
+            frame_timing_total_sync_ms_,
+            sync_begin);
+        if (!sync_ok) {
+          if (error.empty()) {
+            error = "batch pre-record sync failed (batch=" +
+                    std::to_string(replay_batch_index_) +
+                    " seq=" + std::to_string(batch.execute_sequence) + ")";
+          }
+          return false;
         }
-        return false;
       }
       for (const auto command_list_id : batch.command_list_ids) {
+        const auto record_begin = std::chrono::steady_clock::now();
         auto native_it = command_lists_.find(command_list_id);
         if (native_it == command_lists_.end()) {
           return fail(error, "submission references an unknown command list");
@@ -2895,15 +3150,28 @@ private:
         }
         native_lists.push_back(native_it->second.list.get());
         recorded_native_lists.push_back(&native_it->second);
+        accumulate_frame_duration(
+            frame_timing_frame_record_ms_,
+            frame_timing_total_record_ms_,
+            record_begin);
       }
-      if (!sync_resource_data_until(batch.execute_sequence, error) ||
-          !sync_descriptors_until(batch.execute_sequence, error) ||
-          !sync_tile_mapping_updates_until(batch.execute_sequence, error)) {
-        if (error.empty()) {
-          error = "batch pre-submit sync failed (batch=" + std::to_string(replay_batch_index_) +
-                  " seq=" + std::to_string(batch.execute_sequence) + ")";
+      {
+        const auto sync_begin = std::chrono::steady_clock::now();
+        const bool sync_ok =
+            sync_resource_data_until(batch.execute_sequence, error) &&
+            sync_descriptors_until(batch.execute_sequence, error) &&
+            sync_tile_mapping_updates_until(batch.execute_sequence, error);
+        accumulate_frame_duration(
+            frame_timing_frame_sync_ms_,
+            frame_timing_total_sync_ms_,
+            sync_begin);
+        if (!sync_ok) {
+          if (error.empty()) {
+            error = "batch pre-submit sync failed (batch=" + std::to_string(replay_batch_index_) +
+                    " seq=" + std::to_string(batch.execute_sequence) + ")";
+          }
+          return false;
         }
-        return false;
       }
       if (!native_lists.empty()) {
         // Route the batch to a queue matching its command-list type (DIRECT/COMPUTE/COPY). All
@@ -2925,7 +3193,14 @@ private:
                             " seq=" + std::to_string(batch.execute_sequence) +
                             " qtype=" + std::to_string(static_cast<int>(batch_type))).c_str());
         }
-        batch_queue->ExecuteCommandLists(static_cast<UINT>(native_lists.size()), native_lists.data());
+        {
+          const auto execute_begin = std::chrono::steady_clock::now();
+          batch_queue->ExecuteCommandLists(static_cast<UINT>(native_lists.size()), native_lists.data());
+          accumulate_frame_duration(
+              frame_timing_frame_execute_ms_,
+              frame_timing_total_execute_ms_,
+              execute_begin);
+        }
         if (trace_batch) {
           replay_milestone((std::string("submit:executed batch=") +
                             std::to_string(replay_batch_index_)).c_str());
@@ -2935,13 +3210,21 @@ private:
           replay_milestone((std::string("submit:waited batch=") +
                             std::to_string(replay_batch_index_)).c_str());
         }
-        if (!flush_target_texture_watch(recorded_native_lists, error)) {
-          if (error.empty()) {
-            error = "target texture watch failed (batch=" +
-                    std::to_string(replay_batch_index_) +
-                    " seq=" + std::to_string(batch.execute_sequence) + ")";
+        {
+          const auto diagnostic_begin = std::chrono::steady_clock::now();
+          const bool diagnostic_ok = flush_target_texture_watch(recorded_native_lists, error);
+          accumulate_frame_duration(
+              frame_timing_frame_diagnostic_ms_,
+              frame_timing_total_diagnostic_ms_,
+              diagnostic_begin);
+          if (!diagnostic_ok) {
+            if (error.empty()) {
+              error = "target texture watch failed (batch=" +
+                      std::to_string(replay_batch_index_) +
+                      " seq=" + std::to_string(batch.execute_sequence) + ")";
+            }
+            return false;
           }
-          return false;
         }
         // Detect an asynchronous GPU fault from this batch's submission. wait_for_gpu() cannot tell
         // a completed fence from a removed device, so check explicitly and stop at the offending
@@ -2996,15 +3279,28 @@ private:
           flags = static_cast<UINT>(semantic.flags);
           break;
         }
-        if (!capture_present_frame(present_frame_index, sync_interval, flags, error)) {
-          if (error.empty()) {
-            error = "capture_present_frame failed (batch=" + std::to_string(replay_batch_index_) +
-                    " frame=" + std::to_string(present_frame_index) + ")";
+        {
+          const auto diagnostic_begin = std::chrono::steady_clock::now();
+          const bool capture_ok = capture_present_frame(present_frame_index, sync_interval, flags, error);
+          accumulate_frame_duration(
+              frame_timing_frame_diagnostic_ms_,
+              frame_timing_total_diagnostic_ms_,
+              diagnostic_begin);
+          if (!capture_ok) {
+            if (error.empty()) {
+              error = "capture_present_frame failed (batch=" + std::to_string(replay_batch_index_) +
+                      " frame=" + std::to_string(present_frame_index) + ")";
+            }
+            return false;
           }
-          return false;
         }
         if (swap_chain_) {
+          const auto present_begin = std::chrono::steady_clock::now();
           HRESULT hr = swap_chain_->Present(sync_interval, flags);
+          accumulate_frame_duration(
+              frame_timing_frame_present_ms_,
+              frame_timing_total_present_ms_,
+              present_begin);
           record_present_semantics(sync_interval, flags, hr);
           if (FAILED(hr)) {
             error = hresult_error("IDXGISwapChain::Present", hr);
@@ -3016,6 +3312,16 @@ private:
           // trace's per-resource swapchain_buffer_index aliasing stays consistent.
           record_present_semantics(sync_interval, flags, S_OK);
           headless_back_buffer_index_ = (headless_back_buffer_index_ + 1) % kBufferCount;
+        }
+        if (!maybe_write_checkpoint_after_present(present_frame_index + 1, batch.present_sequence, error)) {
+          if (error.empty()) {
+            error = "failed to write D3D12 replay checkpoint";
+          }
+          return false;
+        }
+        if (checkpoint_written_) {
+          log_frame_timing(present_frame_index);
+          break;
         }
         log_frame_timing(present_frame_index);
         if (present_delay_ms_ != 0) {
@@ -7485,6 +7791,8 @@ private:
   };
 
   D3D12ReplayBackend &backend_;
+  const D3D12ReplayBackend::NativeReplayOptions *replay_options_ = nullptr;
+  D3D12ReplayBackend::NativeReplayStats *replay_stats_ = nullptr;
   HWND hwnd_ = nullptr;
   UINT present_delay_ms_ = static_cast<UINT>(env_u32("APITRACE_D3D12_RETRACE_PRESENT_DELAY_MS"));
   std::uint64_t replay_stop_after_present_frame_ = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME");
@@ -7499,8 +7807,19 @@ private:
   bool frame_timing_active_ = false;
   std::chrono::steady_clock::time_point frame_timing_last_present_{};
   std::uint64_t frame_timing_frame_batches_ = 0;
+  double frame_timing_frame_sync_ms_ = 0.0;
+  double frame_timing_frame_record_ms_ = 0.0;
+  double frame_timing_frame_execute_ms_ = 0.0;
   double frame_timing_frame_waited_ms_ = 0.0;
+  double frame_timing_frame_diagnostic_ms_ = 0.0;
+  double frame_timing_frame_present_ms_ = 0.0;
+  double frame_timing_total_elapsed_ms_ = 0.0;
+  double frame_timing_total_sync_ms_ = 0.0;
+  double frame_timing_total_record_ms_ = 0.0;
+  double frame_timing_total_execute_ms_ = 0.0;
   double frame_timing_total_waited_ms_ = 0.0;
+  double frame_timing_total_diagnostic_ms_ = 0.0;
+  double frame_timing_total_present_ms_ = 0.0;
   std::uint64_t frame_timing_total_frames_ = 0;
   const char *event_ordered_profile_file_ = std::getenv("DXMT_RETRACE_PROFILE_FILE");
   bool event_ordered_profile_enabled_ =
@@ -7517,6 +7836,7 @@ private:
   std::uint64_t event_ordered_steady_present_intervals_ = 0;
   UINT64 fence_value_ = 0;
   std::uint64_t replay_batch_index_ = 0;
+  bool checkpoint_written_ = false;
   // Per-command-kind cumulative record time (microseconds) + invocation counts, to attribute a slow
   // batch to a specific command kind. kCommandKindCount covers the ReplayCommandKind enum with slack.
   static constexpr std::size_t kCommandKindCount = 64;
@@ -7621,7 +7941,10 @@ public:
 
 class D3D12NativeReplayer {
 public:
-  explicit D3D12NativeReplayer(D3D12ReplayBackend &) {}
+  explicit D3D12NativeReplayer(
+      D3D12ReplayBackend &,
+      const D3D12ReplayBackend::NativeReplayOptions * = nullptr,
+      D3D12ReplayBackend::NativeReplayStats * = nullptr) {}
 
   bool replay(std::string &error)
   {
