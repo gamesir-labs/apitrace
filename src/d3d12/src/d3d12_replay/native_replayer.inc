@@ -21,6 +21,8 @@ std::vector<D3D12_RECT> d3d12_rects_from_payload(const json &payload)
 using RecordPresentFrameFn = void(WINAPI *)(UINT64, UINT, UINT, UINT, UINT, UINT, const void *, SIZE_T);
 using RecordPresentSemanticsFn = void(WINAPI *)(UINT, UINT, HRESULT);
 using CaptureSuppressionFn = void(WINAPI *)();
+using BeginMetalCaptureFn = void(WINAPI *)(ID3D12Device *, const char *);
+using EndMetalCaptureFn = void(WINAPI *)();
 
 #ifdef _WIN32
 template <typename Fn>
@@ -285,6 +287,7 @@ private:
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT x = 0;
     UINT y = 0;
+    bool full_texture = false;
     UINT width = 0;
     UINT height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
@@ -643,6 +646,27 @@ private:
     return lhs_family != 0 && lhs_family == rhs_family;
   }
 
+  static bool present_capture_decode_format_supported(DXGI_FORMAT format)
+  {
+    switch (format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  static bool present_capture_decode_format_is_32bpp(DXGI_FORMAT format)
+  {
+    return present_capture_decode_format_supported(format);
+  }
+
   DXGI_FORMAT effective_swapchain_back_buffer_format() const
   {
     const auto *fallback = recorded_back_buffer();
@@ -695,14 +719,6 @@ private:
   {
     if (device_ && queue_ && fence_) {
       return true;
-    }
-
-    if (!factory_) {
-      HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(factory_.put()));
-      if (FAILED(hr)) {
-        error = hresult_error("CreateDXGIFactory1", hr);
-        return false;
-      }
     }
 
     D3D_FEATURE_LEVEL feature_level = D3D_FEATURE_LEVEL_11_0;
@@ -805,6 +821,14 @@ private:
         }
       }
     } else {
+      if (!factory_) {
+        hr = CreateDXGIFactory1(IID_PPV_ARGS(factory_.put()));
+        if (FAILED(hr)) {
+          error = hresult_error("CreateDXGIFactory1", hr);
+          return false;
+        }
+      }
+
 #ifdef _WIN32
     HINSTANCE instance = GetModuleHandleA(nullptr);
     WNDCLASSA wc{};
@@ -3397,6 +3421,7 @@ private:
     }
     const auto fmt = static_cast<DXGI_FORMAT>(desc.Format);
     switch (fmt) {
+    case DXGI_FORMAT_R11G11B10_FLOAT:
     case DXGI_FORMAT_R10G10B10A2_UNORM:
     case DXGI_FORMAT_R8G8B8A8_UNORM:
     case DXGI_FORMAT_B8G8R8A8_UNORM:
@@ -3440,6 +3465,30 @@ private:
       for (UINT x = 0; x < w; ++x) {
         auto *dst = rgb.data() + static_cast<std::size_t>(x) * 3u;
         switch (fmt) {
+        case DXGI_FORMAT_R11G11B10_FLOAT: {
+          const auto *src = src_row + static_cast<std::size_t>(x) * 4u;
+          const std::uint32_t px =
+              static_cast<std::uint32_t>(src[0]) |
+              (static_cast<std::uint32_t>(src[1]) << 8) |
+              (static_cast<std::uint32_t>(src[2]) << 16) |
+              (static_cast<std::uint32_t>(src[3]) << 24);
+          const float r = half_bits_to_float(px & 0x7FFu, 6, 5);
+          const float g = half_bits_to_float((px >> 11) & 0x7FFu, 6, 5);
+          const float b = half_bits_to_float((px >> 22) & 0x3FFu, 5, 5);
+          auto encode = [](float v) -> std::uint8_t {
+            if (!(v > 0.0f)) {
+              return 0;
+            }
+            if (v >= 1.0f) {
+              return 255;
+            }
+            return static_cast<std::uint8_t>(v * 255.0f + 0.5f);
+          };
+          dst[0] = encode(r);
+          dst[1] = encode(g);
+          dst[2] = encode(b);
+          break;
+        }
         case DXGI_FORMAT_R10G10B10A2_UNORM: {
           const auto *src = src_row + static_cast<std::size_t>(x) * 4u;
           const std::uint32_t px =
@@ -3774,11 +3823,7 @@ private:
     }
     ID3D12Resource *back_buffer = back_buffers_[back_buffer_index].get();
     const D3D12_RESOURCE_DESC desc = back_buffer->GetDesc();
-    switch (desc.Format) {
-    case DXGI_FORMAT_R8G8B8A8_UNORM:
-    case DXGI_FORMAT_R10G10B10A2_UNORM:
-      break;
-    default:
+    if (!present_capture_decode_format_is_32bpp(desc.Format)) {
       return fail(error, "present-frame capture requires an RGBA8 or R10G10B10A2 swapchain");
     }
     if (desc.Width == 0 || desc.Height == 0 ||
@@ -3793,11 +3838,13 @@ private:
     UINT64 readback_size = 0;
     device_->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &num_rows, &row_size, &readback_size);
     DXGI_FORMAT readback_decode_format = footprint.Footprint.Format;
-    switch (readback_decode_format) {
-    case DXGI_FORMAT_R8G8B8A8_UNORM:
-    case DXGI_FORMAT_R10G10B10A2_UNORM:
-      break;
-    default:
+    const DXGI_FORMAT effective_format = effective_swapchain_back_buffer_format();
+    if (effective_format != DXGI_FORMAT_UNKNOWN &&
+        present_capture_decode_format_is_32bpp(effective_format) &&
+        !dxgi_formats_cast_compatible(desc.Format, effective_format)) {
+      readback_decode_format = effective_format;
+    }
+    if (!present_capture_decode_format_supported(readback_decode_format)) {
       return fail(error, "present-frame capture produced an unsupported readback format");
     }
     if (num_rows == 0 || readback_size == 0 || footprint.Footprint.RowPitch < desc.Width * 4u) {
@@ -3914,6 +3961,21 @@ private:
               dst_px[1] = static_cast<std::uint8_t>((g10 * 255u + 511u) / 1023u);
               dst_px[2] = static_cast<std::uint8_t>((b10 * 255u + 511u) / 1023u);
               dst_px[3] = static_cast<std::uint8_t>(a2 * 85u);
+            }
+          } else if (decode_format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                     decode_format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                     decode_format == DXGI_FORMAT_B8G8R8X8_UNORM ||
+                     decode_format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB) {
+            for (UINT col = 0; col < width; ++col) {
+              const auto *src_px = src_row + static_cast<std::size_t>(col) * 4u;
+              auto *dst_px = dst_row + static_cast<std::size_t>(col) * 4u;
+              dst_px[0] = src_px[2];
+              dst_px[1] = src_px[1];
+              dst_px[2] = src_px[0];
+              dst_px[3] = (decode_format == DXGI_FORMAT_B8G8R8X8_UNORM ||
+                           decode_format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB)
+                              ? 255u
+                              : src_px[3];
             }
           } else {
             std::memcpy(dst_row, src_row, row_pitch);
@@ -4115,6 +4177,73 @@ private:
   }
 #endif
 
+  BeginMetalCaptureFn begin_metal_capture_export() const
+  {
+    static BeginMetalCaptureFn begin =
+        resolve_d3d12_export<BeginMetalCaptureFn>("apitrace_d3d12_begin_metal_capture");
+    return begin;
+  }
+
+  EndMetalCaptureFn end_metal_capture_export() const
+  {
+    static EndMetalCaptureFn end =
+        resolve_d3d12_export<EndMetalCaptureFn>("apitrace_d3d12_end_metal_capture");
+    return end;
+  }
+
+  std::filesystem::path event_ordered_metal_capture_path() const
+  {
+    const std::string filename =
+        "retrace-metalcap-frame" + std::to_string(event_ordered_metal_capture_frame_) + ".gputrace";
+    const char *sink_dir = std::getenv("APITRACE_D3D12_RETRACE_PRESENT_FRAME_DIR");
+    if (sink_dir && *sink_dir) {
+      return std::filesystem::absolute(std::filesystem::path(sink_dir) / filename);
+    }
+    return std::filesystem::path("/tmp") / filename;
+  }
+
+  void event_ordered_maybe_begin_metal_capture(std::uint64_t completed_present_frame)
+  {
+    if (event_ordered_metal_capture_frame_ == 0 ||
+        completed_present_frame + 1 != event_ordered_metal_capture_frame_ ||
+        event_ordered_metal_capture_active_) {
+      return;
+    }
+    BeginMetalCaptureFn begin = begin_metal_capture_export();
+    EndMetalCaptureFn end = end_metal_capture_export();
+    if (!begin || !end || !device_) {
+      replay_milestone((std::string("metal-capture:begin-skipped frame=") +
+                        std::to_string(event_ordered_metal_capture_frame_) +
+                        " begin=" + (begin ? "1" : "0") +
+                        " end=" + (end ? "1" : "0") +
+                        " device=" + (device_ ? "1" : "0")).c_str());
+      return;
+    }
+    event_ordered_metal_capture_path_ = event_ordered_metal_capture_path().string();
+    replay_milestone((std::string("metal-capture:begin frame=") +
+                      std::to_string(event_ordered_metal_capture_frame_) +
+                      " path=" + event_ordered_metal_capture_path_).c_str());
+    begin(device_.get(), event_ordered_metal_capture_path_.c_str());
+    event_ordered_metal_capture_active_ = true;
+  }
+
+  void event_ordered_maybe_end_metal_capture(std::uint64_t completed_present_frame)
+  {
+    if (event_ordered_metal_capture_frame_ == 0 ||
+        completed_present_frame != event_ordered_metal_capture_frame_ ||
+        !event_ordered_metal_capture_active_) {
+      return;
+    }
+    EndMetalCaptureFn end = end_metal_capture_export();
+    if (end) {
+      replay_milestone((std::string("metal-capture:end frame=") +
+                        std::to_string(event_ordered_metal_capture_frame_) +
+                        " path=" + event_ordered_metal_capture_path_).c_str());
+      end();
+    }
+    event_ordered_metal_capture_active_ = false;
+  }
+
   trace::ObjectId resource_object_id_for_cpu_descriptor(
       std::uint64_t descriptor,
       std::uint64_t sequence,
@@ -4279,6 +4408,7 @@ private:
         << " rtvs=" << rtvs
         << " vb0=" << target_texture_watch_buffer_view_summary(native.current_vertex_buffer0)
         << " ib=" << target_texture_watch_buffer_view_summary(native.current_index_buffer)
+        << " draw_vertex_count=" << payload_u32(payload, "vertex_count_per_instance")
         << " draw_index_count=" << payload_u32(payload, "index_count_per_instance")
         << " draw_instance_count=" << payload_u32(payload, "instance_count")
         << " draw_start_index=" << payload_u32(payload, "start_index_location")
@@ -4368,6 +4498,7 @@ private:
       return true;
     }
     switch (static_cast<DXGI_FORMAT>(desc.Format)) {
+    case DXGI_FORMAT_R11G11B10_FLOAT:
     case DXGI_FORMAT_R8G8B8A8_UNORM:
     case DXGI_FORMAT_B8G8R8A8_UNORM:
     case DXGI_FORMAT_B8G8R8X8_UNORM:
@@ -4376,16 +4507,29 @@ private:
     default:
       return true;
     }
-    const UINT x = static_cast<UINT>(desc.Width / 2);
-    const UINT y = desc.Height / 2;
+    const bool full_texture =
+        target_texture_watch_near_stop_sequence(command.sequence) &&
+        std::strcmp(reason ? reason : "", "near-stop-scan") != 0;
+    const UINT x = full_texture ? 0u : static_cast<UINT>(desc.Width / 2);
+    const UINT y = full_texture ? 0u : static_cast<UINT>(desc.Height / 2);
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
-    fp.Offset = 0;
-    fp.Footprint.Format = static_cast<DXGI_FORMAT>(desc.Format);
-    fp.Footprint.Width = 1;
-    fp.Footprint.Height = 1;
-    fp.Footprint.Depth = 1;
-    fp.Footprint.RowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-    const UINT64 total = fp.Footprint.RowPitch;
+    UINT rows = 0;
+    UINT64 row_size = 0;
+    UINT64 total = 0;
+    if (full_texture) {
+      device_->GetCopyableFootprints(&desc, 0, 1, 0, &fp, &rows, &row_size, &total);
+    } else {
+      fp.Offset = 0;
+      fp.Footprint.Format = static_cast<DXGI_FORMAT>(desc.Format);
+      fp.Footprint.Width = 1;
+      fp.Footprint.Height = 1;
+      fp.Footprint.Depth = 1;
+      fp.Footprint.RowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+      total = fp.Footprint.RowPitch;
+    }
+    if (total == 0) {
+      return true;
+    }
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_READBACK;
     D3D12_RESOURCE_DESC bd{};
@@ -4415,10 +4559,10 @@ private:
     box.left = x;
     box.top = y;
     box.front = 0;
-    box.right = x + 1;
-    box.bottom = y + 1;
+    box.right = x + (full_texture ? static_cast<UINT>(desc.Width) : 1u);
+    box.bottom = y + (full_texture ? desc.Height : 1u);
     box.back = 1;
-    native.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    native.list->CopyTextureRegion(&dst, 0, 0, 0, &src, full_texture ? nullptr : &box);
     readback.sequence = command.sequence;
     readback.command_list_object_id = command.command_list_object_id;
     readback.kind = command.kind;
@@ -4429,6 +4573,7 @@ private:
     readback.footprint = fp;
     readback.x = x;
     readback.y = y;
+    readback.full_texture = full_texture;
     readback.width = static_cast<UINT>(desc.Width);
     readback.height = desc.Height;
     readback.format = static_cast<DXGI_FORMAT>(desc.Format);
@@ -5080,6 +5225,15 @@ private:
         }
         const auto *base = static_cast<const std::uint8_t *>(mapped) +
                            static_cast<std::size_t>(watch.footprint.Offset);
+        if (watch.full_texture) {
+          D3D12_RESOURCE_DESC desc{};
+          desc.Width = watch.width;
+          desc.Height = watch.height;
+          desc.Format = watch.format;
+          const std::uint64_t dump_index =
+              watch.sequence * 10u + (watch.phase == "after" ? 1u : 0u);
+          write_probe_texture_ppm(target_object_id, dump_index, desc, watch.footprint, base);
+        }
         const auto *px = base;
         UINT r = 0;
         UINT g = 0;
@@ -5299,8 +5453,7 @@ private:
       const bool target_watch_draw =
           target_watch_command &&
           native.type == D3D12_COMMAND_LIST_TYPE_DIRECT &&
-          target_texture_watch_is_draw_command(cmd_ref) &&
-          target_texture_watch_near_stop_sequence(cmd_ref.sequence);
+          target_texture_watch_is_draw_command(cmd_ref);
       if (!error.empty()) {
         return false;
       }
@@ -7336,6 +7489,9 @@ private:
   UINT present_delay_ms_ = static_cast<UINT>(env_u32("APITRACE_D3D12_RETRACE_PRESENT_DELAY_MS"));
   std::uint64_t replay_stop_after_present_frame_ = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME");
   std::uint64_t replay_stop_after_sequence_ = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE");
+  std::uint64_t event_ordered_metal_capture_frame_ = env_u64("DXMT_CAPTURE_FRAME");
+  bool event_ordered_metal_capture_active_ = false;
+  std::string event_ordered_metal_capture_path_;
   bool replay_stop_sequence_reached_ = false;
   bool replay_stop_command_list_id_initialized_ = false;
   trace::ObjectId replay_stop_command_list_id_ = 0;

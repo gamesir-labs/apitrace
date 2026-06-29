@@ -216,7 +216,56 @@
       }
     } payload_override_scope(record_one_payload_override_, payload);
 
-    record_one(native_it->second, record);
+    NativeCommandList &native = native_it->second;
+    std::string target_watch_reason;
+    const bool target_watch_command =
+        target_texture_watch_enabled() &&
+        (native.type == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+         native.type == D3D12_COMMAND_LIST_TYPE_COPY) &&
+        target_command_may_write_watched_texture(
+            native, record, *payload, target_watch_reason, error);
+    if (!error.empty()) {
+      event_ordered_record_error(event, std::move(error));
+      return;
+    }
+    const bool target_watch_focused_sample =
+        target_texture_watch_enabled() &&
+        !target_watch_command &&
+        target_texture_watch_focused_stop_sequence(record.sequence);
+    const char *target_watch_before_phase =
+        target_watch_command ? "before" : "scan-before";
+    const char *target_watch_after_phase =
+        target_watch_command ? "after" : "scan-after";
+    const char *target_watch_reason_cstr =
+        target_watch_command ? target_watch_reason.c_str() : "near-stop-scan";
+    const bool target_watch_draw =
+        target_watch_command &&
+        native.type == D3D12_COMMAND_LIST_TYPE_DIRECT &&
+        target_texture_watch_is_draw_command(record);
+    if ((target_watch_command || target_watch_focused_sample) &&
+        !append_target_texture_watch_readback(
+            native, record, target_watch_before_phase, target_watch_reason_cstr, error)) {
+      event_ordered_record_error(event, std::move(error));
+      return;
+    }
+    if (target_watch_draw) {
+      log_target_texture_watch_draw_state(native, record, *payload, target_watch_reason);
+      if (!append_target_texture_watch_draw_buffer_readbacks(native, record, error)) {
+        event_ordered_record_error(event, std::move(error));
+        return;
+      }
+      if (!begin_target_texture_watch_occlusion(native, record, target_watch_reason, error)) {
+        event_ordered_record_error(event, std::move(error));
+        return;
+      }
+    }
+
+    record_one(native, record);
+    if (target_watch_draw &&
+        !end_target_texture_watch_occlusion(native, error)) {
+      event_ordered_record_error(event, std::move(error));
+      return;
+    }
     if (!record_one_ok_) {
       event_ordered_record_error(event, record_one_error_);
       return;
@@ -228,11 +277,17 @@
       ++event_ordered_dispatches_recorded_;
     }
 
-    if (!update_target_texture_watch_render_targets(native_it->second, record, *payload, error)) {
+    if (!update_target_texture_watch_render_targets(native, record, *payload, error)) {
       event_ordered_record_error(event, std::move(error));
       return;
     }
-    update_target_texture_watch_state(native_it->second, record, *payload);
+    update_target_texture_watch_state(native, record, *payload);
+    if ((target_watch_command || target_watch_focused_sample) &&
+        !append_target_texture_watch_readback(
+            native, record, target_watch_after_phase, target_watch_reason_cstr, error)) {
+      event_ordered_record_error(event, std::move(error));
+      return;
+    }
   }
 
   void handle_record_event(const trace::EventRecord &event)

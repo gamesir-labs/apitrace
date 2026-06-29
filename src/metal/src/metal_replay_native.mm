@@ -619,17 +619,84 @@ bool env_flag_enabled(const char *name)
          std::strcmp(value, "FALSE") != 0;
 }
 
+std::uint64_t env_u64(const char *name, std::uint64_t fallback = 0)
+{
+  const char *value = std::getenv(name);
+  if (value == nullptr || *value == '\0') {
+    return fallback;
+  }
+  char *end = nullptr;
+  const auto parsed = std::strtoull(value, &end, 10);
+  return end != value ? static_cast<std::uint64_t>(parsed) : fallback;
+}
+
+bool metal_retrace_present_capture_enabled()
+{
+  return env_flag_enabled("APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES") ||
+         env_flag_enabled("APITRACE_METAL_RETRACE_CAPTURE_PRESENT_FRAMES");
+}
+
+bool metal_retrace_capture_frame_in_range(std::uint64_t frame_index)
+{
+  static const std::uint64_t capture_from_frame =
+      env_u64("APITRACE_D3D12_RETRACE_CAPTURE_FROM_FRAME");
+  static const std::uint64_t stop_after_present_frame =
+      env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME");
+  if (capture_from_frame != 0 && frame_index < capture_from_frame) {
+    return false;
+  }
+  if (stop_after_present_frame != 0 && frame_index > stop_after_present_frame) {
+    return false;
+  }
+  return true;
+}
+
+const char *pixel_format_name(MTLPixelFormat format)
+{
+  switch (format) {
+  case MTLPixelFormatRGBA8Unorm:
+    return "rgba8unorm";
+  case MTLPixelFormatRGBA8Unorm_sRGB:
+    return "rgba8unorm_srgb";
+  case MTLPixelFormatBGRA8Unorm:
+    return "bgra8unorm";
+  case MTLPixelFormatBGRA8Unorm_sRGB:
+    return "bgra8unorm_srgb";
+  default:
+    return "unsupported";
+  }
+}
+
 class NativeMetalReplayBackend final : public MetalReplayBackend {
 public:
   NativeMetalReplayBackend() = default;
   ~NativeMetalReplayBackend() override = default;
 
+private:
+  struct RenderPassColorTarget {
+    std::uint64_t command_buffer_id = 0;
+    id<MTLTexture> texture = nil;
+    NSUInteger level = 0;
+    NSUInteger slice = 0;
+    NSUInteger depth_plane = 0;
+  };
+
+  struct RenderPassCapture {
+    std::uint64_t pass_index = 0;
+    id<MTLBuffer> readback = nil;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t row_pitch = 0;
+    MTLPixelFormat pixel_format = MTLPixelFormatInvalid;
+  };
+
+public:
   bool initialize(const trace::TraceBundleReader &reader, const ReplayOptions &options) override
   {
     reader_ = &reader;
     options_ = options;
     options_.enable_metal_present_capture =
-        env_flag_enabled("APITRACE_METAL_RETRACE_CAPTURE_PRESENT_FRAMES");
+        metal_retrace_present_capture_enabled();
     index_asset_paths(reader.assets());
     index_asset_paths(reader.metal_assets());
 
@@ -662,7 +729,7 @@ public:
     fences_ = [[NSMutableDictionary alloc] init];
     pending_presents_ = [[NSMutableDictionary alloc] init];
 
-    if (options_.enable_metal_present_capture) {
+    if (options_.enable_metal_present_capture && env_flag_enabled("APITRACE_METAL_RETRACE_CAPTURE_PRESENT_FRAMES")) {
       const char *bundle_root = std::getenv("APITRACE_TRACE_BUNDLE");
       if (bundle_root == nullptr || *bundle_root == '\0') {
         last_error_ = "APITRACE_METAL_RETRACE_CAPTURE_PRESENT_FRAMES requires APITRACE_TRACE_BUNDLE";
@@ -693,6 +760,8 @@ public:
       const json payload = parse_json(event.payload);
       const auto width = payload.value("width", 0u);
       const auto height = payload.value("height", 0u);
+      command_buffer_present_frame_indices_[event.object_id] =
+          json_u64(payload.value("frame_index", json(nullptr)));
       if (width == 0 || height == 0) {
         continue;
       }
@@ -2259,14 +2328,20 @@ private:
 
     NSDictionary *present_info = [pending_presents_ objectForKey:object_key(event.object_id)];
     if (present_info != nil) {
+      if (!flush_render_pass_captures(event.object_id, present_info)) {
+        return false;
+      }
       if (!capture_present_frame(present_info)) {
         return false;
       }
       [pending_presents_ removeObjectForKey:object_key(event.object_id)];
+    } else {
+      discard_render_pass_captures(event.object_id);
     }
 
     [command_buffer_present_textures_ removeObjectForKey:object_key(event.object_id)];
     [command_buffers_ removeObjectForKey:object_key(event.object_id)];
+    command_buffer_present_frame_indices_.erase(event.object_id);
     return true;
   }
 
@@ -2313,7 +2388,7 @@ private:
 	                                           forKey:object_key(command_buffer_id)];
 	    }
 
-    id<MTLTexture> first_color_texture = nil;
+    RenderPassColorTarget primary_color_target{};
     const auto colors = pass.find("colors");
     if (colors != pass.end() && colors->is_array() && !colors->empty()) {
       for (const auto &color : *colors) {
@@ -2344,8 +2419,14 @@ private:
           }
           color_texture = texture_for_id(texture_id);
         }
-        if (first_color_texture == nil) {
-          first_color_texture = color_texture;
+        if (primary_color_target.texture == nil) {
+          primary_color_target = RenderPassColorTarget{
+              command_buffer_id,
+              color_texture,
+              static_cast<NSUInteger>(level),
+              static_cast<NSUInteger>(slice),
+              static_cast<NSUInteger>(depth_plane),
+          };
         }
 
         MTLLoadAction load_action = MTLLoadActionClear;
@@ -2391,7 +2472,6 @@ private:
         }
         color_texture = texture_for_id(color_texture_id);
       }
-      first_color_texture = color_texture;
 
       std::uint32_t slot = 0;
       std::uint64_t level = 0;
@@ -2403,6 +2483,13 @@ private:
           !required_u64(pass, "depth_plane", depth_plane)) {
         return fail("render pass color attachment is missing subresource metadata");
       }
+      primary_color_target = RenderPassColorTarget{
+          command_buffer_id,
+          color_texture,
+          static_cast<NSUInteger>(level),
+          static_cast<NSUInteger>(slice),
+          static_cast<NSUInteger>(depth_plane),
+      };
       std::array<double, 4> clear{};
       if (!required_clear_color(pass, "clear_color", clear)) {
         return fail("render pass color attachment is missing clear_color");
@@ -2464,6 +2551,9 @@ private:
     }
     [render_encoders_ setObject:encoder forKey:object_key(event.object_id)];
     [render_encoder_command_buffers_ setObject:object_key(command_buffer_id) forKey:object_key(event.object_id)];
+    if (primary_color_target.texture != nil) {
+      render_encoder_color_targets_[event.object_id] = primary_color_target;
+    }
     encoder_resource_states_[event.object_id] = {};
     render_vertex_buffer_bindings_[event.object_id] = {};
     render_fragment_buffer_bindings_[event.object_id] = {};
@@ -2517,8 +2607,10 @@ private:
       return fail("render encoder end references missing encoder");
     }
     [encoder endEncoding];
+    capture_render_pass_color_target(encoder_id);
     [render_encoders_ removeObjectForKey:object_key(encoder_id)];
     [render_encoder_command_buffers_ removeObjectForKey:object_key(encoder_id)];
+    render_encoder_color_targets_.erase(encoder_id);
     encoder_resource_states_.erase(encoder_id);
     render_vertex_buffer_bindings_.erase(encoder_id);
     render_fragment_buffer_bindings_.erase(encoder_id);
@@ -2547,6 +2639,93 @@ private:
     [encoder endEncoding];
     [blit_encoders_ removeObjectForKey:object_key(encoder_id)];
     return true;
+  }
+
+  void capture_render_pass_color_target(std::uint64_t encoder_id)
+  {
+    if (!options_.enable_metal_present_capture) {
+      return;
+    }
+    const char *sink_dir = std::getenv("APITRACE_D3D12_RETRACE_PRESENT_FRAME_DIR");
+    if (sink_dir == nullptr || *sink_dir == '\0') {
+      return;
+    }
+    const auto target_it = render_encoder_color_targets_.find(encoder_id);
+    if (target_it == render_encoder_color_targets_.end()) {
+      return;
+    }
+    const RenderPassColorTarget &target = target_it->second;
+    const auto frame_it = command_buffer_present_frame_indices_.find(target.command_buffer_id);
+    if (frame_it == command_buffer_present_frame_indices_.end() ||
+        !metal_retrace_capture_frame_in_range(frame_it->second)) {
+      return;
+    }
+    id<MTLCommandBuffer> command_buffer = command_buffer_for_id(target.command_buffer_id);
+    if (command_buffer == nil || target.texture == nil) {
+      return;
+    }
+    switch (target.texture.pixelFormat) {
+    case MTLPixelFormatRGBA8Unorm:
+    case MTLPixelFormatRGBA8Unorm_sRGB:
+    case MTLPixelFormatBGRA8Unorm:
+    case MTLPixelFormatBGRA8Unorm_sRGB:
+      break;
+    default:
+      std::fprintf(stderr,
+                   "metal retrace pass capture skipped: unsupported color format %s (%lu)\n",
+                   pixel_format_name(target.texture.pixelFormat),
+                   static_cast<unsigned long>(target.texture.pixelFormat));
+      return;
+    }
+    if (target.texture.sampleCount > 1) {
+      std::fprintf(stderr,
+                   "metal retrace pass capture skipped: multisample color target sampleCount=%lu\n",
+                   static_cast<unsigned long>(target.texture.sampleCount));
+      return;
+    }
+    if (target.texture.width == 0 || target.texture.height == 0 ||
+        target.texture.width > std::numeric_limits<std::uint32_t>::max() ||
+        target.texture.height > std::numeric_limits<std::uint32_t>::max()) {
+      std::fprintf(stderr, "metal retrace pass capture skipped: invalid color target dimensions\n");
+      return;
+    }
+
+    const auto width = static_cast<std::uint32_t>(target.texture.width);
+    const auto height = static_cast<std::uint32_t>(target.texture.height);
+    const auto row_pitch = width * 4u;
+    const auto byte_size =
+        static_cast<NSUInteger>(row_pitch) * static_cast<NSUInteger>(height);
+    id<MTLBuffer> readback =
+        [device_ newBufferWithLength:byte_size options:MTLResourceStorageModeShared];
+    if (readback == nil) {
+      std::fprintf(stderr, "metal retrace pass capture skipped: failed to allocate readback buffer\n");
+      return;
+    }
+    id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+    if (blit == nil) {
+      std::fprintf(stderr, "metal retrace pass capture skipped: failed to create readback blit encoder\n");
+      return;
+    }
+    [blit copyFromTexture:target.texture
+              sourceSlice:target.slice
+              sourceLevel:target.level
+             sourceOrigin:MTLOriginMake(0, 0, target.depth_plane)
+               sourceSize:MTLSizeMake(width, height, 1)
+                 toBuffer:readback
+        destinationOffset:0
+   destinationBytesPerRow:row_pitch
+ destinationBytesPerImage:static_cast<NSUInteger>(row_pitch) * static_cast<NSUInteger>(height)];
+    [blit endEncoding];
+
+    auto &captures = render_pass_captures_[target.command_buffer_id];
+    captures.push_back(RenderPassCapture{
+        ++render_pass_indices_[target.command_buffer_id],
+        readback,
+        width,
+        height,
+        row_pitch,
+        target.texture.pixelFormat,
+    });
   }
 
   bool blit_encoder_batch(const trace::MetalEventRecord &event, const json &payload)
@@ -4052,7 +4231,7 @@ private:
 
   bool capture_present_frame(NSDictionary *present_info)
   {
-    if (!capture_writer_ || !options_.enable_metal_present_capture) {
+    if (!options_.enable_metal_present_capture) {
       return true;
     }
 
@@ -4071,6 +4250,21 @@ private:
           bytesPerRow:row_pitch
            fromRegion:MTLRegionMake2D(0, 0, width, height)
           mipmapLevel:0];
+    if (!write_present_frame_to_dir(
+            "present-frame",
+            static_cast<std::uint64_t>([present_info[@"frame_index"] unsignedLongLongValue]),
+            0,
+            width,
+            height,
+            row_pitch,
+            texture.pixelFormat,
+            bytes.data(),
+            bytes.size())) {
+      return false;
+    }
+    if (!capture_writer_) {
+      return true;
+    }
 
     trace::AssetRecord asset;
     asset.blob_id = ++capture_sequence_;
@@ -4096,6 +4290,144 @@ private:
                          {"frame_path", asset.relative_path.generic_string()}}
                             .dump();
     capture_writer_->append_call_event(event);
+    return true;
+  }
+
+  bool flush_render_pass_captures(std::uint64_t command_buffer_id, NSDictionary *present_info)
+  {
+    const auto frame_index =
+        static_cast<std::uint64_t>([present_info[@"frame_index"] unsignedLongLongValue]);
+    auto captures_it = render_pass_captures_.find(command_buffer_id);
+    if (captures_it == render_pass_captures_.end()) {
+      return true;
+    }
+    if (!metal_retrace_capture_frame_in_range(frame_index)) {
+      discard_render_pass_captures(command_buffer_id);
+      return true;
+    }
+    bool ok = true;
+    for (const auto &capture : captures_it->second) {
+      if (capture.readback == nil || capture.readback.contents == nullptr) {
+        std::fprintf(stderr,
+                     "metal retrace pass capture skipped: frame=%llu pass=%llu has no readback contents\n",
+                     static_cast<unsigned long long>(frame_index),
+                     static_cast<unsigned long long>(capture.pass_index));
+        continue;
+      }
+      if (!write_present_frame_to_dir(
+              "pass",
+              frame_index,
+              capture.pass_index,
+              capture.width,
+              capture.height,
+              capture.row_pitch,
+              capture.pixel_format,
+              capture.readback.contents,
+              static_cast<std::size_t>(capture.row_pitch) * static_cast<std::size_t>(capture.height))) {
+        ok = false;
+      }
+    }
+    discard_render_pass_captures(command_buffer_id);
+    return ok;
+  }
+
+  void discard_render_pass_captures(std::uint64_t command_buffer_id)
+  {
+    render_pass_captures_.erase(command_buffer_id);
+    render_pass_indices_.erase(command_buffer_id);
+  }
+
+  bool write_present_frame_to_dir(
+      const char *kind,
+      std::uint64_t frame_index,
+      std::uint64_t pass_index,
+      std::uint32_t width,
+      std::uint32_t height,
+      std::uint32_t row_pitch,
+      MTLPixelFormat pixel_format,
+      const void *rgba_data,
+      std::size_t rgba_size)
+  {
+    const char *dir = std::getenv("APITRACE_D3D12_RETRACE_PRESENT_FRAME_DIR");
+    if (dir == nullptr || *dir == '\0') {
+      return true;
+    }
+    if (!metal_retrace_capture_frame_in_range(frame_index)) {
+      return true;
+    }
+    if (rgba_data == nullptr || width == 0 || height == 0 || row_pitch < width * 4u ||
+        rgba_size < static_cast<std::size_t>(row_pitch) * static_cast<std::size_t>(height)) {
+      std::fprintf(stderr,
+                   "metal retrace %s capture skipped: invalid readback layout frame=%llu pass=%llu\n",
+                   kind,
+                   static_cast<unsigned long long>(frame_index),
+                   static_cast<unsigned long long>(pass_index));
+      return true;
+    }
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(fs::path(dir), ec);
+    if (ec) {
+      last_error_ = "failed to create present-frame sink dir: " + ec.message();
+      return false;
+    }
+
+    char stem[96];
+    if (std::strcmp(kind, "pass") == 0) {
+      std::snprintf(stem, sizeof(stem), "pass-%06llu-%06llu",
+                    static_cast<unsigned long long>(frame_index),
+                    static_cast<unsigned long long>(pass_index));
+    } else {
+      std::snprintf(stem, sizeof(stem), "present-frame-%06llu",
+                    static_cast<unsigned long long>(frame_index));
+    }
+
+    const auto *bytes = static_cast<const std::uint8_t *>(rgba_data);
+    std::vector<std::uint8_t> rgba(static_cast<std::size_t>(width) * 4u *
+                                  static_cast<std::size_t>(height));
+    for (std::uint32_t row = 0; row < height; ++row) {
+      const auto *src_row = bytes + static_cast<std::size_t>(row) * row_pitch;
+      auto *dst_row = rgba.data() + static_cast<std::size_t>(row) *
+                                      static_cast<std::size_t>(width) * 4u;
+      switch (pixel_format) {
+      case MTLPixelFormatRGBA8Unorm:
+      case MTLPixelFormatRGBA8Unorm_sRGB:
+        std::memcpy(dst_row, src_row, static_cast<std::size_t>(width) * 4u);
+        break;
+      case MTLPixelFormatBGRA8Unorm:
+      case MTLPixelFormatBGRA8Unorm_sRGB:
+        for (std::uint32_t col = 0; col < width; ++col) {
+          const auto *src = src_row + static_cast<std::size_t>(col) * 4u;
+          auto *dst = dst_row + static_cast<std::size_t>(col) * 4u;
+          dst[0] = src[2];
+          dst[1] = src[1];
+          dst[2] = src[0];
+          dst[3] = src[3];
+        }
+        break;
+      default:
+        std::fprintf(stderr,
+                     "metal retrace %s capture skipped: unsupported readback format %s (%lu)\n",
+                     kind,
+                     pixel_format_name(pixel_format),
+                     static_cast<unsigned long>(pixel_format));
+        return true;
+      }
+    }
+
+    const fs::path raw_path = fs::path(dir) / (std::string(stem) + ".rgba");
+    std::ofstream raw(raw_path, std::ios::binary | std::ios::trunc);
+    if (!raw) {
+      last_error_ = "failed to open present-frame raw file: " + raw_path.string();
+      return false;
+    }
+    raw.write(reinterpret_cast<const char *>(rgba.data()),
+              static_cast<std::streamsize>(rgba.size()));
+    if (!raw) {
+      last_error_ = "failed to write present-frame raw file: " + raw_path.string();
+      return false;
+    }
     return true;
   }
 
@@ -4135,6 +4467,10 @@ private:
   std::unordered_map<std::uint64_t, TextureState> texture_states_;
   std::unordered_map<std::uint64_t, SamplerState> sampler_states_;
   std::unordered_map<std::uint64_t, EncoderResourceState> encoder_resource_states_;
+  std::unordered_map<std::uint64_t, RenderPassColorTarget> render_encoder_color_targets_;
+  std::unordered_map<std::uint64_t, std::vector<RenderPassCapture>> render_pass_captures_;
+  std::unordered_map<std::uint64_t, std::uint64_t> render_pass_indices_;
+  std::unordered_map<std::uint64_t, std::uint64_t> command_buffer_present_frame_indices_;
   std::unordered_map<std::uint64_t, BufferBindings> render_vertex_buffer_bindings_;
   std::unordered_map<std::uint64_t, BufferBindings> render_fragment_buffer_bindings_;
   std::unordered_map<std::uint64_t, BufferBindings> compute_buffer_bindings_;

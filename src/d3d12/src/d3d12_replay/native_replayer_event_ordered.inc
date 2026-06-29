@@ -176,6 +176,10 @@
         backend_.event_ordered_replay_timing_.us_iter_total +=
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _iter_t0).count();
       }
+      if (replay_stop_after_sequence_ != 0 &&
+          event_sequence >= replay_stop_after_sequence_) {
+        event_ordered_stop_requested_ = true;
+      }
       if (event_ordered_stop_requested_) {
         break;
       }
@@ -186,6 +190,11 @@
       if (!event_ordered_final_drain_queues(error)) {
         return false;
       }
+    }
+    if (replay_stop_after_sequence_ != 0) {
+      event_ordered_log("[event-ordered] probe:context label=stop-sequence index=" +
+                        std::to_string(replay_stop_after_sequence_));
+      probe_configured_resources(replay_stop_after_sequence_);
     }
     const std::string summary = "[event-ordered] iterated " + std::to_string(event_count) +
                                 " events, categories_hit=" + event_ordered_categories_summary();
@@ -800,6 +809,9 @@ private:
       record_present_semantics(present.sync_interval, present.flags, S_OK);
       headless_back_buffer_index_ = (headless_back_buffer_index_ + 1) % kBufferCount;
     }
+
+    event_ordered_maybe_begin_metal_capture(present.frame_index);
+    event_ordered_maybe_end_metal_capture(present.frame_index);
 
     ++event_ordered_presents_executed_;
     note_event_ordered_present_timing();

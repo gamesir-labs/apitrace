@@ -139,6 +139,25 @@
     event_ordered_command_lists_submitted_ += native_lists.size();
     backend_.event_ordered_metal_calls_replayed_ += native_lists.size();
 
+    if (target_texture_watch_enabled()) {
+      if (!event_ordered_drain_queue(event.object_refs[0], queue, error)) {
+        event_ordered_submit_error(event, std::move(error));
+        return;
+      }
+      std::vector<NativeCommandList *> recorded_native_lists;
+      recorded_native_lists.reserve(command_list_count);
+      for (std::size_t index = 1; index < event.object_refs.size(); ++index) {
+        auto list_it = command_lists_.find(event.object_refs[index]);
+        if (list_it != command_lists_.end()) {
+          recorded_native_lists.push_back(&list_it->second);
+        }
+      }
+      if (!flush_target_texture_watch(recorded_native_lists, error)) {
+        event_ordered_submit_error(event, std::move(error));
+        return;
+      }
+    }
+
     const std::string removed = device_removed_detail();
     if (!removed.empty()) {
       event_ordered_submit_error(event, removed);
