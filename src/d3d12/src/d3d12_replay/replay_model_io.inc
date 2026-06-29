@@ -131,6 +131,90 @@ struct BinReader {
   }
 };
 
+void replay_model_milestone(const std::string &message)
+{
+  const char *path = std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG");
+  if (path == nullptr || *path == '\0') {
+    return;
+  }
+  std::ofstream out(path, std::ios::app | std::ios::binary);
+  if (out) {
+    out << message << "\n";
+    out.flush();
+  }
+}
+
+std::string mib_string(std::uint64_t bytes)
+{
+  return std::to_string(bytes / (1024ull * 1024ull));
+}
+
+bool read_file_to_string_with_progress(
+    const std::filesystem::path &path,
+    const char *label,
+    std::string &out,
+    std::string &error)
+{
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
+  if (!in.is_open()) {
+    error = std::string("failed to open ") + label + " file: " + path.string();
+    return false;
+  }
+  const auto end = in.tellg();
+  if (end < 0) {
+    error = std::string("failed to determine ") + label + " file size: " + path.string();
+    return false;
+  }
+  const auto size = static_cast<std::uint64_t>(end);
+  if (size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    error = std::string(label) + " file is too large for this process: " + path.string();
+    return false;
+  }
+  in.seekg(0, std::ios::beg);
+  out.assign(static_cast<std::size_t>(size), '\0');
+  replay_model_milestone(
+      std::string("model:read-begin label=") + label +
+      " size_mib=" + mib_string(size));
+  const auto begin = std::chrono::steady_clock::now();
+  auto last_report = begin;
+  std::uint64_t next_report = 512ull * 1024ull * 1024ull;
+  std::uint64_t read_total = 0;
+  constexpr std::uint64_t kChunk = 64ull * 1024ull * 1024ull;
+  while (read_total < size) {
+    const auto remaining = size - read_total;
+    const auto chunk = std::min<std::uint64_t>(remaining, kChunk);
+    in.read(out.data() + static_cast<std::size_t>(read_total), static_cast<std::streamsize>(chunk));
+    if (!in) {
+      error = std::string("failed to read ") + label + " file: " + path.string();
+      return false;
+    }
+    read_total += chunk;
+    const auto now = std::chrono::steady_clock::now();
+    if (read_total >= next_report ||
+        std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= 5) {
+      const auto elapsed_ms = std::max<std::uint64_t>(1, apitrace::d3d12::elapsed_ms(begin));
+      const auto speed_mib_s = (read_total / (1024ull * 1024ull)) * 1000ull / elapsed_ms;
+      replay_model_milestone(
+          std::string("model:read-progress label=") + label +
+          " read_mib=" + mib_string(read_total) +
+          " total_mib=" + mib_string(size) +
+          " speed_mib_s=" + std::to_string(speed_mib_s));
+      while (next_report <= read_total) {
+        next_report += 512ull * 1024ull * 1024ull;
+      }
+      last_report = now;
+    }
+  }
+  const auto elapsed_ms = std::max<std::uint64_t>(1, apitrace::d3d12::elapsed_ms(begin));
+  const auto speed_mib_s = (size / (1024ull * 1024ull)) * 1000ull / elapsed_ms;
+  replay_model_milestone(
+      std::string("model:read-end label=") + label +
+      " size_mib=" + mib_string(size) +
+      " elapsed_ms=" + std::to_string(elapsed_ms) +
+      " speed_mib_s=" + std::to_string(speed_mib_s));
+  return true;
+}
+
 // ----------------------------------------------------------------------------
 // Binary blob pool (bulk byte arrays + large strings), referenced inline by {off,len}
 // ----------------------------------------------------------------------------
@@ -149,10 +233,119 @@ struct BlobWriter {
   }
 };
 
-// Read-only view over the loaded pool; slices it by {off,len} with bounds checks.
+// Read-only view over the on-disk pool; slices it by {off,len} with bounds checks.
 struct BlobReader {
-  const std::uint8_t *data = nullptr;
-  std::size_t size = 0;
+  std::filesystem::path path;
+  std::uint64_t size = 0;
+  mutable std::ifstream stream;
+  mutable std::uint64_t stream_offset = 0;
+  mutable std::uint64_t bytes_read = 0;
+  mutable std::uint64_t next_report = 1024ull * 1024ull * 1024ull;
+  mutable std::chrono::steady_clock::time_point begin{};
+  mutable std::chrono::steady_clock::time_point last_report{};
+
+  bool open(
+      const std::filesystem::path &blob_path,
+      std::uint64_t expected_size,
+      std::string &error)
+  {
+    path = blob_path;
+    std::error_code ec;
+    const auto actual_size = std::filesystem::file_size(blob_path, ec);
+    if (ec) {
+      error = "failed to stat replay-model blob file: " + blob_path.string() + ": " + ec.message();
+      return false;
+    }
+    if (actual_size != expected_size) {
+      error = "replay-model blob size mismatch (file " + std::to_string(actual_size) +
+              ", header " + std::to_string(expected_size) + ")";
+      return false;
+    }
+    stream.open(blob_path, std::ios::binary);
+    if (!stream.is_open()) {
+      error = "failed to open replay-model blob file: " + blob_path.string();
+      return false;
+    }
+    size = expected_size;
+    stream_offset = 0;
+    bytes_read = 0;
+    next_report = 1024ull * 1024ull * 1024ull;
+    begin = std::chrono::steady_clock::now();
+    last_report = begin;
+    replay_model_milestone(
+        std::string("model:blob-open size_mib=") + mib_string(size));
+    return true;
+  }
+
+  bool read_slice(std::uint64_t off, std::uint64_t len, char *dst, BinReader &bin) const
+  {
+    if (off > size || len > size - off) {
+      bin.fail("replay-model blob reference out of bounds");
+      return false;
+    }
+    if (len == 0) {
+      return true;
+    }
+    if (len > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+      bin.fail("replay-model blob slice is too large for this process");
+      return false;
+    }
+    if (stream_offset != off) {
+      stream.clear();
+      stream.seekg(static_cast<std::streamoff>(off), std::ios::beg);
+      if (!stream) {
+        bin.fail("failed to seek replay-model blob file");
+        return false;
+      }
+      stream_offset = off;
+    }
+    constexpr std::uint64_t kChunk = 64ull * 1024ull * 1024ull;
+    std::uint64_t copied = 0;
+    while (copied < len) {
+      const auto remaining = len - copied;
+      const auto chunk = std::min<std::uint64_t>(remaining, kChunk);
+      stream.read(dst + static_cast<std::size_t>(copied), static_cast<std::streamsize>(chunk));
+      if (!stream) {
+        bin.fail("failed to read replay-model blob file");
+        return false;
+      }
+      copied += chunk;
+      stream_offset += chunk;
+      bytes_read += chunk;
+      maybe_report_progress();
+    }
+    return true;
+  }
+
+  void maybe_report_progress() const
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (bytes_read < next_report &&
+        std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() < 5) {
+      return;
+    }
+    const auto elapsed_ms = std::max<std::uint64_t>(1, apitrace::d3d12::elapsed_ms(begin));
+    const auto speed_mib_s = (bytes_read / (1024ull * 1024ull)) * 1000ull / elapsed_ms;
+    replay_model_milestone(
+        std::string("model:blob-progress read_mib=") + mib_string(bytes_read) +
+        " total_mib=" + mib_string(size) +
+        " speed_mib_s=" + std::to_string(speed_mib_s));
+    while (next_report <= bytes_read) {
+      next_report += 1024ull * 1024ull * 1024ull;
+    }
+    last_report = now;
+  }
+
+  void finish_progress() const
+  {
+    const auto elapsed_ms = std::max<std::uint64_t>(1, apitrace::d3d12::elapsed_ms(begin));
+    const auto speed_mib_s = (bytes_read / (1024ull * 1024ull)) * 1000ull / elapsed_ms;
+    replay_model_milestone(
+        std::string("model:blob-end read_mib=") + mib_string(bytes_read) +
+        " total_mib=" + mib_string(size) +
+        " elapsed_ms=" + std::to_string(elapsed_ms) +
+        " speed_mib_s=" + std::to_string(speed_mib_s));
+  }
 };
 
 // ----------------------------------------------------------------------------
@@ -361,11 +554,15 @@ struct ReadArchive {
     if (!bin.ok) {
       return;
     }
-    if (off > blobs.size || len > blobs.size - off) {
-      bin.fail("replay-model blob reference out of bounds");
+    if (len > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+      bin.fail("replay-model blob slice is too large for this process");
       return;
     }
-    bytes.assign(blobs.data + off, blobs.data + off + len);
+    bytes.assign(static_cast<std::size_t>(len), std::uint8_t{0});
+    if (len != 0 &&
+        !blobs.read_slice(off, len, reinterpret_cast<char *>(bytes.data()), bin)) {
+      bytes.clear();
+    }
   }
 
   void blob_string(std::string &text)
@@ -375,11 +572,14 @@ struct ReadArchive {
     if (!bin.ok) {
       return;
     }
-    if (off > blobs.size || len > blobs.size - off) {
-      bin.fail("replay-model blob reference out of bounds");
+    if (len > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+      bin.fail("replay-model blob slice is too large for this process");
       return;
     }
-    text.assign(reinterpret_cast<const char *>(blobs.data + off), static_cast<std::size_t>(len));
+    text.assign(static_cast<std::size_t>(len), '\0');
+    if (len != 0 && !blobs.read_slice(off, len, text.data(), bin)) {
+      text.clear();
+    }
   }
 };
 
@@ -1410,17 +1610,9 @@ bool D3D12ReplayBackend::load_replay_model(
     const std::string &expected_source_bundle_hash,
     std::string &error)
 {
-  // Slurp the structural file (one sequential read, no lexer/DOM).
   std::string structural;
-  {
-    std::ifstream in(json_path, std::ios::binary);
-    if (!in.is_open()) {
-      error = "failed to open replay-model file: " + json_path.string();
-      return false;
-    }
-    std::ostringstream contents;
-    contents << in.rdbuf();
-    structural = contents.str();
+  if (!read_file_to_string_with_progress(json_path, "model-structure", structural, error)) {
+    return false;
   }
 
   BinReader head;
@@ -1464,21 +1656,8 @@ bool D3D12ReplayBackend::load_replay_model(
     return false;
   }
 
-  // Load the blob pool and sanity-check its size.
-  std::string blob_buffer;
-  {
-    std::ifstream blob_in(blob_path, std::ios::binary);
-    if (!blob_in.is_open()) {
-      error = "failed to open replay-model blob file: " + blob_path.string();
-      return false;
-    }
-    std::ostringstream contents;
-    contents << blob_in.rdbuf();
-    blob_buffer = contents.str();
-  }
-  if (blob_buffer.size() != expected_blob_size) {
-    error = "replay-model blob size mismatch (file " + std::to_string(blob_buffer.size()) +
-            ", header " + std::to_string(expected_blob_size) + ")";
+  BlobReader blobs;
+  if (!blobs.open(blob_path, expected_blob_size, error)) {
     return false;
   }
 
@@ -1487,9 +1666,6 @@ bool D3D12ReplayBackend::load_replay_model(
   body.data = structural.data();
   body.size = structural.size();
   body.cursor = head.cursor;
-  BlobReader blobs;
-  blobs.data = reinterpret_cast<const std::uint8_t *>(blob_buffer.data());
-  blobs.size = blob_buffer.size();
   ReadArchive a{body, blobs};
 
   // Reset all state before repopulating.
@@ -1576,6 +1752,7 @@ bool D3D12ReplayBackend::load_replay_model(
   // Blob-bearing vectors.
   a.vec(replay_commands_);
   a.vec(tile_mapping_updates_);
+  blobs.finish_progress();
 
   if (!body.ok) {
     error = body.error.empty() ? "replay-model binary decode failed" : body.error;
@@ -1587,7 +1764,3 @@ bool D3D12ReplayBackend::load_replay_model(
   initialized_ = true;
   return true;
 }
-
-
-
-

@@ -1521,6 +1521,49 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
   impl_->layout.metal_buffers_directory_path = impl_->layout.metal_directory_path / kMetalBuffersDirectoryName;
   impl_->layout.metal_textures_directory_path = impl_->layout.metal_directory_path / kMetalTexturesDirectoryName;
 
+  if (options.metadata_only) {
+    if (!std::filesystem::is_regular_file(impl_->layout.callstream_path)) {
+      impl_->last_error = "missing required file: " + file_label(impl_->layout.callstream_path);
+      return false;
+    }
+    std::ifstream callstream_input(impl_->layout.callstream_path);
+    if (!callstream_input.is_open()) {
+      impl_->last_error = "missing required file: " + file_label(impl_->layout.callstream_path);
+      return false;
+    }
+    std::string line;
+    std::size_t line_number = 0;
+    while (std::getline(callstream_input, line)) {
+      ++line_number;
+      if (line.empty()) {
+        continue;
+      }
+      json record = json::parse(line, nullptr, false);
+      if (record.is_discarded()) {
+        std::ostringstream message;
+        message << file_label(impl_->layout.callstream_path) << ": invalid JSON at line " << line_number;
+        impl_->last_error = message.str();
+        return false;
+      }
+      const auto record_kind = record.value("record_kind", std::string());
+      if (record_kind != "bundle_header") {
+        impl_->last_error = file_label(impl_->layout.callstream_path) + ": first record must be bundle_header";
+        return false;
+      }
+      if (!parse_bundle_header(record, impl_->layout.callstream_path, impl_->metadata, impl_->last_error)) {
+        return false;
+      }
+      impl_->prefix_limited =
+          options.stop_after_sequence != 0 ||
+          options.stop_after_present_frame != 0;
+      impl_->last_error.clear();
+      impl_->open = true;
+      return true;
+    }
+    impl_->last_error = file_label(impl_->layout.callstream_path) + ": missing bundle_header";
+    return false;
+  }
+
   std::chrono::steady_clock::duration parse_assets_index_duration{};
   std::chrono::steady_clock::duration parse_callstream_total_duration{};
   std::chrono::steady_clock::duration callstream_register_blob_refs_duration{};

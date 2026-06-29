@@ -127,6 +127,7 @@ public:
     wait_for_gpu();
     replay_milestone((std::string("dbg:setpso_calls=") + std::to_string(dbg_setpso_calls_) +
                       " copy_calls=" + std::to_string(dbg_copy_calls_)).c_str());
+    dump_command_kind_totals();
     replay_milestone("replay:done");
     return true;
   }
@@ -163,10 +164,94 @@ public:
       if (command_kind_micros_[k] == 0) {
         break;
       }
-      top += " kind" + std::to_string(k) + "=" + std::to_string(command_kind_micros_[k] / 1000) +
+      top += std::string(" ") + replay_command_kind_name(k) + "=" +
+             std::to_string(command_kind_micros_[k] / 1000) +
              "ms/" + std::to_string(command_kind_counts_[k]);
     }
     replay_milestone((std::string(prefix) + " cumtop:" + top).c_str());
+  }
+
+  void dump_command_kind_totals() const
+  {
+    dump_command_kind_breakdown("command-kind:total");
+  }
+
+  static const char *replay_command_kind_name(std::size_t kind)
+  {
+    using Kind = D3D12ReplayBackend::ReplayCommandKind;
+    switch (static_cast<Kind>(kind)) {
+    case Kind::Unknown:
+      return "Unknown";
+    case Kind::BeginCommandList:
+      return "BeginCommandList";
+    case Kind::EndCommandList:
+      return "EndCommandList";
+    case Kind::SetPipelineState:
+      return "SetPipelineState";
+    case Kind::SetRootSignature:
+      return "SetRootSignature";
+    case Kind::SetDescriptorHeaps:
+      return "SetDescriptorHeaps";
+    case Kind::SetRootDescriptorTable:
+      return "SetRootDescriptorTable";
+    case Kind::SetRootConstants:
+      return "SetRootConstants";
+    case Kind::SetRootConstantBufferView:
+      return "SetRootConstantBufferView";
+    case Kind::SetViewports:
+      return "SetViewports";
+    case Kind::SetScissorRects:
+      return "SetScissorRects";
+    case Kind::SetRenderTargets:
+      return "SetRenderTargets";
+    case Kind::ClearRenderTarget:
+      return "ClearRenderTarget";
+    case Kind::ClearDepthStencil:
+      return "ClearDepthStencil";
+    case Kind::ClearUnorderedAccess:
+      return "ClearUnorderedAccess";
+    case Kind::DiscardResource:
+      return "DiscardResource";
+    case Kind::SetPrimitiveTopology:
+      return "SetPrimitiveTopology";
+    case Kind::SetVertexBuffers:
+      return "SetVertexBuffers";
+    case Kind::SetIndexBuffer:
+      return "SetIndexBuffer";
+    case Kind::ResourceBarrier:
+      return "ResourceBarrier";
+    case Kind::SetDynamicState:
+      return "SetDynamicState";
+    case Kind::RenderPass:
+      return "RenderPass";
+    case Kind::Query:
+      return "Query";
+    case Kind::Predication:
+      return "Predication";
+    case Kind::WriteBufferImmediate:
+      return "WriteBufferImmediate";
+    case Kind::TemporalUpscale:
+      return "TemporalUpscale";
+    case Kind::UnsupportedNative:
+      return "UnsupportedNative";
+    case Kind::Draw:
+      return "Draw";
+    case Kind::Dispatch:
+      return "Dispatch";
+    case Kind::ExecuteIndirect:
+      return "ExecuteIndirect";
+    case Kind::ExecuteBundle:
+      return "ExecuteBundle";
+    case Kind::Copy:
+      return "Copy";
+    case Kind::Resolve:
+      return "Resolve";
+    case Kind::MapResource:
+      return "MapResource";
+    case Kind::UnmapResource:
+      return "UnmapResource";
+    }
+    return "ReplayCommandKind";
   }
 
   template <typename Fn>
@@ -354,7 +439,25 @@ private:
     if (!frame_timing_enabled_) {
       return;
     }
-    frame_timing_active_ = true;
+    reset_frame_timing_counters();
+    if (frame_timing_start_frame() <= 1) {
+      start_frame_timing_at_current_point(1);
+    } else {
+      frame_timing_active_ = false;
+      replay_milestone((std::string("frame-timing:warmup-until frame=") +
+                        std::to_string(frame_timing_start_frame())).c_str());
+    }
+  }
+
+  std::uint64_t frame_timing_start_frame() const
+  {
+    return replay_options_ && replay_options_->checkpoint_frame != 0
+        ? replay_options_->checkpoint_frame
+        : 1;
+  }
+
+  void reset_frame_timing_counters()
+  {
     frame_timing_last_present_ = std::chrono::steady_clock::now();
     frame_timing_frame_batches_ = 0;
     frame_timing_frame_sync_ms_ = 0.0;
@@ -371,6 +474,27 @@ private:
     frame_timing_total_diagnostic_ms_ = 0.0;
     frame_timing_total_present_ms_ = 0.0;
     frame_timing_total_frames_ = 0;
+  }
+
+  void start_frame_timing_at_current_point(std::uint64_t start_frame)
+  {
+    if (!frame_timing_enabled_) {
+      return;
+    }
+    reset_frame_timing_counters();
+    frame_timing_active_ = true;
+    replay_milestone((std::string("frame-timing:begin frame=") +
+                      std::to_string(start_frame)).c_str());
+  }
+
+  void maybe_start_frame_timing_after_present(std::uint64_t next_frame_index)
+  {
+    if (!frame_timing_enabled_ || frame_timing_active_) {
+      return;
+    }
+    if (next_frame_index == frame_timing_start_frame()) {
+      start_frame_timing_at_current_point(next_frame_index);
+    }
   }
 
   void log_frame_timing(std::uint64_t present_frame_index)
@@ -2187,7 +2311,7 @@ private:
   void note_back_buffer_rtv_use(const D3D12ReplayBackend::DescriptorBinding &binding,
                                 const char *how, std::uint64_t sequence)
   {
-    if (back_buffer_rtv_slots_.empty()) {
+    if (!back_buffer_rtv_log_enabled_ || back_buffer_rtv_slots_.empty()) {
       return;
     }
     const std::uint64_t key =
@@ -2306,18 +2430,20 @@ private:
       // Diagnostic (BUG-007): record which descriptor slots hold an RTV that points at a swapchain
       // back-buffer, so the clear/set-render-target paths can report whether the back-buffer is ever
       // bound as a DRAW target (OMSetRenderTargets) vs only cleared.
-      if (track_back_buffer_rtv && std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG") && resource != nullptr) {
+      if (track_back_buffer_rtv && resource != nullptr) {
         for (UINT bi = 0; bi < kBufferCount; ++bi) {
           if (back_buffers_[bi] && back_buffers_[bi].get() == resource) {
             back_buffer_rtv_slots_.insert(
                 (static_cast<std::uint64_t>(semantic.binding.heap_object_id) << 20) ^
                 semantic.binding.descriptor_index);
-            replay_milestone((std::string("bb:rtv-created slot heap=") +
-                              std::to_string(semantic.binding.heap_object_id) + " idx=" +
-                              std::to_string(semantic.binding.descriptor_index) + " bb=" +
-                              std::to_string(bi) + " res=" +
-                              std::to_string(semantic.resource_object_id) +
-                              " seq=" + std::to_string(semantic.create_sequence)).c_str());
+            if (back_buffer_rtv_log_enabled_) {
+              replay_milestone((std::string("bb:rtv-created slot heap=") +
+                                std::to_string(semantic.binding.heap_object_id) + " idx=" +
+                                std::to_string(semantic.binding.descriptor_index) + " bb=" +
+                                std::to_string(bi) + " res=" +
+                                std::to_string(semantic.resource_object_id) +
+                                " seq=" + std::to_string(semantic.create_sequence)).c_str());
+            }
             break;
           }
         }
@@ -3081,6 +3207,9 @@ private:
         }
       }
     } frame_timing_scope{this};
+    if (frame_timing_enabled_ && frame_timing_start_frame() == 1 && !frame_timing_active_) {
+      start_frame_timing_at_current_point(1);
+    }
     if (checkpoint_output_requested() && replay_options_->checkpoint_frame == 1) {
       if (!maybe_write_checkpoint_after_present(1, 0, error)) {
         if (error.empty()) {
@@ -3088,7 +3217,6 @@ private:
         }
         return false;
       }
-      return true;
     }
     for (const auto &batch : backend_.submissions_.completed_batches()) {
       // Per-batch timing + command-count instrumentation: a batch that takes a long time gets a
@@ -3250,7 +3378,7 @@ private:
                   .c_str());
         }
       }
-      if (frame_timing_enabled_) {
+      if (frame_timing_active_) {
         ++frame_timing_frame_batches_;
       }
       ++replay_batch_index_;
@@ -3319,11 +3447,8 @@ private:
           }
           return false;
         }
-        if (checkpoint_written_) {
-          log_frame_timing(present_frame_index);
-          break;
-        }
         log_frame_timing(present_frame_index);
+        maybe_start_frame_timing_after_present(present_frame_index + 1);
         if (present_delay_ms_ != 0) {
 #ifdef _WIN32
           Sleep(present_delay_ms_);
@@ -7804,6 +7929,7 @@ private:
   bool replay_stop_command_list_id_initialized_ = false;
   trace::ObjectId replay_stop_command_list_id_ = 0;
   bool frame_timing_enabled_ = env_enabled("APITRACE_D3D12_REPLAY_FRAME_TIMING", false);
+  bool back_buffer_rtv_log_enabled_ = env_enabled("APITRACE_D3D12_RETRACE_BB_RTV_LOG", false);
   bool frame_timing_active_ = false;
   std::chrono::steady_clock::time_point frame_timing_last_present_{};
   std::uint64_t frame_timing_frame_batches_ = 0;

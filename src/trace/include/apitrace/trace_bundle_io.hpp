@@ -142,6 +142,11 @@ public:
     // skipping the multi-GB callstream parse. The caller must re-open with this true if it then
     // needs events() (e.g. model load failed and it must fall back to reconstruction).
     bool parse_callstream_events = true;
+    // When true, open() parses only enough of callstream.jsonl to populate bundle metadata. This is
+    // for persisted replay-model retrace, where the model file owns the D3D object/submission state
+    // and reader assets/checksums/events are unused unless the model load fails and the caller
+    // re-opens normally.
+    bool metadata_only = false;
     // When true, open() discovers extra readable asset records from event payload paths and
     // validates blob_refs against assets.json while parsing the streams. Tools that perform their
     // own full reference validation can disable this to avoid a duplicate serial stream pass.

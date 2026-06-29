@@ -2302,9 +2302,27 @@ bool ReplaySession::run()
       !impl_->options.enable_metal_retrace &&
       env_enabled("APITRACE_D3D12_RETRACE_EVENT_ORDERED");
   const bool d3d12_event_ordered_perf_diag = std::getenv("DXMT_PERF_STATS") != nullptr;
+  const bool d3d12_can_try_replay_model =
+      !impl_->options.enable_metal_retrace &&
+      !d3d12_event_ordered_replay &&
+      !env_enabled("APITRACE_D3D12_RETRACE_IGNORE_MODEL");
+  bool d3d12_model_files_present = false;
+  if (d3d12_can_try_replay_model) {
+    std::error_code model_ec;
+    d3d12_model_files_present =
+        std::filesystem::exists(impl_->options.bundle_root / trace::kD3D12ReplayModelJsonName, model_ec) &&
+        std::filesystem::exists(impl_->options.bundle_root / trace::kD3D12ReplayModelBlobName, model_ec);
+  }
   if (!impl_->options.enable_metal_retrace) {
-    reader_options.stop_after_sequence = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE");
-    reader_options.stop_after_present_frame = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME");
+    const std::uint64_t stop_after_sequence = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE");
+    const std::uint64_t stop_after_present_frame = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME");
+    // When a persisted replay model is available, native replay can honor stop-after internally.
+    // Do not prefix-limit the reader, or the model fast path is disabled and retrace pays the full
+    // callstream parse/reconstruction cost before benchmarking the requested tail frame range.
+    reader_options.stop_after_sequence =
+        d3d12_model_files_present ? 0 : stop_after_sequence;
+    reader_options.stop_after_present_frame =
+        d3d12_model_files_present ? 0 : stop_after_present_frame;
     reader_options.extend_stop_after_sequence_to_command_list_submit =
         reader_options.stop_after_sequence != 0;
     const char *capture_present_frames = std::getenv("APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES");
@@ -2320,18 +2338,17 @@ bool ReplaySession::run()
   // model files present, not IGNORE_MODEL, and not prefix-limited. If the model later fails to
   // load, the D3D12 branch re-opens the reader with events to fall back to reconstruction.
   bool will_try_replay_model = false;
-  if (!impl_->options.enable_metal_retrace &&
-      !d3d12_event_ordered_replay &&
+  if (d3d12_can_try_replay_model &&
       reader_options.stop_after_sequence == 0 &&
       reader_options.stop_after_present_frame == 0 &&
-      !env_enabled("APITRACE_D3D12_RETRACE_IGNORE_MODEL")) {
-    std::error_code model_ec;
-    will_try_replay_model =
-        std::filesystem::exists(impl_->options.bundle_root / trace::kD3D12ReplayModelJsonName, model_ec) &&
-        std::filesystem::exists(impl_->options.bundle_root / trace::kD3D12ReplayModelBlobName, model_ec);
+      d3d12_model_files_present) {
+    will_try_replay_model = true;
   }
   if (will_try_replay_model) {
     reader_options.parse_callstream_events = false;
+    reader_options.metadata_only = true;
+    reader_options.validate_file_references = false;
+    reader_options.discover_referenced_assets = false;
   }
   if (d3d12_event_ordered_replay) {
     reader_options.parse_callstream_events = true;
@@ -2543,6 +2560,13 @@ bool ReplaySession::run()
           // them, so re-open the reader with event parsing enabled. Paid only on this rare failure.
           if (!reader_options.parse_callstream_events) {
             reader_options.parse_callstream_events = true;
+            reader_options.metadata_only = false;
+            reader_options.validate_file_references = true;
+            reader_options.discover_referenced_assets = true;
+            reader_options.stop_after_sequence = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE");
+            reader_options.stop_after_present_frame = env_u64("APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME");
+            reader_options.extend_stop_after_sequence_to_command_list_submit =
+                reader_options.stop_after_sequence != 0;
             const auto reopen_begin = std::chrono::steady_clock::now();
             if (!impl_->reader.open(impl_->options.bundle_root, reader_options)) {
               impl_->last_error = impl_->reader.last_error().empty()

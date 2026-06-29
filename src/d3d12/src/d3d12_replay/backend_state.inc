@@ -2,6 +2,23 @@ D3D12ReplayBackend::D3D12ReplayBackend() = default;
 
 D3D12ReplayBackend::~D3D12ReplayBackend() = default;
 
+namespace {
+
+void d3d12_backend_milestone(const std::string &message)
+{
+  const char *path = std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG");
+  if (path == nullptr || *path == '\0') {
+    return;
+  }
+  std::ofstream out(path, std::ios::app | std::ios::binary);
+  if (out) {
+    out << message << "\n";
+    out.flush();
+  }
+}
+
+} // namespace
+
 bool D3D12ReplayBackend::resolve_descriptor_binding(
     std::uint64_t descriptor,
     bool gpu_descriptor,
@@ -1007,6 +1024,7 @@ bool D3D12ReplayBackend::validate_frame_boundaries(const trace::TraceBundleReade
 
 bool D3D12ReplayBackend::validate_replay_closure()
 {
+  d3d12_backend_milestone("validate:begin replay_closure");
   if (submissions_.has_open_batch()) {
     last_error_ = "D3D12 replay ended with an open submission batch";
     return false;
@@ -1017,55 +1035,91 @@ bool D3D12ReplayBackend::validate_replay_closure()
     return false;
   }
 
+  struct ClosureInterval {
+    std::size_t begin_index = 0;
+    std::size_t end_index = 0;
+    std::uint64_t end_sequence = 0;
+  };
+  std::unordered_map<trace::ObjectId, std::vector<ClosureInterval>> intervals_by_command_list;
+  {
+    const auto build_begin = std::chrono::steady_clock::now();
+    std::unordered_map<trace::ObjectId, std::size_t> open_begin_by_list;
+    for (std::size_t command_index = 0; command_index < replay_commands_.size(); ++command_index) {
+      const auto &command = replay_commands_[command_index];
+      if (command.kind == ReplayCommandKind::BeginCommandList) {
+        open_begin_by_list[command.command_list_object_id] = command_index;
+        continue;
+      }
+      if (command.kind != ReplayCommandKind::EndCommandList) {
+        continue;
+      }
+      const auto open_it = open_begin_by_list.find(command.command_list_object_id);
+      if (open_it == open_begin_by_list.end()) {
+        continue;
+      }
+      intervals_by_command_list[command.command_list_object_id].push_back(
+          ClosureInterval{open_it->second, command_index, command.sequence});
+      open_begin_by_list.erase(open_it);
+    }
+    d3d12_backend_milestone(
+        std::string("validate:index replay_closure command_lists=") +
+        std::to_string(intervals_by_command_list.size()) +
+        " elapsed_ms=" + std::to_string(elapsed_ms(build_begin)));
+  }
+
   const auto find_closed_interval_before = [&](trace::ObjectId command_list_id,
                                                std::uint64_t sequence_limit,
                                                std::size_t &closed_begin_index,
                                                std::size_t &closed_end_index) -> bool {
-    constexpr auto invalid_index = std::numeric_limits<std::size_t>::max();
-    auto current_begin_index = invalid_index;
-    closed_begin_index = invalid_index;
-    closed_end_index = invalid_index;
-
-    for (std::size_t command_index = 0; command_index < replay_commands_.size(); ++command_index) {
-      const auto &command = replay_commands_[command_index];
-      if (command.command_list_object_id != command_list_id) {
-        continue;
-      }
-      if (command.sequence >= sequence_limit) {
-        break;
-      }
-
-      if (command.kind == ReplayCommandKind::BeginCommandList) {
-        current_begin_index = command_index;
-        continue;
-      }
-      if (current_begin_index == invalid_index) {
-        continue;
-      }
-      if (command.kind == ReplayCommandKind::EndCommandList) {
-        closed_begin_index = current_begin_index;
-        closed_end_index = command_index;
-        current_begin_index = invalid_index;
-      }
+    const auto intervals_it = intervals_by_command_list.find(command_list_id);
+    if (intervals_it == intervals_by_command_list.end() || intervals_it->second.empty()) {
+      return false;
     }
-
-    return closed_begin_index != invalid_index && closed_end_index != invalid_index;
+    const auto &intervals = intervals_it->second;
+    const auto lower = std::lower_bound(
+        intervals.begin(),
+        intervals.end(),
+        sequence_limit,
+        [](const ClosureInterval &interval, std::uint64_t sequence) {
+          return interval.end_sequence < sequence;
+        });
+    if (lower == intervals.begin()) {
+      return false;
+    }
+    const ClosureInterval &interval = *(lower - 1);
+    closed_begin_index = interval.begin_index;
+    closed_end_index = interval.end_index;
+    return true;
   };
 
-  std::unordered_set<std::size_t> submitted_command_indices;
-  std::unordered_set<std::string> expanded_intervals;
-  const auto interval_key = [](trace::ObjectId command_list_id,
-                               std::size_t begin_index,
-                               std::size_t end_index) {
-    std::ostringstream key;
-    key << command_list_id << ':' << begin_index << ':' << end_index;
-    return key.str();
+  struct SubmittedIntervalKey {
+    trace::ObjectId command_list_id = 0;
+    std::size_t begin_index = 0;
+    std::size_t end_index = 0;
+
+    bool operator==(const SubmittedIntervalKey &other) const noexcept
+    {
+      return command_list_id == other.command_list_id &&
+             begin_index == other.begin_index &&
+             end_index == other.end_index;
+    }
   };
+  struct SubmittedIntervalKeyHash {
+    std::size_t operator()(const SubmittedIntervalKey &key) const noexcept
+    {
+      std::size_t h = static_cast<std::size_t>(key.command_list_id);
+      h ^= key.begin_index + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+      h ^= key.end_index + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+      return h;
+    }
+  };
+  std::unordered_set<SubmittedIntervalKey, SubmittedIntervalKeyHash> expanded_intervals;
   const auto mark_submitted_interval = [&](auto &self,
                                            trace::ObjectId command_list_id,
                                            std::size_t begin_index,
                                            std::size_t end_index) -> bool {
-    const auto [_, inserted] = expanded_intervals.insert(interval_key(command_list_id, begin_index, end_index));
+    const auto [_, inserted] = expanded_intervals.insert(
+        SubmittedIntervalKey{command_list_id, begin_index, end_index});
     if (!inserted) {
       return true;
     }
@@ -1074,7 +1128,6 @@ bool D3D12ReplayBackend::validate_replay_closure()
       if (command.command_list_object_id != command_list_id) {
         continue;
       }
-      submitted_command_indices.insert(command_index);
       if (command.kind != ReplayCommandKind::ExecuteBundle) {
         continue;
       }
@@ -1150,6 +1203,9 @@ bool D3D12ReplayBackend::validate_replay_closure()
     return false;
   }
 
+  d3d12_backend_milestone(
+      std::string("validate:end replay_closure expanded_intervals=") +
+      std::to_string(expanded_intervals.size()));
 	  return true;
 	}
 
@@ -2567,15 +2623,28 @@ bool D3D12ReplayBackend::finalize_replay(
     const NativeReplayOptions *options,
     NativeReplayStats *stats)
 {
+  d3d12_backend_milestone("finalize:begin");
+  const auto validate_begin = std::chrono::steady_clock::now();
   if (!validate_replay_closure() || !validate_native_replay_readiness()) {
     return false;
   }
-  // resource_versions_ is fully populated by now (reconstruction or model load). Build the
-  // per-object_id version indexes once so replay resolves reused object ids by command sequence.
-  build_resource_version_index();
-  build_pipeline_version_index();
+  d3d12_backend_milestone(
+      std::string("finalize:validated elapsed_ms=") +
+      std::to_string(elapsed_ms(validate_begin)));
+  if (resource_versions_by_id_.empty() || pipeline_versions_by_id_.empty()) {
+    const auto index_begin = std::chrono::steady_clock::now();
+    build_resource_version_index();
+    build_pipeline_version_index();
+    d3d12_backend_milestone(
+        std::string("finalize:indexed elapsed_ms=") +
+        std::to_string(elapsed_ms(index_begin)));
+  } else {
+    d3d12_backend_milestone("finalize:indexed reused");
+  }
   D3D12NativeReplayer native_replayer(*this, options, stats);
-  return native_replayer.replay(last_error_);
+  const bool ok = native_replayer.replay(last_error_);
+  d3d12_backend_milestone(ok ? "finalize:end" : "finalize:FAIL");
+  return ok;
 }
 
 bool D3D12ReplayBackend::replay_event_ordered(const trace::TraceBundleReader &reader)
