@@ -1231,7 +1231,7 @@ private:
 
   bool save_runtime_checkpoint(ReplayCheckpoint &checkpoint, std::string &error)
   {
-    wait_for_gpu();
+    wait_for_all_replay_queues();
     std::filesystem::path blob_staging_path = replay_options_->checkpoint_out;
     blob_staging_path += ".blob.tmp";
     std::error_code ec;
@@ -4592,9 +4592,13 @@ private:
   void build_command_list_intervals()
   {
     command_list_intervals_.clear();
+    command_indices_by_list_.clear();
     std::unordered_map<trace::ObjectId, std::size_t> open_begin;
     for (std::size_t index = 0; index < backend_.replay_commands_.size(); ++index) {
       const auto &command = backend_.replay_commands_[index];
+      if (command.command_list_object_id != 0) {
+        command_indices_by_list_[command.command_list_object_id].push_back(index);
+      }
       if (command.kind == D3D12ReplayBackend::ReplayCommandKind::BeginCommandList) {
         open_begin[command.command_list_object_id] = index;
       } else if (command.kind == D3D12ReplayBackend::ReplayCommandKind::EndCommandList) {
@@ -4643,6 +4647,15 @@ private:
       return nullptr;
     }
     return &*(lower - 1);
+  }
+
+  const std::vector<std::uint64_t> *command_indices_for(trace::ObjectId command_list_id) const
+  {
+    const auto it = command_indices_by_list_.find(command_list_id);
+    if (it == command_indices_by_list_.end()) {
+      return nullptr;
+    }
+    return &it->second;
   }
 
   bool find_submitted_interval(
@@ -5216,8 +5229,9 @@ private:
     if (!queue) {
       return fail(error, "UpdateTileMappings requires a native command queue");
     }
-    const auto resource_it = resources_.find(update.resource_object_id);
-    if (resource_it == resources_.end()) {
+    const ReplaySequenceScope update_scope(this, update.sequence);
+    ID3D12Resource *native_resource = resource_for(update.resource_object_id, error);
+    if (native_resource == nullptr) {
       return fail(error, "UpdateTileMappings references an unknown resource");
     }
     ID3D12Heap *native_heap = nullptr;
@@ -5302,7 +5316,7 @@ private:
     // the pHeap parameter. This build is capture-only and never replays, but
     // it must compile.
     queue->UpdateTileMappings(
-        resource_it->second.resource.get(),
+        native_resource,
         region_count,
         regions.data(),
         region_sizes.data(),
@@ -5317,7 +5331,7 @@ private:
     // build (matching DXMT's d3d12.dll vtable ABI) omits the pHeap parameter.
     (void)native_heap;
     queue->UpdateTileMappings(
-        resource_it->second.resource.get(),
+        native_resource,
         region_count,
         regions.data(),
         region_sizes.data(),
@@ -5952,6 +5966,7 @@ private:
     if (back_buffer_index >= kBufferCount || !back_buffers_[back_buffer_index]) {
       return fail(error, "swapchain back-buffer is missing for present-frame capture");
     }
+    wait_for_all_replay_queues();
     // Diagnostic: dump the center texel of EVERY back-buffer at this present. If all are a flat
     // color, the scene never landed on any swapchain back-buffer (RTV/binding bug); if one holds a
     // real image, the captured index is just rotated wrong. Gated on the milestone log being set.
@@ -7507,9 +7522,8 @@ private:
       std::size_t n_setpso = 0, n_draw = 0;
       const trace::ObjectId dbg_list_id =
           backend_.replay_commands_[begin_index].command_list_object_id;
-      const auto dbg_list_it = backend_.command_lists_.find(dbg_list_id);
-      if (dbg_list_it != backend_.command_lists_.end()) {
-        const auto &dbg_indices = dbg_list_it->second.command_indices;
+      if (const auto *dbg_indices_ptr = command_indices_for(dbg_list_id)) {
+        const auto &dbg_indices = *dbg_indices_ptr;
         const auto dbg_begin = std::upper_bound(
             dbg_indices.begin(), dbg_indices.end(), static_cast<std::uint64_t>(begin_index));
         const auto dbg_end = std::lower_bound(
@@ -7570,7 +7584,11 @@ private:
     if (command_list_state_it == backend_.command_lists_.end()) {
       return fail(error, "record interval references an unknown backend command list");
     }
-    const auto &command_indices = command_list_state_it->second.command_indices;
+    const auto *command_indices_ptr = command_indices_for(this_list_id);
+    if (!command_indices_ptr) {
+      return fail(error, "record interval references a command list with no replay command index");
+    }
+    const auto &command_indices = *command_indices_ptr;
     const auto command_begin = std::upper_bound(
         command_indices.begin(), command_indices.end(), static_cast<std::uint64_t>(begin_index));
     const auto command_end = std::lower_bound(
@@ -9804,6 +9822,7 @@ private:
   std::array<std::uint64_t, kCommandKindCount> command_kind_micros_{};
   std::array<std::uint64_t, kCommandKindCount> command_kind_counts_{};
   std::unordered_map<trace::ObjectId, std::vector<CommandListInterval>> command_list_intervals_;
+  std::unordered_map<trace::ObjectId, std::vector<std::uint64_t>> command_indices_by_list_;
   std::vector<json> payload_dom_cache_;
   std::unordered_set<std::uint64_t> back_buffer_rtv_slots_;
   std::uint64_t dbg_setpso_calls_ = 0;

@@ -1722,7 +1722,9 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       return false;
     }
     auto &state = command_lists_[command_list_object_id];
+    auto command_indices = std::move(state.command_indices);
     state = CommandListSemanticState{};
+    state.command_indices = std::move(command_indices);
     state.recording = true;
     state.first_sequence = event.callsite.sequence;
     state.type = type;
@@ -1744,7 +1746,9 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       return false;
     }
     auto &state = command_lists_[command_list_object_id];
+    auto command_indices = std::move(state.command_indices);
     state = CommandListSemanticState{};
+    state.command_indices = std::move(command_indices);
     state.recording = false;
     state.first_sequence = event.callsite.sequence;
     state.type = payload_u32(payload, "type");
@@ -1775,7 +1779,9 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       last_error_ = record_prefix(event) + ": Reset references an unknown initial pipeline state";
       return false;
     }
+    auto command_indices = std::move(command_list_state->command_indices);
     *command_list_state = CommandListSemanticState{};
+    command_list_state->command_indices = std::move(command_indices);
     command_list_state->recording = true;
     command_list_state->first_sequence = event.callsite.sequence;
     command_list_state->type = allocator_it->second.type;
