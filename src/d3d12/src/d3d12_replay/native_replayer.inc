@@ -125,7 +125,7 @@ public:
       }
       return false;
     }
-    wait_for_gpu();
+    wait_for_all_replay_queues();
     replay_milestone((std::string("dbg:setpso_calls=") + std::to_string(dbg_setpso_calls_) +
                       " copy_calls=" + std::to_string(dbg_copy_calls_)).c_str());
     dump_command_kind_totals();
@@ -1910,6 +1910,17 @@ private:
     std::vector<TargetTextureWatchBufferReadback> target_watch_buffer_readbacks;
   };
 
+  struct PendingAllocatorRelease {
+    ID3D12Fence *fence = nullptr;
+    UINT64 fence_value = 0;
+    ComPtr<ID3D12CommandAllocator> allocator;
+  };
+
+  struct QueueReleaseFence {
+    ComPtr<ID3D12Fence> fence;
+    UINT64 next_value = 0;
+  };
+
   struct ReplaySequenceScope {
     D3D12NativeReplayer *self = nullptr;
     std::uint64_t saved = 0;
@@ -1959,7 +1970,7 @@ private:
 
   void shutdown()
   {
-    wait_for_gpu();
+    wait_for_all_replay_queues();
 #ifdef _WIN32
     if (fence_event_) {
       CloseHandle(fence_event_);
@@ -1968,6 +1979,8 @@ private:
 #endif
     command_lists_.clear();
     command_allocators_.clear();
+    pending_allocator_releases_.clear();
+    queue_release_fences_.clear();
     app_fences_.clear();
     replay_queues_by_object_.clear();
     query_heaps_.clear();
@@ -4240,6 +4253,53 @@ private:
 
   bool create_command_objects(std::string &error)
   {
+    for (const auto &[object_id, queue] : backend_.command_queues_) {
+      const auto type = static_cast<D3D12_COMMAND_LIST_TYPE>(queue.type);
+      switch (type) {
+      case D3D12_COMMAND_LIST_TYPE_DIRECT: {
+        if (!queue_) {
+          return fail(error, "direct replay queue is not initialized");
+        }
+        queue_->AddRef();
+        ComPtr<ID3D12CommandQueue> native;
+        native.reset(queue_.get());
+        replay_queues_by_object_[object_id] = std::move(native);
+        break;
+      }
+      case D3D12_COMMAND_LIST_TYPE_COMPUTE:
+      case D3D12_COMMAND_LIST_TYPE_COPY: {
+        D3D12_COMMAND_QUEUE_DESC desc{};
+        desc.Type = type;
+        desc.Priority = queue.priority;
+        desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(queue.flags);
+        desc.NodeMask = queue.node_mask;
+        ComPtr<ID3D12CommandQueue> native;
+        HRESULT hr = device_->CreateCommandQueue(&desc, IID_PPV_ARGS(native.put()));
+        if (FAILED(hr)) {
+          error = hresult_error("CreateCommandQueue", hr);
+          return false;
+        }
+        replay_queues_by_object_[object_id] = std::move(native);
+        break;
+      }
+      default:
+        return fail(error, "unsupported command queue type for native replay");
+      }
+    }
+
+    for (const auto &[object_id, fence] : backend_.fences_) {
+      ComPtr<ID3D12Fence> native;
+      HRESULT hr = device_->CreateFence(
+          fence.initial_value,
+          static_cast<D3D12_FENCE_FLAGS>(fence.flags),
+          IID_PPV_ARGS(native.put()));
+      if (FAILED(hr)) {
+        error = hresult_error("CreateFence", hr);
+        return false;
+      }
+      app_fences_[object_id] = std::move(native);
+    }
+
     for (const auto &[object_id, command_list] : backend_.command_lists_) {
       switch (static_cast<D3D12_COMMAND_LIST_TYPE>(command_list.type)) {
       case D3D12_COMMAND_LIST_TYPE_DIRECT:
@@ -4380,6 +4440,201 @@ private:
     return false;
   }
 
+  ID3D12CommandQueue *native_queue_for_submission(
+      trace::ObjectId queue_object_id,
+      D3D12_COMMAND_LIST_TYPE fallback_type,
+      std::string &error)
+  {
+    if (queue_object_id != 0) {
+      const auto queue_it = replay_queues_by_object_.find(queue_object_id);
+      if (queue_it == replay_queues_by_object_.end() || !queue_it->second) {
+        fail(error, "submission references an unmaterialized command queue");
+        return nullptr;
+      }
+      return queue_it->second.get();
+    }
+    ID3D12CommandQueue *fallback = get_or_create_queue(fallback_type);
+    if (!fallback) {
+      fail(error, "failed to create command queue for batch list type");
+    }
+    return fallback;
+  }
+
+  bool apply_submission_waits(
+      const D3D12SubmissionBatch &batch,
+      ID3D12CommandQueue *batch_queue,
+      std::string &error)
+  {
+    for (const auto &wait : batch.waits_before_execute) {
+      ID3D12CommandQueue *queue = batch_queue;
+      if (wait.queue_object_id != 0 && wait.queue_object_id != batch.queue_object_id) {
+        const auto queue_it = replay_queues_by_object_.find(wait.queue_object_id);
+        if (queue_it == replay_queues_by_object_.end() || !queue_it->second) {
+          return fail(error, "queue wait references an unmaterialized command queue");
+        }
+        queue = queue_it->second.get();
+      }
+      const auto fence_it = app_fences_.find(wait.fence_object_id);
+      if (fence_it == app_fences_.end() || !fence_it->second) {
+        return fail(error, "queue wait references an unmaterialized app fence");
+      }
+      const HRESULT hr = queue->Wait(fence_it->second.get(), wait.fence_value);
+      if (FAILED(hr)) {
+        error = hresult_error("ID3D12CommandQueue::Wait", hr);
+        return false;
+      }
+      if (std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG")) {
+        replay_milestone((std::string("submit:queue-wait batch=") +
+                          std::to_string(replay_batch_index_) +
+                          " seq=" + std::to_string(batch.execute_sequence) +
+                          " wait_seq=" + std::to_string(wait.sequence) +
+                          " queue=" + std::to_string(wait.queue_object_id) +
+                          " fence=" + std::to_string(wait.fence_object_id) +
+                          " value=" + std::to_string(wait.fence_value))
+                             .c_str());
+      }
+    }
+    return true;
+  }
+
+  bool signal_submission_fence(
+      const D3D12SubmissionBatch &batch,
+      ID3D12CommandQueue *batch_queue,
+      std::string &error)
+  {
+    if (batch.fence_object_id == 0) {
+      return true;
+    }
+    const auto fence_it = app_fences_.find(batch.fence_object_id);
+    if (fence_it == app_fences_.end() || !fence_it->second) {
+      return fail(error, "submission signal references an unmaterialized app fence");
+    }
+    const HRESULT hr = batch_queue->Signal(fence_it->second.get(), batch.fence_value);
+    if (FAILED(hr)) {
+      error = hresult_error("ID3D12CommandQueue::Signal", hr);
+      return false;
+    }
+    if (std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG")) {
+      replay_milestone((std::string("submit:queue-signal batch=") +
+                        std::to_string(replay_batch_index_) +
+                        " seq=" + std::to_string(batch.execute_sequence) +
+                        " signal_seq=" + std::to_string(batch.fence_sequence) +
+                        " queue=" + std::to_string(batch.queue_object_id) +
+                        " fence=" + std::to_string(batch.fence_object_id) +
+                        " value=" + std::to_string(batch.fence_value))
+                           .c_str());
+    }
+    return true;
+  }
+
+  bool apply_cpu_fence_operations_until(std::uint64_t sequence, std::string &error)
+  {
+    while (next_fence_operation_index_ < backend_.fence_operations_.size() &&
+           backend_.fence_operations_[next_fence_operation_index_].sequence <= sequence) {
+      const auto &operation = backend_.fence_operations_[next_fence_operation_index_];
+      if (operation.queue_operation || operation.event_operation) {
+        ++next_fence_operation_index_;
+        continue;
+      }
+      const auto fence_it = app_fences_.find(operation.fence_object_id);
+      if (fence_it == app_fences_.end() || !fence_it->second) {
+        return fail(error, "CPU fence operation references an unmaterialized app fence");
+      }
+      const HRESULT hr = fence_it->second->Signal(operation.fence_value);
+      if (FAILED(hr)) {
+        error = hresult_error("ID3D12Fence::Signal", hr);
+        return false;
+      }
+      if (std::getenv("APITRACE_D3D12_REPLAY_MILESTONE_LOG")) {
+        replay_milestone((std::string("submit:cpu-fence-signal seq=") +
+                          std::to_string(operation.sequence) +
+                          " fence=" + std::to_string(operation.fence_object_id) +
+                          " value=" + std::to_string(operation.fence_value))
+                             .c_str());
+      }
+      ++next_fence_operation_index_;
+    }
+    return true;
+  }
+
+  static bool has_target_texture_watch_outputs(
+      const std::vector<NativeCommandList *> &recorded_lists)
+  {
+    for (const auto *native : recorded_lists) {
+      if (!native) {
+        continue;
+      }
+      if (!native->target_watch_readbacks.empty() ||
+          !native->target_watch_occlusions.empty() ||
+          !native->target_watch_buffer_readbacks.empty()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void retire_pending_allocator_releases()
+  {
+    auto keep = pending_allocator_releases_.begin();
+    for (auto it = pending_allocator_releases_.begin(); it != pending_allocator_releases_.end(); ++it) {
+      if (it->fence && it->fence->GetCompletedValue() >= it->fence_value) {
+        continue;
+      }
+      if (keep != it) {
+        *keep = std::move(*it);
+      }
+      ++keep;
+    }
+    pending_allocator_releases_.erase(keep, pending_allocator_releases_.end());
+  }
+
+  QueueReleaseFence *release_fence_for_queue(ID3D12CommandQueue *queue, std::string &error)
+  {
+    if (!queue) {
+      fail(error, "release fence requested for a null command queue");
+      return nullptr;
+    }
+    const auto key = reinterpret_cast<std::uintptr_t>(queue);
+    auto it = queue_release_fences_.find(key);
+    if (it != queue_release_fences_.end()) {
+      return &it->second;
+    }
+    QueueReleaseFence release;
+    HRESULT hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(release.fence.put()));
+    if (FAILED(hr)) {
+      error = hresult_error("CreateFence(retrace allocator release)", hr);
+      return nullptr;
+    }
+    auto [inserted, _] = queue_release_fences_.emplace(key, std::move(release));
+    return &inserted->second;
+  }
+
+  bool retain_allocator_until_queue_idle(
+      ID3D12CommandQueue *queue,
+      NativeCommandList &native,
+      std::string &error)
+  {
+    if (!native.allocator) {
+      return true;
+    }
+    QueueReleaseFence *release = release_fence_for_queue(queue, error);
+    if (!release) {
+      return false;
+    }
+    const UINT64 value = ++release->next_value;
+    HRESULT hr = queue->Signal(release->fence.get(), value);
+    if (FAILED(hr)) {
+      error = hresult_error("ID3D12CommandQueue::Signal(retrace allocator release)", hr);
+      return false;
+    }
+    PendingAllocatorRelease pending;
+    pending.fence = release->fence.get();
+    pending.fence_value = value;
+    pending.allocator = std::move(native.allocator);
+    pending_allocator_releases_.push_back(std::move(pending));
+    return true;
+  }
+
   bool replay_submissions(std::string &error)
   {
     // Build the per-command-list interval index once, so per-batch interval lookups are a binary
@@ -4492,19 +4747,34 @@ private:
         }
       }
       if (!native_lists.empty()) {
-        // Route the batch to a queue matching its command-list type (DIRECT/COMPUTE/COPY). All
-        // lists in a batch share a type (they executed on one queue). With a full wait_for_gpu after
-        // every batch, cross-queue ordering (e.g. compute auto-exposure -> graphics tonemap) is
-        // preserved by serialization without needing captured fence replay.
+        // Route through the captured queue object when available. Cross-queue ordering is carried by
+        // the batch's captured Queue::Wait records instead of a retrace-side CPU drain.
         D3D12_COMMAND_LIST_TYPE batch_type = command_lists_.at(batch.command_list_ids.front()).type;
-        ID3D12CommandQueue *batch_queue = get_or_create_queue(batch_type);
+        ID3D12CommandQueue *batch_queue =
+            native_queue_for_submission(batch.queue_object_id, batch_type, error);
         if (!batch_queue) {
-          return fail(error, "failed to create command queue for batch list type");
+          return false;
         }
         // Bounded per-batch markers: every batch for the first few, then sparse. Lets us see
-        // whether a stall is between ExecuteCommandLists and wait_for_gpu (DXMT submission) or in
-        // the GPU wait itself, without flooding for a full replay.
+        // whether a stall is before ExecuteCommandLists or in CPU-visible diagnostics, without
+        // flooding for a full replay.
         const bool trace_batch = replay_batch_index_ < 8 || (replay_batch_index_ % 50) == 0;
+        if (!apply_cpu_fence_operations_until(batch.execute_sequence, error)) {
+          if (error.empty()) {
+            error = "apply_cpu_fence_operations_until failed (batch=" +
+                    std::to_string(replay_batch_index_) +
+                    " seq=" + std::to_string(batch.execute_sequence) + ")";
+          }
+          return false;
+        }
+        if (!apply_submission_waits(batch, batch_queue, error)) {
+          if (error.empty()) {
+            error = "apply_submission_waits failed (batch=" +
+                    std::to_string(replay_batch_index_) +
+                    " seq=" + std::to_string(batch.execute_sequence) + ")";
+          }
+          return false;
+        }
         if (trace_batch) {
           replay_milestone((std::string("submit:execute batch=") +
                             std::to_string(replay_batch_index_) +
@@ -4523,10 +4793,32 @@ private:
           replay_milestone((std::string("submit:executed batch=") +
                             std::to_string(replay_batch_index_)).c_str());
         }
-        wait_for_gpu(batch_queue, true);
-        if (trace_batch) {
-          replay_milestone((std::string("submit:waited batch=") +
-                            std::to_string(replay_batch_index_)).c_str());
+        if (!signal_submission_fence(batch, batch_queue, error)) {
+          if (error.empty()) {
+            error = "signal_submission_fence failed (batch=" +
+                    std::to_string(replay_batch_index_) +
+                    " seq=" + std::to_string(batch.execute_sequence) + ")";
+          }
+          return false;
+        }
+        for (auto *native : recorded_native_lists) {
+          if (!native ||
+              !retain_allocator_until_queue_idle(batch_queue, *native, error)) {
+            if (error.empty()) {
+              error = "retain_allocator_until_queue_idle failed (batch=" +
+                      std::to_string(replay_batch_index_) +
+                      " seq=" + std::to_string(batch.execute_sequence) + ")";
+            }
+            return false;
+          }
+        }
+        retire_pending_allocator_releases();
+        if (has_target_texture_watch_outputs(recorded_native_lists)) {
+          wait_for_gpu(batch_queue, true);
+          if (trace_batch) {
+            replay_milestone((std::string("submit:waited-diagnostic batch=") +
+                              std::to_string(replay_batch_index_)).c_str());
+          }
         }
         {
           const auto diagnostic_begin = std::chrono::steady_clock::now();
@@ -6954,11 +7246,13 @@ private:
       std::size_t end_index,
       std::string &error)
   {
-    HRESULT hr = native.allocator->Reset();
+    ComPtr<ID3D12CommandAllocator> allocator;
+    HRESULT hr = device_->CreateCommandAllocator(native.type, IID_PPV_ARGS(allocator.put()));
     if (FAILED(hr)) {
-      error = hresult_error("ID3D12CommandAllocator::Reset", hr);
+      error = hresult_error("CreateCommandAllocator(retrace submit)", hr);
       return false;
     }
+    native.allocator = std::move(allocator);
     // Reset with the recorded initial pipeline state, not nullptr. Some applications bind graphics
     // PSO through Reset/CreateCommandList and then draw without a separate SetPipelineState.
     // Passing nullptr leaves the list with no PSO and drops those draws.
@@ -9118,6 +9412,28 @@ private:
     }
   }
 
+  void wait_for_all_replay_queues()
+  {
+    std::unordered_set<ID3D12CommandQueue *> queues;
+    if (queue_) {
+      queues.insert(queue_.get());
+    }
+    for (const auto &[_, queue] : queues_by_type_) {
+      if (queue) {
+        queues.insert(queue.get());
+      }
+    }
+    for (const auto &[_, queue] : replay_queues_by_object_) {
+      if (queue) {
+        queues.insert(queue.get());
+      }
+    }
+    for (auto *queue : queues) {
+      wait_for_gpu(queue);
+    }
+    retire_pending_allocator_releases();
+  }
+
   // Returns a human-readable device-removed reason if the device has faulted, else an empty string.
   // A removed device makes wait_for_gpu() return immediately (GetCompletedValue() == UINT64_MAX),
   // so an illegal submission (e.g. binding a BC7 resource as an RTV) otherwise fails silently and we
@@ -9276,6 +9592,9 @@ private:
   std::size_t next_descriptor_copy_index_ = 0;
   std::size_t next_resource_update_index_ = 0;
   std::size_t next_tile_mapping_update_index_ = 0;
+  std::size_t next_fence_operation_index_ = 0;
+  std::vector<PendingAllocatorRelease> pending_allocator_releases_;
+  std::unordered_map<std::uintptr_t, QueueReleaseFence> queue_release_fences_;
   const json *record_one_payload_override_ = nullptr;
   bool record_one_ok_ = true;
   std::string record_one_error_;
