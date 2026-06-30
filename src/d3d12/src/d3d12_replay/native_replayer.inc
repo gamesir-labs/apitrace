@@ -1903,6 +1903,15 @@ private:
     bool swapchain_back_buffer = false;
   };
 
+  struct ResourceUploadMapping {
+    ID3D12Resource *resource = nullptr;
+    UINT subresource = 0;
+    void *mapped = nullptr;
+    std::uint64_t written_begin = 0;
+    std::uint64_t written_end = 0;
+    bool active = false;
+  };
+
   struct TargetTextureWatchReadback {
     std::uint64_t sequence = 0;
     trace::ObjectId command_list_object_id = 0;
@@ -2882,6 +2891,54 @@ private:
         static_cast<SIZE_T>(update.written_begin),
         static_cast<SIZE_T>(update.written_end)};
     resource->Unmap(update.subresource, &written_range);
+    return true;
+  }
+
+  bool flush_resource_upload_mapping(ResourceUploadMapping &mapping)
+  {
+    if (!mapping.active || mapping.resource == nullptr) {
+      return true;
+    }
+    D3D12_RANGE written_range{
+        static_cast<SIZE_T>(mapping.written_begin),
+        static_cast<SIZE_T>(mapping.written_end)};
+    mapping.resource->Unmap(mapping.subresource, &written_range);
+    mapping = {};
+    return true;
+  }
+
+  bool upload_resource_data_batched(
+      ResourceUploadMapping &mapping,
+      ID3D12Resource *resource,
+      const D3D12ReplayBackend::ResourceDataUpdate &update,
+      std::string &error)
+  {
+    if (!mapping.active ||
+        mapping.resource != resource ||
+        mapping.subresource != update.subresource) {
+      flush_resource_upload_mapping(mapping);
+      void *mapped = nullptr;
+      D3D12_RANGE read_range{0, 0};
+      HRESULT hr = resource->Map(update.subresource, &read_range, &mapped);
+      if (FAILED(hr) || !mapped) {
+        error = hresult_error("Map(resource data)", hr);
+        return false;
+      }
+      mapping.resource = resource;
+      mapping.subresource = update.subresource;
+      mapping.mapped = mapped;
+      mapping.written_begin = update.written_begin;
+      mapping.written_end = update.written_end;
+      mapping.active = true;
+    } else {
+      mapping.written_begin = std::min(mapping.written_begin, update.written_begin);
+      mapping.written_end = std::max(mapping.written_end, update.written_end);
+    }
+
+    std::memcpy(
+        static_cast<std::uint8_t *>(mapping.mapped) + static_cast<std::size_t>(update.written_begin),
+        update.bytes.data(),
+        update.bytes.size());
     return true;
   }
 
@@ -4174,6 +4231,7 @@ private:
     const auto sync_begin = std::chrono::steady_clock::now();
     std::uint64_t updates = 0;
     std::uint64_t update_bytes = 0;
+    ResourceUploadMapping upload_mapping;
     const ReplaySequenceScope sync_scope(this, sequence);
     while (next_resource_update_index_ < resource_update_timeline_.size() &&
            resource_update_timeline_[next_resource_update_index_].sequence <= sequence) {
@@ -4194,12 +4252,14 @@ private:
       const ReplaySequenceScope update_scope(this, entry.sequence);
       ID3D12Resource *target = resource_for(entry.resource_object_id, error);
       if (!target) {
+        flush_resource_upload_mapping(upload_mapping);
         if (event_ordered_recording_) {
           event_ordered_resource_updates_applied_keys_.erase(event_ordered_key);
         }
         return false;
       }
-      if (!upload_resource_data(target, *entry.update, error)) {
+      if (!upload_resource_data_batched(upload_mapping, target, *entry.update, error)) {
+        flush_resource_upload_mapping(upload_mapping);
         if (event_ordered_recording_) {
           event_ordered_resource_updates_applied_keys_.erase(event_ordered_key);
         }
@@ -4212,6 +4272,7 @@ private:
       }
       ++next_resource_update_index_;
     }
+    flush_resource_upload_mapping(upload_mapping);
     accumulate_frame_duration(
         frame_timing_frame_sync_ms_,
         frame_timing_total_sync_ms_,
