@@ -104,6 +104,7 @@ public:
         !log_stage("create_heaps", [&] { return create_heaps(error); }) ||
         !log_stage("create_resources", [&] { return create_resources(error); }) ||
         !log_stage("create_descriptor_heaps", [&] { return create_descriptor_heaps(error); }) ||
+        !log_stage("prepare_descriptor_copy_relocations", [&] { return prepare_descriptor_copy_relocations(error); }) ||
         !log_stage("create_query_heaps", [&] { return create_query_heaps(error); }) ||
         !log_stage("create_root_signatures", [&] { return create_root_signatures(error); }) ||
         !log_stage("create_pipelines", [&] { return create_pipelines(error); }) ||
@@ -287,6 +288,13 @@ private:
         upload->Unmap(0, nullptr);
       }
     }
+  };
+
+  struct ResolvedDescriptorCopy {
+    D3D12_CPU_DESCRIPTOR_HANDLE dst{};
+    D3D12_CPU_DESCRIPTOR_HANDLE src{};
+    std::uint64_t dst_stride = 0;
+    std::uint64_t src_stride = 0;
   };
 
   struct ResourceVersionKey {
@@ -3955,21 +3963,12 @@ private:
     return true;
   }
 
-  bool apply_descriptor_copy(
+  bool resolve_descriptor_copy(
       const D3D12ReplayBackend::CopyDescriptorSemanticState &semantic,
+      std::vector<ResolvedDescriptorCopy> &resolved,
       std::string &error)
   {
-    if (semantic.descriptors.empty()) {
-      return true;
-    }
-    struct ResolvedDescriptorCopy {
-      D3D12_CPU_DESCRIPTOR_HANDLE dst{};
-      D3D12_CPU_DESCRIPTOR_HANDLE src{};
-      std::uint64_t dst_stride = 0;
-      std::uint64_t src_stride = 0;
-    };
-
-    std::vector<ResolvedDescriptorCopy> resolved;
+    resolved.clear();
     resolved.reserve(semantic.descriptors.size());
     for (const auto &descriptor : semantic.descriptors) {
       D3D12ReplayBackend::DescriptorBinding dst_binding;
@@ -4002,7 +4001,15 @@ private:
       }
       resolved.push_back(ResolvedDescriptorCopy{dst, src, dst_stride, src_stride});
     }
+    return true;
+  }
 
+  bool copy_resolved_descriptors(
+      const D3D12ReplayBackend::CopyDescriptorSemanticState &semantic,
+      const std::vector<ResolvedDescriptorCopy> &resolved,
+      std::string &error)
+  {
+    (void)error;
     const auto heap_type = static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(semantic.descriptor_heap_type);
     std::size_t run_begin = 0;
     while (run_begin < resolved.size()) {
@@ -4041,6 +4048,58 @@ private:
     return true;
   }
 
+  bool apply_descriptor_copy(
+      const D3D12ReplayBackend::CopyDescriptorSemanticState &semantic,
+      std::size_t semantic_index,
+      std::string &error)
+  {
+    if (semantic.descriptors.empty()) {
+      return true;
+    }
+    const std::vector<ResolvedDescriptorCopy> *resolved = nullptr;
+    std::vector<ResolvedDescriptorCopy> scratch;
+    if (semantic_index < resolved_descriptor_copies_.size()) {
+      resolved = &resolved_descriptor_copies_[semantic_index];
+    } else {
+      if (!resolve_descriptor_copy(semantic, scratch, error)) {
+        return false;
+      }
+      resolved = &scratch;
+    }
+    return copy_resolved_descriptors(semantic, *resolved, error);
+  }
+
+  bool apply_descriptor_copy(
+      const D3D12ReplayBackend::CopyDescriptorSemanticState &semantic,
+      std::string &error)
+  {
+    std::size_t copy_index = std::numeric_limits<std::size_t>::max();
+    const auto copy_index_it = descriptor_copy_index_by_semantic_.find(&semantic);
+    if (copy_index_it != descriptor_copy_index_by_semantic_.end()) {
+      copy_index = copy_index_it->second;
+    }
+    return apply_descriptor_copy(semantic, copy_index, error);
+  }
+
+  bool prepare_descriptor_copy_relocations(std::string &error)
+  {
+    resolved_descriptor_copies_.clear();
+    resolved_descriptor_copies_.resize(backend_.descriptor_copies_.size());
+    descriptor_copy_index_by_semantic_.clear();
+    descriptor_copy_index_by_semantic_.reserve(backend_.descriptor_copies_.size());
+    for (std::size_t index = 0; index < backend_.descriptor_copies_.size(); ++index) {
+      const auto &semantic = backend_.descriptor_copies_[index];
+      descriptor_copy_index_by_semantic_.emplace(&semantic, index);
+      if (!resolve_descriptor_copy(semantic, resolved_descriptor_copies_[index], error)) {
+        if (error.empty()) {
+          error = "failed to resolve descriptor copy relocation";
+        }
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool sync_descriptors_until(std::uint64_t sequence, std::string &error)
   {
     const auto sync_begin = std::chrono::steady_clock::now();
@@ -4071,9 +4130,14 @@ private:
         ++next_sampler_index_;
         ++sampler_updates;
       } else if (next_descriptor_copy_sequence < next_descriptor_sequence) {
-        descriptor_copy_descriptors +=
-            descriptor_copy_timeline_[next_descriptor_copy_index_]->descriptors.size();
-        if (!apply_descriptor_copy(*descriptor_copy_timeline_[next_descriptor_copy_index_], error)) {
+        const auto *copy = descriptor_copy_timeline_[next_descriptor_copy_index_];
+        descriptor_copy_descriptors += copy->descriptors.size();
+        std::size_t copy_index = std::numeric_limits<std::size_t>::max();
+        const auto copy_index_it = descriptor_copy_index_by_semantic_.find(copy);
+        if (copy_index_it != descriptor_copy_index_by_semantic_.end()) {
+          copy_index = copy_index_it->second;
+        }
+        if (!apply_descriptor_copy(*copy, copy_index, error)) {
           return false;
         }
         ++next_descriptor_copy_index_;
@@ -9729,6 +9793,9 @@ private:
   std::vector<const D3D12ReplayBackend::DescriptorSemanticState *> descriptor_timeline_;
   std::vector<const D3D12ReplayBackend::SamplerSemanticState *> sampler_timeline_;
   std::vector<const D3D12ReplayBackend::CopyDescriptorSemanticState *> descriptor_copy_timeline_;
+  std::vector<std::vector<ResolvedDescriptorCopy>> resolved_descriptor_copies_;
+  std::unordered_map<const D3D12ReplayBackend::CopyDescriptorSemanticState *, std::size_t>
+      descriptor_copy_index_by_semantic_;
   std::vector<ResourceDataUpdateRef> resource_update_timeline_;
   std::deque<D3D12ReplayBackend::ResourceDataUpdate> event_ordered_resource_update_storage_;
   std::unordered_set<std::string> event_ordered_ingested_update_keys_;
