@@ -7267,13 +7267,18 @@ private:
       std::size_t n_setpso = 0, n_draw = 0;
       const trace::ObjectId dbg_list_id =
           backend_.replay_commands_[begin_index].command_list_object_id;
-      for (std::size_t i = begin_index + 1; i < end_index; ++i) {
-        if (backend_.replay_commands_[i].command_list_object_id != dbg_list_id) {
-          continue;
+      const auto dbg_list_it = backend_.command_lists_.find(dbg_list_id);
+      if (dbg_list_it != backend_.command_lists_.end()) {
+        const auto &dbg_indices = dbg_list_it->second.command_indices;
+        const auto dbg_begin = std::upper_bound(
+            dbg_indices.begin(), dbg_indices.end(), static_cast<std::uint64_t>(begin_index));
+        const auto dbg_end = std::lower_bound(
+            dbg_indices.begin(), dbg_indices.end(), static_cast<std::uint64_t>(end_index));
+        for (auto it = dbg_begin; it != dbg_end; ++it) {
+          const auto k = backend_.replay_commands_[static_cast<std::size_t>(*it)].kind;
+          if (k == D3D12ReplayBackend::ReplayCommandKind::SetPipelineState) ++n_setpso;
+          else if (k == D3D12ReplayBackend::ReplayCommandKind::Draw) ++n_draw;
         }
-        const auto k = backend_.replay_commands_[i].kind;
-        if (k == D3D12ReplayBackend::ReplayCommandKind::SetPipelineState) ++n_setpso;
-        else if (k == D3D12ReplayBackend::ReplayCommandKind::Draw) ++n_draw;
       }
       if (n_draw > 0 && native.type != D3D12_COMMAND_LIST_TYPE_DIRECT && dbg < 16) {
         ++dbg;
@@ -7321,11 +7326,18 @@ private:
         target_texture_watch_enabled() &&
         (native.type == D3D12_COMMAND_LIST_TYPE_DIRECT ||
          native.type == D3D12_COMMAND_LIST_TYPE_COPY);
-    for (std::size_t index = begin_index + 1; index < end_index; ++index) {
+    const auto command_list_state_it = backend_.command_lists_.find(this_list_id);
+    if (command_list_state_it == backend_.command_lists_.end()) {
+      return fail(error, "record interval references an unknown backend command list");
+    }
+    const auto &command_indices = command_list_state_it->second.command_indices;
+    const auto command_begin = std::upper_bound(
+        command_indices.begin(), command_indices.end(), static_cast<std::uint64_t>(begin_index));
+    const auto command_end = std::lower_bound(
+        command_indices.begin(), command_indices.end(), static_cast<std::uint64_t>(end_index));
+    for (auto command_it = command_begin; command_it != command_end; ++command_it) {
+      const std::size_t index = static_cast<std::size_t>(*command_it);
       const auto &cmd_ref = backend_.replay_commands_[index];
-      if (cmd_ref.command_list_object_id != this_list_id) {
-        continue;  // interleaved command from another concurrently-recorded list
-      }
       if (stop_this_list && cmd_ref.sequence > replay_stop_after_sequence_) {
         replay_stop_sequence_reached_ = true;
         break;
@@ -7334,7 +7346,8 @@ private:
       // the cumulative per-kind breakdown WHILE still inside the loop (the per-batch batch:slow log
       // only fires at the end, which never happens for a stuck list). Checked sparsely so the check
       // itself is free.
-      if (!grind_warned && (index - begin_index) % 2000 == 0) {
+      const auto command_offset = static_cast<std::size_t>(command_it - command_begin);
+      if (!grind_warned && command_offset % 2000 == 0) {
         const auto grind_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                   std::chrono::steady_clock::now() - record_begin)
                                   .count();
@@ -7342,8 +7355,8 @@ private:
           grind_warned = true;
           dump_command_kind_breakdown(
               (std::string("batch:grinding batch=") + std::to_string(replay_batch_index_) +
-               " at_index=" + std::to_string(index - begin_index) + "/" +
-               std::to_string(end_index - begin_index) + " grind_ms=" + std::to_string(grind_ms) +
+               " at_index=" + std::to_string(command_offset) + "/" +
+               std::to_string(command_end - command_begin) + " grind_ms=" + std::to_string(grind_ms) +
                " cur_kind=" + std::to_string(static_cast<int>(cmd_ref.kind)) +
                " cur_fn=" + cmd_ref.function_name + " cur_seq=" + std::to_string(cmd_ref.sequence))
                   .c_str());
