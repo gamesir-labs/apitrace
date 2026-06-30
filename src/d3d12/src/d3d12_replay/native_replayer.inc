@@ -1652,18 +1652,38 @@ private:
     frame_timing_last_present_ = std::chrono::steady_clock::now();
     frame_timing_frame_batches_ = 0;
     frame_timing_frame_sync_ms_ = 0.0;
+    frame_timing_frame_sync_resource_ms_ = 0.0;
+    frame_timing_frame_sync_descriptor_ms_ = 0.0;
+    frame_timing_frame_sync_tile_ms_ = 0.0;
     frame_timing_frame_record_ms_ = 0.0;
     frame_timing_frame_execute_ms_ = 0.0;
     frame_timing_frame_waited_ms_ = 0.0;
     frame_timing_frame_diagnostic_ms_ = 0.0;
     frame_timing_frame_present_ms_ = 0.0;
+    frame_timing_frame_resource_updates_ = 0;
+    frame_timing_frame_resource_update_bytes_ = 0;
+    frame_timing_frame_descriptor_updates_ = 0;
+    frame_timing_frame_sampler_updates_ = 0;
+    frame_timing_frame_descriptor_copy_ops_ = 0;
+    frame_timing_frame_descriptor_copy_descriptors_ = 0;
+    frame_timing_frame_tile_updates_ = 0;
     frame_timing_total_elapsed_ms_ = 0.0;
     frame_timing_total_sync_ms_ = 0.0;
+    frame_timing_total_sync_resource_ms_ = 0.0;
+    frame_timing_total_sync_descriptor_ms_ = 0.0;
+    frame_timing_total_sync_tile_ms_ = 0.0;
     frame_timing_total_record_ms_ = 0.0;
     frame_timing_total_execute_ms_ = 0.0;
     frame_timing_total_waited_ms_ = 0.0;
     frame_timing_total_diagnostic_ms_ = 0.0;
     frame_timing_total_present_ms_ = 0.0;
+    frame_timing_total_resource_updates_ = 0;
+    frame_timing_total_resource_update_bytes_ = 0;
+    frame_timing_total_descriptor_updates_ = 0;
+    frame_timing_total_sampler_updates_ = 0;
+    frame_timing_total_descriptor_copy_ops_ = 0;
+    frame_timing_total_descriptor_copy_descriptors_ = 0;
+    frame_timing_total_tile_updates_ = 0;
     frame_timing_total_frames_ = 0;
   }
 
@@ -1712,6 +1732,16 @@ private:
          << " elapsed_ms=" << elapsed_ms
          << " batches=" << frame_timing_frame_batches_
          << " retrace_sync_ms=" << frame_timing_frame_sync_ms_
+         << " sync_resource_ms=" << frame_timing_frame_sync_resource_ms_
+         << " sync_descriptor_ms=" << frame_timing_frame_sync_descriptor_ms_
+         << " sync_tile_ms=" << frame_timing_frame_sync_tile_ms_
+         << " resource_updates=" << frame_timing_frame_resource_updates_
+         << " resource_update_bytes=" << frame_timing_frame_resource_update_bytes_
+         << " descriptor_updates=" << frame_timing_frame_descriptor_updates_
+         << " sampler_updates=" << frame_timing_frame_sampler_updates_
+         << " descriptor_copy_ops=" << frame_timing_frame_descriptor_copy_ops_
+         << " descriptor_copy_descriptors=" << frame_timing_frame_descriptor_copy_descriptors_
+         << " tile_updates=" << frame_timing_frame_tile_updates_
          << " retrace_record_ms=" << frame_timing_frame_record_ms_
          << " backend_execute_ms=" << frame_timing_frame_execute_ms_
          << " backend_wait_ms=" << frame_timing_frame_waited_ms_
@@ -1724,11 +1754,21 @@ private:
     frame_timing_last_present_ = now;
     frame_timing_frame_batches_ = 0;
     frame_timing_frame_sync_ms_ = 0.0;
+    frame_timing_frame_sync_resource_ms_ = 0.0;
+    frame_timing_frame_sync_descriptor_ms_ = 0.0;
+    frame_timing_frame_sync_tile_ms_ = 0.0;
     frame_timing_frame_record_ms_ = 0.0;
     frame_timing_frame_execute_ms_ = 0.0;
     frame_timing_frame_waited_ms_ = 0.0;
     frame_timing_frame_diagnostic_ms_ = 0.0;
     frame_timing_frame_present_ms_ = 0.0;
+    frame_timing_frame_resource_updates_ = 0;
+    frame_timing_frame_resource_update_bytes_ = 0;
+    frame_timing_frame_descriptor_updates_ = 0;
+    frame_timing_frame_sampler_updates_ = 0;
+    frame_timing_frame_descriptor_copy_ops_ = 0;
+    frame_timing_frame_descriptor_copy_descriptors_ = 0;
+    frame_timing_frame_tile_updates_ = 0;
   }
 
   void accumulate_frame_duration(
@@ -1744,6 +1784,25 @@ private:
             .count();
     frame_target += elapsed_ms;
     total_target += elapsed_ms;
+  }
+
+  void accumulate_frame_duration(
+      double &frame_target,
+      double &total_target,
+      double &frame_detail_target,
+      double &total_detail_target,
+      std::chrono::steady_clock::time_point begin)
+  {
+    if (!frame_timing_active_) {
+      return;
+    }
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+            .count();
+    frame_target += elapsed_ms;
+    total_target += elapsed_ms;
+    frame_detail_target += elapsed_ms;
+    total_detail_target += elapsed_ms;
   }
 
   void accumulate_submit_wait_timing(std::chrono::steady_clock::time_point wait_begin)
@@ -1777,6 +1836,16 @@ private:
             : 0.0;
     line << "total_elapsed_ms=" << frame_timing_total_elapsed_ms_
          << " total_retrace_sync_ms=" << frame_timing_total_sync_ms_
+         << " total_sync_resource_ms=" << frame_timing_total_sync_resource_ms_
+         << " total_sync_descriptor_ms=" << frame_timing_total_sync_descriptor_ms_
+         << " total_sync_tile_ms=" << frame_timing_total_sync_tile_ms_
+         << " total_resource_updates=" << frame_timing_total_resource_updates_
+         << " total_resource_update_bytes=" << frame_timing_total_resource_update_bytes_
+         << " total_descriptor_updates=" << frame_timing_total_descriptor_updates_
+         << " total_sampler_updates=" << frame_timing_total_sampler_updates_
+         << " total_descriptor_copy_ops=" << frame_timing_total_descriptor_copy_ops_
+         << " total_descriptor_copy_descriptors=" << frame_timing_total_descriptor_copy_descriptors_
+         << " total_tile_updates=" << frame_timing_total_tile_updates_
          << " total_retrace_record_ms=" << frame_timing_total_record_ms_
          << " total_backend_execute_ms=" << frame_timing_total_execute_ms_
          << " total_backend_wait_ms=" << frame_timing_total_waited_ms_
@@ -3974,6 +4043,11 @@ private:
 
   bool sync_descriptors_until(std::uint64_t sequence, std::string &error)
   {
+    const auto sync_begin = std::chrono::steady_clock::now();
+    std::uint64_t descriptor_updates = 0;
+    std::uint64_t sampler_updates = 0;
+    std::uint64_t descriptor_copy_ops = 0;
+    std::uint64_t descriptor_copy_descriptors = 0;
     while ((next_descriptor_index_ < descriptor_timeline_.size() &&
             descriptor_timeline_[next_descriptor_index_]->create_sequence <= sequence) ||
            (next_sampler_index_ < sampler_timeline_.size() &&
@@ -3995,23 +4069,47 @@ private:
           return false;
         }
         ++next_sampler_index_;
+        ++sampler_updates;
       } else if (next_descriptor_copy_sequence < next_descriptor_sequence) {
+        descriptor_copy_descriptors +=
+            descriptor_copy_timeline_[next_descriptor_copy_index_]->descriptors.size();
         if (!apply_descriptor_copy(*descriptor_copy_timeline_[next_descriptor_copy_index_], error)) {
           return false;
         }
         ++next_descriptor_copy_index_;
+        ++descriptor_copy_ops;
       } else {
         if (!apply_descriptor(*descriptor_timeline_[next_descriptor_index_], error)) {
           return false;
         }
         ++next_descriptor_index_;
+        ++descriptor_updates;
       }
+    }
+    accumulate_frame_duration(
+        frame_timing_frame_sync_ms_,
+        frame_timing_total_sync_ms_,
+        frame_timing_frame_sync_descriptor_ms_,
+        frame_timing_total_sync_descriptor_ms_,
+        sync_begin);
+    if (frame_timing_active_) {
+      frame_timing_frame_descriptor_updates_ += descriptor_updates;
+      frame_timing_frame_sampler_updates_ += sampler_updates;
+      frame_timing_frame_descriptor_copy_ops_ += descriptor_copy_ops;
+      frame_timing_frame_descriptor_copy_descriptors_ += descriptor_copy_descriptors;
+      frame_timing_total_descriptor_updates_ += descriptor_updates;
+      frame_timing_total_sampler_updates_ += sampler_updates;
+      frame_timing_total_descriptor_copy_ops_ += descriptor_copy_ops;
+      frame_timing_total_descriptor_copy_descriptors_ += descriptor_copy_descriptors;
     }
     return true;
   }
 
   bool sync_resource_data_until(std::uint64_t sequence, std::string &error)
   {
+    const auto sync_begin = std::chrono::steady_clock::now();
+    std::uint64_t updates = 0;
+    std::uint64_t update_bytes = 0;
     const ReplaySequenceScope sync_scope(this, sequence);
     while (next_resource_update_index_ < resource_update_timeline_.size() &&
            resource_update_timeline_[next_resource_update_index_].sequence <= sequence) {
@@ -4043,10 +4141,24 @@ private:
         }
         return false;
       }
+      ++updates;
+      update_bytes += entry.update->bytes.size();
       if (event_ordered_recording_) {
         ++event_ordered_resource_updates_applied_;
       }
       ++next_resource_update_index_;
+    }
+    accumulate_frame_duration(
+        frame_timing_frame_sync_ms_,
+        frame_timing_total_sync_ms_,
+        frame_timing_frame_sync_resource_ms_,
+        frame_timing_total_sync_resource_ms_,
+        sync_begin);
+    if (frame_timing_active_) {
+      frame_timing_frame_resource_updates_ += updates;
+      frame_timing_frame_resource_update_bytes_ += update_bytes;
+      frame_timing_total_resource_updates_ += updates;
+      frame_timing_total_resource_update_bytes_ += update_bytes;
     }
     return true;
   }
@@ -4681,14 +4793,9 @@ private:
       // shader-visible descriptors before recording the lists. CPU descriptors used by commands
       // such as OMSetRenderTargets are still materialized at their command sequence below.
       {
-        const auto sync_begin = std::chrono::steady_clock::now();
         const bool sync_ok =
             sync_resource_data_until(batch.execute_sequence, error) &&
             sync_descriptors_until(batch.execute_sequence, error);
-        accumulate_frame_duration(
-            frame_timing_frame_sync_ms_,
-            frame_timing_total_sync_ms_,
-            sync_begin);
         if (!sync_ok) {
           if (error.empty()) {
             error = "batch pre-record sync failed (batch=" +
@@ -4729,15 +4836,10 @@ private:
             record_begin);
       }
       {
-        const auto sync_begin = std::chrono::steady_clock::now();
         const bool sync_ok =
             sync_resource_data_until(batch.execute_sequence, error) &&
             sync_descriptors_until(batch.execute_sequence, error) &&
             sync_tile_mapping_updates_until(batch.execute_sequence, error);
-        accumulate_frame_duration(
-            frame_timing_frame_sync_ms_,
-            frame_timing_total_sync_ms_,
-            sync_begin);
         if (!sync_ok) {
           if (error.empty()) {
             error = "batch pre-submit sync failed (batch=" + std::to_string(replay_batch_index_) +
@@ -4954,6 +5056,8 @@ private:
       std::string &error,
       ID3D12CommandQueue *queue_override = nullptr)
   {
+    const auto sync_begin = std::chrono::steady_clock::now();
+    std::uint64_t updates = 0;
     while (next_tile_mapping_update_index_ < backend_.tile_mapping_updates_.size() &&
            backend_.tile_mapping_updates_[next_tile_mapping_update_index_].sequence <= sequence) {
       if (!apply_tile_mapping_update(
@@ -4963,6 +5067,17 @@ private:
         return false;
       }
       ++next_tile_mapping_update_index_;
+      ++updates;
+    }
+    accumulate_frame_duration(
+        frame_timing_frame_sync_ms_,
+        frame_timing_total_sync_ms_,
+        frame_timing_frame_sync_tile_ms_,
+        frame_timing_total_sync_tile_ms_,
+        sync_begin);
+    if (frame_timing_active_) {
+      frame_timing_frame_tile_updates_ += updates;
+      frame_timing_total_tile_updates_ += updates;
     }
     return true;
   }
@@ -9506,18 +9621,38 @@ private:
   std::chrono::steady_clock::time_point frame_timing_last_present_{};
   std::uint64_t frame_timing_frame_batches_ = 0;
   double frame_timing_frame_sync_ms_ = 0.0;
+  double frame_timing_frame_sync_resource_ms_ = 0.0;
+  double frame_timing_frame_sync_descriptor_ms_ = 0.0;
+  double frame_timing_frame_sync_tile_ms_ = 0.0;
   double frame_timing_frame_record_ms_ = 0.0;
   double frame_timing_frame_execute_ms_ = 0.0;
   double frame_timing_frame_waited_ms_ = 0.0;
   double frame_timing_frame_diagnostic_ms_ = 0.0;
   double frame_timing_frame_present_ms_ = 0.0;
+  std::uint64_t frame_timing_frame_resource_updates_ = 0;
+  std::uint64_t frame_timing_frame_resource_update_bytes_ = 0;
+  std::uint64_t frame_timing_frame_descriptor_updates_ = 0;
+  std::uint64_t frame_timing_frame_sampler_updates_ = 0;
+  std::uint64_t frame_timing_frame_descriptor_copy_ops_ = 0;
+  std::uint64_t frame_timing_frame_descriptor_copy_descriptors_ = 0;
+  std::uint64_t frame_timing_frame_tile_updates_ = 0;
   double frame_timing_total_elapsed_ms_ = 0.0;
   double frame_timing_total_sync_ms_ = 0.0;
+  double frame_timing_total_sync_resource_ms_ = 0.0;
+  double frame_timing_total_sync_descriptor_ms_ = 0.0;
+  double frame_timing_total_sync_tile_ms_ = 0.0;
   double frame_timing_total_record_ms_ = 0.0;
   double frame_timing_total_execute_ms_ = 0.0;
   double frame_timing_total_waited_ms_ = 0.0;
   double frame_timing_total_diagnostic_ms_ = 0.0;
   double frame_timing_total_present_ms_ = 0.0;
+  std::uint64_t frame_timing_total_resource_updates_ = 0;
+  std::uint64_t frame_timing_total_resource_update_bytes_ = 0;
+  std::uint64_t frame_timing_total_descriptor_updates_ = 0;
+  std::uint64_t frame_timing_total_sampler_updates_ = 0;
+  std::uint64_t frame_timing_total_descriptor_copy_ops_ = 0;
+  std::uint64_t frame_timing_total_descriptor_copy_descriptors_ = 0;
+  std::uint64_t frame_timing_total_tile_updates_ = 0;
   std::uint64_t frame_timing_total_frames_ = 0;
   const char *event_ordered_profile_file_ = std::getenv("DXMT_RETRACE_PROFILE_FILE");
   bool event_ordered_profile_enabled_ =
