@@ -12,7 +12,6 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <limits>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -41,6 +40,17 @@ bool expect(bool condition, const char *message)
 std::string quote_arg(const std::filesystem::path &path)
 {
   std::string text = path.string();
+#ifdef _WIN32
+  std::string quoted = "\"";
+  for (const char ch : text) {
+    if (ch == '"') {
+      quoted += "\\\"";
+    } else {
+      quoted += ch;
+    }
+  }
+  quoted += "\"";
+#else
   std::string quoted = "'";
   for (const char ch : text) {
     if (ch == '\'') {
@@ -50,12 +60,18 @@ std::string quote_arg(const std::filesystem::path &path)
     }
   }
   quoted += "'";
+#endif
   return quoted;
 }
 
 bool run_command(const std::string &command)
 {
+#ifdef _WIN32
+  const auto shell_command = "\"" + command + "\"";
+  const auto result = std::system(shell_command.c_str());
+#else
   const auto result = std::system(command.c_str());
+#endif
   if (result != 0) {
     std::cerr << "command failed: " << command << "\n";
     return false;
@@ -65,7 +81,12 @@ bool run_command(const std::string &command)
 
 bool run_command_expect_failure(const std::string &command)
 {
+#ifdef _WIN32
+  const auto shell_command = "\"" + command + "\"";
+  const auto result = std::system(shell_command.c_str());
+#else
   const auto result = std::system(command.c_str());
+#endif
   if (result == 0) {
     std::cerr << "command unexpectedly succeeded: " << command << "\n";
     return false;
@@ -364,29 +385,6 @@ std::vector<std::uint8_t> read_file_bytes(const std::filesystem::path &path)
       std::istreambuf_iterator<char>());
 }
 
-std::string sha256_bytes(const std::string &text)
-{
-  return apitrace::trace::content_hash_bytes(text.data(), text.size());
-}
-
-std::string sha256_bytes(const std::vector<std::uint8_t> &bytes)
-{
-  return apitrace::trace::content_hash_bytes(bytes.empty() ? nullptr : bytes.data(), bytes.size());
-}
-
-std::string replace_all_copy(std::string text, std::string_view from, std::string_view to)
-{
-  if (from.empty()) {
-    return text;
-  }
-  std::size_t pos = 0;
-  while ((pos = text.find(from, pos)) != std::string::npos) {
-    text.replace(pos, from.size(), to.data(), to.size());
-    pos += to.size();
-  }
-  return text;
-}
-
 json sorted_json_array(json array, const std::vector<std::string> &keys)
 {
   if (!array.is_array()) {
@@ -600,6 +598,39 @@ bool write_passthrough_mixed_raw_capture(
   }
 
   if (!expect(writer.flush_commit(), "failed to commit passthrough raw capture")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+  writer.close();
+  return true;
+}
+
+bool write_passthrough_lines_raw_capture(
+    const std::filesystem::path &bundle,
+    const std::vector<std::string> &lines)
+{
+  using namespace apitrace::trace::raw;
+
+  std::filesystem::remove_all(bundle);
+  RawCaptureWriter writer;
+  if (!expect(writer.open(bundle), "failed to open passthrough-lines raw writer")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  std::uint64_t raw_sequence = 1;
+  for (const auto &line : lines) {
+    if (!append_raw_event(
+            writer,
+            raw_sequence++,
+            RawEventOpcode::Passthrough,
+            encode_passthrough_final_json_payload(line))) {
+      std::cerr << writer.last_error() << "\n";
+      return false;
+    }
+  }
+
+  if (!expect(writer.flush_commit(), "failed to commit passthrough-lines raw capture")) {
     std::cerr << writer.last_error() << "\n";
     return false;
   }
@@ -994,39 +1025,6 @@ bool validate_raw_blob_assets_are_path_backed(const std::filesystem::path &bundl
          expect(saw_path_backed_asset, "path-backed raw capture did not decode any assets");
 }
 
-bool load_asset_payload_bytes_for_legacy_baseline(
-    const std::filesystem::path &bundle,
-    apitrace::trace::AssetRecord &asset)
-{
-  if (!asset.payload_bytes.empty() || asset.payload_path.empty()) {
-    return true;
-  }
-  std::ifstream input(bundle / asset.payload_path, std::ios::binary);
-  if (!expect(input.is_open(), "legacy baseline failed to open payload source")) {
-    return false;
-  }
-  input.seekg(static_cast<std::streamoff>(asset.payload_offset), std::ios::beg);
-  if (!expect(input.good(), "legacy baseline failed to seek payload source")) {
-    return false;
-  }
-  if (!expect(asset.byte_size <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()),
-              "legacy baseline payload too large for test")) {
-    return false;
-  }
-  asset.payload_bytes.resize(static_cast<std::size_t>(asset.byte_size));
-  if (!asset.payload_bytes.empty()) {
-    input.read(reinterpret_cast<char *>(asset.payload_bytes.data()), static_cast<std::streamsize>(asset.payload_bytes.size()));
-    if (!expect(static_cast<std::size_t>(input.gcount()) == asset.payload_bytes.size(),
-                "legacy baseline short payload read")) {
-      asset.payload_bytes.clear();
-      return false;
-    }
-  }
-  asset.payload_path.clear();
-  asset.payload_offset = 0;
-  return true;
-}
-
 bool validate_final_bundle(const std::filesystem::path &bundle)
 {
   const auto records = read_jsonl(bundle / "callstream.jsonl");
@@ -1131,67 +1129,6 @@ bool validate_texture_unmap_raw_bundle(const std::filesystem::path &bundle)
               "texture-unmap flat payload shape mismatch")) {
     return false;
   }
-  return true;
-}
-
-bool legacy_materialize_raw_capture_to_final_bundle(const std::filesystem::path &bundle)
-{
-  using namespace apitrace::trace;
-  using namespace apitrace::trace::raw;
-
-  RawCaptureReader reader;
-  if (!expect(reader.open(bundle), "legacy materializer failed to open raw capture")) {
-    std::cerr << reader.last_error() << "\n";
-    return false;
-  }
-  const auto raw_events = reader.read_events();
-  const auto decoded = decode_raw_events(reader, raw_events);
-  if (!expect(decoded.error.empty(), "legacy materializer failed to decode raw capture")) {
-    std::cerr << decoded.error << "\n";
-    return false;
-  }
-
-  TraceBundleWriter writer;
-  if (!expect(writer.open(bundle), "legacy materializer failed to open bundle writer")) {
-    return false;
-  }
-  writer.write_metadata({ApiKind::D3D12, kFormatVersion, "raw-to-final", false});
-  for (const auto &decoded_event : decoded.events) {
-    if (decoded_event.passthrough) {
-      for (const auto &asset : decoded_event.assets) {
-        auto legacy_asset = asset;
-        if (!load_asset_payload_bytes_for_legacy_baseline(bundle, legacy_asset)) {
-          return false;
-        }
-        writer.register_asset(std::move(legacy_asset));
-      }
-      writer.append_callstream_json_line(decoded_event.passthrough_jsonl_record);
-      continue;
-    }
-    auto event = decoded_event.event;
-    for (const auto &asset : decoded_event.assets) {
-      auto legacy_asset = asset;
-      if (!load_asset_payload_bytes_for_legacy_baseline(bundle, legacy_asset)) {
-        return false;
-      }
-      const auto input_blob_id = legacy_asset.blob_id;
-      const auto input_relative_path = legacy_asset.relative_path.generic_string();
-      auto registered = writer.register_asset(std::move(legacy_asset));
-      if (registered.blob_id != input_blob_id) {
-        for (auto &blob_id : event.blob_refs) {
-          if (blob_id == input_blob_id) {
-            blob_id = registered.blob_id;
-          }
-        }
-      }
-      const auto registered_relative_path = registered.relative_path.generic_string();
-      if (!input_relative_path.empty() && input_relative_path != registered_relative_path) {
-        event.payload = replace_all_copy(event.payload, input_relative_path, registered_relative_path);
-      }
-    }
-    writer.append_call_event(std::move(event));
-  }
-  writer.close();
   return true;
 }
 
@@ -1437,125 +1374,54 @@ bool validate_passthrough_blob_remap_bundle(
 
 bool run_streaming_equivalence_test(
     const std::filesystem::path &source_bundle,
-    const std::filesystem::path &legacy_bundle,
-    const std::filesystem::path &streaming_bundle,
+    const std::filesystem::path &serial_bundle,
+    const std::filesystem::path &parallel_bundle,
     const char *finalize,
     const char *check)
 {
   return write_streaming_equivalence_raw_capture(source_bundle) &&
          validate_raw_blob_assets_are_path_backed(source_bundle) &&
-         copy_directory(source_bundle, legacy_bundle) &&
-         copy_directory(source_bundle, streaming_bundle) &&
-         legacy_materialize_raw_capture_to_final_bundle(legacy_bundle) &&
-         run_command(quote_arg(finalize) + " --no-progress --jobs 1 " + quote_arg(legacy_bundle)) &&
-         run_command(quote_arg(finalize) + " --raw-format --no-progress --jobs 1 " + quote_arg(streaming_bundle)) &&
-         run_command(quote_arg(check) + " --verify-hashes " + quote_arg(legacy_bundle)) &&
-         run_command(quote_arg(check) + " --verify-hashes " + quote_arg(streaming_bundle)) &&
-         compare_finalized_bundles(legacy_bundle, streaming_bundle);
+         copy_directory(source_bundle, serial_bundle) &&
+         copy_directory(source_bundle, parallel_bundle) &&
+         run_command(quote_arg(finalize) + " --no-progress --jobs 1 " + quote_arg(serial_bundle)) &&
+         run_command(quote_arg(finalize) + " --no-progress --jobs 4 " + quote_arg(parallel_bundle)) &&
+         run_command(quote_arg(check) + " --verify-hashes " + quote_arg(serial_bundle)) &&
+         run_command(quote_arg(check) + " --verify-hashes " + quote_arg(parallel_bundle)) &&
+         compare_finalized_bundles(serial_bundle, parallel_bundle);
 }
 
-bool write_sequence_regression_bundle(const std::filesystem::path &bundle)
+bool write_sequence_regression_raw_capture(const std::filesystem::path &bundle)
 {
-  std::filesystem::remove_all(bundle);
-  std::filesystem::create_directories(bundle);
-  std::ofstream metadata(bundle / "metadata.json", std::ios::binary | std::ios::trunc);
-  metadata << "{\"schema\":\"apitrace.bundle.v1\",\"api\":\"d3d12\",\"created_by\":\"sequence-regression-test\","
-              "\"version\":1,\"entry_file\":\"callstream.jsonl\"}\n";
-  metadata.close();
-
-  std::ofstream callstream(bundle / "callstream.jsonl", std::ios::binary | std::ios::trunc);
-  callstream
-      << "{\"record_kind\":\"bundle_header\",\"sequence\":1,\"time_ns\":1001,\"payload\":{\"label\":\"header\"}}\n"
-      << "{\"record_kind\":\"call\",\"sequence\":2,\"time_ns\":1002,\"function\":\"ID3D12GraphicsCommandList::DrawInstanced\",\"result_code\":0,\"payload\":{\"records\":[[2,7]],\"columns\":[\"sequence\",\"value\"],\"nested\":{\"d3d_sequence\":2}}}\n"
-      << "{\"record_kind\":\"boundary\",\"sequence\":3,\"time_ns\":1003,\"boundary\":\"DebugMarker\",\"payload\":{\"label\":\"before-reset\"}}\n"
-      << "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1004,\"function\":\"ID3D12GraphicsCommandList::Dispatch\",\"result_code\":0,\"payload\":{\"ops\":[[1,8]],\"columns\":[\"d3d_sequence\",\"value\"],\"sequence\":1}}\n"
-      << "{\"record_kind\":\"call\",\"sequence\":2,\"time_ns\":1005,\"function\":\"ID3D12GraphicsCommandList::SetPipelineState\",\"result_code\":0,\"payload\":{\"label\":\"after-reset\",\"nested\":{\"sequence\":2}}}\n"
-      << "{\"record_kind\":\"boundary\",\"sequence\":1,\"time_ns\":1006,\"boundary\":\"DebugMarker\",\"payload\":{\"records\":[[1]],\"columns\":[\"sequence\"]}}\n"
-      << "{\"record_kind\":\"call\",\"sequence\":2,\"time_ns\":1007,\"function\":\"ID3D12GraphicsCommandList::DrawInstanced\",\"result_code\":0,\"payload\":{\"label\":\"tail\",\"array\":[{\"sequence\":2}]}}\n";
-  callstream.close();
-
-  std::ofstream checksums(bundle / "checksums.json", std::ios::binary | std::ios::trunc);
-  checksums << "{\"schema\":\"apitrace.checksums.v1\",\"files\":{}}\n";
-  return true;
+  return write_passthrough_lines_raw_capture(
+      bundle,
+      {
+          "{\"record_kind\":\"call\",\"sequence\":2,\"time_ns\":1002,\"function\":\"ID3D12GraphicsCommandList::DrawInstanced\",\"result_code\":0,\"payload\":{\"records\":[[2,7]],\"columns\":[\"sequence\",\"value\"],\"nested\":{\"d3d_sequence\":2}}}",
+          "{\"record_kind\":\"boundary\",\"sequence\":3,\"time_ns\":1003,\"boundary\":\"DebugMarker\",\"payload\":{\"label\":\"before-reset\"}}",
+          "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1004,\"function\":\"ID3D12GraphicsCommandList::Dispatch\",\"result_code\":0,\"payload\":{\"ops\":[[1,8]],\"columns\":[\"d3d_sequence\",\"value\"],\"sequence\":1}}",
+          "{\"record_kind\":\"call\",\"sequence\":2,\"time_ns\":1005,\"function\":\"ID3D12GraphicsCommandList::SetPipelineState\",\"result_code\":0,\"payload\":{\"label\":\"after-reset\",\"nested\":{\"sequence\":2}}}",
+          "{\"record_kind\":\"boundary\",\"sequence\":1,\"time_ns\":1006,\"boundary\":\"DebugMarker\",\"payload\":{\"records\":[[1]],\"columns\":[\"sequence\"]}}",
+          "{\"record_kind\":\"call\",\"sequence\":2,\"time_ns\":1007,\"function\":\"ID3D12GraphicsCommandList::DrawInstanced\",\"result_code\":0,\"payload\":{\"label\":\"tail\",\"array\":[{\"sequence\":2}]}}",
+      });
 }
 
-bool write_reference_rewrite_bundle(const std::filesystem::path &bundle)
+bool write_reference_rewrite_raw_capture(const std::filesystem::path &bundle)
 {
-  std::filesystem::remove_all(bundle);
-  std::filesystem::create_directories(bundle / "buffers");
-
-  const std::vector<std::uint8_t> seed_blob = {0x01, 0x02, 0x03};
-  const std::vector<std::uint8_t> remapped_blob = {0xaa, 0xbb, 0xcc, 0xdd};
-  const auto seed_hash = sha256_bytes(seed_blob);
-  const auto remapped_hash = sha256_bytes(remapped_blob);
-  const std::string seed_path = "buffers/" + seed_hash + ".buffer";
-  const std::string remapped_path = "buffers/" + remapped_hash + ".buffer";
-
-  {
-    std::ofstream output(bundle / seed_path, std::ios::binary | std::ios::trunc);
-    output.write(reinterpret_cast<const char *>(seed_blob.data()), static_cast<std::streamsize>(seed_blob.size()));
-  }
-  {
-    std::ofstream output(bundle / remapped_path, std::ios::binary | std::ios::trunc);
-    output.write(reinterpret_cast<const char *>(remapped_blob.data()), static_cast<std::streamsize>(remapped_blob.size()));
-  }
-
   const std::uint64_t colliding_blob_id = 4462313;
-  const std::string metadata =
-      "{\"schema\":\"apitrace.bundle.v1\",\"api\":\"d3d12\",\"created_by\":\"reference-rewrite-test\","
-      "\"version\":1,\"entry_file\":\"callstream.jsonl\"}\n";
-  const std::string assets =
-      "{\n"
-      "  \"assets\": [\n"
-      "    {\n"
-      "      \"binary_payload\": true,\n"
-      "      \"blob_id\": " + std::to_string(colliding_blob_id) + ",\n"
-      "      \"byte_size\": " + std::to_string(seed_blob.size()) + ",\n"
-      "      \"content_hash\": \"" + seed_hash + "\",\n"
-      "      \"debug_name\": \"reference-rewrite-seed\",\n"
-      "      \"kind\": \"Buffer\",\n"
-      "      \"metal\": false,\n"
-      "      \"path\": \"" + seed_path + "\"\n"
-      "    },\n"
-      "    {\n"
-      "      \"binary_payload\": true,\n"
-      "      \"blob_id\": " + std::to_string(colliding_blob_id) + ",\n"
-      "      \"byte_size\": " + std::to_string(remapped_blob.size()) + ",\n"
-      "      \"content_hash\": \"" + remapped_hash + "\",\n"
-      "      \"debug_name\": \"reference-rewrite-remapped\",\n"
-      "      \"kind\": \"Buffer\",\n"
-      "      \"metal\": false,\n"
-      "      \"path\": \"" + remapped_path + "\"\n"
-      "    }\n"
-      "  ]\n"
-      "}\n";
-  const std::string callstream =
-      "{\"record_kind\":\"bundle_header\",\"format_version\":1,\"api\":\"D3D12\",\"producer\":\"reference-rewrite-test\",\"has_metal_callstream\":false,\"time_origin_ns\":1000,\"monotonic_origin_ns\":2000,\"entry_file\":\"callstream.jsonl\"}\n"
-      "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":0,\"function\":\"ID3D12Resource::Unmap\",\"result_code\":0,\"blob_refs\":[" +
+  const std::string provisional_path = "buffers/asset-00000000004462313.buffer";
+  const std::string remapped_line =
+      "{\"record_kind\":\"call\",\"sequence\":2,\"time_ns\":1002,\"elapsed_ns\":0,"
+      "\"function\":\"ID3D12Resource::Unmap\",\"result_code\":0,\"blob_refs\":[" +
       std::to_string(colliding_blob_id) +
       "],\"payload\":{\"blob_id\":" + std::to_string(colliding_blob_id) +
-      ",\"buffer_path\":\"" + seed_path +
-      "\",\"resource_object_id\":200,\"subresource\":0,\"written_begin\":0,\"written_end\":3,\"written_size\":3}}\n"
-      "{\"record_kind\":\"call\",\"sequence\":2,\"time_ns\":1002,\"elapsed_ns\":0,\"function\":\"ID3D12Resource::Unmap\",\"result_code\":0,\"blob_refs\":[" +
-      std::to_string(colliding_blob_id) +
-      "],\"payload\":{\"blob_id\":" + std::to_string(colliding_blob_id) +
-      ",\"buffer_path\":\"" + remapped_path +
+      ",\"buffer_path\":\"" + provisional_path +
       "\",\"nested\":{\"blob_id\":" + std::to_string(colliding_blob_id) +
-      "},\"resource_object_id\":201,\"subresource\":0,\"written_begin\":0,\"written_end\":4,\"written_size\":4}}\n";
-  const std::string checksums =
-      "{\"schema\":\"apitrace.checksums.v1\",\"files\":{"
-      "\"assets.json\":\"sha256:" + sha256_bytes(assets) + ":" + std::to_string(assets.size()) + "\","
-      "\"callstream.jsonl\":\"sha256:" + sha256_bytes(callstream) + ":" + std::to_string(callstream.size()) + "\","
-      "\"metadata.json\":\"sha256:" + sha256_bytes(metadata) + ":" + std::to_string(metadata.size()) + "\","
-      "\"" + seed_path + "\":\"sha256:" + seed_hash + ":" + std::to_string(seed_blob.size()) + "\","
-      "\"" + remapped_path + "\":\"sha256:" + remapped_hash + ":" + std::to_string(remapped_blob.size()) + "\""
-      "}}\n";
-
-  std::ofstream(bundle / "metadata.json", std::ios::binary | std::ios::trunc) << metadata;
-  std::ofstream(bundle / "assets.json", std::ios::binary | std::ios::trunc) << assets;
-  std::ofstream(bundle / "callstream.jsonl", std::ios::binary | std::ios::trunc) << callstream;
-  std::ofstream(bundle / "checksums.json", std::ios::binary | std::ios::trunc) << checksums;
-  return true;
+      "},\"resource_object_id\":201,\"subresource\":0,\"written_begin\":0,"
+      "\"written_end\":4,\"written_size\":4}}";
+  return write_passthrough_blob_remap_collision_raw_capture(
+      bundle,
+      colliding_blob_id,
+      provisional_path,
+      remapped_line);
 }
 
 bool run_sequence_repair_parallel_parity_test(
@@ -1566,15 +1432,15 @@ bool run_sequence_repair_parallel_parity_test(
     const char *check)
 {
   ScopedEnvVar forced_chunk_size("APITRACE_TEST_SEQUENCE_REPAIR_CHUNK_BYTES", "160");
-  return write_sequence_regression_bundle(source_bundle) &&
+  return write_sequence_regression_raw_capture(source_bundle) &&
          copy_directory(source_bundle, serial_bundle) &&
          copy_directory(source_bundle, parallel_bundle) &&
          run_command(quote_arg(finalize) + " --no-progress --jobs 1 " + quote_arg(serial_bundle)) &&
          run_command(quote_arg(finalize) + " --no-progress --jobs 4 " + quote_arg(parallel_bundle)) &&
          run_command(quote_arg(check) + " --verify-hashes " + quote_arg(serial_bundle)) &&
          run_command(quote_arg(check) + " --verify-hashes " + quote_arg(parallel_bundle)) &&
-         expect(read_file_bytes(serial_bundle / "callstream.jsonl") ==
-                    read_file_bytes(parallel_bundle / "callstream.jsonl"),
+         expect(normalized_callstream_lines(serial_bundle) ==
+                    normalized_callstream_lines(parallel_bundle),
                 "sequence repair serial/parallel callstream mismatch");
 }
 
@@ -1586,15 +1452,15 @@ bool run_reference_rewrite_parallel_parity_test(
     const char *check)
 {
   ScopedEnvVar forced_chunk_size("APITRACE_TEST_REFERENCE_REWRITE_CHUNK_BYTES", "180");
-  return write_reference_rewrite_bundle(source_bundle) &&
+  return write_reference_rewrite_raw_capture(source_bundle) &&
          copy_directory(source_bundle, serial_bundle) &&
          copy_directory(source_bundle, parallel_bundle) &&
          run_command(quote_arg(finalize) + " --no-progress --jobs 1 " + quote_arg(serial_bundle)) &&
          run_command(quote_arg(finalize) + " --no-progress --jobs 4 " + quote_arg(parallel_bundle)) &&
          run_command(quote_arg(check) + " --verify-hashes " + quote_arg(serial_bundle)) &&
          run_command(quote_arg(check) + " --verify-hashes " + quote_arg(parallel_bundle)) &&
-         expect(read_file_bytes(serial_bundle / "callstream.jsonl") ==
-                    read_file_bytes(parallel_bundle / "callstream.jsonl"),
+         expect(normalized_callstream_lines(serial_bundle) ==
+                    normalized_callstream_lines(parallel_bundle),
                 "reference rewrite serial/parallel callstream mismatch");
 }
 
@@ -1622,8 +1488,8 @@ int main(int argc, char **argv)
   const auto texture_unmap_bundle = work_dir / "synthetic-texture-unmap-raw.apitrace";
   const auto texture_unmap_missing_map_bundle = work_dir / "synthetic-texture-unmap-missing-map-raw.apitrace";
   const auto streaming_equivalence_bundle = work_dir / "synthetic-streaming-equivalence.apitrace";
-  const auto streaming_equivalence_legacy_bundle = work_dir / "synthetic-streaming-equivalence-legacy.apitrace";
-  const auto streaming_equivalence_raw_bundle = work_dir / "synthetic-streaming-equivalence-raw.apitrace";
+  const auto streaming_equivalence_serial_bundle = work_dir / "synthetic-streaming-equivalence-serial.apitrace";
+  const auto streaming_equivalence_parallel_bundle = work_dir / "synthetic-streaming-equivalence-parallel.apitrace";
   const auto sequence_regression_source_bundle = work_dir / "synthetic-sequence-regression-source.apitrace";
   const auto sequence_regression_serial_bundle = work_dir / "synthetic-sequence-regression-serial.apitrace";
   const auto sequence_regression_parallel_bundle = work_dir / "synthetic-sequence-regression-parallel.apitrace";
@@ -1660,15 +1526,20 @@ int main(int argc, char **argv)
 
   const bool ok =
       write_synthetic_trace_session_capture(bundle) &&
-      run_command(quote_arg(argv[1]) + " --raw-format --no-progress " + quote_arg(bundle)) &&
+      run_command_expect_failure(quote_arg(argv[1]) + " --dry-run " + quote_arg(bundle)) &&
+      run_command_expect_failure(quote_arg(argv[1]) + " --raw-format " + quote_arg(bundle)) &&
+      run_command(quote_arg(argv[1]) + " --no-progress " + quote_arg(bundle)) &&
+      run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(bundle)) &&
+      validate_final_bundle(bundle) &&
+      run_command(quote_arg(argv[1]) + " --no-progress " + quote_arg(bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(bundle)) &&
       validate_final_bundle(bundle) &&
       write_passthrough_mixed_raw_capture(passthrough_bundle, passthrough_before, passthrough_after) &&
-      run_command(quote_arg(argv[1]) + " --raw-format --no-progress " + quote_arg(passthrough_bundle)) &&
+      run_command(quote_arg(argv[1]) + " --no-progress " + quote_arg(passthrough_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(passthrough_bundle)) &&
       validate_passthrough_mixed_bundle(passthrough_bundle, passthrough_before, passthrough_after) &&
       write_passthrough_with_blob_raw_capture(passthrough_blob_bundle, passthrough_blob_line, passthrough_non_blob_line) &&
-      run_command(quote_arg(argv[1]) + " --raw-format --no-progress " + quote_arg(passthrough_blob_bundle)) &&
+      run_command(quote_arg(argv[1]) + " --no-progress " + quote_arg(passthrough_blob_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(passthrough_blob_bundle)) &&
       validate_passthrough_with_blob_bundle(passthrough_blob_bundle, passthrough_blob_line, passthrough_non_blob_line) &&
       write_passthrough_blob_remap_collision_raw_capture(
@@ -1676,7 +1547,7 @@ int main(int argc, char **argv)
           remap_collision_blob_id,
           remap_provisional_path,
           passthrough_d3d12_remap_line) &&
-      run_command(quote_arg(argv[1]) + " --raw-format --no-progress --jobs 1 " + quote_arg(passthrough_d3d12_remap_bundle)) &&
+      run_command(quote_arg(argv[1]) + " --no-progress --jobs 1 " + quote_arg(passthrough_d3d12_remap_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(passthrough_d3d12_remap_bundle)) &&
       validate_passthrough_blob_remap_bundle(
           passthrough_d3d12_remap_bundle,
@@ -1688,7 +1559,7 @@ int main(int argc, char **argv)
           remap_collision_blob_id,
           remap_provisional_path,
           passthrough_metal_remap_line) &&
-      run_command(quote_arg(argv[1]) + " --raw-format --no-progress --jobs 1 " + quote_arg(passthrough_metal_remap_bundle)) &&
+      run_command(quote_arg(argv[1]) + " --no-progress --jobs 1 " + quote_arg(passthrough_metal_remap_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(passthrough_metal_remap_bundle)) &&
       validate_passthrough_blob_remap_bundle(
           passthrough_metal_remap_bundle,
@@ -1696,23 +1567,23 @@ int main(int argc, char **argv)
           remap_provisional_path,
           true) &&
       write_duplicate_content_raw_capture(duplicate_content_bundle) &&
-      run_command(quote_arg(argv[1]) + " --raw-format --no-progress " + quote_arg(duplicate_content_bundle)) &&
+      run_command(quote_arg(argv[1]) + " --no-progress " + quote_arg(duplicate_content_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(duplicate_content_bundle)) &&
       validate_duplicate_content_raw_bundle(duplicate_content_bundle) &&
       write_no_end_periodic_commit_capture(no_end_raw_bundle) &&
-      run_command(quote_arg(argv[1]) + " --raw-format --no-progress --jobs 1 " + quote_arg(no_end_raw_bundle)) &&
+      run_command(quote_arg(argv[1]) + " --no-progress --jobs 1 " + quote_arg(no_end_raw_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(no_end_raw_bundle)) &&
       write_texture_unmap_raw_capture(texture_unmap_bundle, true) &&
-      run_command(quote_arg(argv[1]) + " --raw-format --no-progress --jobs 1 " + quote_arg(texture_unmap_bundle)) &&
+      run_command(quote_arg(argv[1]) + " --no-progress --jobs 1 " + quote_arg(texture_unmap_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(texture_unmap_bundle)) &&
       validate_texture_unmap_raw_bundle(texture_unmap_bundle) &&
       write_texture_unmap_raw_capture(texture_unmap_missing_map_bundle, false) &&
       run_command_expect_failure(
-          quote_arg(argv[1]) + " --raw-format --no-progress --jobs 1 " + quote_arg(texture_unmap_missing_map_bundle)) &&
+          quote_arg(argv[1]) + " --no-progress --jobs 1 " + quote_arg(texture_unmap_missing_map_bundle)) &&
       run_streaming_equivalence_test(
           streaming_equivalence_bundle,
-          streaming_equivalence_legacy_bundle,
-          streaming_equivalence_raw_bundle,
+          streaming_equivalence_serial_bundle,
+          streaming_equivalence_parallel_bundle,
           argv[1],
           argv[2]) &&
       run_sequence_repair_parallel_parity_test(

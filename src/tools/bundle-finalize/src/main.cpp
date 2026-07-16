@@ -70,7 +70,6 @@ struct Options {
   fs::path bundle_root;
   std::size_t jobs = default_job_count();
   bool dry_run = false;
-  bool raw_format = false;
   bool keep_duplicates = false;
   bool profile = false;
   bool progress = false;
@@ -721,7 +720,6 @@ void print_usage(const char *argv0)
       << "\n"
       << "Options:\n"
       << "  --profile          Print per-stage timing and throughput to stderr.\n"
-      << "  --raw-format       Materialize raw/events.bin + raw/blobs.bin before normal finalization.\n"
       << "  --progress         Force interactive progress on stderr.\n"
       << "  --no-progress      Disable interactive progress on stderr.\n"
       << "  --verify-existing-canonical\n"
@@ -1031,7 +1029,8 @@ RawDecodedChunk decode_raw_chunk(
 bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stats, ProgressReporter *progress)
 {
   if (options.dry_run) {
-    std::cerr << "error: --raw-format cannot be combined with --dry-run before materialization exists\n";
+    std::cerr << "error: --dry-run cannot materialize a raw capture; "
+                 "run bundle-finalize once without --dry-run\n";
     return false;
   }
 
@@ -1804,6 +1803,18 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
   return true;
 }
 
+bool has_materialized_bundle_header(const fs::path &bundle_root)
+{
+  std::ifstream callstream(bundle_root / apitrace::trace::kCallstreamFileName, std::ios::binary);
+  std::string header_line;
+  if (!std::getline(callstream, header_line)) {
+    return false;
+  }
+  const auto header = json::parse(header_line, nullptr, false);
+  return header.is_object() &&
+         header.value("record_kind", std::string()) == "bundle_header";
+}
+
 std::optional<Options> parse_args(int argc, char **argv)
 {
   Options options;
@@ -1813,8 +1824,6 @@ std::optional<Options> parse_args(int argc, char **argv)
     const std::string arg = argv[i];
     if (arg == "--dry-run") {
       options.dry_run = true;
-    } else if (arg == "--raw-format") {
-      options.raw_format = true;
     } else if (arg == "--keep-duplicates") {
       options.keep_duplicates = true;
     } else if (arg == "--profile") {
@@ -4371,61 +4380,65 @@ void repair_finalized_single_blob_asset_index(
     }
   }
 
-  const auto callstream_path = bundle_root / apitrace::trace::kCallstreamFileName;
-  if (!fs::is_regular_file(callstream_path)) {
-    return;
-  }
+  for (const auto *callstream_name : {
+           apitrace::trace::kCallstreamFileName,
+           apitrace::trace::kMetalCallstreamFileName}) {
+    const auto callstream_path = bundle_root / callstream_name;
+    if (!fs::is_regular_file(callstream_path)) {
+      continue;
+    }
 
-  scan_jsonl_file(callstream_path, [&](const JsonlLineView &line_view) {
-    const auto line = line_view.line;
-    const auto tokens = scan_jsonl_line_tokens(line);
-    if (!tokens.blob_refs_key || !tokens_may_contain_path_reference(tokens)) {
-      return true;
-    }
-    const auto record = json::parse(std::string(line), nullptr, false);
-    if (record.is_discarded()) {
-      return true;
-    }
-    const auto pair = single_blob_ref_asset_path_pair(bundle_root, record);
-    if (!pair) {
-      return true;
-    }
-    const auto &[blob_id, path] = *pair;
-    const auto index = asset_index_by_blob_id.find(blob_id);
-    if (index == asset_index_by_blob_id.end()) {
-      auto asset = make_discovered_asset(bundle_root, blob_id, path);
-      if (asset) {
-        assets.push_back(std::move(*asset));
-        asset_index_by_blob_id.emplace(blob_id, assets.size() - 1);
+    scan_jsonl_file(callstream_path, [&](const JsonlLineView &line_view) {
+      const auto line = line_view.line;
+      const auto tokens = scan_jsonl_line_tokens(line);
+      if (!tokens.blob_refs_key || !tokens_may_contain_path_reference(tokens)) {
+        return true;
       }
-      return true;
-    }
+      const auto record = json::parse(std::string(line), nullptr, false);
+      if (record.is_discarded()) {
+        return true;
+      }
+      const auto pair = single_blob_ref_asset_path_pair(bundle_root, record);
+      if (!pair) {
+        return true;
+      }
+      const auto &[blob_id, path] = *pair;
+      const auto index = asset_index_by_blob_id.find(blob_id);
+      if (index == asset_index_by_blob_id.end()) {
+        auto asset = make_discovered_asset(bundle_root, blob_id, path);
+        if (asset) {
+          assets.push_back(std::move(*asset));
+          asset_index_by_blob_id.emplace(blob_id, assets.size() - 1);
+        }
+        return true;
+      }
 
-    auto &asset = assets[index->second];
-    const auto current_path = effective_asset_path(asset);
-    if (current_path == path || asset.path == path) {
+      auto &asset = assets[index->second];
+      const auto current_path = effective_asset_path(asset);
+      if (current_path == path || asset.path == path) {
+        return true;
+      }
+      if (!path_exists_as_asset_file(bundle_root, path)) {
+        return true;
+      }
+      asset.path = path;
+      asset.canonical_path.clear();
+      asset.kind = asset_kind_from_path(fs::path(path));
+      asset.metal = path.rfind("metal/", 0) == 0;
+      asset.payload_path.clear();
+      asset.payload_offset = 0;
+      asset.payload_slice_exists = false;
+      asset.file_exists = true;
+      asset.original_file_exists = true;
+      asset.safe_path = true;
+      asset.safe_payload_path = false;
+      asset.content_hash.clear();
+      asset.digest.clear();
+      asset.byte_size = 0;
+      asset.actual_size = 0;
       return true;
-    }
-    if (!path_exists_as_asset_file(bundle_root, path)) {
-      return true;
-    }
-    asset.path = path;
-    asset.canonical_path.clear();
-    asset.kind = asset_kind_from_path(fs::path(path));
-    asset.metal = path.rfind("metal/", 0) == 0;
-    asset.payload_path.clear();
-    asset.payload_offset = 0;
-    asset.payload_slice_exists = false;
-    asset.file_exists = true;
-    asset.original_file_exists = true;
-    asset.safe_path = true;
-    asset.safe_payload_path = false;
-    asset.content_hash.clear();
-    asset.digest.clear();
-    asset.byte_size = 0;
-    asset.actual_size = 0;
-    return true;
-  });
+    });
+  }
 }
 
 bool is_typed_asset_file_path(const fs::path &relative)
@@ -8435,6 +8448,9 @@ std::unordered_set<std::string> rebuild_d3d12_pipeline_semantics(
   ++stats.rewritten_text_files;
   rewritten_paths.insert(apitrace::trace::kCallstreamFileName);
   if (!options.dry_run) {
+    // The source stream must be closed before replacing callstream.jsonl on
+    // Windows, where an open reader denies the rename used for atomic rewrite.
+    input.close();
     const auto digest_and_size = output.digest_and_size();
     output.close();
     if (!replace_with_temporary_file(callstream_path, temporary)) {
@@ -9366,6 +9382,18 @@ bool test_hook_hash_assets_shared_payload_slices(
          stats.spooled_asset_bytes == 20;
 }
 
+bool test_hook_repair_finalized_single_blob_asset_index(
+    const fs::path &bundle_root,
+    std::uint64_t expected_blob_id,
+    const std::string &expected_path)
+{
+  std::vector<AssetEntry> assets;
+  repair_finalized_single_blob_asset_index(bundle_root, assets, true);
+  return assets.size() == 1 &&
+         assets[0].blob_id == expected_blob_id &&
+         effective_asset_path(assets[0]) == expected_path;
+}
+
 } // namespace apitrace::tools
 #endif
 
@@ -9401,8 +9429,14 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
   std::size_t loaded_asset_count = 0;
   bool raw_to_final_ok = true;
   run_stage(options, progress, stage_index, kStageCount, "raw_to_final", [&] {
-    if (options.raw_format) {
+    std::error_code raw_error;
+    const bool has_raw_capture =
+        fs::is_regular_file(options.bundle_root / "raw" / "commit.meta", raw_error) && !raw_error;
+    if (has_raw_capture) {
       raw_to_final_ok = materialize_raw_capture_to_final_bundle(options, stats, &progress);
+    } else if (!has_materialized_bundle_header(options.bundle_root)) {
+      std::cerr << "error: bundle has neither a committed raw capture nor a materialized callstream\n";
+      raw_to_final_ok = false;
     }
   });
   if (!raw_to_final_ok) {

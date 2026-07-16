@@ -102,7 +102,11 @@ bool run_raw_sink_roundtrip(const std::filesystem::path &bundle)
   return expect(decoded.events.size() == 1 &&
                     decoded.events[0].event.callsite.function_name == "ID3D12Resource::Unmap" &&
                     decoded.events[0].assets.size() == 1 &&
-                    decoded.events[0].assets[0].payload_bytes == blob,
+                    decoded.events[0].assets[0].payload_path.generic_string() == "raw/blobs.bin" &&
+                    decoded.events[0].assets[0].payload_offset == extent.offset &&
+                    decoded.events[0].assets[0].byte_size == blob.size() &&
+                    decoded.events[0].assets[0].binary_payload &&
+                    decoded.events[0].assets[0].payload_bytes.empty(),
                 "raw sink decoded event mismatch");
 }
 

@@ -2248,6 +2248,23 @@ bool validate_metal_replay_closure(
     }
   }
 
+  if (!render_encoder_ids.empty()) {
+    error = "metal validate-only ended with an open render encoder";
+    return false;
+  }
+  if (!compute_encoder_ids.empty()) {
+    error = "metal validate-only ended with an open compute encoder";
+    return false;
+  }
+  if (!blit_encoder_ids.empty()) {
+    error = "metal validate-only ended with an open blit encoder";
+    return false;
+  }
+  if (!command_buffer_ids.empty()) {
+    error = "metal validate-only ended with an uncommitted command buffer";
+    return false;
+  }
+
   if (!has_library_asset) {
     error = "metal validate-only found no referenced library assets";
     return false;

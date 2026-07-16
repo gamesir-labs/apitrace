@@ -132,7 +132,6 @@ function(configure_apitrace_core_target target_name)
         target_compile_definitions(${target_name} PUBLIC APITRACE_HAS_D3D_NATIVE=1)
         target_link_libraries(${target_name} PUBLIC
             apitrace_d3d_headers
-            apitrace_dxmt::winemetal
             apitrace_dxmt::dxgi
             apitrace_dxmt::d3d11
             apitrace_dxmt::d3d12

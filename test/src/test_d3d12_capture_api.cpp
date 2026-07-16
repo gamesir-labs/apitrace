@@ -119,6 +119,17 @@ bool read_asset_payload(
 
 std::string shell_quote_path(const std::filesystem::path &path)
 {
+#ifdef _WIN32
+  std::string quoted = "\"";
+  for (const char ch : path.string()) {
+    if (ch == '"') {
+      quoted += "\\\"";
+    } else {
+      quoted += ch;
+    }
+  }
+  quoted += "\"";
+#else
   std::string quoted = "'";
   for (const char ch : path.string()) {
     if (ch == '\'') {
@@ -128,7 +139,18 @@ std::string shell_quote_path(const std::filesystem::path &path)
     }
   }
   quoted += "'";
+#endif
   return quoted;
+}
+
+int run_shell_command(const std::string &command)
+{
+#ifdef _WIN32
+  const auto shell_command = "\"" + command + "\"";
+  return std::system(shell_command.c_str());
+#else
+  return std::system(command.c_str());
+#endif
 }
 
 bool finalize_raw_bundle(const char *argv0, const std::filesystem::path &bundle)
@@ -141,8 +163,8 @@ bool finalize_raw_bundle(const char *argv0, const std::filesystem::path &bundle)
       finalize = sibling;
     }
   }
-  const auto command = shell_quote_path(finalize) + " --raw-format --jobs 1 " + shell_quote_path(bundle);
-  return std::system(command.c_str()) == 0;
+  const auto command = shell_quote_path(finalize) + " --jobs 1 " + shell_quote_path(bundle);
+  return run_shell_command(command) == 0;
 }
 
 bool run_raw_capture_smoke(const char *argv0, const std::filesystem::path &base_bundle)
@@ -235,7 +257,7 @@ bool run_raw_capture_smoke(const char *argv0, const std::filesystem::path &base_
   }
 
   if (!finalize_raw_bundle(argv0, raw_bundle)) {
-    std::cerr << "bundle-finalize --raw-format failed for raw capture smoke bundle\n";
+    std::cerr << "bundle-finalize failed for raw capture smoke bundle\n";
     return false;
   }
   const auto records_text = read_text(raw_bundle / apitrace::trace::kCallstreamFileName);
@@ -259,7 +281,7 @@ bool verify_bundle_check(const char *argv0, const std::filesystem::path &bundle)
     }
   }
   const auto command = shell_quote_path(check) + " --verify-hashes " + shell_quote_path(bundle);
-  return std::system(command.c_str()) == 0;
+  return run_shell_command(command) == 0;
 }
 
 bool run_raw_passthrough_smoke(const char *argv0, const std::filesystem::path &base_bundle)
@@ -383,7 +405,7 @@ bool run_raw_passthrough_smoke(const char *argv0, const std::filesystem::path &b
   }
 
   if (!finalize_raw_bundle(argv0, raw_bundle)) {
-    std::cerr << "bundle-finalize --raw-format failed for raw smoke bundle\n";
+    std::cerr << "bundle-finalize failed for raw smoke bundle\n";
     return false;
   }
   if (!verify_bundle_check(argv0, raw_bundle)) {
@@ -1038,7 +1060,7 @@ int main(int argc, char **argv)
     return 1;
   }
   if (!finalize_raw_bundle(argv[0], bundle)) {
-    std::cerr << "bundle-finalize --raw-format failed for capture api bundle\n";
+    std::cerr << "bundle-finalize failed for capture api bundle\n";
     return 1;
   }
   if (!verify_mapped_descriptor_cbv_capture(bundle)) {

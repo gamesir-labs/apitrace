@@ -294,6 +294,17 @@ bool replay_all_events(apitrace::trace::TraceBundleReader &reader, apitrace::d3d
 
 std::string shell_quote_path(const std::filesystem::path &path)
 {
+#ifdef _WIN32
+  std::string quoted = "\"";
+  for (const char ch : path.string()) {
+    if (ch == '"') {
+      quoted += "\\\"";
+    } else {
+      quoted += ch;
+    }
+  }
+  quoted += "\"";
+#else
   std::string quoted = "'";
   for (const char ch : path.string()) {
     if (ch == '\'') {
@@ -303,6 +314,7 @@ std::string shell_quote_path(const std::filesystem::path &path)
     }
   }
   quoted += "'";
+#endif
   return quoted;
 }
 
@@ -315,8 +327,13 @@ bool finalize_bundle(const std::filesystem::path &bundle)
     g_open_bundle_error = "missing bundle-finalize path";
     return false;
   }
-  const auto command = shell_quote_path(g_bundle_finalize) + " --jobs 1 " + shell_quote_path(bundle);
+  const auto command = shell_quote_path(g_bundle_finalize) + " --no-progress --jobs 1 " + shell_quote_path(bundle);
+#ifdef _WIN32
+  const auto shell_command = "\"" + command + "\"";
+  const auto result = std::system(shell_command.c_str());
+#else
   const auto result = std::system(command.c_str());
+#endif
   if (result != 0) {
     g_open_bundle_error = "bundle-finalize failed for " + bundle.string();
     return false;
@@ -382,6 +399,42 @@ bool expect_d3d12_replay_failure(
   }
   if (backend.last_error().find(expected_error) == std::string::npos) {
     std::cerr << "D3D12 replay failed with unexpected error: " << backend.last_error() << "\n";
+    return false;
+  }
+  return true;
+}
+
+bool expect_d3d12_replay_failure_without_finalize(
+    const std::filesystem::path &bundle,
+    const std::string &expected_error)
+{
+  apitrace::trace::TraceBundleReader reader;
+  if (!reader.open(bundle)) {
+    std::cerr << "reader failed to open unfinalized bundle: " << reader.last_error() << "\n";
+    return false;
+  }
+  apitrace::d3d12::D3D12ReplayBackend backend;
+  if (replay_all_events(reader, backend)) {
+    std::cerr << "D3D12 replay accepted expected-failure unfinalized bundle\n";
+    return false;
+  }
+  if (backend.last_error().find(expected_error) == std::string::npos) {
+    std::cerr << "D3D12 replay failed with unexpected unfinalized error: " << backend.last_error() << "\n";
+    return false;
+  }
+  return true;
+}
+
+bool expect_d3d12_replay_success_after_finalize(const std::filesystem::path &bundle)
+{
+  apitrace::trace::TraceBundleReader reader;
+  if (!open_finalized_bundle(reader, bundle)) {
+    std::cerr << "reader failed to reopen repaired bundle: " << g_open_bundle_error << "\n";
+    return false;
+  }
+  apitrace::d3d12::D3D12ReplayBackend backend;
+  if (!replay_all_events(reader, backend)) {
+    std::cerr << "D3D12 replay rejected repaired bundle: " << backend.last_error() << "\n";
     return false;
   }
   return true;

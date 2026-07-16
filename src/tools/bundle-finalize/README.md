@@ -3,8 +3,9 @@
 `bundle-finalize` is the offline finalization tool for apitrace trace bundles.
 It is part of apitrace's own tool distribution, not a DXMT integration detail.
 
-The capture process should prioritize writing raw event streams and sideband
-asset shards. This tool performs the expensive publish-time work afterwards:
+The capture process writes the raw event stream under `raw/`. This tool first
+materializes that capture into the final bundle representation, then performs
+the expensive publish-time work:
 
 - merge `assets.json` with `analysis/sideband-assets.json`
 - hash asset files outside the game process
@@ -29,8 +30,16 @@ Usage:
 bundle-finalize [--dry-run] [--keep-duplicates] [--jobs N] [--no-progress] <trace-bundle>
 ```
 
-Run `--dry-run` first on large captures to inspect the expected rewrite and
-removal counts before modifying the bundle.
+Raw capture materialization is the only supported normal finalization path and
+is enabled unconditionally; there is no format-selection option. Because that
+first stage creates `callstream.jsonl` and provisional assets, `--dry-run`
+cannot be used for the initial materialization. Run a normal finalization first
+and use `bundle-check` for a non-mutating integrity audit.
+
+An already materialized bundle without `raw/commit.meta` can still be reopened
+for offline maintenance (for example reference repair or integrity tests). This
+does not provide a second capture path: all new captures are written through
+the RAW stream and are materialized automatically whenever RAW data is present.
 
 When stderr is an interactive TTY, `bundle-finalize` prints stage progress to
 stderr by default. The final `bundle-finalize:` summary remains on stdout for

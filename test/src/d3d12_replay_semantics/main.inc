@@ -1149,11 +1149,16 @@ int main(int argc, char **argv)
     std::cerr << "failed to write draw-without-pipeline-assets bundle\n";
     return 1;
   }
-  if (!expect_d3d12_replay_failure(missing_pipeline_shader_ref_bundle, "asset path is not covered by blob_refs")) {
-    std::cerr << "D3D12 replay accepted a pipeline shader path missing from blob_refs\n";
+  if (!expect_d3d12_replay_failure_without_finalize(
+          missing_pipeline_shader_ref_bundle,
+          "asset path is not covered by blob_refs") ||
+      !expect_d3d12_replay_success_after_finalize(missing_pipeline_shader_ref_bundle)) {
+    std::cerr << "D3D12 finalizer did not repair a recoverable missing pipeline shader blob_ref\n";
     return 1;
   }
-  if (!expect_d3d12_replay_failure(incomplete_pipeline_metadata_bundle, "pipeline shader stage is missing bytecode_size")) {
+  if (!expect_d3d12_replay_failure(
+          incomplete_pipeline_metadata_bundle,
+          "pipeline shader stage is missing bytecode_size")) {
     std::cerr << "D3D12 replay accepted incomplete pipeline shader metadata\n";
     return 1;
   }
@@ -1203,8 +1208,11 @@ int main(int argc, char **argv)
     std::cerr << "failed to write root-signature wrong-blob-ref bundle\n";
     return 1;
   }
-  if (!expect_d3d12_replay_failure(root_signature_wrong_blob_ref_bundle, "asset path is not covered by blob_refs")) {
-    std::cerr << "D3D12 replay accepted a root signature path missing from blob_refs\n";
+  if (!expect_d3d12_replay_failure_without_finalize(
+          root_signature_wrong_blob_ref_bundle,
+          "asset path is not covered by blob_refs") ||
+      !expect_d3d12_replay_success_after_finalize(root_signature_wrong_blob_ref_bundle)) {
+    std::cerr << "D3D12 finalizer did not repair a recoverable root-signature blob_ref\n";
     return 1;
   }
 
@@ -1613,8 +1621,11 @@ int main(int argc, char **argv)
     std::cerr << "failed to write Unmap wrong-blob-ref bundle\n";
     return 1;
   }
-  if (!expect_d3d12_replay_failure(unmap_wrong_blob_ref_bundle, "asset path is not covered by blob_refs")) {
-    std::cerr << "D3D12 replay accepted an Unmap buffer path missing from blob_refs\n";
+  if (!expect_d3d12_replay_failure_without_finalize(
+          unmap_wrong_blob_ref_bundle,
+          "asset path is not covered by blob_refs") ||
+      !expect_d3d12_replay_success_after_finalize(unmap_wrong_blob_ref_bundle)) {
+    std::cerr << "D3D12 finalizer did not repair a recoverable Unmap buffer blob_ref\n";
     return 1;
   }
 
@@ -1624,8 +1635,11 @@ int main(int argc, char **argv)
     std::cerr << "failed to write ResolveQueryDataResult wrong-blob-ref bundle\n";
     return 1;
   }
-  if (!expect_d3d12_replay_failure(resolve_query_wrong_blob_ref_bundle, "asset path is not covered by blob_refs")) {
-    std::cerr << "D3D12 replay accepted a ResolveQueryDataResult buffer path missing from blob_refs\n";
+  if (!expect_d3d12_replay_failure_without_finalize(
+          resolve_query_wrong_blob_ref_bundle,
+          "asset path is not covered by blob_refs") ||
+      !expect_d3d12_replay_success_after_finalize(resolve_query_wrong_blob_ref_bundle)) {
+    std::cerr << "D3D12 finalizer did not repair a recoverable ResolveQueryDataResult blob_ref\n";
     return 1;
   }
 

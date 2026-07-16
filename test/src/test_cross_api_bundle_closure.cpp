@@ -172,6 +172,17 @@ std::string texture2d_desc_json(std::uint64_t width, std::uint32_t height, std::
 
 std::string shell_quote_path(const std::filesystem::path &path)
 {
+#ifdef _WIN32
+  std::string quoted = "\"";
+  for (const char ch : path.string()) {
+    if (ch == '"') {
+      quoted += "\\\"";
+    } else {
+      quoted += ch;
+    }
+  }
+  quoted += "\"";
+#else
   std::string quoted = "'";
   for (const char ch : path.string()) {
     if (ch == '\'') {
@@ -181,12 +192,18 @@ std::string shell_quote_path(const std::filesystem::path &path)
     }
   }
   quoted += "'";
+#endif
   return quoted;
 }
 
 int run_command(const std::string &command)
 {
+#ifdef _WIN32
+  const auto shell_command = "\"" + command + "\"";
+  return std::system(shell_command.c_str());
+#else
   return std::system(command.c_str());
+#endif
 }
 
 bool run_tool(

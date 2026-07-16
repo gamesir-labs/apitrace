@@ -194,6 +194,17 @@ void unset_env_var(const char *name)
 
 std::string shell_quote_path(const std::filesystem::path &path)
 {
+#ifdef _WIN32
+  std::string quoted = "\"";
+  for (const char ch : path.string()) {
+    if (ch == '"') {
+      quoted += "\\\"";
+    } else {
+      quoted += ch;
+    }
+  }
+  quoted += "\"";
+#else
   std::string quoted = "'";
   for (const char ch : path.string()) {
     if (ch == '\'') {
@@ -203,7 +214,18 @@ std::string shell_quote_path(const std::filesystem::path &path)
     }
   }
   quoted += "'";
+#endif
   return quoted;
+}
+
+int run_shell_command(const std::string &command)
+{
+#ifdef _WIN32
+  const auto shell_command = "\"" + command + "\"";
+  return std::system(shell_command.c_str());
+#else
+  return std::system(command.c_str());
+#endif
 }
 
 int run_bundle_check(
@@ -212,7 +234,7 @@ int run_bundle_check(
     const std::string &options)
 {
   const auto command = shell_quote_path(bundle_check) + " " + options + " " + shell_quote_path(bundle);
-  return std::system(command.c_str());
+  return run_shell_command(command);
 }
 
 int run_bundle_finalize(
@@ -221,7 +243,7 @@ int run_bundle_finalize(
 {
   const auto command =
       shell_quote_path(bundle_finalize) + " --no-progress " + shell_quote_path(bundle);
-  return std::system(command.c_str());
+  return run_shell_command(command);
 }
 
 std::size_t count_substrings(const std::string &text, const std::string &needle)

@@ -269,7 +269,7 @@ int main(int argc, char **argv)
     return 1;
   }
   if (validate_metal_bundle(missing_bind_bundle, replay_error) ||
-      !expect_contains(replay_error, "draw occurs before a valid render pipeline bind")) {
+      !expect_contains(replay_error, "render work occurs before a valid render pipeline bind")) {
     std::cerr << "missing-pipeline-bind bundle did not fail validate-only as expected: "
               << replay_error << "\n";
     return 1;
@@ -361,7 +361,7 @@ int main(int argc, char **argv)
     return 1;
   }
   if (validate_metal_bundle(wrong_blob_ref_bundle, replay_error) ||
-      !expect_contains(replay_error, "asset path blob_ref does not match")) {
+      !expect_contains(replay_error, "descriptor_path does not reference a Metal pipeline asset")) {
     std::cerr << "wrong-blob-ref bundle did not fail validate-only as expected: "
               << replay_error << "\n";
     return 1;
