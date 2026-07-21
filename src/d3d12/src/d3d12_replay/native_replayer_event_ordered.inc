@@ -27,6 +27,9 @@
     event_ordered_queue_waits_ = 0;
     event_ordered_fence_signals_ = 0;
     event_ordered_fence_events_registered_ = 0;
+    event_ordered_resource_update_retained_bytes_ = 0;
+    event_ordered_resource_update_peak_retained_bytes_ = 0;
+    event_ordered_resource_update_released_bytes_ = 0;
     event_ordered_registered_fence_events_.clear();
     event_ordered_stop_requested_ = false;
     event_ordered_failed_ = false;
@@ -44,11 +47,14 @@
     descriptor_copy_timeline_.clear();
     next_resource_update_index_ = 0;
     next_descriptor_copy_index_ = 0;
-    event_ordered_ingested_update_keys_.clear();
     event_ordered_resource_update_notification_cursor_ = 0;
-    event_ordered_copied_descriptor_storage_.clear();
-    event_ordered_resource_updates_applied_keys_.clear();
-    event_ordered_copy_descriptors_applied_keys_.clear();
+    event_ordered_live_descriptors_.clear();
+    event_ordered_live_samplers_.clear();
+    event_ordered_descriptor_semantic_index_cursor_ = 0;
+    event_ordered_sampler_semantic_index_cursor_ = 0;
+    event_ordered_descriptor_semantic_index_by_sequence_.clear();
+    event_ordered_sampler_semantic_index_by_sequence_.clear();
+    event_ordered_copy_descriptors_applied_indices_.clear();
     event_ordered_descriptor_copy_index_cursor_ = 0;
     event_ordered_descriptor_copy_indices_by_sequence_.clear();
     backend_.event_ordered_counters_.clear();
@@ -745,6 +751,10 @@ private:
            " lists_reset=" + std::to_string(event_ordered_lists_reset_) +
            " lists_closed=" + std::to_string(event_ordered_lists_closed_) +
            " resource_updates_applied=" + std::to_string(event_ordered_resource_updates_applied_) +
+           " resource_update_released_bytes=" +
+           std::to_string(event_ordered_resource_update_released_bytes_) +
+           " resource_update_peak_retained_bytes=" +
+           std::to_string(event_ordered_resource_update_peak_retained_bytes_) +
            " copy_descriptors_applied=" + std::to_string(event_ordered_copy_descriptors_applied_) +
            " command_lists_submitted=" + std::to_string(event_ordered_command_lists_submitted_) +
            " draws_recorded=" + std::to_string(event_ordered_draws_recorded_) +

@@ -133,6 +133,12 @@ native compiled-dispatch retrace 打开 bundle 时只读取 bundle header 和 di
 dispatch 时间；目标是让 retrace 的自有工作收敛为有界内存的顺序解码和立即分发，DXMT 内部的 PSO、
 descriptor、submission 和同步成本则原样保留，作为被测负载。
 
+event-ordered native replay 只依据已经按原始 sequence 消费的事件维护 descriptor 和 sampler 的
+当前槽位状态，不为每个创建或拷贝事件重新扫描、排序或重建全量历史。此精简仅适用于严格单调消费的
+event-ordered 路径；持久化 replay model 的随机时序查询仍保留完整历史。资源更新 payload 在 bytes
+已经复制进 native mapped resource，或已经按原语义判定为过期资源世代后可以立即释放；不得在复制前
+释放，也不得改变 Map / Unmap 边界或应用 sequence。
+
 finalize 的验收也区分一次性编译和无变化复用：一次性编译记录完整 wall time、CPU time、peak RSS、
 输入/输出字节和记录数；并行 JSONL 分块必须受内存上限约束，不能用 worker 数乘以大块输入换取吞吐。
 无变化复用不得读取或 hash 完整 callstream/dispatch，目标是亚秒级且常量内存。没有 blob 引用的

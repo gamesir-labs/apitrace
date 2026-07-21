@@ -3996,6 +3996,14 @@ private:
       std::uint64_t descriptor,
       std::uint64_t sequence) const
   {
+    if (event_ordered_recording_) {
+      const auto descriptor_it = event_ordered_live_descriptors_.find(descriptor);
+      if (descriptor_it == event_ordered_live_descriptors_.end() ||
+          descriptor_it->second.create_sequence > sequence) {
+        return nullptr;
+      }
+      return &descriptor_it->second;
+    }
     const auto history_it = descriptor_slot_history_.find(descriptor);
     if (history_it == descriptor_slot_history_.end() || history_it->second.empty()) {
       return nullptr;
@@ -4335,15 +4343,7 @@ private:
     const ReplaySequenceScope sync_scope(this, sequence);
     while (next_resource_update_index_ < resource_update_timeline_.size() &&
            resource_update_timeline_[next_resource_update_index_].sequence <= sequence) {
-      const auto &entry = resource_update_timeline_[next_resource_update_index_];
-      std::string event_ordered_key;
-      if (event_ordered_recording_) {
-        event_ordered_key = event_ordered_resource_update_key(entry);
-        if (!event_ordered_resource_updates_applied_keys_.insert(event_ordered_key).second) {
-          ++next_resource_update_index_;
-          continue;
-        }
-      }
+      auto &entry = resource_update_timeline_[next_resource_update_index_];
       if (should_skip_stale_generation_unmap(
               entry.resource_object_id, entry.sequence, entry.update)) {
         const auto *recorded = recorded_resource_at(entry.resource_object_id, entry.sequence);
@@ -4355,6 +4355,9 @@ private:
                << " bytes=" << entry.update->bytes.size();
         replay_milestone(detail.str().c_str());
         ++stale_generation_resource_updates_skipped_;
+        if (event_ordered_recording_) {
+          event_ordered_release_resource_update(entry);
+        }
         ++next_resource_update_index_;
         continue;
       }
@@ -4367,9 +4370,6 @@ private:
       ID3D12Resource *target = resource_for(entry.resource_object_id, error);
       if (!target) {
         flush_resource_upload_mapping(upload_mapping);
-        if (event_ordered_recording_) {
-          event_ordered_resource_updates_applied_keys_.erase(event_ordered_key);
-        }
         return false;
       }
       auto *persistent_mapping = event_ordered_recording_
@@ -4429,19 +4429,20 @@ private:
         error = detail.str();
         replay_milestone((std::string("resource-upload-map-fail ") + error).c_str());
         flush_resource_upload_mapping(upload_mapping);
-        if (event_ordered_recording_) {
-          event_ordered_resource_updates_applied_keys_.erase(event_ordered_key);
-        }
         return false;
       }
       ++updates;
       update_bytes += entry.update->bytes.size();
       if (event_ordered_recording_) {
         ++event_ordered_resource_updates_applied_;
+        event_ordered_release_resource_update(entry);
       }
       ++next_resource_update_index_;
     }
     flush_resource_upload_mapping(upload_mapping);
+    if (event_ordered_recording_) {
+      event_ordered_compact_resource_update_timeline();
+    }
     accumulate_frame_duration(
         frame_timing_frame_sync_ms_,
         frame_timing_total_sync_ms_,
@@ -9964,6 +9965,7 @@ private:
     std::uint64_t sequence = 0;
     trace::ObjectId resource_object_id = 0;
     const D3D12ReplayBackend::ResourceDataUpdate *update = nullptr;
+    D3D12ReplayBackend::ResourceDataUpdate *releasable_update = nullptr;
   };
 
   struct DescriptorSlotHistoryEntry {
@@ -10128,9 +10130,17 @@ private:
   std::unordered_map<const D3D12ReplayBackend::CopyDescriptorSemanticState *, std::size_t>
       descriptor_copy_index_by_semantic_;
   std::vector<ResourceDataUpdateRef> resource_update_timeline_;
-  std::unordered_set<std::string> event_ordered_ingested_update_keys_;
   std::size_t event_ordered_resource_update_notification_cursor_ = 0;
-  std::deque<D3D12ReplayBackend::DescriptorSemanticState> event_ordered_copied_descriptor_storage_;
+  std::unordered_map<std::uint64_t, D3D12ReplayBackend::DescriptorSemanticState>
+      event_ordered_live_descriptors_;
+  std::unordered_map<std::uint64_t, D3D12ReplayBackend::SamplerSemanticState>
+      event_ordered_live_samplers_;
+  std::size_t event_ordered_descriptor_semantic_index_cursor_ = 0;
+  std::size_t event_ordered_sampler_semantic_index_cursor_ = 0;
+  std::unordered_map<std::uint64_t, std::size_t>
+      event_ordered_descriptor_semantic_index_by_sequence_;
+  std::unordered_map<std::uint64_t, std::size_t>
+      event_ordered_sampler_semantic_index_by_sequence_;
   std::size_t next_descriptor_index_ = 0;
   std::size_t next_sampler_index_ = 0;
   std::size_t next_descriptor_copy_index_ = 0;
@@ -10158,11 +10168,13 @@ private:
   std::uint64_t event_ordered_queue_waits_ = 0;
   std::uint64_t event_ordered_fence_signals_ = 0;
   std::uint64_t event_ordered_fence_events_registered_ = 0;
+  std::uint64_t event_ordered_resource_update_retained_bytes_ = 0;
+  std::uint64_t event_ordered_resource_update_peak_retained_bytes_ = 0;
+  std::uint64_t event_ordered_resource_update_released_bytes_ = 0;
   std::vector<std::unique_ptr<ScopedFenceEvent>> event_ordered_registered_fence_events_;
   bool event_ordered_stop_requested_ = false;
   std::unordered_set<std::uint64_t> event_ordered_presented_frames_;
-  std::unordered_set<std::string> event_ordered_resource_updates_applied_keys_;
-  std::unordered_set<std::string> event_ordered_copy_descriptors_applied_keys_;
+  std::unordered_set<std::size_t> event_ordered_copy_descriptors_applied_indices_;
   std::size_t event_ordered_descriptor_copy_index_cursor_ = 0;
   std::unordered_map<std::uint64_t, std::vector<std::size_t>>
       event_ordered_descriptor_copy_indices_by_sequence_;

@@ -39,16 +39,13 @@
 
   void event_ordered_note_resource_update(
       trace::ObjectId resource_object_id,
-      const D3D12ReplayBackend::ResourceDataUpdate &update)
+      D3D12ReplayBackend::ResourceDataUpdate &update)
   {
     ResourceDataUpdateRef entry;
     entry.sequence = event_ordered_effective_resource_update_sequence(update);
     entry.resource_object_id = resource_object_id;
     entry.update = &update;
-    std::string update_key = event_ordered_resource_update_key(entry);
-    if (event_ordered_ingested_update_keys_.find(update_key) != event_ordered_ingested_update_keys_.end()) {
-      return;
-    }
+    entry.releasable_update = &update;
     auto insert_at = std::upper_bound(
         resource_update_timeline_.begin(),
         resource_update_timeline_.end(),
@@ -62,7 +59,10 @@
     if (inserted_index < next_resource_update_index_) {
       next_resource_update_index_ = inserted_index;
     }
-    event_ordered_ingested_update_keys_.insert(std::move(update_key));
+    event_ordered_resource_update_retained_bytes_ += update.bytes.size();
+    event_ordered_resource_update_peak_retained_bytes_ = std::max(
+        event_ordered_resource_update_peak_retained_bytes_,
+        event_ordered_resource_update_retained_bytes_);
   }
 
   void event_ordered_ingest_resource_updates()
@@ -80,24 +80,39 @@
     }
   }
 
-  std::string event_ordered_resource_update_key(const ResourceDataUpdateRef &entry) const
+  void event_ordered_release_resource_update(ResourceDataUpdateRef &entry)
   {
-    std::ostringstream key;
-    key << entry.resource_object_id << ":"
-        << entry.sequence << ":";
-    if (entry.update == nullptr) {
-      key << "<null>";
-      return key.str();
+    if (entry.releasable_update == nullptr) {
+      return;
     }
-    key << entry.update->subresource << ":"
-        << entry.update->written_begin << ":"
-        << entry.update->written_end << ":"
-        << entry.update->relative_path.generic_string() << ":"
-        << entry.update->bytes.size();
-    for (const auto blob_ref : entry.update->blob_refs) {
-      key << ":" << blob_ref;
+    const auto released_bytes = entry.releasable_update->bytes.size();
+    std::vector<std::uint8_t>().swap(entry.releasable_update->bytes);
+    event_ordered_resource_update_retained_bytes_ =
+        released_bytes <= event_ordered_resource_update_retained_bytes_
+            ? event_ordered_resource_update_retained_bytes_ - released_bytes
+            : 0;
+    event_ordered_resource_update_released_bytes_ += released_bytes;
+    entry.update = nullptr;
+    entry.releasable_update = nullptr;
+  }
+
+  void event_ordered_compact_resource_update_timeline()
+  {
+    if (next_resource_update_index_ == 0) {
+      return;
     }
-    return key.str();
+    if (next_resource_update_index_ == resource_update_timeline_.size()) {
+      resource_update_timeline_.clear();
+      next_resource_update_index_ = 0;
+      return;
+    }
+    if (next_resource_update_index_ >= 4096) {
+      resource_update_timeline_.erase(
+          resource_update_timeline_.begin(),
+          resource_update_timeline_.begin() +
+              static_cast<std::ptrdiff_t>(next_resource_update_index_));
+      next_resource_update_index_ = 0;
+    }
   }
 
   void event_ordered_report_content_error(
@@ -279,16 +294,12 @@
       std::uint64_t descriptor,
       std::uint64_t sequence) const
   {
-    const D3D12ReplayBackend::SamplerSemanticState *found = nullptr;
-    for (const auto &sampler : backend_.samplers_) {
-      if (sampler.descriptor != descriptor || sampler.create_sequence > sequence) {
-        continue;
-      }
-      if (found == nullptr || found->create_sequence < sampler.create_sequence) {
-        found = &sampler;
-      }
+    const auto sampler_it = event_ordered_live_samplers_.find(descriptor);
+    if (sampler_it == event_ordered_live_samplers_.end() ||
+        sampler_it->second.create_sequence > sequence) {
+      return nullptr;
     }
-    return found;
+    return &sampler_it->second;
   }
 
   void event_ordered_remember_descriptor_copy_history(
@@ -320,27 +331,9 @@
               binding_error)) {
         copied.binding = dst_binding;
       }
-      event_ordered_copied_descriptor_storage_.push_back(std::move(copied));
-      const auto &stored = event_ordered_copied_descriptor_storage_.back();
-      descriptor_slot_history_[pair.dst_descriptor].push_back(
-          DescriptorSlotHistoryEntry{copy.create_sequence, &stored});
+      event_ordered_live_samplers_.erase(pair.dst_descriptor);
+      event_ordered_live_descriptors_[pair.dst_descriptor] = std::move(copied);
     }
-  }
-
-  void event_ordered_refresh_descriptor_copy_state()
-  {
-    descriptor_copy_timeline_.clear();
-    descriptor_copy_timeline_.reserve(backend_.descriptor_copies_.size());
-    for (const auto &copy : backend_.descriptor_copies_) {
-      descriptor_copy_timeline_.push_back(&copy);
-    }
-    std::stable_sort(
-        descriptor_copy_timeline_.begin(),
-        descriptor_copy_timeline_.end(),
-        [](const auto *lhs, const auto *rhs) {
-          return lhs->create_sequence < rhs->create_sequence;
-        });
-    next_descriptor_copy_index_ = descriptor_copy_timeline_.size();
   }
 
   void event_ordered_index_descriptor_copies()
@@ -381,17 +374,6 @@
     return true;
   }
 
-  static std::string event_ordered_descriptor_copy_key(
-      const D3D12ReplayBackend::CopyDescriptorSemanticState &copy)
-  {
-    std::ostringstream key;
-    key << copy.create_sequence << ":" << copy.descriptor_heap_type;
-    for (const auto &pair : copy.descriptors) {
-      key << ":" << pair.dst_descriptor << "<-" << pair.src_descriptor;
-    }
-    return key.str();
-  }
-
   void event_ordered_apply_copy_descriptors(const trace::EventRecord &event)
   {
     event_ordered_index_descriptor_copies();
@@ -404,7 +386,6 @@
       return;
     }
 
-    bool applied_any = false;
     for (const auto sequence : copy_sequences) {
       const auto index_it = event_ordered_descriptor_copy_indices_by_sequence_.find(sequence);
       if (index_it == event_ordered_descriptor_copy_indices_by_sequence_.end()) {
@@ -415,22 +396,18 @@
           continue;
         }
         const auto &copy = backend_.descriptor_copies_[copy_index];
-        const auto key = event_ordered_descriptor_copy_key(copy);
-        if (!event_ordered_copy_descriptors_applied_keys_.insert(key).second) {
+        if (!event_ordered_copy_descriptors_applied_indices_.insert(copy_index).second) {
           continue;
         }
         std::string error;
         if (!apply_descriptor_copy(copy, error)) {
-          event_ordered_copy_descriptors_applied_keys_.erase(key);
+          event_ordered_copy_descriptors_applied_indices_.erase(copy_index);
           event_ordered_report_content_error(event, "copy-descriptors", std::move(error));
           continue;
         }
         event_ordered_remember_descriptor_copy_history(copy);
         ++event_ordered_copy_descriptors_applied_;
-        applied_any = true;
       }
-    }
-    if (applied_any) {
-      event_ordered_refresh_descriptor_copy_state();
+      event_ordered_descriptor_copy_indices_by_sequence_.erase(sequence);
     }
   }

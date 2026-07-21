@@ -108,46 +108,32 @@
     }
   }
 
-  void event_ordered_refresh_descriptor_state()
+  void event_ordered_index_descriptor_semantics()
   {
-    descriptor_timeline_.clear();
-    descriptor_timeline_.reserve(backend_.descriptors_.size());
-    for (const auto &descriptor : backend_.descriptors_) {
-      descriptor_timeline_.push_back(&descriptor);
+    while (event_ordered_descriptor_semantic_index_cursor_ < backend_.descriptors_.size()) {
+      const auto &descriptor =
+          backend_.descriptors_[event_ordered_descriptor_semantic_index_cursor_];
+      event_ordered_descriptor_semantic_index_by_sequence_[descriptor.create_sequence] =
+          event_ordered_descriptor_semantic_index_cursor_;
+      ++event_ordered_descriptor_semantic_index_cursor_;
     }
-    std::stable_sort(
-        descriptor_timeline_.begin(),
-        descriptor_timeline_.end(),
-        [](const auto *lhs, const auto *rhs) {
-          return lhs->create_sequence < rhs->create_sequence;
-        });
-
-    descriptor_slot_history_.clear();
-    for (const auto *descriptor : descriptor_timeline_) {
-      descriptor_slot_history_[descriptor->descriptor].push_back(
-          DescriptorSlotHistoryEntry{descriptor->create_sequence, descriptor});
-    }
-    for (const auto &copied : event_ordered_copied_descriptor_storage_) {
-      descriptor_slot_history_[copied.descriptor].push_back(
-          DescriptorSlotHistoryEntry{copied.create_sequence, &copied});
-    }
-    next_descriptor_index_ = descriptor_timeline_.size();
   }
 
-  void event_ordered_refresh_sampler_state()
+  void event_ordered_index_sampler_semantics()
   {
-    sampler_timeline_.clear();
-    sampler_timeline_.reserve(backend_.samplers_.size());
-    for (const auto &sampler : backend_.samplers_) {
-      sampler_timeline_.push_back(&sampler);
+    while (event_ordered_sampler_semantic_index_cursor_ < backend_.samplers_.size()) {
+      const auto &sampler = backend_.samplers_[event_ordered_sampler_semantic_index_cursor_];
+      event_ordered_sampler_semantic_index_by_sequence_[sampler.create_sequence] =
+          event_ordered_sampler_semantic_index_cursor_;
+      ++event_ordered_sampler_semantic_index_cursor_;
     }
-    std::stable_sort(
-        sampler_timeline_.begin(),
-        sampler_timeline_.end(),
-        [](const auto *lhs, const auto *rhs) {
-          return lhs->create_sequence < rhs->create_sequence;
-        });
-    next_sampler_index_ = sampler_timeline_.size();
+  }
+
+  void event_ordered_remember_descriptor_semantic(
+      const D3D12ReplayBackend::DescriptorSemanticState &semantic)
+  {
+    event_ordered_live_samplers_.erase(semantic.descriptor);
+    event_ordered_live_descriptors_[semantic.descriptor] = semantic;
   }
 
   const D3D12ReplayBackend::DescriptorSemanticState *event_ordered_find_descriptor_semantic(
@@ -155,14 +141,16 @@
       std::uint64_t descriptor,
       std::string_view kind) const
   {
-    for (auto it = backend_.descriptors_.rbegin(); it != backend_.descriptors_.rend(); ++it) {
-      if (it->create_sequence == sequence &&
-          it->descriptor == descriptor &&
-          (kind.empty() || it->kind == kind)) {
-        return &*it;
-      }
+    const auto index_it = event_ordered_descriptor_semantic_index_by_sequence_.find(sequence);
+    if (index_it == event_ordered_descriptor_semantic_index_by_sequence_.end() ||
+        index_it->second >= backend_.descriptors_.size()) {
+      return nullptr;
     }
-    return nullptr;
+    const auto &semantic = backend_.descriptors_[index_it->second];
+    return semantic.descriptor == descriptor &&
+                   (kind.empty() || semantic.kind == kind)
+               ? &semantic
+               : nullptr;
   }
 
   bool event_ordered_apply_descriptor_semantic(
@@ -205,6 +193,7 @@
       return;
     }
     const auto &payload = *payload_ptr;
+    event_ordered_index_descriptor_semantics();
 
     const auto descriptor = payload_u64(payload, "descriptor");
     const auto *semantic =
@@ -217,9 +206,11 @@
               " kind=" + std::string(kind));
       return;
     }
+    event_ordered_descriptor_semantic_index_by_sequence_.erase(
+        event.callsite.sequence);
 
     if (event_ordered_apply_descriptor_semantic(event, *semantic)) {
-      event_ordered_refresh_descriptor_state();
+      event_ordered_remember_descriptor_semantic(*semantic);
     }
   }
 
@@ -232,6 +223,7 @@
       return;
     }
     const auto &payload = *payload_ptr;
+    event_ordered_index_descriptor_semantics();
     if (payload_string(payload, "schema") != "descriptor-view-v2") {
       event_ordered_record_materialize_error(
           event,
@@ -245,7 +237,6 @@
       return;
     }
 
-    bool materialized_any = false;
     for (const auto &op : *ops) {
       if (!op.is_array() || op.size() < 16) {
         event_ordered_record_materialize_error(event, "descriptor batch v2 op must be a 16-column array");
@@ -271,13 +262,10 @@
                 " kind=" + std::string(kind));
         continue;
       }
+      event_ordered_descriptor_semantic_index_by_sequence_.erase(sequence);
       if (event_ordered_apply_descriptor_semantic(event, *semantic)) {
-        materialized_any = true;
+        event_ordered_remember_descriptor_semantic(*semantic);
       }
-    }
-
-    if (materialized_any) {
-      event_ordered_refresh_descriptor_state();
     }
   }
 
@@ -285,12 +273,13 @@
       std::uint64_t sequence,
       std::uint64_t descriptor) const
   {
-    for (auto it = backend_.samplers_.rbegin(); it != backend_.samplers_.rend(); ++it) {
-      if (it->create_sequence == sequence && it->descriptor == descriptor) {
-        return &*it;
-      }
+    const auto index_it = event_ordered_sampler_semantic_index_by_sequence_.find(sequence);
+    if (index_it == event_ordered_sampler_semantic_index_by_sequence_.end() ||
+        index_it->second >= backend_.samplers_.size()) {
+      return nullptr;
     }
-    return nullptr;
+    const auto &semantic = backend_.samplers_[index_it->second];
+    return semantic.descriptor == descriptor ? &semantic : nullptr;
   }
 
   void materialize_create_sampler(const trace::EventRecord &event)
@@ -302,6 +291,7 @@
       return;
     }
     const auto &payload = *payload_ptr;
+    event_ordered_index_sampler_semantics();
 
     const auto descriptor = payload_u64(payload, "descriptor");
     const auto *semantic = event_ordered_find_sampler_semantic(event.callsite.sequence, descriptor);
@@ -311,10 +301,13 @@
           "CreateSampler missing SamplerSemanticState descriptor=" + std::to_string(descriptor));
       return;
     }
+    event_ordered_sampler_semantic_index_by_sequence_.erase(
+        event.callsite.sequence);
 
     if (!apply_sampler(*semantic, error)) {
       event_ordered_record_materialize_error(event, std::move(error));
       return;
     }
-    event_ordered_refresh_sampler_state();
+    event_ordered_live_descriptors_.erase(semantic->descriptor);
+    event_ordered_live_samplers_[semantic->descriptor] = *semantic;
   }
