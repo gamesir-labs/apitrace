@@ -143,16 +143,19 @@ sample.apitrace/
 
 这是 `bundle-finalize` 从 `callstream.jsonl` 编译出的可删除、可重建 D3D12 retrace 加速文件。
 它逐条保留事件种类、原 sequence、函数标识、对象/资产引用和完整语义；finalize 同时把 native
-handler 路由及 command semantic kind 编译为固定 opcode。已覆盖的 route 使用带版本的类型化二进制
-payload（当前包括 `UpdateTileMappings` 的 region/range 数组，以及 `D3D12ResourceDataUpdate` 的
-resource/range/asset locator），其余 route 暂以 MessagePack 保存完整
-payload，直到对应类型化 schema 落地。不允许合并、跳过、
+handler 路由及 command semantic kind 编译为固定 opcode。所有 route 都使用带版本的类型化二进制
+payload：通用 route 把 null、布尔、无符号/有符号整数、浮点、字符串、数组和对象编译为有界节点；
+`UpdateTileMappings` 的 region/range 数组及 `D3D12ResourceDataUpdate` 的
+resource/range/asset locator 使用更紧凑的专用结构。生产 dispatch 不再包含 MessagePack 或 JSON
+payload。不允许合并、跳过、
 重排或提前执行 API 调用。文件头同时记录源
 `callstream.jsonl` 字节数、记录数和编码字节数，reader 在使用前校验版本、源大小和 checksum。
 
 `callstream.jsonl` 仍然是调用语义权威来源。`d3d12-dispatch.bin` 把顶层 JSON 解析、payload
 规范化、记录边界检查、route-specific 字段验证和 native handler 分类前移到 finalize，使 native retrace 可以单记录流式
-解码后按 opcode 直接分发，而不把完整调用流载入内存，也不逐事件扫描函数名。缺失、过期或损坏
+解码类型化节点后按 opcode 直接分发，而不把完整调用流载入内存，也不逐事件扫描函数名。fresh RAW
+物化时会按最终事件顺序同时生成 dispatch；若后续资产或 pipeline 修复改写 callstream，则在最后一次
+对象审计扫描中同步重建 dispatch，不再单独二次扫描 callstream。缺失、过期或损坏
 时，native retrace 必须提示重新运行 `bundle-finalize`，
 不能静默回退到 retrace 内 JSON 解释器。
 

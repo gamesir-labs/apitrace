@@ -159,6 +159,72 @@ bool validate_compiled_resource_data_update_codec(const std::filesystem::path &p
       "typed ResourceDataUpdate dispatch roundtrip failed");
 }
 
+bool validate_compiled_node_codec(const std::filesystem::path &path)
+{
+  apitrace::trace::EventRecord input;
+  input.kind = apitrace::trace::EventKind::Call;
+  input.callsite.sequence = 99;
+  input.callsite.function_name = "ID3D12GraphicsCommandList::DrawInstanced";
+  input.object_refs = {500};
+  const auto expected = json::parse(
+      R"({"null_value":null,"false_value":false,"true_value":true,"unsigned_value":18446744073709551615,"signed_value":-17,"float_value":1.25,"string_value":"typed","array_value":[1,-2,3.5,false],"object_value":{"nested":"value"}})");
+  input.payload = expected.dump();
+
+  std::vector<std::uint8_t> encoded;
+  std::string error;
+  if (!expect(
+          apitrace::trace::encode_compiled_dispatch_event(input, encoded, error),
+          "failed to compile typed-node payload")) {
+    std::cerr << error << "\n";
+    return false;
+  }
+  apitrace::trace::CompiledDispatchHeader header;
+  header.source_callstream_bytes = 789;
+  header.record_count = 1;
+  header.encoded_record_bytes = encoded.size();
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  if (!expect(
+          output.is_open() && apitrace::trace::write_compiled_dispatch_header(output, header, error),
+          "failed to write typed-node dispatch header")) {
+    std::cerr << error << "\n";
+    return false;
+  }
+  output.write(reinterpret_cast<const char *>(encoded.data()), encoded.size());
+  output.close();
+
+  bool visited = false;
+  bool payload_ok = false;
+  const bool decoded = apitrace::trace::for_each_compiled_dispatch_event(
+      path,
+      header.source_callstream_bytes,
+      [&](const apitrace::trace::EventRecord &event) {
+        visited = true;
+        json payload;
+        payload_ok =
+            event.payload_encoding == apitrace::trace::EventPayloadEncoding::CompiledNodes &&
+            event.dispatch_route == apitrace::trace::CompiledDispatchRoute::RecordCommand &&
+            event.command_kind == apitrace::trace::CompiledCommandKind::Draw &&
+            apitrace::trace::decode_compiled_payload_nodes(event.payload, payload, error) &&
+            payload == expected;
+        return true;
+      },
+      nullptr,
+      error);
+  std::string malformed(1, static_cast<char>(0xff));
+  json rejected;
+  std::string malformed_error;
+  const bool rejected_malformed =
+      !apitrace::trace::decode_compiled_payload_nodes(
+          malformed, rejected, malformed_error) &&
+      !malformed_error.empty();
+  if (!decoded) {
+    std::cerr << error << "\n";
+  }
+  return expect(
+      decoded && visited && payload_ok && rejected_malformed,
+      "typed-node dispatch roundtrip or malformed-input rejection failed");
+}
+
 std::string quote_arg(const std::filesystem::path &path)
 {
   std::string text = path.string();
@@ -1428,14 +1494,13 @@ bool validate_final_bundle(const std::filesystem::path &bundle)
   std::vector<apitrace::trace::CompiledCommandKind> dispatched_command_kinds;
   std::string stream_error;
   if (!expect(reader.for_each_event([&](const apitrace::trace::EventRecord &event) {
-        if (event.payload_encoding != apitrace::trace::EventPayloadEncoding::MessagePack) {
-          stream_error = "compiled dispatch event did not use MessagePack payload";
+        if (event.payload_encoding != apitrace::trace::EventPayloadEncoding::CompiledNodes) {
+          stream_error = "compiled dispatch event did not use typed-node payload";
           return false;
         }
-        auto payload = json::from_msgpack(
-            event.payload.begin(), event.payload.end(), true, false);
-        if (payload.is_discarded() || !payload.is_object()) {
-          stream_error = "compiled dispatch payload failed to decode";
+        json payload;
+        if (!apitrace::trace::decode_compiled_payload_nodes(
+                event.payload, payload, stream_error)) {
           return false;
         }
         dispatched_functions.push_back(event.callsite.function_name);
@@ -1904,6 +1969,7 @@ int main(int argc, char **argv)
   const bool ok =
       validate_compiled_tile_mapping_codec(work_dir / "compiled-tile-mapping.bin") &&
       validate_compiled_resource_data_update_codec(work_dir / "compiled-resource-update.bin") &&
+      validate_compiled_node_codec(work_dir / "compiled-node.bin") &&
       write_synthetic_trace_session_capture(bundle) &&
       run_command_expect_failure(quote_arg(argv[1]) + " --dry-run " + quote_arg(bundle)) &&
       run_command_expect_failure(quote_arg(argv[1]) + " --raw-format " + quote_arg(bundle)) &&

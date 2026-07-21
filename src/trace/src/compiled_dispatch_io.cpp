@@ -16,9 +16,22 @@ namespace {
 using json = nlohmann::json;
 
 constexpr std::array<std::uint8_t, 8> kMagic = {
-    'A', 'P', 'I', 'D', 'S', 'P', '4', '\0'};
+    'A', 'P', 'I', 'D', 'S', 'P', '5', '\0'};
 constexpr std::uint32_t kHeaderBytes = 48;
 constexpr std::uint32_t kRecordFixedBytes = 72;
+constexpr std::uint32_t kCompiledNodeMaxDepth = 64;
+
+enum class CompiledNodeTag : std::uint8_t {
+  Null = 0,
+  False = 1,
+  True = 2,
+  Unsigned = 3,
+  Signed = 4,
+  Float64 = 5,
+  String = 6,
+  Array = 7,
+  Object = 8,
+};
 
 bool contains(std::string_view text, std::string_view needle)
 {
@@ -296,6 +309,227 @@ bool json_u64(const json &value, std::uint64_t &result)
       return true;
     }
   }
+  return false;
+}
+
+bool encode_compiled_node(
+    const json &node,
+    std::vector<std::uint8_t> &encoded,
+    std::uint32_t depth,
+    std::string &error)
+{
+  if (depth > kCompiledNodeMaxDepth) {
+    error = "compiled payload exceeds the maximum node depth";
+    return false;
+  }
+  if (node.is_null()) {
+    encoded.push_back(static_cast<std::uint8_t>(CompiledNodeTag::Null));
+    return true;
+  }
+  if (node.is_boolean()) {
+    encoded.push_back(static_cast<std::uint8_t>(
+        node.get<bool>() ? CompiledNodeTag::True : CompiledNodeTag::False));
+    return true;
+  }
+  if (node.is_number_unsigned()) {
+    encoded.push_back(static_cast<std::uint8_t>(CompiledNodeTag::Unsigned));
+    append_le(encoded, node.get<std::uint64_t>());
+    return true;
+  }
+  if (node.is_number_integer()) {
+    encoded.push_back(static_cast<std::uint8_t>(CompiledNodeTag::Signed));
+    append_le(encoded, node.get<std::int64_t>());
+    return true;
+  }
+  if (node.is_number_float()) {
+    encoded.push_back(static_cast<std::uint8_t>(CompiledNodeTag::Float64));
+    const auto value = node.get<double>();
+    std::uint64_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    append_le(encoded, bits);
+    return true;
+  }
+  if (node.is_string()) {
+    const auto &value = node.get_ref<const std::string &>();
+    std::uint32_t bytes = 0;
+    if (!checked_u32(value.size(), "node string", bytes, error)) {
+      return false;
+    }
+    encoded.push_back(static_cast<std::uint8_t>(CompiledNodeTag::String));
+    append_le(encoded, bytes);
+    encoded.insert(encoded.end(), value.begin(), value.end());
+    return true;
+  }
+  if (node.is_array()) {
+    std::uint32_t count = 0;
+    if (!checked_u32(node.size(), "node array", count, error)) {
+      return false;
+    }
+    encoded.push_back(static_cast<std::uint8_t>(CompiledNodeTag::Array));
+    append_le(encoded, count);
+    for (const auto &element : node) {
+      if (!encode_compiled_node(element, encoded, depth + 1, error)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (node.is_object()) {
+    std::uint32_t count = 0;
+    if (!checked_u32(node.size(), "node object", count, error)) {
+      return false;
+    }
+    encoded.push_back(static_cast<std::uint8_t>(CompiledNodeTag::Object));
+    append_le(encoded, count);
+    for (auto it = node.begin(); it != node.end(); ++it) {
+      std::uint32_t key_bytes = 0;
+      if (!checked_u32(it.key().size(), "node key", key_bytes, error)) {
+        return false;
+      }
+      append_le(encoded, key_bytes);
+      encoded.insert(encoded.end(), it.key().begin(), it.key().end());
+      if (!encode_compiled_node(it.value(), encoded, depth + 1, error)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  error = "compiled payload contains an unsupported JSON node";
+  return false;
+}
+
+bool encode_compiled_payload_nodes(
+    const json &payload,
+    std::vector<std::uint8_t> &encoded,
+    std::string &error)
+{
+  encoded.clear();
+  if (!payload.is_object()) {
+    error = "compiled payload root must be an object";
+    return false;
+  }
+  return encode_compiled_node(payload, encoded, 0, error);
+}
+
+bool decode_compiled_node(
+    const std::uint8_t *&cursor,
+    const std::uint8_t *end,
+    json &node,
+    std::uint32_t depth,
+    std::string &error)
+{
+  if (depth > kCompiledNodeMaxDepth || cursor == end) {
+    error = depth > kCompiledNodeMaxDepth
+                ? "compiled payload exceeds the maximum node depth"
+                : "compiled payload node is truncated";
+    return false;
+  }
+  const auto raw_tag = *cursor++;
+  if (raw_tag > static_cast<std::uint8_t>(CompiledNodeTag::Object)) {
+    error = "compiled payload has an unknown node tag";
+    return false;
+  }
+  const auto tag = static_cast<CompiledNodeTag>(raw_tag);
+  switch (tag) {
+  case CompiledNodeTag::Null:
+    node = nullptr;
+    return true;
+  case CompiledNodeTag::False:
+    node = false;
+    return true;
+  case CompiledNodeTag::True:
+    node = true;
+    return true;
+  case CompiledNodeTag::Unsigned: {
+    std::uint64_t value = 0;
+    if (!read_le(cursor, end, value)) {
+      error = "compiled unsigned node is truncated";
+      return false;
+    }
+    node = value;
+    return true;
+  }
+  case CompiledNodeTag::Signed: {
+    std::int64_t value = 0;
+    if (!read_le(cursor, end, value)) {
+      error = "compiled signed node is truncated";
+      return false;
+    }
+    node = value;
+    return true;
+  }
+  case CompiledNodeTag::Float64: {
+    std::uint64_t bits = 0;
+    if (!read_le(cursor, end, bits)) {
+      error = "compiled float node is truncated";
+      return false;
+    }
+    double value = 0.0;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&value, &bits, sizeof(value));
+    node = value;
+    return true;
+  }
+  case CompiledNodeTag::String: {
+    std::uint32_t bytes = 0;
+    if (!read_le(cursor, end, bytes) || static_cast<std::size_t>(end - cursor) < bytes) {
+      error = "compiled string node is truncated";
+      return false;
+    }
+    node = std::string(reinterpret_cast<const char *>(cursor), bytes);
+    cursor += bytes;
+    return true;
+  }
+  case CompiledNodeTag::Array: {
+    std::uint32_t count = 0;
+    if (!read_le(cursor, end, count) || count > static_cast<std::uint32_t>(end - cursor)) {
+      error = "compiled array node has an invalid element count";
+      return false;
+    }
+    node = json::array();
+    auto &array = node.get_ref<json::array_t &>();
+    array.reserve(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+      json element;
+      if (!decode_compiled_node(cursor, end, element, depth + 1, error)) {
+        return false;
+      }
+      array.push_back(std::move(element));
+    }
+    return true;
+  }
+  case CompiledNodeTag::Object: {
+    std::uint32_t count = 0;
+    if (!read_le(cursor, end, count) ||
+        count > static_cast<std::uint32_t>((end - cursor) / 5)) {
+      error = "compiled object node has an invalid member count";
+      return false;
+    }
+    node = json::object();
+    auto &object = node.get_ref<json::object_t &>();
+    for (std::uint32_t index = 0; index < count; ++index) {
+      std::uint32_t key_bytes = 0;
+      if (!read_le(cursor, end, key_bytes) ||
+          static_cast<std::size_t>(end - cursor) < key_bytes) {
+        error = "compiled object key is truncated";
+        return false;
+      }
+      std::string key(reinterpret_cast<const char *>(cursor), key_bytes);
+      cursor += key_bytes;
+      json value;
+      if (!decode_compiled_node(cursor, end, value, depth + 1, error)) {
+        return false;
+      }
+      if (!object.emplace(std::move(key), std::move(value)).second) {
+        error = "compiled object contains a duplicate key";
+        return false;
+      }
+    }
+    return true;
+  }
+  }
+  error = "compiled payload node is invalid";
   return false;
 }
 
@@ -602,6 +836,34 @@ bool read_compiled_dispatch_header(
 
 } // namespace
 
+bool decode_compiled_payload_nodes(
+    std::string_view encoded,
+    nlohmann::json &payload,
+    std::string &error)
+{
+  error.clear();
+  if (encoded.empty()) {
+    error = "compiled payload is empty";
+    payload = json();
+    return false;
+  }
+  const auto *cursor = reinterpret_cast<const std::uint8_t *>(encoded.data());
+  const auto *end = cursor + encoded.size();
+  if (!decode_compiled_node(cursor, end, payload, 0, error) || cursor != end) {
+    if (error.empty()) {
+      error = "compiled payload has trailing bytes";
+    }
+    payload = json();
+    return false;
+  }
+  if (!payload.is_object()) {
+    error = "compiled payload root is not an object";
+    payload = json();
+    return false;
+  }
+  return true;
+}
+
 bool encode_compiled_dispatch_event(
     const EventRecord &event,
     std::vector<std::uint8_t> &encoded,
@@ -621,7 +883,7 @@ bool encode_compiled_dispatch_event(
   }
   const auto dispatch_route = compile_dispatch_route(event, payload);
   const auto command_kind = compile_command_kind(event.callsite.function_name);
-  auto payload_encoding = EventPayloadEncoding::MessagePack;
+  auto payload_encoding = EventPayloadEncoding::CompiledNodes;
   std::vector<std::uint8_t> compiled_payload;
   if (dispatch_route == CompiledDispatchRoute::UpdateTileMappings) {
     if (!encode_compiled_tile_mappings(payload, compiled_payload, error)) {
@@ -636,7 +898,10 @@ bool encode_compiled_dispatch_event(
     }
     payload_encoding = EventPayloadEncoding::CompiledResourceDataUpdate;
   } else {
-    compiled_payload = json::to_msgpack(payload);
+    if (!encode_compiled_payload_nodes(payload, compiled_payload, error)) {
+      error = "sequence " + std::to_string(event.callsite.sequence) + ": " + error;
+      return false;
+    }
   }
 
   std::uint32_t function_bytes = 0;
@@ -834,7 +1099,10 @@ bool for_each_compiled_dispatch_event(
         (dispatch_route == static_cast<std::uint32_t>(CompiledDispatchRoute::UpdateTileMappings)) !=
             (payload_encoding == static_cast<std::uint8_t>(EventPayloadEncoding::CompiledTileMappings)) ||
         (dispatch_route == static_cast<std::uint32_t>(CompiledDispatchRoute::ResourceDataUpdate)) !=
-            (payload_encoding == static_cast<std::uint8_t>(EventPayloadEncoding::CompiledResourceDataUpdate))) {
+            (payload_encoding == static_cast<std::uint8_t>(EventPayloadEncoding::CompiledResourceDataUpdate)) ||
+        (dispatch_route != static_cast<std::uint32_t>(CompiledDispatchRoute::UpdateTileMappings) &&
+         dispatch_route != static_cast<std::uint32_t>(CompiledDispatchRoute::ResourceDataUpdate) &&
+         payload_encoding != static_cast<std::uint8_t>(EventPayloadEncoding::CompiledNodes))) {
       error = "compiled dispatch stream has invalid record fields";
       return false;
     }

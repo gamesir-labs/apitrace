@@ -12,8 +12,11 @@ the expensive publish-time work:
 - deduplicate identical assets into content-addressed paths
 - rewrite JSON/JSONL asset path references
 - compile the authoritative D3D12 JSONL into `analysis/d3d12-dispatch.bin`, preserving one record
-  per original event while normalizing payloads to MessagePack and preselecting the native handler
-  opcode
+  per original event while compiling every payload to bounded typed nodes and preselecting the
+  native handler opcode
+- emit dispatch records directly while materializing fresh RAW events; if later normalization
+  changes callstream semantics, rebuild them inside the already-required final object audit scan
+  instead of scanning `callstream.jsonl` again only for dispatch
 - remove duplicate asset files by default, while preserving any alias path that
   is still referenced after rewriting
 - regenerate root `assets.json`

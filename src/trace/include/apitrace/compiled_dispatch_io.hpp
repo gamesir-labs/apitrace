@@ -2,16 +2,19 @@
 
 #include "apitrace/event_types.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <iosfwd>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace apitrace::trace {
 
-inline constexpr std::uint32_t kCompiledDispatchVersion = 4;
+inline constexpr std::uint32_t kCompiledDispatchVersion = 5;
 
 struct CompiledDispatchHeader {
   std::uint64_t source_callstream_bytes = 0;
@@ -24,6 +27,14 @@ struct CompiledDispatchHeader {
 bool encode_compiled_dispatch_event(
     const EventRecord &event,
     std::vector<std::uint8_t> &encoded,
+    std::string &error);
+
+// Decodes the bounded typed-node payload emitted by bundle-finalize directly into the replay
+// payload object. This format deliberately has no generic MessagePack fallback: every scalar and
+// container carries an explicit node tag and all lengths are checked before allocation.
+bool decode_compiled_payload_nodes(
+    std::string_view encoded,
+    nlohmann::json &payload,
     std::string &error);
 
 bool write_compiled_dispatch_header(

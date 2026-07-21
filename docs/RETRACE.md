@@ -113,12 +113,12 @@ descriptor 更新、command-list Reset / 录制 / Close、queue 提交、fence �
 Present 仍必须在各自原始 sequence 上重新发出。不得先急切重建全部对象、合并提交 batch、改变调用
 边界，或通过 retrace-side cache / wait 调节 DXMT 负载。
 
-类型化 payload 的迁移规则是：finalize 校验原 JSON 的类型、计数、范围和数组长度，再写入 route 专用
-标量布局；retrace reader 只做边界检查和 little-endian 解码，native handler 不得重新构造 JSON DOM。
-`UpdateTileMappings` 已按此规则编译 region、region size、range flags、heap offsets、tile counts 和 flags；
-`D3D12ResourceDataUpdate` 已编译 resource identity、subresource、apply sequence、written range 和 asset
-locator。提交同步阶段直接消费这些类型化记录。后续 route 应沿用同一模式；MessagePack 只是尚未迁移 route 的过渡
-表示，不能成为新增语义的默认实现。
+finalize 校验原 JSON 的类型、计数、范围和数组长度，再写入类型化节点或 route 专用标量布局；retrace
+reader 只做边界检查和 little-endian 解码。通用节点显式区分 null、布尔、无符号/有符号整数、浮点、
+字符串、数组和对象，并限制嵌套深度、成员数和字节范围。`UpdateTileMappings` 继续使用 region、region
+size、range flags、heap offsets、tile counts 和 flags 的专用结构；`D3D12ResourceDataUpdate` 使用
+resource identity、subresource、apply sequence、written range 和 asset locator 的专用结构。生产
+dispatch 中不允许 MessagePack 或 JSON payload。
 
 finalize 也是交付路径的一部分，必须同时约束一次性编译与重复运行成本。它负责完整解析和验证
 `callstream.jsonl`、`checksums.json`、`assets.json`、`objects.json` 及资产闭包，并把 retrace 所需的
@@ -135,9 +135,10 @@ descriptor、submission 和同步成本则原样保留，作为被测负载。
 
 finalize 的验收也区分一次性编译和无变化复用：一次性编译记录完整 wall time、CPU time、peak RSS、
 输入/输出字节和记录数；并行 JSONL 分块必须受内存上限约束，不能用 worker 数乘以大块输入换取吞吐。
-无变化复用不得读取或 hash 完整 callstream/dispatch，目标是亚秒级且常量内存。retrace 则必须分别输出
-reader decode、semantic state、content sync 和 native dispatch 时间；任何仍在 semantic state 阶段解析
-MessagePack/JSON 的 route 都视为待迁移，不得把这部分开销归入 DXMT 被测负载。
+无变化复用不得读取或 hash 完整 callstream/dispatch，目标是亚秒级且常量内存。fresh RAW→final 在
+顺序物化 callstream 时直接生成 dispatch；若后续规范化确实改写 callstream，则把 dispatch 编译融合到
+本来就需要的最终对象审计扫描，禁止额外启动独立 callstream 编译扫描。retrace 必须分别输出 reader
+decode、semantic state、content sync 和 native dispatch 时间；语义状态阶段不得解析 MessagePack/JSON。
 
 `callstream.jsonl` 仍然是权威语义，compiled dispatch 只是可重建的执行索引；两者的记录数、顺序和
 payload 语义必须一一对应。dispatch 文件缺失、源大小不匹配、版本不支持或解码失败时，native retrace

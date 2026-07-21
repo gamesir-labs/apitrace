@@ -28,7 +28,7 @@ enum class BoundaryKind {
 
 enum class EventPayloadEncoding : std::uint8_t {
   Json = 0,
-  MessagePack = 1,
+  CompiledNodes = 1,
   CompiledTileMappings = 2,
   CompiledResourceDataUpdate = 3,
 };
@@ -49,7 +49,7 @@ struct CompiledTileRegionSize {
 };
 
 // Route-specific payload compiled by bundle-finalize. Native retrace only decodes these scalar
-// arrays; it never reparses the original JSON/MessagePack object at submission time.
+// arrays; it never reparses the original readable JSON object at submission time.
 struct CompiledTileMappingPayload {
   std::uint32_t flags = 0;
   std::vector<CompiledTileCoordinate> regions;

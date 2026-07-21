@@ -1,4 +1,5 @@
 #include "apitrace/d3d12_replay.hpp"
+#include "apitrace/compiled_dispatch_io.hpp"
 #include "apitrace/trace_bundle_io.hpp"
 
 #include <nlohmann/json.hpp>
@@ -545,18 +546,19 @@ CachedPayloadJson payload_to_json_cached(const trace::EventRecord &event)
   thread_local bool tl_ok = false;
   thread_local std::string tl_error;
   if (tl_event != &event || tl_sequence != event.callsite.sequence) {
-    if (event.payload_encoding == trace::EventPayloadEncoding::MessagePack) {
-      tl_payload = json::from_msgpack(
-          event.payload.begin(),
-          event.payload.end(),
-          true,
-          false);
+    tl_error.clear();
+    if (event.payload_encoding == trace::EventPayloadEncoding::CompiledNodes) {
+      tl_ok = trace::decode_compiled_payload_nodes(event.payload, tl_payload, tl_error);
     } else {
       tl_payload = json::parse(event.payload, nullptr, false);
+      tl_ok = !tl_payload.is_discarded() && tl_payload.is_object();
     }
-    tl_ok = true;
-    tl_error.clear();
-    if (tl_payload.is_discarded() || !tl_payload.is_object()) {
+    if (!tl_ok) {
+      if (tl_error.empty()) {
+        tl_error = "payload must be a JSON object";
+      }
+      tl_error = record_prefix(event) + ": " + tl_error;
+    } else if (tl_payload.is_discarded() || !tl_payload.is_object()) {
       tl_error = record_prefix(event) + ": payload must be a JSON object";
       tl_ok = false;
     }
