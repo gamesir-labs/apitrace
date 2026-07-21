@@ -49,9 +49,6 @@
     if (event_ordered_ingested_update_keys_.find(update_key) != event_ordered_ingested_update_keys_.end()) {
       return;
     }
-    event_ordered_resource_update_storage_.push_back(update);
-    const auto &stable_update = event_ordered_resource_update_storage_.back();
-    entry.update = &stable_update;
     auto insert_at = std::upper_bound(
         resource_update_timeline_.begin(),
         resource_update_timeline_.end(),
@@ -70,28 +67,16 @@
 
   void event_ordered_ingest_resource_updates()
   {
-    if (event_ordered_resource_version_update_cursors_.size() < backend_.resource_versions_.size()) {
-      event_ordered_resource_version_update_cursors_.resize(backend_.resource_versions_.size());
-    }
-    for (std::size_t index = 0; index < backend_.resource_versions_.size(); ++index) {
-      const auto &resource = backend_.resource_versions_[index];
-      auto &cursor = event_ordered_resource_version_update_cursors_[index];
-      for (std::size_t update_index = cursor; update_index < resource.data_updates.size(); ++update_index) {
-        const auto &update = resource.data_updates[update_index];
-        event_ordered_note_resource_update(resource.resource_object_id, update);
+    const auto &notifications = backend_.resource_data_update_notifications_;
+    while (event_ordered_resource_update_notification_cursor_ < notifications.size()) {
+      const auto &notification =
+          notifications[event_ordered_resource_update_notification_cursor_++];
+      if (notification.update_index >= backend_.event_ordered_resource_data_updates_.size()) {
+        continue;
       }
-      cursor = resource.data_updates.size();
-    }
-    for (const auto &[resource_object_id, resource] : backend_.resources_) {
-      auto &cursor = event_ordered_resource_update_cursors_[resource_object_id];
-      if (cursor > resource.data_updates.size()) {
-        cursor = 0;
-      }
-      for (std::size_t update_index = cursor; update_index < resource.data_updates.size(); ++update_index) {
-        const auto &update = resource.data_updates[update_index];
-        event_ordered_note_resource_update(resource_object_id, update);
-      }
-      cursor = resource.data_updates.size();
+      event_ordered_note_resource_update(
+          notification.resource_object_id,
+          backend_.event_ordered_resource_data_updates_[notification.update_index]);
     }
   }
 
@@ -125,7 +110,135 @@
                              " fn=" + event_ordered_event_name(event) +
                              " phase=" + phase + " " + error;
     backend_.last_error_ = std::move(error);
+    event_ordered_failed_ = true;
     event_ordered_log(line);
+  }
+
+  EventOrderedMappedResource *event_ordered_mapped_resource(
+      trace::ObjectId object_id,
+      UINT subresource)
+  {
+    const auto resource_it = event_ordered_mapped_resources_.find(object_id);
+    if (resource_it == event_ordered_mapped_resources_.end()) {
+      return nullptr;
+    }
+    const auto subresource_it = resource_it->second.find(subresource);
+    return subresource_it == resource_it->second.end() ? nullptr : &subresource_it->second;
+  }
+
+  void event_ordered_handle_resource_map(const trace::EventRecord &event)
+  {
+    if (event.object_refs.empty() || event.object_refs.front() == 0) {
+      event_ordered_report_content_error(event, "map", "Map missing resource object id");
+      return;
+    }
+    std::string error;
+    const json *payload_ptr = payload_to_json_cached_ref(event, error);
+    if (!payload_ptr) {
+      event_ordered_report_content_error(event, "map", std::move(error));
+      return;
+    }
+    const auto &payload = *payload_ptr;
+    const UINT subresource = static_cast<UINT>(payload_u32(payload, "subresource"));
+    D3D12_RANGE read_range{};
+    const D3D12_RANGE *read_range_ptr = nullptr;
+    if (!payload.contains("read_range") || !payload["read_range"].is_null()) {
+      read_range.Begin = static_cast<SIZE_T>(payload_u64(payload, "read_begin"));
+      read_range.End = static_cast<SIZE_T>(payload_u64(payload, "read_end", read_range.Begin));
+      read_range_ptr = &read_range;
+    }
+
+    const ReplaySequenceScope sequence_scope(this, event.callsite.sequence);
+    ID3D12Resource *resource = resource_for(event.object_refs.front(), error);
+    if (!resource) {
+      event_ordered_report_content_error(event, "map", std::move(error));
+      return;
+    }
+    void *mapped = nullptr;
+    const HRESULT hr = resource->Map(subresource, read_range_ptr, &mapped);
+    const bool replay_mapped = SUCCEEDED(hr) && mapped != nullptr;
+    const bool capture_mapped = event.callsite.result_code >= 0 && payload.value("mapped", false);
+    if (replay_mapped != capture_mapped) {
+      if (replay_mapped) {
+        resource->Unmap(subresource, nullptr);
+      }
+      event_ordered_report_content_error(
+          event,
+          "map",
+          "Map result differs from capture replay_hr=" +
+              std::to_string(static_cast<std::int32_t>(hr)) +
+              " captured_result=" + std::to_string(event.callsite.result_code));
+      return;
+    }
+    if (!replay_mapped) {
+      return;
+    }
+
+    auto &mapping = event_ordered_mapped_resources_[event.object_refs.front()][subresource];
+    mapping.resource = resource;
+    mapping.data = mapped;
+    ++mapping.depth;
+  }
+
+  void event_ordered_handle_resource_data_update(const trace::EventRecord &event)
+  {
+    event_ordered_ingest_resource_updates();
+    std::string error;
+    if (!sync_resource_data_until(event.callsite.sequence, error)) {
+      event_ordered_report_content_error(event, "resource-update", std::move(error));
+    }
+  }
+
+  void event_ordered_handle_resource_unmap(const trace::EventRecord &event)
+  {
+    event_ordered_handle_resource_data_update(event);
+
+    std::string error;
+    const json *payload_ptr = payload_to_json_cached_ref(event, error);
+    if (!payload_ptr) {
+      event_ordered_report_content_error(event, "unmap", std::move(error));
+      return;
+    }
+    const auto &payload = *payload_ptr;
+    // Old bundles used Unmap as a generic mapped-memory snapshot record. Only the explicit bit in
+    // the new schema proves that the game called the API; otherwise applying the bytes above is the
+    // most faithful compatibility behavior available.
+    if (!payload.value("api_call", false)) {
+      return;
+    }
+    if (event.object_refs.empty() || event.object_refs.front() == 0) {
+      event_ordered_report_content_error(event, "unmap", "Unmap missing resource object id");
+      return;
+    }
+    const trace::ObjectId object_id = event.object_refs.front();
+    const UINT subresource = static_cast<UINT>(payload_u32(payload, "subresource"));
+    auto resource_it = event_ordered_mapped_resources_.find(object_id);
+    if (resource_it == event_ordered_mapped_resources_.end()) {
+      event_ordered_report_content_error(event, "unmap", "Unmap has no matching replay Map");
+      return;
+    }
+    auto mapping_it = resource_it->second.find(subresource);
+    if (mapping_it == resource_it->second.end() ||
+        mapping_it->second.resource == nullptr ||
+        mapping_it->second.depth == 0) {
+      event_ordered_report_content_error(event, "unmap", "Unmap subresource has no matching replay Map");
+      return;
+    }
+
+    D3D12_RANGE written_range{};
+    const D3D12_RANGE *written_range_ptr = nullptr;
+    if (payload.contains("written_begin") || payload.contains("written_end")) {
+      written_range.Begin = static_cast<SIZE_T>(payload_u64(payload, "written_begin"));
+      written_range.End = static_cast<SIZE_T>(payload_u64(payload, "written_end", written_range.Begin));
+      written_range_ptr = &written_range;
+    }
+    mapping_it->second.resource->Unmap(subresource, written_range_ptr);
+    if (--mapping_it->second.depth == 0) {
+      resource_it->second.erase(mapping_it);
+      if (resource_it->second.empty()) {
+        event_ordered_mapped_resources_.erase(resource_it);
+      }
+    }
   }
 
   bool event_ordered_is_content_consumer_event(const trace::EventRecord &event) const
@@ -249,11 +362,12 @@
       return true;
     }
 
-    json payload;
     std::string error;
-    if (!payload_to_json(event, payload, error)) {
+    const json *payload_ptr = payload_to_json_cached_ref(event, error);
+    if (!payload_ptr) {
       return false;
     }
+    const auto &payload = *payload_ptr;
     const auto ops = payload.find("ops");
     if (ops == payload.end() || !ops->is_array()) {
       return false;

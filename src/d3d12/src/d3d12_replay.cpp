@@ -200,12 +200,18 @@ std::uint64_t env_u64(const char *name, std::uint64_t fallback = 0)
 }
 
 std::uint64_t g_event_ordered_profile_decode_us = 0;
+std::uint64_t g_event_ordered_profile_semantic_us = 0;
+std::uint64_t g_event_ordered_profile_content_sync_us = 0;
 std::uint64_t g_event_ordered_profile_dispatch_us = 0;
 std::uint64_t g_event_ordered_profile_events = 0;
 
 #if defined(APITRACE_HAS_D3D_NATIVE)
 
 #define EVENT_ORDERED_DISPATCH_PROFILE_KIND_LIST(X) \
+  X(ObjectCreate, "object_create") \
+  X(ObjectDestroy, "object_destroy") \
+  X(ResourceBlob, "resource_blob") \
+  X(D3D12ResourceDataUpdate, "apitrace::D3D12ResourceDataUpdate") \
   X(D3D12CreateDevice, "D3D12CreateDevice") \
   X(IDXGIFactory_CreateSwapChain, "IDXGIFactory::CreateSwapChain") \
   X(ID3D12Device_QueryInterface, "ID3D12Device::QueryInterface") \
@@ -534,11 +540,20 @@ struct CachedPayloadJson {
 CachedPayloadJson payload_to_json_cached(const trace::EventRecord &event)
 {
   thread_local const trace::EventRecord *tl_event = nullptr;
+  thread_local std::uint64_t tl_sequence = 0;
   thread_local json tl_payload;
   thread_local bool tl_ok = false;
   thread_local std::string tl_error;
-  if (tl_event != &event) {
-    tl_payload = json::parse(event.payload, nullptr, false);
+  if (tl_event != &event || tl_sequence != event.callsite.sequence) {
+    if (event.payload_encoding == trace::EventPayloadEncoding::MessagePack) {
+      tl_payload = json::from_msgpack(
+          event.payload.begin(),
+          event.payload.end(),
+          true,
+          false);
+    } else {
+      tl_payload = json::parse(event.payload, nullptr, false);
+    }
     tl_ok = true;
     tl_error.clear();
     if (tl_payload.is_discarded() || !tl_payload.is_object()) {
@@ -546,6 +561,7 @@ CachedPayloadJson payload_to_json_cached(const trace::EventRecord &event)
       tl_ok = false;
     }
     tl_event = &event;
+    tl_sequence = event.callsite.sequence;
   }
   return CachedPayloadJson{&tl_payload, tl_ok, &tl_error};
 }
@@ -1184,6 +1200,7 @@ bool is_supported_d3d12_call(std::string_view function_name)
          function_name == "ID3D12GraphicsCommandList6::DispatchMesh" ||
          function_name == "ID3D12Resource::Map" ||
          function_name == "ID3D12Resource::Unmap" ||
+         function_name == "apitrace::D3D12ResourceDataUpdate" ||
          function_name == "IDXGISwapChain::Present" ||
          function_name == "ID3D12Fence::SetEventOnCompletion" ||
          function_name == "ID3D12Fence::GetCompletedValue" ||

@@ -96,16 +96,54 @@ Present boundary、FrameBegin / FrameEnd、`sync_interval`、`flags` 和 `frame_
   和 bug 诊断
 - `APITRACE_D3D12_RETRACE_PRESENT_DELAY_MS` 只用于人工观察窗口播放，默认值为 `0`；它不是 trace
   输入语义，也不参与逐帧像素对比验收
+- `APITRACE_D3D12_RETRACE_HEADLESS=1` 只用于无法创建 Wine HWND 时的离屏诊断。该路径会用明确的
+  DXMT headless frame boundary 代替真实 swapchain Present，因此不能作为调用级或 Present 负载保真
+  验收结果；默认路径必须创建真实 swapchain，并在无法满足条件时明确失败
 - D3D12 retrace 范围控制只能限制 replay 何时停止，不能跳过前序 command stream。调试某个目标帧时，
   仍然必须从 trace 开头重建资源、descriptor、pipeline、command list 和 submission，再在达到
   `APITRACE_D3D12_RETRACE_STOP_AFTER_PRESENT_FRAME` 或
   `APITRACE_D3D12_RETRACE_STOP_AFTER_SEQUENCE` 后停止。不要加入 capture-time frame-range 过滤，
   因为丢失前序命令会破坏资源状态和 replay 语义。
 
-默认 D3D12 retrace 会按收集到的语义重建 replay-side device、swapchain back buffer、resource、
-descriptor heap、root signature、PSO、command signature 和 command list，然后按
-`ExecuteCommandLists` submission batch 重新提交。遇到尚未覆盖的 native D3D12 语义时必须明确失败，
-并报告 `D3D12 native command replay incomplete`，不能回退到 present-frame playback。
+默认 D3D12 retrace 顺序消费 `bundle-finalize` 从 `callstream.jsonl` 编译出的
+`analysis/d3d12-dispatch.bin`。finalize 完成 JSON 解析、事件字段校验、native handler opcode、
+command semantic kind 分类和 route-specific payload 编译；retrace 使用单记录流式游标快速解码并按 opcode 立即分发，不预载
+完整事件数组、不重复建立 Present 索引，也不在热路径重新扫描函数名决定 handler。对象创建和销毁、
+descriptor 更新、command-list Reset / 录制 / Close、queue 提交、fence 和
+Present 仍必须在各自原始 sequence 上重新发出。不得先急切重建全部对象、合并提交 batch、改变调用
+边界，或通过 retrace-side cache / wait 调节 DXMT 负载。
+
+类型化 payload 的迁移规则是：finalize 校验原 JSON 的类型、计数、范围和数组长度，再写入 route 专用
+标量布局；retrace reader 只做边界检查和 little-endian 解码，native handler 不得重新构造 JSON DOM。
+`UpdateTileMappings` 已按此规则编译 region、region size、range flags、heap offsets、tile counts 和 flags；
+`D3D12ResourceDataUpdate` 已编译 resource identity、subresource、apply sequence、written range 和 asset
+locator。提交同步阶段直接消费这些类型化记录。后续 route 应沿用同一模式；MessagePack 只是尚未迁移 route 的过渡
+表示，不能成为新增语义的默认实现。
+
+finalize 也是交付路径的一部分，必须同时约束一次性编译与重复运行成本。它负责完整解析和验证
+`callstream.jsonl`、`checksums.json`、`assets.json`、`objects.json` 及资产闭包，并把 retrace 所需的
+路由、command kind、直接资产路径和规范化 payload 编译进 dispatch 文件。dispatch 与源
+callstream 未变化时，重复 finalize 只校验文件头和源大小后复用结果，不再解析或重写大型 JSON。
+native compiled-dispatch retrace 打开 bundle 时只读取 bundle header 和 dispatch header，不加载 checksums、assets
+或 objects 索引；资产仍在实际消费点按 finalize 已验证的相对路径打开，并保留文件存在、长度和读取
+结果检查。新增需要全局索引或前向扫描的语义必须移到 finalize，不能把预处理重新塞回 retrace。
+
+性能验收必须分别记录 finalize wall time / peak RSS，以及 retrace open time / peak RSS、逐事件 decode
+和 native dispatch 时间。retrace-side 改动不得通过缓存、批处理、跳过调用或改变等待语义来降低
+dispatch 时间；目标是让 retrace 的自有工作收敛为有界内存的顺序解码和立即分发，DXMT 内部的 PSO、
+descriptor、submission 和同步成本则原样保留，作为被测负载。
+
+finalize 的验收也区分一次性编译和无变化复用：一次性编译记录完整 wall time、CPU time、peak RSS、
+输入/输出字节和记录数；并行 JSONL 分块必须受内存上限约束，不能用 worker 数乘以大块输入换取吞吐。
+无变化复用不得读取或 hash 完整 callstream/dispatch，目标是亚秒级且常量内存。retrace 则必须分别输出
+reader decode、semantic state、content sync 和 native dispatch 时间；任何仍在 semantic state 阶段解析
+MessagePack/JSON 的 route 都视为待迁移，不得把这部分开销归入 DXMT 被测负载。
+
+`callstream.jsonl` 仍然是权威语义，compiled dispatch 只是可重建的执行索引；两者的记录数、顺序和
+payload 语义必须一一对应。dispatch 文件缺失、源大小不匹配、版本不支持或解码失败时，native retrace
+必须明确失败并提示重新 finalize，不能静默回到 JSON 解释路径。持久化 replay model 只用于
+validate-only、离线语义检查和差异分析，不是默认 native replay 的执行输入。遇到尚未覆盖的 native
+D3D12 语义时也必须在原事件处明确失败，不能回退到持久化模型或 present-frame playback。
 
 逐帧验收路径应当是：第一次 trace 打开 `APITRACE_D3D12_CAPTURE_PRESENT_FRAMES=1` 生成参考帧；
 再对 retrace 进程进行 trace，并打开 `APITRACE_D3D12_RETRACE_CAPTURE_PRESENT_FRAMES=1` 生成
@@ -131,7 +169,8 @@ callstream 闭包，不能证明 GPU 命令实际执行；`apitrace_test_metal_n
   `bundle-finalize` 生成的 `pipeline_path`，不会在 replay 进程内从 raw PSO evidence 重建 pipeline
   JSON；遇到 raw-only `pso_raw_version` payload 时必须明确报错，提示先运行 `bundle-finalize` 或检查
   incomplete D3D12 pipeline semantic rebuild
-- resource 创建参数，包括完整 resource desc、optimized clear value、Map 状态、Unmap 写入区间、buffer asset bytes 与 blob 引用的资源数据表
+- resource 创建参数，包括完整 resource desc、optimized clear value、真实 Map / Unmap 调用，以及与
+  API 调用分离的 `apitrace::D3D12ResourceDataUpdate` buffer 资产
 - GPU virtual address 到 resource object id / offset 的重定位，用于 VB/IB/root CBV/root SRV/root UAV/indirect buffer 等绑定
 - descriptor heap 元数据、descriptor view 创建记录、结构化 view desc，以及 raw descriptor handle 到
   heap/index 的重定位；CBV 的 `buffer_location` 和 RTAS SRV 的 `location` 会按 GPU VA 规则重定位
@@ -153,21 +192,21 @@ callstream 闭包，不能证明 GPU 命令实际执行；`apitrace_test_metal_n
 - draw / indexed draw 的完整参数，以及 dispatch / indirect / copy / resolve 调用；dispatch
   会保留 thread group 三元组，DXR `DispatchRays` 会把 shader table GPU VA 重定位到 replay
   resource 语义
-- `ID3D12Resource::Map` / `Unmap` 的范围和可落盘 buffer 资产
+- `ID3D12Resource::Map` / `Unmap` 的真实调用范围，以及映射内存快照对应的
+  `apitrace::D3D12ResourceDataUpdate` 资产
 
-这些语义会进入 D3D12 replay 状态跟踪与校验；Map/Unmap 写入资产会挂回对应 replay
-resource，native replay 重新创建资源和 descriptor 后按原始 command stream 录制 GPU 命令。
+这些语义会进入 D3D12 replay 状态跟踪与校验；真实 Map / Unmap 必须在原 sequence 调用 native
+resource。内部 DataUpdate 只把捕获到的 bytes 写入当时仍有效的映射，不得额外发出 Map / Unmap。
+native replay 重新创建资源和 descriptor 后按原始 command stream 录制 GPU 命令。
 当前覆盖默认 D3D12 验证矩阵所需的 draw / indexed draw / dispatch / indirect / copy /
 resolve 路径；DXR、mesh shader 和更多 descriptor 维度仍应在扩展覆盖时按相同规则补齐。
 
-D3D12 retrace 内部会按原始 sequence 构建 replay command stream，并把每条 command-list
-语义挂回对应的 command list 状态。`ExecuteCommandLists` 会形成 completed submission batch，
-并校验被提交的 command list 已经 Close，同时把 command list 的 allocator 和 descriptor heap
-依赖快照并入 batch。queue wait 会作为对应 queue 下一次 submission 的前置 fence 依赖保存；
-后续的 queue signal 和 Present boundary 会继续标注到对应 queue 最近一次 submission batch 上。
-这些字段只保存应用 API 顺序语义，不引入 retrace 自己的时间控制。这样后续 native D3D12 command
-re-emit 可以直接消费已整理好的 command stream 和 submission batch，而不是重新扫描
-`callstream.jsonl`。
+D3D12 retrace 内部可按原始 sequence 维护用于校验的 command-list 与 submission 状态，但这些状态
+不能取代调用流。`ExecuteCommandLists` 只提交该事件列出的、已经 Close 的 command list；queue wait、
+queue signal、CPU fence signal 和 `SetEventOnCompletion` 都在各自事件处发出。特别地，
+`SetEventOnCompletion` 只注册替代事件句柄并保持其生命周期，不在 retrace 内等待；游戏的
+`WaitForSingleObject` 属于未被 D3D trace 捕获的主机调用。除 replay 结束后的资源回收 drain 或显式
+诊断功能外，native replay 不插入额外 GPU/CPU 等待。
 
 ## 与转译层的关系
 

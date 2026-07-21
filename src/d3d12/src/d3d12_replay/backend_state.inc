@@ -211,22 +211,34 @@ bool D3D12ReplayBackend::append_resource_data_update(
     std::string &error)
 {
   const auto index_it = live_resource_version_indices_.find(resource_object_id);
-  if (index_it != live_resource_version_indices_.end() &&
-      index_it->second < resource_versions_.size()) {
-    auto &version = resource_versions_[index_it->second];
+  const auto resource_it = resources_.find(resource_object_id);
+  const bool has_live_version =
+      index_it != live_resource_version_indices_.end() &&
+      index_it->second < resource_versions_.size();
+  if (!has_live_version && resource_it == resources_.end()) {
+    error = "resource data update references an unknown replay resource";
+    return false;
+  }
+
+  if (event_ordered_init_) {
+    event_ordered_resource_data_updates_.push_back(std::move(update));
+    resource_data_update_notifications_.push_back(ResourceDataUpdateNotification{
+        resource_object_id,
+        event_ordered_resource_data_updates_.size() - 1,
+    });
+    return true;
+  }
+
+  if (has_live_version) {
+    const auto version_index = index_it->second;
+    auto &version = resource_versions_[version_index];
     version.data_updates.push_back(update);
-    auto resource_it = resources_.find(resource_object_id);
     if (resource_it != resources_.end()) {
       resource_it->second.data_updates.push_back(std::move(update));
     }
     return true;
   }
 
-  auto resource_it = resources_.find(resource_object_id);
-  if (resource_it == resources_.end()) {
-    error = "resource data update references an unknown replay resource";
-    return false;
-  }
   resource_it->second.data_updates.push_back(std::move(update));
   return true;
 }
@@ -448,10 +460,11 @@ bool D3D12ReplayBackend::parse_texture_copy_location_payload(
     TextureCopyLocation &location,
     std::string &error) const
 {
-  json payload;
-  if (!payload_to_json(event, payload, error)) {
+  const json *payload_ptr = payload_to_json_cached_ref(event, error);
+  if (!payload_ptr) {
     return false;
   }
+  const auto &payload = *payload_ptr;
   const auto value_it = payload.find(payload_name);
   if (value_it == payload.end()) {
     error = record_prefix(event) + ": missing texture copy location " + payload_name;
@@ -539,6 +552,8 @@ bool D3D12ReplayBackend::initialize(const trace::TraceBundleReader &reader)
   resources_.clear();
   resource_versions_.clear();
   live_resource_version_indices_.clear();
+  event_ordered_resource_data_updates_.clear();
+  resource_data_update_notifications_.clear();
   resource_versions_by_id_.clear();
   resource_versions_by_va_.clear();
   max_resource_va_width_ = 0;
@@ -617,7 +632,7 @@ bool D3D12ReplayBackend::initialize(const trace::TraceBundleReader &reader)
     ScopedDurationAccumulator timer(
         presch_index_semantics_duration,
         event_ordered_timing_enabled_);
-    if (!index_present_semantics(reader)) {
+    if (!event_ordered_init_ && !index_present_semantics(reader)) {
       return false;
     }
   }
@@ -625,7 +640,7 @@ bool D3D12ReplayBackend::initialize(const trace::TraceBundleReader &reader)
     ScopedDurationAccumulator timer(
         presch_validate_present_duration,
         event_ordered_timing_enabled_);
-    if (!validate_present_boundaries(reader)) {
+    if (!event_ordered_init_ && !validate_present_boundaries(reader)) {
       return false;
     }
   }

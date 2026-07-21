@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <d3d12.h>
+
 #ifdef _WIN32
 #include <stdlib.h>
 #endif
@@ -88,17 +90,42 @@ bool run_rawonly_unmap_fast_path(const std::filesystem::path &bundle)
   std::vector<std::uint8_t> first = {0x10, 0x11, 0x12, 0x13};
   std::vector<std::uint8_t> same = first;
   std::vector<std::uint8_t> changed = {0x10, 0x21, 0x12, 0x13};
-  apitrace::d3d12::record_resource_unmap(resource, 0, 64, 68, first.data(), first.size());
-  apitrace::d3d12::record_resource_unmap(resource, 0, 64, 68, same.data(), same.size());
-  apitrace::d3d12::record_resource_unmap(resource, 0, 64, 68, changed.data(), changed.size());
+  if (apitrace::d3d12::record_resource_map(
+          resource, 0, false, 0, 0, first.data(), true, 0) == 0) {
+    std::cerr << "failed to record mapped resource generation\n";
+    return false;
+  }
+  apitrace::d3d12::record_resource_snapshot(resource, 0, 64, 68, first.data(), first.size());
+  apitrace::d3d12::record_resource_snapshot(resource, 0, 64, 68, same.data(), same.size());
+  apitrace::d3d12::record_resource_snapshot(resource, 0, 64, 68, changed.data(), changed.size());
+
+  // Reuse the same raw pointer for a new resource lifetime. The old mapped pointer must not be
+  // consumed by mapped-input capture, and raw-unmap deduplication must not cross generations.
+  apitrace::d3d12::record_object_create(
+      resource,
+      apitrace::d3d12::CaptureObjectKind::Resource,
+      device,
+      "ID3D12Resource");
+  D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
+  cbv.BufferLocation = 0x220000;
+  cbv.SizeInBytes = static_cast<UINT>(first.size());
+  apitrace::d3d12::record_create_constant_buffer_view(
+      static_cast<ID3D12Device *>(device),
+      &cbv,
+      D3D12_CPU_DESCRIPTOR_HANDLE{0x23000},
+      resource,
+      0,
+      first.size());
+  apitrace::d3d12::record_resource_snapshot(resource, 0, 64, 68, changed.data(), changed.size());
 
   apitrace::runtime::shutdown_process_trace_session();
   clear_capture_env();
 
   const auto counters = apitrace::d3d12::raw_unmap_fast_path_counters_for_test();
-  if (!expect(counters.unmap_candidates == 3, "unexpected raw unmap candidate count") ||
+  if (!expect(counters.unmap_candidates == 4, "unexpected raw unmap candidate count") ||
       !expect(counters.unchanged_skipped == 1, "unchanged raw unmap was not skipped") ||
-      !expect(counters.emitted_blob_bytes == first.size() + changed.size(), "unexpected emitted blob byte count") ||
+      !expect(counters.emitted_blob_bytes == first.size() + changed.size() + changed.size(),
+              "unexpected emitted blob byte count") ||
       !expect(counters.raw_write_failures == 0, "raw unmap write failure was recorded")) {
     return false;
   }
@@ -115,8 +142,8 @@ bool run_rawonly_unmap_fast_path(const std::filesystem::path &bundle)
       unmaps.push_back(record);
     }
   }
-  if (!expect(unmaps.size() == 2, "raw unchanged unmap emitted an extra event") ||
-      !expect(reader.blob_extents().size() == 2, "raw unchanged unmap emitted an extra blob")) {
+  if (!expect(unmaps.size() == 3, "raw unmap generation isolation mismatch") ||
+      !expect(reader.blob_extents().size() == 3, "raw unmap generation blob mismatch")) {
     return false;
   }
 
@@ -137,6 +164,13 @@ bool run_rawonly_unmap_fast_path(const std::filesystem::path &bundle)
     return false;
   }
 
+  std::vector<std::uint8_t> blob2;
+  const auto blob2_id = read_le64(unmaps[2].payload, 8);
+  if (!expect(reader.read_blob(blob2_id, blob2), "failed to read reused-generation raw unmap blob") ||
+      !expect(blob2 == changed, "reused-generation raw unmap blob mismatch")) {
+    return false;
+  }
+
   const auto decoded = decode_raw_events(reader, unmaps);
   if (!expect(decoded.error.empty(), "raw unmap events failed to decode")) {
     std::cerr << decoded.error << "\n";
@@ -144,13 +178,16 @@ bool run_rawonly_unmap_fast_path(const std::filesystem::path &bundle)
   }
   std::vector<std::uint8_t> decoded_blob0;
   std::vector<std::uint8_t> decoded_blob1;
-  if (!expect(decoded.events.size() == 2 &&
-                  decoded.events[0].event.callsite.function_name == "ID3D12Resource::Unmap" &&
-                  decoded.events[1].event.callsite.function_name == "ID3D12Resource::Unmap" &&
+  if (!expect(decoded.events.size() == 3 &&
+                  decoded.events[0].event.callsite.function_name == "apitrace::D3D12ResourceDataUpdate" &&
+                  decoded.events[1].event.callsite.function_name == "apitrace::D3D12ResourceDataUpdate" &&
+                  decoded.events[2].event.callsite.function_name == "apitrace::D3D12ResourceDataUpdate" &&
                   decoded.events[0].assets.size() == 1 &&
                   decoded.events[1].assets.size() == 1 &&
+                  decoded.events[2].assets.size() == 1 &&
                   decoded.events[0].assets[0].payload_path.generic_string() == "raw/blobs.bin" &&
-                  decoded.events[1].assets[0].payload_path.generic_string() == "raw/blobs.bin",
+                  decoded.events[1].assets[0].payload_path.generic_string() == "raw/blobs.bin" &&
+                  decoded.events[2].assets[0].payload_path.generic_string() == "raw/blobs.bin",
               "decoded raw unmap event/blob mismatch") ||
       !expect(reader.read_blob(blob0_id, decoded_blob0), "failed to read decoded first raw unmap blob") ||
       !expect(reader.read_blob(blob1_id, decoded_blob1), "failed to read decoded second raw unmap blob") ||

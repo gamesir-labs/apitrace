@@ -23,6 +23,13 @@ struct TranslationLinkRecord;
 
 std::string event_record_json(const EventRecord &event);
 
+// Parses one readable callstream event line without requiring a whole bundle reader. Offline
+// finalization uses this to compile the authoritative JSONL stream into a derived dispatch cache.
+bool parse_event_record_json_line(
+    std::string_view line,
+    EventRecord &event,
+    std::string &error);
+
 struct AnalysisRecord {
   std::string stream_name;
   std::string record_type;
@@ -48,7 +55,8 @@ public:
 
   bool open(
       const std::filesystem::path &bundle_root,
-      TraceBundleOpenMode mode = TraceBundleOpenMode::Primary);
+      TraceBundleOpenMode mode = TraceBundleOpenMode::Primary,
+      const std::filesystem::path &primary_callstream_path_override = {});
   void set_async_asset_worker_count(std::size_t worker_count);
   using ProgressCallback = std::function<void(
       std::string_view phase,
@@ -69,6 +77,8 @@ public:
   void append_call_event(EventRecord &&event);
   void append_existing_header_json_line(std::string_view json_line);
   void append_callstream_json_line(std::string_view json_line);
+  void append_callstream_json_line(std::string &&json_line);
+  void append_callstream_json_lines(std::vector<std::string> json_lines);
   void append_metal_event(const MetalEventRecord &event);
   AssetRecord register_asset(const AssetRecord &asset);
   AssetRecord register_asset(AssetRecord &&asset);
@@ -130,6 +140,11 @@ public:
   struct OpenOptions {
     bool load_metal_sideband = true;
     bool validate_checksum_contents = true;
+    // Bound stream parsing to the byte sizes recorded in checksums.json. Readers normally keep
+    // this enabled so an append racing an older checksum index is ignored. Finalize disables it
+    // while rebuilding derived data because checksums.json is intentionally refreshed only after
+    // the finalized callstreams and replay model have been written.
+    bool enforce_checksum_byte_limits = true;
     // When false, open() still parses bundle metadata, indexes, and callstream events, but skips
     // validating checksum entries and asset file references. This is for bundle-finalize's
     // in-process reconstruction after assets.json has been rewritten but before checksums.json is
@@ -152,6 +167,9 @@ public:
     // own full reference validation can disable this to avoid a duplicate serial stream pass.
     bool discover_referenced_assets = true;
     bool collect_open_timing = false;
+    // Prefer the bundle-finalize generated D3D12 dispatch stream. This keeps callstream.jsonl as
+    // the readable authority while moving top-level JSON and payload normalization out of retrace.
+    bool use_compiled_d3d12_dispatch = false;
     // For D3D12 diagnostic replay, a stop sequence can target an event recorded inside a command
     // list. The reader still has to include the later ExecuteCommandLists event that submits that
     // list, while the native replayer performs the actual in-list truncation.
@@ -171,6 +189,11 @@ public:
   const BundleLayout &layout() const noexcept;
   const TraceMetadata &metadata() const noexcept;
   const std::vector<EventRecord> &events() const noexcept;
+  // Streams the finalized D3D12 dispatch artifact when enabled, otherwise visits events(). The
+  // callback may return false for a successful early stop.
+  bool for_each_event(
+      const std::function<bool(const EventRecord &event)> &callback,
+      std::string &error) const;
   const std::vector<MetalEventRecord> &metal_events() const noexcept;
   const std::vector<AssetRecord> &assets() const noexcept;
   const std::vector<AssetRecord> &metal_assets() const noexcept;

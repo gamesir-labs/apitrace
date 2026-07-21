@@ -1438,13 +1438,37 @@ void serialize_fields(A &a, Backend::ReplayCommandRecord &v)
 }
 
 template <typename A>
+void serialize_fields(A &a, trace::CompiledTileCoordinate &v)
+{
+  a.scalar(v.subresource);
+  a.scalar(v.x);
+  a.scalar(v.y);
+  a.scalar(v.z);
+}
+
+template <typename A>
+void serialize_fields(A &a, trace::CompiledTileRegionSize &v)
+{
+  a.scalar(v.num_tiles);
+  a.scalar(v.use_box);
+  a.scalar(v.width);
+  a.scalar(v.height);
+  a.scalar(v.depth);
+}
+
+template <typename A>
 void serialize_fields(A &a, Backend::TileMappingUpdateRecord &v)
 {
   a.scalar(v.sequence);
   a.scalar(v.queue_object_id);
   a.scalar(v.resource_object_id);
   a.scalar(v.heap_object_id);
-  a.blob_string(v.payload);
+  a.scalar(v.payload.flags);
+  a.vec(v.payload.regions);
+  a.vec(v.payload.region_sizes);
+  a.scalar_vec(v.payload.range_flags);
+  a.scalar_vec(v.payload.heap_range_offsets);
+  a.scalar_vec(v.payload.range_tile_counts);
 }
 
 // D3D12ObjectRegistry tracked object record.

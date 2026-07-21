@@ -11,10 +11,35 @@ the expensive publish-time work:
 - hash asset files outside the game process
 - deduplicate identical assets into content-addressed paths
 - rewrite JSON/JSONL asset path references
+- compile the authoritative D3D12 JSONL into `analysis/d3d12-dispatch.bin`, preserving one record
+  per original event while normalizing payloads to MessagePack and preselecting the native handler
+  opcode
 - remove duplicate asset files by default, while preserving any alias path that
   is still referenced after rewriting
 - regenerate root `assets.json`
 - regenerate `checksums.json`
+
+The default native D3D12 retrace depends on that compiled dispatch artifact and streams it one
+record at a time. Finalization therefore owns all reusable parsing, validation, and dispatch-route
+selection work; retrace must not reparse the multi-GB JSONL, scan function names to select a
+handler, or preload every event. A stale or missing artifact is an
+explicit finalization error rather than a reason to fall back to a slower replay interpreter.
+
+Finalize performance is part of the format contract. Dispatch compilation uses newline-aligned
+chunks and `--jobs N`, publishes chunks in source order, and reports
+`compiled_dispatch_records`, `compiled_dispatch_bytes`, and `compiled_dispatch_ms`. The old D3D12
+replay model is not generated or retained by a normal finalize; use `--persist-replay-model-only`
+only for offline validation and differential analysis.
+
+RAW materialization writes `callstream.jsonl` through a sibling temporary file and atomically
+publishes it only after the complete committed prefix has been decoded. A failed or interrupted
+run must leave the previous readable callstream intact. When the committed RAW prefix is older
+than a materialized callstream whose recorded checksum sizes still match, repeated finalize runs
+reuse that output instead of decoding every RAW event again. If the compiled dispatch is missing or
+has an old format version, the dispatch-only fast path rebuilds it without reloading the full asset
+index or rerunning the other publication passes; if it is current, finalize only verifies its header
+and source generation. The summary reports `raw_to_final_reused=true` and
+`finalize_fast_path=dispatch_rebuilt|verified`.
 
 Build it from apitrace:
 

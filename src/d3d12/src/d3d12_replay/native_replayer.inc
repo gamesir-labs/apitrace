@@ -23,6 +23,7 @@ using RecordPresentSemanticsFn = void(WINAPI *)(UINT, UINT, HRESULT);
 using CaptureSuppressionFn = void(WINAPI *)();
 using BeginMetalCaptureFn = void(WINAPI *)(ID3D12Device *, const char *);
 using EndMetalCaptureFn = void(WINAPI *)();
+using DxmtReplayFrameBoundaryFn = HRESULT(WINAPI *)(ID3D12Device *);
 
 #ifdef _WIN32
 template <typename Fn>
@@ -97,6 +98,14 @@ public:
       return false;
     }
     replay_milestone("replay:begin");
+    replay_milestone((std::string("replay:model-cardinality live_resources=") +
+                      std::to_string(backend_.resources_.size()) +
+                      " resource_versions=" + std::to_string(backend_.resource_versions_.size()) +
+                      " descriptor_events=" + std::to_string(backend_.descriptors_.size()) +
+                      " descriptor_copy_events=" + std::to_string(backend_.descriptor_copies_.size()) +
+                      " replay_commands=" + std::to_string(backend_.replay_commands_.size()) +
+                      " submission_batches=" +
+                      std::to_string(backend_.submissions_.completed_batches().size())).c_str());
     if (!load_checkpoint_if_requested(error)) {
       return false;
     }
@@ -128,7 +137,9 @@ public:
     }
     wait_for_all_replay_queues();
     replay_milestone((std::string("dbg:setpso_calls=") + std::to_string(dbg_setpso_calls_) +
-                      " copy_calls=" + std::to_string(dbg_copy_calls_)).c_str());
+                      " copy_calls=" + std::to_string(dbg_copy_calls_) +
+                      " stale_generation_updates_skipped=" +
+                      std::to_string(stale_generation_resource_updates_skipped_)).c_str());
     dump_command_kind_totals();
     replay_milestone("replay:done");
     return true;
@@ -2366,30 +2377,37 @@ private:
       return true;
     }
 
-    D3D_FEATURE_LEVEL feature_level = D3D_FEATURE_LEVEL_11_0;
-    for (const auto &[object_id, device] : backend_.devices_) {
-      (void)object_id;
-      feature_level = static_cast<D3D_FEATURE_LEVEL>(device.minimum_feature_level);
-      break;
-    }
-    HRESULT hr = D3D12CreateDevice(nullptr, feature_level, IID_PPV_ARGS(device_.put()));
-    if (FAILED(hr)) {
-      error = hresult_error("D3D12CreateDevice", hr);
-      return false;
-    }
-
-    D3D12_COMMAND_QUEUE_DESC queue_desc{};
-    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    hr = device_->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(queue_.put()));
-    if (FAILED(hr)) {
-      error = hresult_error("CreateCommandQueue", hr);
-      return false;
+    HRESULT hr = S_OK;
+    if (!device_) {
+      D3D_FEATURE_LEVEL feature_level = D3D_FEATURE_LEVEL_11_0;
+      for (const auto &[object_id, device] : backend_.devices_) {
+        (void)object_id;
+        feature_level = static_cast<D3D_FEATURE_LEVEL>(device.minimum_feature_level);
+        break;
+      }
+      hr = D3D12CreateDevice(nullptr, feature_level, IID_PPV_ARGS(device_.put()));
+      if (FAILED(hr)) {
+        error = hresult_error("D3D12CreateDevice", hr);
+        return false;
+      }
     }
 
-    hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence_.put()));
-    if (FAILED(hr)) {
-      error = hresult_error("CreateFence", hr);
-      return false;
+    if (!queue_) {
+      D3D12_COMMAND_QUEUE_DESC queue_desc{};
+      queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+      hr = device_->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(queue_.put()));
+      if (FAILED(hr)) {
+        error = hresult_error("CreateCommandQueue", hr);
+        return false;
+      }
+    }
+
+    if (!fence_) {
+      hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence_.put()));
+      if (FAILED(hr)) {
+        error = hresult_error("CreateFence", hr);
+        return false;
+      }
     }
 #ifdef _WIN32
     fence_event_ = CreateEventA(nullptr, FALSE, FALSE, nullptr);
@@ -2407,6 +2425,86 @@ private:
         return false;
       }
     }
+    return true;
+  }
+
+  bool bootstrap_replay_window(UINT width, UINT height, std::string &error)
+  {
+    if (hwnd_) {
+      return true;
+    }
+#ifdef _WIN32
+    HINSTANCE instance = GetModuleHandleA(nullptr);
+    WNDCLASSA wc{};
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = replay_window_proc;
+    wc.hInstance = instance;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.lpszClassName = "apitrace_d3d12_native_retrace_window";
+    if (!RegisterClassA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+      return fail(error, "RegisterClassA failed");
+    }
+
+    RECT rect{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+    hwnd_ = CreateWindowExA(
+        0,
+        wc.lpszClassName,
+        "apitrace D3D12 native retrace",
+        WS_OVERLAPPEDWINDOW,
+        0,
+        0,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        nullptr,
+        nullptr,
+        instance,
+        nullptr);
+    if (!hwnd_) {
+      const DWORD custom_class_error = GetLastError();
+      // Wine's macOS window driver can reject a process-local class before its GUI driver has
+      // completed initialization. A predefined class preserves the same HWND/swapchain contract
+      // without introducing another D3D or DXGI call.
+      hwnd_ = CreateWindowExA(
+          0,
+          "STATIC",
+          "apitrace D3D12 native retrace",
+          WS_OVERLAPPEDWINDOW,
+          0,
+          0,
+          rect.right - rect.left,
+          rect.bottom - rect.top,
+          nullptr,
+          nullptr,
+          instance,
+          nullptr);
+      if (!hwnd_) {
+        return fail(
+            error,
+            "CreateWindowExA failed (custom_error=" +
+                std::to_string(static_cast<unsigned long>(custom_class_error)) +
+                ", static_error=" +
+                std::to_string(static_cast<unsigned long>(GetLastError())) + ")");
+      }
+    }
+    ShowWindow(hwnd_, SW_SHOWDEFAULT);
+    UpdateWindow(hwnd_);
+#elif defined(__APPLE__)
+    apitrace::platform::macos::WindowSpec spec;
+    spec.width = width;
+    spec.height = height;
+    spec.title = "apitrace D3D12 native retrace";
+    spec.show = true;
+    if (!apitrace::platform::macos::create_window(spec, window_handles_, error)) {
+      return fail(error, error.empty() ? "failed to create native macOS replay window" : error);
+    }
+    hwnd_ = static_cast<HWND>(window_handles_.nswindow);
+    if (!hwnd_) {
+      return fail(error, "native macOS replay window did not produce an HWND token");
+    }
+#else
+    return fail(error, "D3D12 native replay has no window bootstrap for this platform");
+#endif
     return true;
   }
 
@@ -2474,58 +2572,9 @@ private:
         }
       }
 
-#ifdef _WIN32
-    HINSTANCE instance = GetModuleHandleA(nullptr);
-    WNDCLASSA wc{};
-    wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = replay_window_proc;
-    wc.hInstance = instance;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.lpszClassName = "apitrace_d3d12_native_retrace_window";
-    if (!RegisterClassA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-      return fail(error, "RegisterClassA failed");
+    if (!bootstrap_replay_window(width, height, error)) {
+      return false;
     }
-
-    RECT rect{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
-    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
-    // Use an explicit (0,0) origin instead of CW_USEDEFAULT: under headless wine-on-macOS the
-    // CW_USEDEFAULT placement makes win32u query the virtual screen rect (NtGdiOpenDCW ->
-    // get_virtual_screen_rect -> lock_display_devices), which deadlocks on the display-device lock
-    // when called from the replay worker thread. An explicit origin skips that query.
-    hwnd_ = CreateWindowExA(
-        0,
-        wc.lpszClassName,
-        "apitrace D3D12 native retrace",
-        WS_OVERLAPPEDWINDOW,
-        0,
-        0,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-        nullptr,
-        nullptr,
-        instance,
-        nullptr);
-    if (!hwnd_) {
-      return fail(error, "CreateWindowExA failed");
-    }
-    ShowWindow(hwnd_, SW_SHOWDEFAULT);
-    UpdateWindow(hwnd_);
-#elif defined(__APPLE__)
-    apitrace::platform::macos::WindowSpec spec;
-    spec.width = width;
-    spec.height = height;
-    spec.title = "apitrace D3D12 native retrace";
-    spec.show = true;
-    if (!apitrace::platform::macos::create_window(spec, window_handles_, error)) {
-      return fail(error, error.empty() ? "failed to create native macOS replay window" : error);
-    }
-    hwnd_ = static_cast<HWND>(window_handles_.nswindow);
-    if (!hwnd_) {
-      return fail(error, "native macOS replay window did not produce an HWND token");
-    }
-#else
-    return fail(error, "D3D12 native replay has no window bootstrap for this platform");
-#endif
 
     // Match the effective back-buffer format so windowed replay uses the same
     // resource semantics as the headless path. Present-frame export decodes
@@ -2845,15 +2894,18 @@ private:
       resources_.emplace(object_id, std::move(native));
     }
 
-    // For object_ids created more than once (D3D12 pointer reuse across lifetimes), build a native
-    // resource per version so descriptors/commands resolve to the version live at their sequence.
+    // Build per-version natives for reused object_ids and for resources that were destroyed before
+    // capture ended. resources_ contains only resources still live at the end of reconstruction,
+    // while resource_versions_ is the append-only lifetime history. A destroyed single-lifetime
+    // resource therefore has no flat-map native but is still required by earlier replay commands.
     std::unordered_map<trace::ObjectId, std::size_t> version_counts;
     for (const auto &resource : backend_.resource_versions_) {
       ++version_counts[resource.resource_object_id];
     }
     for (const auto &resource : backend_.resource_versions_) {
-      if (version_counts[resource.resource_object_id] < 2) {
-        continue;  // single version: resources_ already holds it
+      if (version_counts[resource.resource_object_id] < 2 &&
+          backend_.resources_.find(resource.resource_object_id) != backend_.resources_.end()) {
+        continue;  // Single live version: resources_ already owns its native.
       }
       NativeResource native;
       if (!make_native_resource(resource, native, error)) {
@@ -4226,6 +4278,54 @@ private:
     return true;
   }
 
+  static bool heap_is_definitely_cpu_invisible(
+      std::uint32_t heap_type,
+      std::uint32_t cpu_page_property)
+  {
+    if (heap_type == D3D12_HEAP_TYPE_DEFAULT) {
+      return true;
+    }
+    return heap_type == D3D12_HEAP_TYPE_CUSTOM &&
+           cpu_page_property == D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+  }
+
+  bool resource_is_definitely_cpu_invisible(
+      const D3D12ReplayBackend::ResourceSemanticState &resource) const
+  {
+    if (resource.external_resource || resource.swapchain_back_buffer) {
+      return false;
+    }
+    if (resource.heap_object_id != 0) {
+      const auto heap_it = backend_.heaps_.find(resource.heap_object_id);
+      return heap_it != backend_.heaps_.end() &&
+             heap_is_definitely_cpu_invisible(
+                 heap_it->second.heap_type,
+                 heap_it->second.cpu_page_property);
+    }
+    return heap_is_definitely_cpu_invisible(
+        resource.heap_type,
+        D3D12_CPU_PAGE_PROPERTY_UNKNOWN);
+  }
+
+  bool should_skip_stale_generation_unmap(
+      trace::ObjectId resource_object_id,
+      std::uint64_t sequence,
+      const D3D12ReplayBackend::ResourceDataUpdate *update) const
+  {
+    if (update == nullptr ||
+        unmap_resource_update_sequences_.find(update->sequence) ==
+            unmap_resource_update_sequences_.end()) {
+      return false;
+    }
+    const auto *resource = recorded_resource_at(resource_object_id, sequence);
+    if (resource == nullptr || !resource_is_definitely_cpu_invisible(*resource)) {
+      return false;
+    }
+    const ResourceVersionKey key{resource->resource_object_id, resource->create_sequence};
+    return successful_map_resource_versions_.find(key) ==
+           successful_map_resource_versions_.end();
+  }
+
   bool sync_resource_data_until(std::uint64_t sequence, std::string &error)
   {
     const auto sync_begin = std::chrono::steady_clock::now();
@@ -4244,6 +4344,20 @@ private:
           continue;
         }
       }
+      if (should_skip_stale_generation_unmap(
+              entry.resource_object_id, entry.sequence, entry.update)) {
+        const auto *recorded = recorded_resource_at(entry.resource_object_id, entry.sequence);
+        std::ostringstream detail;
+        detail << "resource-update:skip-stale-generation-unmap"
+               << " object=" << entry.resource_object_id
+               << " create_seq=" << (recorded ? recorded->create_sequence : 0)
+               << " update_seq=" << entry.update->sequence
+               << " bytes=" << entry.update->bytes.size();
+        replay_milestone(detail.str().c_str());
+        ++stale_generation_resource_updates_skipped_;
+        ++next_resource_update_index_;
+        continue;
+      }
       // Resolve the SAME version that reads (record_copy/bindings via resource_for) will see at this
       // update's sequence, NOT the flat resources_ last-version. For a reused object_id (a per-frame
       // ring/pool upload buffer, e.g. one seen reused 192x), the flat map points at the final native
@@ -4258,7 +4372,62 @@ private:
         }
         return false;
       }
-      if (!upload_resource_data_batched(upload_mapping, target, *entry.update, error)) {
+      auto *persistent_mapping = event_ordered_recording_
+                                     ? event_ordered_mapped_resource(
+                                           entry.resource_object_id,
+                                           entry.update->subresource)
+                                     : nullptr;
+      bool upload_ok = true;
+      if (persistent_mapping && persistent_mapping->data) {
+        flush_resource_upload_mapping(upload_mapping);
+        std::memcpy(
+            static_cast<std::uint8_t *>(persistent_mapping->data) +
+                static_cast<std::size_t>(entry.update->written_begin),
+            entry.update->bytes.data(),
+            entry.update->bytes.size());
+      } else {
+        upload_ok = upload_resource_data_batched(upload_mapping, target, *entry.update, error);
+      }
+      if (!upload_ok) {
+        const auto *recorded = recorded_resource_at(entry.resource_object_id, entry.sequence);
+        const D3D12_RESOURCE_DESC actual_desc = target->GetDesc();
+        D3D12_HEAP_PROPERTIES actual_heap{};
+        D3D12_HEAP_FLAGS actual_heap_flags = D3D12_HEAP_FLAG_NONE;
+        const HRESULT heap_hr = target->GetHeapProperties(&actual_heap, &actual_heap_flags);
+        std::ostringstream detail;
+        detail << error
+               << " object_id=" << entry.resource_object_id
+               << " update_sequence=" << entry.update->sequence
+               << " apply_sequence=" << entry.update->apply_sequence
+               << " effective_sequence=" << entry.sequence
+               << " subresource=" << entry.update->subresource
+               << " written_range=[" << entry.update->written_begin
+               << "," << entry.update->written_end << ")"
+               << " update_bytes=" << entry.update->bytes.size()
+               << " actual_dimension=" << static_cast<unsigned>(actual_desc.Dimension)
+               << " actual_width=" << actual_desc.Width
+               << " actual_layout=" << static_cast<unsigned>(actual_desc.Layout)
+               << " actual_flags=0x" << std::hex << static_cast<unsigned>(actual_desc.Flags)
+               << " actual_heap_query_hr=0x" << static_cast<std::uint32_t>(heap_hr)
+               << " actual_heap_type=" << std::dec << static_cast<unsigned>(actual_heap.Type)
+               << " actual_cpu_page=" << static_cast<unsigned>(actual_heap.CPUPageProperty)
+               << " actual_memory_pool=" << static_cast<unsigned>(actual_heap.MemoryPoolPreference)
+               << " actual_heap_flags=0x" << std::hex << static_cast<unsigned>(actual_heap_flags)
+               << std::dec;
+        if (recorded != nullptr) {
+          detail << " recorded_create_sequence=" << recorded->create_sequence
+                 << " recorded_dimension=" << recorded->dimension
+                 << " recorded_width=" << recorded->width
+                 << " recorded_heap_type=" << recorded->heap_type
+                 << " recorded_heap_object=" << recorded->heap_object_id
+                 << " recorded_reserved=" << (recorded->reserved_resource ? 1 : 0)
+                 << " recorded_initial_state=0x" << std::hex << recorded->initial_state
+                 << std::dec;
+        } else {
+          detail << " recorded_resource=missing";
+        }
+        error = detail.str();
+        replay_milestone((std::string("resource-upload-map-fail ") + error).c_str());
         flush_resource_upload_mapping(upload_mapping);
         if (event_ordered_recording_) {
           event_ordered_resource_updates_applied_keys_.erase(event_ordered_key);
@@ -4290,6 +4459,28 @@ private:
 
   bool prepare_chronological_state(std::string &error)
   {
+    successful_map_resource_versions_.clear();
+    unmap_resource_update_sequences_.clear();
+    for (const auto &command : backend_.replay_commands_) {
+      if (command.kind == D3D12ReplayBackend::ReplayCommandKind::UnmapResource) {
+        unmap_resource_update_sequences_.insert(command.sequence);
+        continue;
+      }
+      if (command.kind != D3D12ReplayBackend::ReplayCommandKind::MapResource ||
+          command.object_refs.empty() || command.object_refs.front() == 0) {
+        continue;
+      }
+      const auto payload = json::parse(command.payload, nullptr, false);
+      if (payload.is_discarded() || !payload.is_object() || !payload.value("mapped", false)) {
+        continue;
+      }
+      const auto *resource = recorded_resource_at(command.object_refs.front(), command.sequence);
+      if (resource != nullptr) {
+        successful_map_resource_versions_.insert(
+            ResourceVersionKey{resource->resource_object_id, resource->create_sequence});
+      }
+    }
+
     descriptor_timeline_.clear();
     descriptor_timeline_.reserve(backend_.descriptors_.size());
     for (const auto &descriptor : backend_.descriptors_) {
@@ -4859,14 +5050,22 @@ private:
     return &inserted->second;
   }
 
-  bool retain_allocator_until_queue_idle(
+  bool retain_batch_allocators_until_queue_idle(
       ID3D12CommandQueue *queue,
-      NativeCommandList &native,
+      const std::vector<NativeCommandList *> &native_lists,
       std::string &error)
   {
-    if (!native.allocator) {
+    bool has_allocator = false;
+    for (const auto *native : native_lists) {
+      if (!native) {
+        return fail(error, "allocator retention received a null command list");
+      }
+      has_allocator |= static_cast<bool>(native->allocator);
+    }
+    if (!has_allocator) {
       return true;
     }
+
     QueueReleaseFence *release = release_fence_for_queue(queue, error);
     if (!release) {
       return false;
@@ -4877,11 +5076,19 @@ private:
       error = hresult_error("ID3D12CommandQueue::Signal(retrace allocator release)", hr);
       return false;
     }
-    PendingAllocatorRelease pending;
-    pending.fence = release->fence.get();
-    pending.fence_value = value;
-    pending.allocator = std::move(native.allocator);
-    pending_allocator_releases_.push_back(std::move(pending));
+    // One queue signal retires every allocator submitted by the original API batch. Signaling once
+    // per command list invents queue-control work and splits the backend submission profile for
+    // calls such as ExecuteCommandLists(14, ...).
+    for (auto *native : native_lists) {
+      if (!native->allocator) {
+        continue;
+      }
+      PendingAllocatorRelease pending;
+      pending.fence = release->fence.get();
+      pending.fence_value = value;
+      pending.allocator = std::move(native->allocator);
+      pending_allocator_releases_.push_back(std::move(pending));
+    }
     return true;
   }
 
@@ -5041,21 +5248,21 @@ private:
           }
           return false;
         }
-        for (auto *native : recorded_native_lists) {
-          if (!native ||
-              !retain_allocator_until_queue_idle(batch_queue, *native, error)) {
-            if (error.empty()) {
-              error = "retain_allocator_until_queue_idle failed (batch=" +
-                      std::to_string(replay_batch_index_) +
-                      " seq=" + std::to_string(batch.execute_sequence) + ")";
-            }
-            return false;
+        if (!retain_batch_allocators_until_queue_idle(
+                batch_queue, recorded_native_lists, error)) {
+          if (error.empty()) {
+            error = "retain_batch_allocators_until_queue_idle failed (batch=" +
+                    std::to_string(replay_batch_index_) +
+                    " seq=" + std::to_string(batch.execute_sequence) + ")";
           }
+          return false;
         }
         retire_pending_allocator_releases();
-        if (has_target_texture_watch_outputs(recorded_native_lists)) {
+        const bool diagnostic_wait =
+            has_target_texture_watch_outputs(recorded_native_lists);
+        if (diagnostic_wait) {
           wait_for_gpu(batch_queue, true);
-          if (trace_batch) {
+          if (diagnostic_wait && trace_batch) {
             replay_milestone((std::string("submit:waited-diagnostic batch=") +
                               std::to_string(replay_batch_index_)).c_str());
           }
@@ -5161,6 +5368,9 @@ private:
           // Rotate the back-buffer index to mirror FLIP_DISCARD's 0,1,0,1 alternation so the
           // trace's per-resource swapchain_buffer_index aliasing stays consistent.
           record_present_semantics(sync_interval, flags, S_OK);
+          if (!notify_dxmt_headless_frame_boundary(error)) {
+            return false;
+          }
           headless_back_buffer_index_ = (headless_back_buffer_index_ + 1) % kBufferCount;
         }
         if (!maybe_write_checkpoint_after_present(present_frame_index + 1, batch.present_sequence, error)) {
@@ -5243,72 +5453,53 @@ private:
       native_heap = heap_it->second.heap.get();
     }
 
-    json payload = json::parse(update.payload, nullptr, false);
-    if (payload.is_discarded() || !payload.is_object()) {
-      return fail(error, "UpdateTileMappings payload must be a JSON object");
+    const auto &payload = update.payload;
+    if (payload.regions.size() != payload.region_sizes.size() ||
+        payload.range_flags.size() != payload.heap_range_offsets.size() ||
+        payload.range_flags.size() != payload.range_tile_counts.size() ||
+        payload.regions.size() > std::numeric_limits<UINT>::max() ||
+        payload.range_flags.size() > std::numeric_limits<UINT>::max()) {
+      return fail(error, "UpdateTileMappings compiled payload arrays are inconsistent");
     }
-    const auto region_count = payload_u32(payload, "region_count");
-    const auto range_count = payload_u32(payload, "range_count");
-    const auto regions_json = payload.find("regions");
-    const auto region_sizes_json = payload.find("region_sizes");
-    const auto range_flags_json = payload.find("range_flags");
-    const auto heap_offsets_json = payload.find("heap_range_offsets");
-    const auto tile_counts_json = payload.find("range_tile_counts");
-    if (regions_json == payload.end() || !regions_json->is_array() ||
-        region_sizes_json == payload.end() || !region_sizes_json->is_array() ||
-        range_flags_json == payload.end() || !range_flags_json->is_array() ||
-        heap_offsets_json == payload.end() || !heap_offsets_json->is_array() ||
-        tile_counts_json == payload.end() || !tile_counts_json->is_array()) {
-      return fail(error, "UpdateTileMappings payload arrays are missing");
-    }
-    if (regions_json->size() != region_count || region_sizes_json->size() != region_count ||
-        range_flags_json->size() != range_count || heap_offsets_json->size() != range_count ||
-        tile_counts_json->size() != range_count) {
-      return fail(error, "UpdateTileMappings payload counts do not match arrays");
-    }
+    const auto region_count = static_cast<UINT>(payload.regions.size());
+    const auto range_count = static_cast<UINT>(payload.range_flags.size());
 
     std::vector<D3D12_TILED_RESOURCE_COORDINATE> regions;
     std::vector<D3D12_TILE_REGION_SIZE> region_sizes;
     std::vector<D3D12_TILE_RANGE_FLAGS> range_flags;
     std::vector<UINT> heap_offsets;
     std::vector<UINT> tile_counts;
-    regions.reserve(regions_json->size());
-    region_sizes.reserve(region_sizes_json->size());
-    range_flags.reserve(range_flags_json->size());
-    heap_offsets.reserve(heap_offsets_json->size());
-    tile_counts.reserve(tile_counts_json->size());
+    regions.reserve(payload.regions.size());
+    region_sizes.reserve(payload.region_sizes.size());
+    range_flags.reserve(payload.range_flags.size());
+    heap_offsets.reserve(payload.heap_range_offsets.size());
+    tile_counts.reserve(payload.range_tile_counts.size());
 
-    for (const auto &region_json : *regions_json) {
-      if (!region_json.is_object()) {
-        return fail(error, "UpdateTileMappings region must be an object");
-      }
+    for (const auto &compiled_region : payload.regions) {
       D3D12_TILED_RESOURCE_COORDINATE region{};
-      region.Subresource = payload_u32(region_json, "subresource");
-      region.X = payload_u32(region_json, "x");
-      region.Y = payload_u32(region_json, "y");
-      region.Z = payload_u32(region_json, "z");
+      region.Subresource = compiled_region.subresource;
+      region.X = compiled_region.x;
+      region.Y = compiled_region.y;
+      region.Z = compiled_region.z;
       regions.push_back(region);
     }
-    for (const auto &size_json : *region_sizes_json) {
-      if (!size_json.is_object()) {
-        return fail(error, "UpdateTileMappings region size must be an object");
-      }
+    for (const auto &compiled_size : payload.region_sizes) {
       D3D12_TILE_REGION_SIZE size{};
-      size.NumTiles = payload_u32(size_json, "num_tiles");
-      size.UseBox = payload_bool(size_json, "use_box");
-      size.Width = payload_u32(size_json, "width");
-      size.Height = payload_u32(size_json, "height");
-      size.Depth = payload_u32(size_json, "depth");
+      size.NumTiles = compiled_size.num_tiles;
+      size.UseBox = compiled_size.use_box;
+      size.Width = compiled_size.width;
+      size.Height = compiled_size.height;
+      size.Depth = compiled_size.depth;
       region_sizes.push_back(size);
     }
-    for (const auto &flag_json : *range_flags_json) {
-      range_flags.push_back(static_cast<D3D12_TILE_RANGE_FLAGS>(json_u64(flag_json)));
+    for (const auto flag : payload.range_flags) {
+      range_flags.push_back(static_cast<D3D12_TILE_RANGE_FLAGS>(flag));
     }
-    for (const auto &offset_json : *heap_offsets_json) {
-      heap_offsets.push_back(static_cast<UINT>(json_u64(offset_json)));
+    for (const auto offset : payload.heap_range_offsets) {
+      heap_offsets.push_back(static_cast<UINT>(offset));
     }
-    for (const auto &count_json : *tile_counts_json) {
-      tile_counts.push_back(static_cast<UINT>(json_u64(count_json)));
+    for (const auto count : payload.range_tile_counts) {
+      tile_counts.push_back(static_cast<UINT>(count));
     }
 
 #ifdef _WIN32
@@ -5325,7 +5516,7 @@ private:
         range_flags.data(),
         heap_offsets.data(),
         tile_counts.data(),
-        static_cast<D3D12_TILE_MAPPING_FLAGS>(payload_u32(payload, "flags")));
+        static_cast<D3D12_TILE_MAPPING_FLAGS>(payload.flags));
 #else
     // The vendored third_party/d3d-headers d3d12.h used by the native retrace
     // build (matching DXMT's d3d12.dll vtable ABI) omits the pHeap parameter.
@@ -5339,7 +5530,7 @@ private:
         range_flags.data(),
         heap_offsets.data(),
         tile_counts.data(),
-        static_cast<D3D12_TILE_MAPPING_FLAGS>(payload_u32(payload, "flags")));
+        static_cast<D3D12_TILE_MAPPING_FLAGS>(payload.flags));
 #endif
     return true;
   }
@@ -5354,6 +5545,27 @@ private:
     if (record) {
       record(sync_interval, flags, result);
     }
+  }
+
+  bool notify_dxmt_headless_frame_boundary(std::string &error)
+  {
+    static DxmtReplayFrameBoundaryFn boundary =
+        resolve_d3d12_export<DxmtReplayFrameBoundaryFn>(
+            "DXMTD3D12ReplayFrameBoundary");
+    if (!boundary) {
+      if (std::getenv("DXMT_PERF_STATS")) {
+        return fail(
+            error,
+            "headless DXMT perf replay requires "
+            "DXMTD3D12ReplayFrameBoundary export");
+      }
+      return true;
+    }
+    const HRESULT hr = boundary(device_.get());
+    if (FAILED(hr)) {
+      return fail(error, hresult_error("DXMTD3D12ReplayFrameBoundary", hr));
+    }
+    return true;
   }
 
   static std::string hex32(std::uint32_t v)
@@ -7495,10 +7707,9 @@ private:
     return pipeline_for(static_cast<trace::ObjectId>(pso_id), begin_cmd.sequence, error);
   }
 
-  bool record_command_list(
+  bool begin_command_list_recording(
       NativeCommandList &native,
       std::size_t begin_index,
-      std::size_t end_index,
       std::string &error)
   {
     ComPtr<ID3D12CommandAllocator> allocator;
@@ -7510,9 +7721,51 @@ private:
     native.allocator = std::move(allocator);
     // Reset with the recorded initial pipeline state, not nullptr. Some applications bind graphics
     // PSO through Reset/CreateCommandList and then draw without a separate SetPipelineState.
-    // Passing nullptr leaves the list with no PSO and drops those draws.
     ID3D12PipelineState *initial_pso = initial_pipeline_state_for(begin_index, error);
     if (!error.empty()) {
+      return false;
+    }
+    hr = native.list->Reset(native.allocator.get(), initial_pso);
+    if (FAILED(hr)) {
+      error = hresult_error("ID3D12GraphicsCommandList::Reset", hr);
+      return false;
+    }
+    native.current_render_targets = {};
+    native.current_render_target_count = 0;
+    native.current_pipeline_state_object_id = 0;
+    native.current_graphics_root_signature_object_id = 0;
+    native.current_graphics_root_tables = {};
+    native.current_graphics_root_descriptors = {};
+    native.current_viewport = {};
+    native.has_current_viewport = false;
+    native.current_scissor = {};
+    native.has_current_scissor = false;
+    native.current_primitive_topology = 0;
+    native.current_vertex_buffer0 = {};
+    native.current_index_buffer = {};
+    native.target_watch_readbacks.clear();
+    native.target_watch_occlusions.clear();
+    native.target_watch_buffer_readbacks.clear();
+    return true;
+  }
+
+  bool end_command_list_recording(NativeCommandList &native, std::string &error)
+  {
+    const HRESULT hr = native.list->Close();
+    if (FAILED(hr)) {
+      error = hresult_error("ID3D12GraphicsCommandList::Close", hr);
+      return false;
+    }
+    return true;
+  }
+
+  bool record_command_list(
+      NativeCommandList &native,
+      std::size_t begin_index,
+      std::size_t end_index,
+      std::string &error)
+  {
+    if (!begin_command_list_recording(native, begin_index, error)) {
       return false;
     }
     // Diagnostic (BUG-007): a native list whose TYPE is not DIRECT but whose recorded interval has
@@ -7543,27 +7796,6 @@ private:
                           " begin=" + std::to_string(begin_index)).c_str());
       }
     }
-    hr = native.list->Reset(native.allocator.get(), initial_pso);
-    if (FAILED(hr)) {
-      error = hresult_error("ID3D12GraphicsCommandList::Reset", hr);
-      return false;
-    }
-    native.current_render_targets = {};
-    native.current_render_target_count = 0;
-    native.current_pipeline_state_object_id = 0;
-    native.current_graphics_root_signature_object_id = 0;
-    native.current_graphics_root_tables = {};
-    native.current_graphics_root_descriptors = {};
-    native.current_viewport = {};
-    native.has_current_viewport = false;
-    native.current_scissor = {};
-    native.has_current_scissor = false;
-    native.current_primitive_topology = 0;
-    native.current_vertex_buffer0 = {};
-    native.current_index_buffer = {};
-    native.target_watch_readbacks.clear();
-    native.target_watch_occlusions.clear();
-    native.target_watch_buffer_readbacks.clear();
     const auto record_begin = std::chrono::steady_clock::now();
     bool grind_warned = false;
     // replay_commands_ is a GLOBAL sequence-ordered stream; when the app records multiple command
@@ -7695,12 +7927,7 @@ private:
         break;
       }
     }
-    hr = native.list->Close();
-    if (FAILED(hr)) {
-      error = hresult_error("ID3D12GraphicsCommandList::Close", hr);
-      return false;
-    }
-    return true;
+    return end_command_list_recording(native, error);
   }
 
   bool ensure_command_list_recorded(
@@ -7807,7 +8034,14 @@ private:
     }
     const auto resource_it = resources_.find(object_id);
     if (resource_it == resources_.end() || !resource_it->second.resource) {
-      error = "D3D12 native command replay incomplete: command references an unknown resource";
+      const auto version_count = ver_it == resource_version_natives_.end()
+                                     ? std::size_t{0}
+                                     : ver_it->second.size();
+      error = "D3D12 native command replay incomplete: command references an unknown resource"
+              " object_id=" + std::to_string(object_id) +
+              " replay_sequence=" + std::to_string(current_replay_sequence_) +
+              " version_count=" + std::to_string(version_count) +
+              " flat_entry=" + std::to_string(resource_it != resources_.end());
       return nullptr;
     }
     return resource_it->second.resource.get();
@@ -9683,7 +9917,7 @@ private:
     }
   }
 
-  void wait_for_all_replay_queues()
+  void wait_for_all_replay_queues(bool count_frame_timing = false)
   {
     std::unordered_set<ID3D12CommandQueue *> queues;
     if (queue_) {
@@ -9700,7 +9934,7 @@ private:
       }
     }
     for (auto *queue : queues) {
-      wait_for_gpu(queue);
+      wait_for_gpu(queue, count_frame_timing);
     }
     retire_pending_allocator_releases();
   }
@@ -9804,6 +10038,10 @@ private:
       event_ordered_profile_dispatch_kind_counts_{};
   std::array<std::uint64_t, kEventOrderedDispatchProfileKindCount>
       event_ordered_profile_dispatch_kind_us_{};
+  std::array<std::uint64_t, kEventOrderedDispatchProfileKindCount>
+      event_ordered_profile_semantic_kind_counts_{};
+  std::array<std::uint64_t, kEventOrderedDispatchProfileKindCount>
+      event_ordered_profile_semantic_kind_us_{};
   bool event_ordered_present_timing_active_ = false;
   bool event_ordered_first_present_seen_ = false;
   std::chrono::steady_clock::time_point event_ordered_present_timing_begin_{};
@@ -9860,12 +10098,25 @@ private:
   mutable bool shader_candidate_index_built_ = false;
   mutable std::unordered_map<std::uint64_t, std::vector<std::filesystem::path>> shader_candidate_paths_by_size_;
   std::unordered_map<trace::ObjectId, NativeResource> resources_;
+  struct EventOrderedMappedResource {
+    ID3D12Resource *resource = nullptr;
+    void *data = nullptr;
+    std::uint32_t depth = 0;
+  };
+  std::unordered_map<
+      trace::ObjectId,
+      std::unordered_map<UINT, EventOrderedMappedResource>>
+      event_ordered_mapped_resources_;
   std::unordered_map<ResourceVersionKey, TrackedResourceState, ResourceVersionKeyHash>
       tracked_resource_states_;
-  // Per-version native resources for object_ids reused across lifetimes (BUG-20260614-004). Built
-  // from backend_.resource_versions_ when more than one version exists for an id. Each entry is a
+  std::unordered_set<ResourceVersionKey, ResourceVersionKeyHash>
+      successful_map_resource_versions_;
+  std::unordered_set<std::uint64_t> unmap_resource_update_sequences_;
+  std::uint64_t stale_generation_resource_updates_skipped_ = 0;
+  // Per-version native resources for object_ids reused across lifetimes (BUG-20260614-004), plus
+  // destroyed single-lifetime resources absent from backend_.resources_. Each entry is a
   // (create_sequence, native resource) sorted by create_sequence; resource_for resolves to the
-  // version live at current_replay_sequence_. Empty when no id is reused (resources_ suffices).
+  // version live at current_replay_sequence_.
   std::unordered_map<trace::ObjectId, std::vector<std::pair<std::uint64_t, NativeResource>>>
       resource_version_natives_;
   std::uint64_t current_replay_sequence_ = 0;
@@ -9877,10 +10128,8 @@ private:
   std::unordered_map<const D3D12ReplayBackend::CopyDescriptorSemanticState *, std::size_t>
       descriptor_copy_index_by_semantic_;
   std::vector<ResourceDataUpdateRef> resource_update_timeline_;
-  std::deque<D3D12ReplayBackend::ResourceDataUpdate> event_ordered_resource_update_storage_;
   std::unordered_set<std::string> event_ordered_ingested_update_keys_;
-  std::vector<std::size_t> event_ordered_resource_version_update_cursors_;
-  std::unordered_map<trace::ObjectId, std::size_t> event_ordered_resource_update_cursors_;
+  std::size_t event_ordered_resource_update_notification_cursor_ = 0;
   std::deque<D3D12ReplayBackend::DescriptorSemanticState> event_ordered_copied_descriptor_storage_;
   std::size_t next_descriptor_index_ = 0;
   std::size_t next_sampler_index_ = 0;
@@ -9894,6 +10143,7 @@ private:
   bool record_one_ok_ = true;
   std::string record_one_error_;
   bool event_ordered_recording_ = false;
+  bool event_ordered_failed_ = false;
   std::uint64_t event_ordered_recorded_commands_ = 0;
   std::uint64_t event_ordered_lists_reset_ = 0;
   std::uint64_t event_ordered_lists_closed_ = 0;
@@ -9907,8 +10157,8 @@ private:
   std::uint64_t event_ordered_queue_signals_ = 0;
   std::uint64_t event_ordered_queue_waits_ = 0;
   std::uint64_t event_ordered_fence_signals_ = 0;
-  std::uint64_t event_ordered_cpu_waits_ = 0;
-  std::uint64_t event_ordered_cpu_wait_timeouts_ = 0;
+  std::uint64_t event_ordered_fence_events_registered_ = 0;
+  std::vector<std::unique_ptr<ScopedFenceEvent>> event_ordered_registered_fence_events_;
   bool event_ordered_stop_requested_ = false;
   std::unordered_set<std::uint64_t> event_ordered_presented_frames_;
   std::unordered_set<std::string> event_ordered_resource_updates_applied_keys_;

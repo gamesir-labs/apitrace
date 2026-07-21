@@ -1,5 +1,6 @@
 #include "apitrace/asset_index.hpp"
 #include "apitrace/bundle_layout.hpp"
+#include "apitrace/compiled_dispatch_io.hpp"
 #include "apitrace/d3d12_replay.hpp"
 #include "apitrace/raw_event_codec.hpp"
 #include "apitrace/trace_bundle_io.hpp"
@@ -49,6 +50,9 @@ constexpr std::uint64_t kDefaultMaxTruncateFrames = 120;
 constexpr std::size_t kFileCopyBufferSize = 8ull * 1024ull * 1024ull;
 constexpr std::uint64_t kJsonlMaxChunkSize = 64ull * 1024ull * 1024ull;
 constexpr std::uint64_t kJsonlMinChunkSize = 64ull * 1024ull;
+// Each dispatch worker owns the source chunk, a parsed payload, and an encoded record. Keep the
+// source slice smaller than the generic JSONL chunk so parallel finalize memory stays bounded.
+constexpr std::uint64_t kCompiledDispatchChunkSize = 16ull * 1024ull * 1024ull;
 constexpr std::uint64_t kRawToFinalAssetFlushMinBytes = 256ull * 1024ull * 1024ull;
 constexpr std::uint64_t kRawToFinalAssetFlushMaxBytes = 2ull * 1024ull * 1024ull * 1024ull;
 constexpr std::uint64_t kRawToFinalAssetFlushBytesPerJob = 64ull * 1024ull * 1024ull;
@@ -184,6 +188,15 @@ struct Stats {
   std::size_t recovered_unindexed_asset_aliases = 0;
   std::uint64_t sequence_regression_segments = 0;
   std::uint64_t remapped_sequence_records = 0;
+  std::uint64_t raw_sequence_regressions = 0;
+  std::uint64_t raw_sequence_reordered_events = 0;
+  std::uint64_t raw_batch_records_expanded = 0;
+  std::uint64_t raw_batch_ops_expanded = 0;
+  std::uint64_t compiled_dispatch_records = 0;
+  std::uint64_t compiled_dispatch_bytes = 0;
+  std::uint64_t compiled_dispatch_ms = 0;
+  std::uint64_t removed_replay_model_bytes = 0;
+  bool raw_to_final_reused = false;
   std::size_t raw_to_final_events = 0;
   std::size_t raw_to_final_assets = 0;
   std::uint64_t raw_to_final_asset_bytes = 0;
@@ -914,6 +927,134 @@ bool scan_raw_event_chunks(
   return true;
 }
 
+bool count_raw_event_sequence_regressions(
+    const fs::path &bundle_root,
+    std::uint64_t committed_bytes,
+    std::uint64_t &regressions,
+    std::string &error)
+{
+  regressions = 0;
+  error.clear();
+  const auto events_path = bundle_root / "raw" / "events.bin";
+  std::ifstream input(events_path, std::ios::binary);
+  if (!input.is_open()) {
+    error = "failed to open raw events file";
+    return false;
+  }
+  input.seekg(static_cast<std::streamoff>(kRawFileHeaderBytes), std::ios::beg);
+  if (!input.good()) {
+    error = "failed to seek raw events file";
+    return false;
+  }
+
+  std::uint64_t cursor = kRawFileHeaderBytes;
+  std::uint64_t last_sequence = 0;
+  while (cursor + kRawEventHeaderBytes <= committed_bytes) {
+    std::array<std::uint8_t, kRawEventHeaderBytes> header_bytes{};
+    if (!read_exact_bytes(input, header_bytes.data(), header_bytes.size())) {
+      error = "failed to read raw event header at byte offset " + std::to_string(cursor);
+      return false;
+    }
+    const auto header = read_raw_event_header(header_bytes);
+    const auto event_offset = cursor;
+    cursor += kRawEventHeaderBytes;
+    if (header.payload_len > committed_bytes - cursor ||
+        header.payload_len > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+      error = "invalid raw event payload length at byte offset " + std::to_string(event_offset);
+      return false;
+    }
+    if (header.sequence == 0) {
+      error = "raw event has sequence zero at byte offset " + std::to_string(event_offset);
+      return false;
+    }
+    if (header.sequence == last_sequence) {
+      error = "raw events have adjacent duplicate sequence " +
+              std::to_string(header.sequence) + " at byte offset " +
+              std::to_string(event_offset);
+      return false;
+    }
+    if (header.sequence < last_sequence) {
+      ++regressions;
+    }
+    last_sequence = header.sequence;
+    input.seekg(static_cast<std::streamoff>(header.payload_len), std::ios::cur);
+    if (!input.good()) {
+      error = "failed to skip raw event payload at byte offset " + std::to_string(cursor);
+      return false;
+    }
+    cursor += header.payload_len;
+  }
+  if (cursor != committed_bytes) {
+    error = "raw events committed prefix ends inside an event header at byte offset " +
+            std::to_string(cursor);
+    return false;
+  }
+  return true;
+}
+
+bool reorder_raw_event_chunks_by_sequence(
+    std::vector<RawDecodeChunk> &chunks,
+    std::uint64_t &reordered_events,
+    std::string &error)
+{
+  reordered_events = 0;
+  error.clear();
+  std::size_t event_count = 0;
+  for (const auto &chunk : chunks) {
+    event_count += chunk.events.size();
+  }
+
+  std::vector<RawEventRange> events;
+  events.reserve(event_count);
+  for (auto &chunk : chunks) {
+    events.insert(
+        events.end(),
+        std::make_move_iterator(chunk.events.begin()),
+        std::make_move_iterator(chunk.events.end()));
+  }
+  std::sort(events.begin(), events.end(), [](const RawEventRange &left, const RawEventRange &right) {
+    if (left.sequence != right.sequence) {
+      return left.sequence < right.sequence;
+    }
+    return left.offset < right.offset;
+  });
+
+  for (std::size_t index = 0; index < events.size(); ++index) {
+    if (events[index].sequence == 0) {
+      error = "raw event has sequence zero at byte offset " + std::to_string(events[index].offset);
+      return false;
+    }
+    if (index != 0 && events[index - 1].sequence == events[index].sequence) {
+      error = "raw events have duplicate sequence " + std::to_string(events[index].sequence) +
+              " at byte offsets " + std::to_string(events[index - 1].offset) + " and " +
+              std::to_string(events[index].offset);
+      return false;
+    }
+  }
+
+  chunks.clear();
+  RawDecodeChunk chunk;
+  chunk.index = 0;
+  for (auto &event : events) {
+    if (chunk.events.empty()) {
+      chunk.offset = event.offset;
+    }
+    chunk.byte_size += event.byte_size;
+    chunk.events.push_back(std::move(event));
+    if (chunk.byte_size >= kRawDecodeTargetChunkBytes ||
+        chunk.events.size() >= kRawDecodeMaxChunkEvents) {
+      chunks.push_back(std::move(chunk));
+      chunk = RawDecodeChunk{};
+      chunk.index = chunks.size();
+    }
+  }
+  if (!chunk.events.empty()) {
+    chunks.push_back(std::move(chunk));
+  }
+  reordered_events = event_count;
+  return true;
+}
+
 bool read_raw_event_at(
     std::ifstream &input,
     const RawEventRange &range,
@@ -1002,6 +1143,15 @@ RawDecodedChunk decode_raw_chunk(
   }
   std::uint64_t cursor = chunk.events.empty() ? chunk.offset : chunk.events.front().offset;
   for (const auto &range : chunk.events) {
+    if (cursor != range.offset) {
+      events_input.clear();
+      events_input.seekg(static_cast<std::streamoff>(range.offset), std::ios::beg);
+      if (!events_input.good()) {
+        result.error = "failed to seek raw event at byte offset " + std::to_string(range.offset);
+        return result;
+      }
+      cursor = range.offset;
+    }
     apitrace::trace::raw::RawEventRecord record;
     if (!read_next_raw_event_in_chunk(events_input, cursor, range, record, result.error)) {
       return result;
@@ -1026,6 +1176,160 @@ RawDecodedChunk decode_raw_chunk(
   return result;
 }
 
+bool expand_raw_batch_event(
+    apitrace::trace::raw::DecodedRawEvent &&decoded,
+    std::vector<apitrace::trace::raw::DecodedRawEvent> &expanded,
+    std::string &error)
+{
+  expanded.clear();
+  error.clear();
+  if (!decoded.passthrough) {
+    expanded.push_back(std::move(decoded));
+    return true;
+  }
+
+  // Only the recorder's six synthetic batch functions require expansion.  A
+  // broad "Batch" substring check also matched ordinary payload strings and
+  // forced millions of unrelated calls through the JSON parser during
+  // finalize.  Keep the cheap exact-name gate ahead of semantic parsing.
+  const auto &raw_record = decoded.passthrough_jsonl_record;
+  const bool supported_batch =
+      raw_record.find("ID3D12Device::CreateDescriptorViewBatch") !=
+          std::string::npos ||
+      raw_record.find("ID3D12Device::CopyDescriptorsBatch") !=
+          std::string::npos ||
+      raw_record.find("ID3D12GraphicsCommandList::CopyTextureRegionBatch") !=
+          std::string::npos ||
+      raw_record.find("DXMT::FenceDependencyBatch") != std::string::npos ||
+      raw_record.find("ID3D12GraphicsCommandList::CopyBufferRegionBatch") !=
+          std::string::npos ||
+      raw_record.find("ID3D12GraphicsCommandList::ResourceBarrierBatch") !=
+          std::string::npos;
+  if (!supported_batch) {
+    expanded.push_back(std::move(decoded));
+    return true;
+  }
+
+  auto record = json::parse(raw_record, nullptr, false);
+  if (record.is_discarded() || !record.is_object() ||
+      record.value("record_kind", std::string()) != "call") {
+    expanded.push_back(std::move(decoded));
+    return true;
+  }
+
+  const auto function = record.value("function", std::string());
+  const char *array_key = nullptr;
+  const char *count_key = nullptr;
+  bool object_rows = false;
+  if (function == "ID3D12Device::CreateDescriptorViewBatch" ||
+      function == "ID3D12Device::CopyDescriptorsBatch" ||
+      function == "ID3D12GraphicsCommandList::CopyTextureRegionBatch" ||
+      function == "DXMT::FenceDependencyBatch") {
+    array_key = "ops";
+    count_key = "op_count";
+  } else if (function == "ID3D12GraphicsCommandList::CopyBufferRegionBatch") {
+    array_key = "ops";
+    count_key = "op_count";
+    object_rows = true;
+  } else if (function == "ID3D12GraphicsCommandList::ResourceBarrierBatch") {
+    array_key = "barriers";
+    count_key = "barrier_count";
+  } else {
+    expanded.push_back(std::move(decoded));
+    return true;
+  }
+
+  if (!decoded.assets.empty()) {
+    error = function + " unexpectedly references assets and cannot be split safely";
+    return false;
+  }
+  auto payload_it = record.find("payload");
+  if (payload_it == record.end() || !payload_it->is_object()) {
+    error = function + " is missing an object payload";
+    return false;
+  }
+  auto rows_it = payload_it->find(array_key);
+  if (rows_it == payload_it->end() || !rows_it->is_array() || rows_it->empty()) {
+    error = function + " is missing non-empty batch rows";
+    return false;
+  }
+
+  expanded.reserve(rows_it->size());
+  std::uint64_t previous_sequence = 0;
+  for (const auto &row : *rows_it) {
+    std::uint64_t sequence = 0;
+    if (object_rows) {
+      if (!row.is_object()) {
+        error = function + " has a non-object batch row";
+        return false;
+      }
+      sequence = row.value("sequence", 0ull);
+    } else {
+      if (!row.is_array() || row.empty() || !row.front().is_number_unsigned()) {
+        error = function + " has a malformed compact batch row";
+        return false;
+      }
+      sequence = row.front().get<std::uint64_t>();
+    }
+    if (sequence == 0 || sequence <= previous_sequence) {
+      error = function + " has a zero or non-increasing batch sequence";
+      return false;
+    }
+    previous_sequence = sequence;
+
+    json split_record = record;
+    split_record["sequence"] = sequence;
+    auto &split_payload = split_record["payload"];
+    split_payload[count_key] = 1;
+    split_payload[array_key] = json::array();
+    split_payload[array_key].push_back(row);
+
+    json split_object_refs = json::array();
+    if (function == "ID3D12GraphicsCommandList::CopyBufferRegionBatch" ||
+        function == "ID3D12GraphicsCommandList::ResourceBarrierBatch" ||
+        function == "ID3D12GraphicsCommandList::CopyTextureRegionBatch") {
+      const auto refs = record.find("object_refs");
+      if (refs == record.end() || !refs->is_array() || refs->empty() ||
+          !refs->front().is_number_unsigned()) {
+        error = function + " is missing its command-list object reference";
+        return false;
+      }
+      split_object_refs.push_back(refs->front());
+    } else if (function == "ID3D12Device::CreateDescriptorViewBatch") {
+      for (const std::size_t column : {3u, 4u, 12u}) {
+        if (column < row.size() && row[column].is_number_unsigned() &&
+            row[column].get<std::uint64_t>() != 0 &&
+            std::find(split_object_refs.begin(), split_object_refs.end(), row[column]) ==
+                split_object_refs.end()) {
+          split_object_refs.push_back(row[column]);
+        }
+      }
+    }
+    if (split_object_refs.empty()) {
+      split_record.erase("object_refs");
+    } else {
+      split_record["object_refs"] = std::move(split_object_refs);
+    }
+
+    apitrace::trace::raw::DecodedRawEvent split;
+    split.event = decoded.event;
+    split.event.callsite.sequence = sequence;
+    split.passthrough = true;
+    split.passthrough_jsonl_record = split_record.dump();
+    expanded.push_back(std::move(split));
+  }
+
+  const auto top_sequence = decoded.event.callsite.sequence;
+  if (top_sequence == 0 || expanded.front().event.callsite.sequence != top_sequence) {
+    error = function + " top-level sequence does not match its first batch operation";
+    return false;
+  }
+  return true;
+}
+
+fs::path temporary_rewrite_path(const fs::path &path);
+bool replace_with_temporary_file(const fs::path &path, const fs::path &temporary);
+
 bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stats, ProgressReporter *progress)
 {
   if (options.dry_run) {
@@ -1046,6 +1350,11 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     std::getline(existing_callstream, existing_header_line);
   }
   apitrace::trace::TraceBundleWriter writer;
+  const auto final_callstream_path =
+      options.bundle_root / apitrace::trace::kCallstreamFileName;
+  const auto temporary_callstream_path = temporary_rewrite_path(final_callstream_path);
+  std::error_code temporary_error;
+  fs::remove(temporary_callstream_path, temporary_error);
   writer.set_async_asset_worker_count(options.jobs);
   if (progress) {
     writer.set_progress_callback([progress](
@@ -1057,7 +1366,10 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
       progress->update_detail(phase, items_done, item_count, bytes_done, byte_count);
     });
   }
-  if (!writer.open(options.bundle_root)) {
+  if (!writer.open(
+          options.bundle_root,
+          apitrace::trace::TraceBundleOpenMode::Primary,
+          temporary_callstream_path)) {
     std::cerr << "error: failed to open final bundle writer for raw materialization\n";
     return false;
   }
@@ -1196,6 +1508,64 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     }
     return true;
   };
+  const auto fast_u64_after = [](std::string_view text, std::size_t position)
+      -> std::optional<std::uint64_t> {
+    while (position < text.size() &&
+           (text[position] == ' ' || text[position] == '\t' ||
+            text[position] == '\r' || text[position] == '\n' ||
+            text[position] == ':')) {
+      ++position;
+    }
+    if (position >= text.size() || text[position] < '0' || text[position] > '9') {
+      return std::nullopt;
+    }
+    std::uint64_t value = 0;
+    while (position < text.size() && text[position] >= '0' && text[position] <= '9') {
+      const auto digit = static_cast<std::uint64_t>(text[position] - '0');
+      if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
+        return std::nullopt;
+      }
+      value = value * 10 + digit;
+      ++position;
+    }
+    return value;
+  };
+  const auto fast_named_u64 = [&](std::string_view text, std::string_view key, std::size_t start = 0)
+      -> std::optional<std::uint64_t> {
+    const auto position = text.find(key, start);
+    return position == std::string_view::npos
+               ? std::nullopt
+               : fast_u64_after(text, position + key.size());
+  };
+  const auto fast_object_ref = [&](std::string_view text, std::size_t wanted_index)
+      -> std::optional<std::uint64_t> {
+    const auto key = text.find("\"object_refs\"");
+    if (key == std::string_view::npos) {
+      return std::nullopt;
+    }
+    auto position = text.find('[', key);
+    if (position == std::string_view::npos) {
+      return std::nullopt;
+    }
+    ++position;
+    for (std::size_t index = 0; index <= wanted_index; ++index) {
+      while (position < text.size() &&
+             (text[position] == ' ' || text[position] == '\t' || text[position] == ',')) {
+        ++position;
+      }
+      const auto value = fast_u64_after(text, position);
+      if (!value) {
+        return std::nullopt;
+      }
+      if (index == wanted_index) {
+        return value;
+      }
+      while (position < text.size() && text[position] >= '0' && text[position] <= '9') {
+        ++position;
+      }
+    }
+    return std::nullopt;
+  };
   const auto track_passthrough_context = [&](const std::string &line) -> bool {
     const auto resource_pos = line.find("Resource");
     if (resource_pos == std::string::npos) {
@@ -1213,66 +1583,45 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
       return true;
     }
 
-    auto record = json::parse(line, nullptr, false);
-    if (record.is_discarded() || !record.is_object()) {
-      return true;
-    }
-    const auto record_kind = record.value("record_kind", std::string());
-    json payload = json::object();
-    const auto payload_it = record.find("payload");
-    if (payload_it != record.end() && payload_it->is_object()) {
-      payload = *payload_it;
-    }
-
-    if (record_kind == "object_create" &&
-        record.value("object_kind", std::string()) == "Resource") {
-      const auto object_id = record.value("object_id", 0ull);
-      if (auto dimension = payload.contains("dimension") ? maybe_u64(payload["dimension"]) : std::nullopt) {
-        remember_resource_dimension(object_id, *dimension);
+    if (may_update_object_resource) {
+      const auto object_id = fast_named_u64(line, "\"object_id\"");
+      const auto payload = line.find("\"payload\"");
+      const auto dimension = payload == std::string::npos
+                                 ? std::nullopt
+                                 : fast_named_u64(line, "\"dimension\"", payload);
+      if (object_id && *object_id != 0 && dimension) {
+        remember_resource_dimension(*object_id, *dimension);
       }
       return true;
     }
-
-    if (record_kind != "call") {
-      return true;
-    }
-    const auto function = record.value("function", std::string());
-    const auto object_refs = record.value("object_refs", std::vector<std::uint64_t>{});
-    if ((function == "ID3D12Device::CreateCommittedResource" ||
-         function == "ID3D12Device8::CreateCommittedResource2") &&
-        object_refs.size() >= 2) {
-      if (auto dimension = resource_desc_dimension(payload)) {
-        remember_resource_dimension(object_refs[1], *dimension);
+    if (may_update_create_resource) {
+      const bool placed = line.find("CreatePlacedResource") != std::string::npos;
+      const auto resource_id = fast_object_ref(line, placed ? 2 : 1);
+      const auto resource_desc = line.find("\"resource_desc\"");
+      const auto dimension = resource_desc == std::string::npos
+                                 ? std::nullopt
+                                 : fast_named_u64(line, "\"dimension\"", resource_desc);
+      if (resource_id && *resource_id != 0 && dimension) {
+        remember_resource_dimension(*resource_id, *dimension);
       }
       return true;
     }
-    if ((function == "ID3D12Device::CreatePlacedResource" ||
-         function == "ID3D12Device8::CreatePlacedResource1") &&
-        object_refs.size() >= 3) {
-      if (auto dimension = resource_desc_dimension(payload)) {
-        remember_resource_dimension(object_refs[2], *dimension);
-      }
-      return true;
-    }
-    if (function == "ID3D12Device::CreateReservedResource" && object_refs.size() >= 2) {
-      if (auto dimension = resource_desc_dimension(payload)) {
-        remember_resource_dimension(object_refs[1], *dimension);
-      }
-      return true;
-    }
-    if (function == "ID3D12Resource::Map" && !object_refs.empty()) {
-      auto subresource_it = payload.find("subresource");
-      if (subresource_it != payload.end()) {
-        if (auto subresource = maybe_u64(*subresource_it)) {
-          resources[object_refs.front()].last_map_subresource = *subresource;
-        }
+    if (may_update_map) {
+      const auto resource_id = fast_object_ref(line, 0);
+      const auto payload = line.find("\"payload\"");
+      const auto subresource = payload == std::string::npos
+                                   ? std::nullopt
+                                   : fast_named_u64(line, "\"subresource\"", payload);
+      if (resource_id && *resource_id != 0 && subresource) {
+        resources[*resource_id].last_map_subresource = *subresource;
       }
     }
     return true;
   };
   const auto finalize_binary_unmap_payload = [&](apitrace::trace::EventRecord &event) -> bool {
     if (event.kind != apitrace::trace::EventKind::Call ||
-        event.callsite.function_name != "ID3D12Resource::Unmap") {
+        (event.callsite.function_name != "ID3D12Resource::Unmap" &&
+         event.callsite.function_name != "apitrace::D3D12ResourceDataUpdate")) {
       return true;
     }
     if (event.object_refs.empty() || event.object_refs.front() == 0) {
@@ -1345,6 +1694,35 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
       raw_committed.events_committed_bytes > kRawFileHeaderBytes
           ? raw_committed.events_committed_bytes - kRawFileHeaderBytes
           : 0;
+  std::vector<RawDecodeChunk> sequence_ordered_chunks;
+  bool use_sequence_ordered_chunks = false;
+  {
+    std::string sequence_error;
+    if (!count_raw_event_sequence_regressions(
+            options.bundle_root,
+            raw_committed.events_committed_bytes,
+            stats.raw_sequence_regressions,
+            sequence_error)) {
+      std::cerr << "error: failed to inspect raw event sequence order: " << sequence_error << "\n";
+      ok = false;
+    } else if (stats.raw_sequence_regressions != 0) {
+      if (!scan_raw_event_chunks(
+              options.bundle_root,
+              raw_committed.events_committed_bytes,
+              sequence_ordered_chunks,
+              progress,
+              sequence_error) ||
+          !reorder_raw_event_chunks_by_sequence(
+              sequence_ordered_chunks,
+              stats.raw_sequence_reordered_events,
+              sequence_error)) {
+        std::cerr << "error: failed to restore raw event sequence order: " << sequence_error << "\n";
+        ok = false;
+      } else {
+        use_sequence_ordered_chunks = true;
+      }
+    }
+  }
   const auto remember_asset_flush_pressure = [&](std::uint64_t byte_size) {
     pending_asset_flush_bytes += byte_size;
     ++pending_asset_flush_events;
@@ -1370,6 +1748,17 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     pending_asset_flush_bytes = 0;
     pending_asset_flush_events = 0;
   };
+  constexpr std::size_t kRawToFinalCallstreamBatchLines = 8192;
+  std::vector<std::string> pending_passthrough_lines;
+  pending_passthrough_lines.reserve(kRawToFinalCallstreamBatchLines);
+  const auto flush_passthrough_lines = [&]() {
+    if (pending_passthrough_lines.empty()) {
+      return;
+    }
+    writer.append_callstream_json_lines(std::move(pending_passthrough_lines));
+    pending_passthrough_lines.clear();
+    pending_passthrough_lines.reserve(kRawToFinalCallstreamBatchLines);
+  };
   const auto emit_decoded_event = [&](apitrace::trace::raw::DecodedRawEvent &&decoded_event) {
     if (decoded_event.passthrough) {
       std::unordered_map<std::uint64_t, std::uint64_t> blob_id_remap;
@@ -1389,15 +1778,20 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
           relative_path_remap.emplace(input_relative_path, registered_relative_path);
         }
       }
-      auto passthrough_line =
-          rewrite_passthrough_blob_refs_copy(decoded_event.passthrough_jsonl_record, blob_id_remap);
+      auto passthrough_line = std::move(decoded_event.passthrough_jsonl_record);
+      if (!blob_id_remap.empty()) {
+        passthrough_line = rewrite_passthrough_blob_refs_copy(passthrough_line, blob_id_remap);
+      }
       for (const auto &entry : relative_path_remap) {
         passthrough_line = replace_all_copy(passthrough_line, entry.first, entry.second);
       }
       if (!track_passthrough_context(passthrough_line)) {
         return false;
       }
-      writer.append_callstream_json_line(passthrough_line);
+      pending_passthrough_lines.push_back(std::move(passthrough_line));
+      if (pending_passthrough_lines.size() >= kRawToFinalCallstreamBatchLines) {
+        flush_passthrough_lines();
+      }
       ++stats.raw_to_final_events;
       flush_assets_if_needed();
       return true;
@@ -1425,9 +1819,65 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     if (!finalize_binary_unmap_payload(event) || !track_final_event_context(decoded_event, event)) {
       return false;
     }
+    flush_passthrough_lines();
     writer.append_call_event(std::move(event));
     ++stats.raw_to_final_events;
     flush_assets_if_needed();
+    return true;
+  };
+  struct PendingLogicalEvent {
+    std::uint64_t sequence = 0;
+    std::uint64_t insertion_order = 0;
+    apitrace::trace::raw::DecodedRawEvent event;
+  };
+  struct PendingLogicalEventLater {
+    bool operator()(const PendingLogicalEvent &left, const PendingLogicalEvent &right) const noexcept
+    {
+      if (left.sequence != right.sequence) {
+        return left.sequence > right.sequence;
+      }
+      return left.insertion_order > right.insertion_order;
+    }
+  };
+  std::vector<PendingLogicalEvent> pending_logical_events;
+  const PendingLogicalEventLater pending_logical_event_later;
+  std::uint64_t logical_insertion_order = 0;
+  std::uint64_t last_emitted_logical_sequence = 0;
+  const auto emit_pending_logical_before = [&](std::uint64_t sequence_limit) {
+    while (!pending_logical_events.empty() &&
+           pending_logical_events.front().sequence < sequence_limit) {
+      std::pop_heap(
+          pending_logical_events.begin(),
+          pending_logical_events.end(),
+          pending_logical_event_later);
+      auto pending = std::move(pending_logical_events.back());
+      pending_logical_events.pop_back();
+      if (pending.sequence == 0 || pending.sequence <= last_emitted_logical_sequence) {
+        raw_context_error = "raw logical sequence is zero, duplicate, or decreasing at " +
+                            std::to_string(pending.sequence);
+        return false;
+      }
+      if (!emit_decoded_event(std::move(pending.event))) {
+        return false;
+      }
+      last_emitted_logical_sequence = pending.sequence;
+    }
+    return true;
+  };
+  const auto enqueue_logical_event = [&](apitrace::trace::raw::DecodedRawEvent &&event) {
+    const auto sequence = event.event.callsite.sequence;
+    if (sequence == 0) {
+      raw_context_error = "raw logical event has sequence zero";
+      return false;
+    }
+    pending_logical_events.push_back(PendingLogicalEvent{
+        sequence,
+        logical_insertion_order++,
+        std::move(event)});
+    std::push_heap(
+        pending_logical_events.begin(),
+        pending_logical_events.end(),
+        pending_logical_event_later);
     return true;
   };
   std::atomic_uint64_t scanned_events_done{0};
@@ -1489,6 +1939,34 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
         pipeline_cv.notify_all();
         return true;
       };
+
+      if (use_sequence_ordered_chunks) {
+        std::uint64_t scanned_events = 0;
+        std::uint64_t scanned_bytes = 0;
+        for (auto &ready_chunk : sequence_ordered_chunks) {
+          scanned_events += ready_chunk.events.size();
+          scanned_bytes += ready_chunk.byte_size;
+          scanned_events_done.store(scanned_events, std::memory_order_relaxed);
+          scanned_bytes_done.store(scanned_bytes, std::memory_order_relaxed);
+          if (!publish_chunk(std::move(ready_chunk))) {
+            return;
+          }
+          if (progress) {
+            progress->update_detail(
+                "raw_scan",
+                scanned_events,
+                stats.raw_sequence_reordered_events,
+                scanned_bytes,
+                raw_total_event_bytes);
+          }
+        }
+        {
+          std::lock_guard<std::mutex> lock(pipeline_mutex);
+          scan_done.store(true, std::memory_order_release);
+        }
+        pipeline_cv.notify_all();
+        return;
+      }
 
       std::ifstream input(events_path, std::ios::binary);
       if (!input.is_open()) {
@@ -1734,7 +2212,49 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
                                      ? 0
                                      : decoded.byte_size / decoded.events.size();
     for (auto &decoded_event : decoded.events) {
-      ok = emit_decoded_event(std::move(decoded_event));
+      const auto top_level_sequence = decoded_event.event.callsite.sequence;
+      if (top_level_sequence == 0) {
+        std::cerr << "error: decoded raw event is missing its top-level sequence\n";
+        ok = false;
+        break;
+      }
+      ok = emit_pending_logical_before(top_level_sequence);
+      if (!ok) {
+        break;
+      }
+      std::vector<apitrace::trace::raw::DecodedRawEvent> logical_events;
+      std::string expansion_error;
+      if (!expand_raw_batch_event(
+              std::move(decoded_event), logical_events, expansion_error)) {
+        std::cerr << "error: failed to expand raw batch event at sequence "
+                  << top_level_sequence << ": " << expansion_error << "\n";
+        ok = false;
+        break;
+      }
+      if (logical_events.size() > 1) {
+        ++stats.raw_batch_records_expanded;
+        stats.raw_batch_ops_expanded += logical_events.size();
+      }
+      if (pending_logical_events.empty() && logical_events.size() == 1 &&
+          logical_events.front().event.callsite.sequence == top_level_sequence) {
+        if (top_level_sequence <= last_emitted_logical_sequence ||
+            !emit_decoded_event(std::move(logical_events.front()))) {
+          if (raw_context_error.empty()) {
+            raw_context_error = "raw logical sequence is duplicate or decreasing at " +
+                                std::to_string(top_level_sequence);
+          }
+          ok = false;
+        } else {
+          last_emitted_logical_sequence = top_level_sequence;
+        }
+      } else {
+        for (auto &logical_event : logical_events) {
+          if (!enqueue_logical_event(std::move(logical_event))) {
+            ok = false;
+            break;
+          }
+        }
+      }
       if (!ok) {
         break;
       }
@@ -1767,6 +2287,28 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
     next_commit_chunk_visible.store(next_commit_chunk, std::memory_order_release);
     pipeline_cv.notify_all();
   }
+
+  if (ok && !emit_pending_logical_before(std::numeric_limits<std::uint64_t>::max())) {
+    ok = false;
+  }
+  while (ok && !pending_logical_events.empty()) {
+    std::pop_heap(
+        pending_logical_events.begin(),
+        pending_logical_events.end(),
+        pending_logical_event_later);
+    auto pending = std::move(pending_logical_events.back());
+    pending_logical_events.pop_back();
+    if (pending.sequence == 0 || pending.sequence <= last_emitted_logical_sequence) {
+      std::cerr << "error: raw logical sequence is zero, duplicate, or decreasing at "
+                << pending.sequence << "\n";
+      ok = false;
+      break;
+    }
+    ok = emit_decoded_event(std::move(pending.event));
+    if (ok) {
+      last_emitted_logical_sequence = pending.sequence;
+    }
+  }
   if (!ok) {
     decode_failed.store(true, std::memory_order_release);
     pipeline_cv.notify_all();
@@ -1795,11 +2337,19 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
               << raw_context_error << "\n";
   }
   if (!ok) {
+    flush_passthrough_lines();
     writer.close();
+    std::error_code remove_error;
+    fs::remove(temporary_callstream_path, remove_error);
     return false;
   }
+  flush_passthrough_lines();
   flush_remaining_assets();
   writer.close();
+  if (!replace_with_temporary_file(final_callstream_path, temporary_callstream_path)) {
+    std::cerr << "error: failed to publish materialized callstream atomically\n";
+    return false;
+  }
   return true;
 }
 
@@ -1813,6 +2363,91 @@ bool has_materialized_bundle_header(const fs::path &bundle_root)
   const auto header = json::parse(header_line, nullptr, false);
   return header.is_object() &&
          header.value("record_kind", std::string()) == "bundle_header";
+}
+
+std::optional<std::uint64_t> recorded_checksum_size(
+    const fs::path &checksums_path,
+    std::string_view relative_path)
+{
+  std::ifstream input(checksums_path, std::ios::binary);
+  if (!input.is_open()) {
+    return std::nullopt;
+  }
+
+  const std::string key = "\"" + std::string(relative_path) + "\"";
+  std::string line;
+  while (std::getline(input, line)) {
+    const auto key_at = line.find(key);
+    if (key_at == std::string::npos) {
+      continue;
+    }
+    const auto value_begin = line.find("\"sha256:", key_at + key.size());
+    if (value_begin == std::string::npos) {
+      return std::nullopt;
+    }
+    const auto value_end = line.find('"', value_begin + 1);
+    if (value_end == std::string::npos) {
+      return std::nullopt;
+    }
+    const auto size_separator = line.rfind(':', value_end);
+    if (size_separator == std::string::npos || size_separator <= value_begin) {
+      return std::nullopt;
+    }
+    const auto size_text = line.substr(size_separator + 1, value_end - size_separator - 1);
+    char *end = nullptr;
+    errno = 0;
+    const auto size = std::strtoull(size_text.c_str(), &end, 10);
+    if (errno != 0 || end == size_text.c_str() || *end != '\0') {
+      return std::nullopt;
+    }
+    return static_cast<std::uint64_t>(size);
+  }
+  return std::nullopt;
+}
+
+bool can_reuse_materialized_raw_output(const fs::path &bundle_root)
+{
+  const auto callstream_path = bundle_root / apitrace::trace::kCallstreamFileName;
+  const auto assets_path = bundle_root / apitrace::trace::kAssetIndexFileName;
+  const auto checksums_path = bundle_root / apitrace::trace::kChecksumsFileName;
+  const auto raw_commit_path = bundle_root / "raw" / "commit.meta";
+  if (!has_materialized_bundle_header(bundle_root) ||
+      !fs::is_regular_file(assets_path) ||
+      !fs::is_regular_file(checksums_path)) {
+    return false;
+  }
+
+  // A raw capture session creates the readable bundle header up front, before RAW events have
+  // been materialized. Do not mistake that header-only placeholder for reusable final output.
+  {
+    std::ifstream callstream(callstream_path, std::ios::binary);
+    std::string header_line;
+    std::string first_event_line;
+    if (!std::getline(callstream, header_line) || !std::getline(callstream, first_event_line) ||
+        first_event_line.empty()) {
+      return false;
+    }
+  }
+
+  const auto matches_recorded_size = [&](const fs::path &relative) {
+    const auto recorded_size =
+        recorded_checksum_size(checksums_path, relative.generic_string());
+    std::error_code size_error;
+    const auto actual_size = fs::file_size(bundle_root / relative, size_error);
+    return !size_error && recorded_size && actual_size == *recorded_size;
+  };
+  if (!matches_recorded_size(apitrace::trace::kCallstreamFileName) ||
+      !matches_recorded_size(apitrace::trace::kAssetIndexFileName)) {
+    return false;
+  }
+
+  std::error_code time_error;
+  const auto raw_commit_time = fs::last_write_time(raw_commit_path, time_error);
+  if (time_error) {
+    return false;
+  }
+  const auto callstream_time = fs::last_write_time(callstream_path, time_error);
+  return !time_error && callstream_time >= raw_commit_time;
 }
 
 std::optional<Options> parse_args(int argc, char **argv)
@@ -3855,6 +4490,221 @@ bool for_each_jsonl_line_in_chunk(std::string_view text, std::uint64_t chunk_off
     }
     cursor = end;
   }
+  return true;
+}
+
+struct CompiledDispatchChunkResult {
+  fs::path path;
+  std::uint64_t record_count = 0;
+  std::uint64_t encoded_bytes = 0;
+  std::string error;
+};
+
+CompiledDispatchChunkResult compile_dispatch_chunk(
+    const fs::path &callstream_path,
+    const JsonlByteChunk &chunk,
+    const fs::path &chunk_path)
+{
+  CompiledDispatchChunkResult result;
+  result.path = chunk_path;
+  std::string text;
+  if (!read_jsonl_byte_chunk(callstream_path, chunk, text)) {
+    result.error = "failed to read callstream chunk at byte " + std::to_string(chunk.offset);
+    return result;
+  }
+  std::ofstream output(chunk_path, std::ios::binary | std::ios::trunc);
+  if (!output.is_open()) {
+    result.error = "failed to create compiled dispatch chunk " + chunk_path.string();
+    return result;
+  }
+
+  std::vector<std::uint8_t> encoded;
+  bool ok = for_each_jsonl_line_in_chunk(text, chunk.offset, [&](const JsonlLineView &line_view) {
+    if (line_view.line.empty()) {
+      return true;
+    }
+    if (line_view.offset == 0) {
+      const auto header = json::parse(line_view.line, nullptr, false);
+      if (header.is_discarded() ||
+          header.value("record_kind", std::string()) != "bundle_header") {
+        result.error = "callstream first line is not a valid bundle_header";
+        return false;
+      }
+      return true;
+    }
+
+    apitrace::trace::EventRecord event;
+    if (!apitrace::trace::parse_event_record_json_line(line_view.line, event, result.error)) {
+      result.error = "callstream byte " + std::to_string(line_view.offset) + ": " + result.error;
+      return false;
+    }
+    if (!apitrace::trace::encode_compiled_dispatch_event(event, encoded, result.error)) {
+      result.error = "callstream byte " + std::to_string(line_view.offset) + ": " + result.error;
+      return false;
+    }
+    output.write(
+        reinterpret_cast<const char *>(encoded.data()),
+        static_cast<std::streamsize>(encoded.size()));
+    if (!output) {
+      result.error = "failed to write compiled dispatch chunk " + chunk_path.string();
+      return false;
+    }
+    ++result.record_count;
+    result.encoded_bytes += encoded.size();
+    return true;
+  });
+  output.close();
+  if (!ok || !result.error.empty()) {
+    std::error_code remove_error;
+    fs::remove(chunk_path, remove_error);
+  }
+  return result;
+}
+
+bool compile_d3d12_dispatch_stream(
+    const fs::path &bundle_root,
+    const Options &options,
+    Stats &stats,
+    FileDigestCache &digest_cache,
+    std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> &rewritten_digests,
+    ProgressReporter *progress)
+{
+  const auto started = std::chrono::steady_clock::now();
+  const auto callstream_path = bundle_root / apitrace::trace::kCallstreamFileName;
+  std::error_code size_error;
+  const auto callstream_bytes = fs::file_size(callstream_path, size_error);
+  if (size_error) {
+    std::cerr << "error: failed to stat callstream for dispatch compilation: "
+              << size_error.message() << "\n";
+    return false;
+  }
+  if (options.dry_run) {
+    return true;
+  }
+
+  const auto chunks = build_newline_aligned_jsonl_chunks(
+      callstream_path, kCompiledDispatchChunkSize);
+  if (chunks.empty()) {
+    std::cerr << "error: callstream has no dispatch-compilable records\n";
+    return false;
+  }
+  const auto dispatch_path = bundle_root / apitrace::trace::kD3D12CompiledDispatchName;
+  fs::create_directories(dispatch_path.parent_path(), size_error);
+  if (size_error) {
+    std::cerr << "error: failed to create dispatch analysis directory: "
+              << size_error.message() << "\n";
+    return false;
+  }
+
+  std::vector<CompiledDispatchChunkResult> results(chunks.size());
+  std::atomic<std::size_t> next_chunk{0};
+  std::atomic<std::uint64_t> completed_bytes{0};
+  const auto worker = [&]() {
+    for (;;) {
+      const auto index = next_chunk.fetch_add(1, std::memory_order_relaxed);
+      if (index >= chunks.size()) {
+        return;
+      }
+      const auto chunk_path = dispatch_path.parent_path() /
+          (dispatch_path.filename().string() + ".chunk-" + std::to_string(index) + ".tmp");
+      try {
+        results[index] = compile_dispatch_chunk(callstream_path, chunks[index], chunk_path);
+      } catch (const std::exception &exception) {
+        results[index].path = chunk_path;
+        results[index].error = exception.what();
+      }
+      const auto done_bytes =
+          completed_bytes.fetch_add(chunks[index].size, std::memory_order_relaxed) +
+          chunks[index].size;
+      if (progress) {
+        progress->update(index + 1, chunks.size(), done_bytes, callstream_bytes);
+      }
+    }
+  };
+  std::vector<std::thread> workers;
+  const auto worker_count = std::max<std::size_t>(1, std::min(options.jobs, chunks.size()));
+  workers.reserve(worker_count);
+  for (std::size_t index = 0; index < worker_count; ++index) {
+    workers.emplace_back(worker);
+  }
+  for (auto &worker_thread : workers) {
+    worker_thread.join();
+  }
+
+  bool failed = false;
+  apitrace::trace::CompiledDispatchHeader header;
+  header.source_callstream_bytes = callstream_bytes;
+  for (const auto &result : results) {
+    if (!result.error.empty()) {
+      std::cerr << "error: compiled dispatch chunk failed: " << result.error << "\n";
+      failed = true;
+    }
+    header.record_count += result.record_count;
+    header.encoded_record_bytes += result.encoded_bytes;
+  }
+  if (failed || header.record_count == 0) {
+    for (const auto &result : results) {
+      std::error_code remove_error;
+      fs::remove(result.path, remove_error);
+    }
+    return false;
+  }
+
+  std::ostringstream header_stream(std::ios::binary | std::ios::out);
+  std::string header_error;
+  if (!apitrace::trace::write_compiled_dispatch_header(header_stream, header, header_error)) {
+    std::cerr << "error: " << header_error << "\n";
+    return false;
+  }
+  const auto temporary = temporary_rewrite_path(dispatch_path);
+  std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+  if (!output.is_open()) {
+    std::cerr << "error: failed to create compiled dispatch stream " << temporary << "\n";
+    return false;
+  }
+  const auto header_bytes = header_stream.str();
+  output.write(header_bytes.data(), static_cast<std::streamsize>(header_bytes.size()));
+  apitrace::trace::ContentHasher dispatch_hasher;
+  dispatch_hasher.update(
+      reinterpret_cast<const std::uint8_t *>(header_bytes.data()),
+      header_bytes.size());
+  std::vector<char> copy_buffer(kFileCopyBufferSize);
+  for (const auto &result : results) {
+    std::ifstream input(result.path, std::ios::binary);
+    while (input) {
+      input.read(copy_buffer.data(), static_cast<std::streamsize>(copy_buffer.size()));
+      const auto read_count = input.gcount();
+      if (read_count > 0) {
+        output.write(copy_buffer.data(), read_count);
+        dispatch_hasher.update(
+            reinterpret_cast<const std::uint8_t *>(copy_buffer.data()),
+            static_cast<std::size_t>(read_count));
+      }
+    }
+    std::error_code remove_error;
+    fs::remove(result.path, remove_error);
+  }
+  output.close();
+  std::error_code output_size_error;
+  const auto output_size = fs::file_size(temporary, output_size_error);
+  if (output_size_error || output_size != 48 + header.encoded_record_bytes ||
+      !replace_with_temporary_file(dispatch_path, temporary)) {
+    std::cerr << "error: failed to publish compiled dispatch stream\n";
+    return false;
+  }
+  const auto dispatch_digest = dispatch_hasher.final_hex();
+  const std::pair<std::string, std::uint64_t> digest_and_size = {
+      dispatch_digest,
+      static_cast<std::uint64_t>(output_size)};
+  const auto relative = fs::path(apitrace::trace::kD3D12CompiledDispatchName).generic_string();
+  rewritten_digests[relative] = digest_and_size;
+  digest_cache.remember(dispatch_path, digest_and_size.first, digest_and_size.second);
+  stats.compiled_dispatch_records = header.record_count;
+  stats.compiled_dispatch_bytes = digest_and_size.second;
+  stats.compiled_dispatch_ms = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - started)
+          .count());
   return true;
 }
 
@@ -9177,6 +10027,17 @@ bool persist_d3d12_replay_model(const fs::path &bundle_root, const Options &opti
     return false;
   }
 
+  std::error_code source_identity_error;
+  const std::string source_bundle_hash =
+      apitrace::trace::replay_model_source_identity(
+          bundle_root, source_identity_error);
+  if (source_identity_error) {
+    std::cerr << "warning: replay-model persist skipped: failed to stat "
+                 "callstream: "
+              << source_identity_error.message() << "\n";
+    return false;
+  }
+
   apitrace::trace::TraceBundleReader reader;
   // The D3D12 object-model reconstruction consumes only the D3D12 event stream; it never touches
   // the Metal sideband. Skip loading metal-callstream.jsonl (can be multiple GB) — parsing it here
@@ -9188,6 +10049,10 @@ bool persist_d3d12_replay_model(const fs::path &bundle_root, const Options &opti
   reader_options.load_metal_sideband = false;
   reader_options.validate_checksum_contents = false;
   reader_options.validate_file_references = false;
+  // write_checksums is deliberately the next stage. The existing checksum index can describe the
+  // pre-finalize committed prefix, so it must not truncate replay-model reconstruction after the
+  // callstream has already been extended to its finalized length.
+  reader_options.enforce_checksum_byte_limits = false;
   reader_options.discover_referenced_assets = false;
   if (!reader.open(bundle_root, reader_options)) {
     std::cerr << "warning: replay-model persist skipped: failed to reopen bundle: "
@@ -9212,13 +10077,15 @@ bool persist_d3d12_replay_model(const fs::path &bundle_root, const Options &opti
     }
   }
 
-  // Staleness binding is intentionally not recorded: retrace trusts the persisted model as valid
-  // input (finalize+retrace are a configured pipeline) rather than paying a multi-GB re-hash per
-  // run to catch a user swapping the callstream. Bundle-level integrity is still covered by
-  // checksums.json (which hashes the model files too). Leave source_bundle_hash empty; schema_version
-  // remains the format guard. Binding to the bundle_hash would also be circular — the model files
-  // are part of the bundle, so they change the very hash they would try to record.
-  const std::string source_bundle_hash;
+  std::error_code replay_identity_error;
+  const std::string replay_source_identity =
+      apitrace::trace::replay_model_source_identity(
+          bundle_root, replay_identity_error);
+  if (replay_identity_error || replay_source_identity != source_bundle_hash) {
+    std::cerr << "warning: replay-model persist skipped: callstream changed "
+                 "during reconstruction\n";
+    return false;
+  }
 
   const auto json_path = bundle_root / apitrace::trace::kD3D12ReplayModelJsonName;
   const auto blob_path = bundle_root / apitrace::trace::kD3D12ReplayModelBlobName;
@@ -9228,6 +10095,16 @@ bool persist_d3d12_replay_model(const fs::path &bundle_root, const Options &opti
   std::string error;
   if (!backend.save_replay_model(json_path, blob_path, source_bundle_hash, error)) {
     std::cerr << "warning: replay-model persist failed: " << error << "\n";
+    return false;
+  }
+
+  std::error_code save_identity_error;
+  const std::string save_source_identity =
+      apitrace::trace::replay_model_source_identity(
+          bundle_root, save_identity_error);
+  if (save_identity_error || save_source_identity != source_bundle_hash) {
+    std::cerr << "warning: replay-model persist failed: callstream changed "
+                 "while writing the model\n";
     return false;
   }
 
@@ -9428,12 +10305,17 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
   IncompleteSpoolRef incomplete_spool_ref;
   std::size_t loaded_asset_count = 0;
   bool raw_to_final_ok = true;
+  std::error_code raw_presence_error;
+  const bool has_raw_capture =
+      fs::is_regular_file(options.bundle_root / "raw" / "commit.meta", raw_presence_error) &&
+      !raw_presence_error;
   run_stage(options, progress, stage_index, kStageCount, "raw_to_final", [&] {
-    std::error_code raw_error;
-    const bool has_raw_capture =
-        fs::is_regular_file(options.bundle_root / "raw" / "commit.meta", raw_error) && !raw_error;
     if (has_raw_capture) {
-      raw_to_final_ok = materialize_raw_capture_to_final_bundle(options, stats, &progress);
+      if (!options.dry_run && can_reuse_materialized_raw_output(options.bundle_root)) {
+        stats.raw_to_final_reused = true;
+      } else {
+        raw_to_final_ok = materialize_raw_capture_to_final_bundle(options, stats, &progress);
+      }
     } else if (!has_materialized_bundle_header(options.bundle_root)) {
       std::cerr << "error: bundle has neither a committed raw capture nor a materialized callstream\n";
       raw_to_final_ok = false;
@@ -9441,6 +10323,115 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
   });
   if (!raw_to_final_ok) {
     return 1;
+  }
+
+  // A materialized RAW prefix whose sizes and timestamps still match is already the authoritative
+  // finalized asset/callstream state. In that case do not reload a multi-hundred-megabyte asset
+  // index and repeat all publication passes merely to create or refresh the retrace dispatch IR.
+  // The compiled format version and source byte count are validated by the reader below.
+  if (stats.raw_to_final_reused && !options.dry_run) {
+    const auto callstream_path =
+        options.bundle_root / apitrace::trace::kCallstreamFileName;
+    const auto dispatch_path =
+        options.bundle_root / apitrace::trace::kD3D12CompiledDispatchName;
+    std::error_code source_size_error;
+    const auto source_bytes = fs::file_size(callstream_path, source_size_error);
+    apitrace::trace::CompiledDispatchHeader dispatch_header;
+    std::string dispatch_error;
+    bool dispatch_current =
+        !source_size_error &&
+        apitrace::trace::inspect_compiled_dispatch(
+            dispatch_path, source_bytes, dispatch_header, dispatch_error);
+    std::error_code time_error;
+    if (dispatch_current) {
+      const auto source_time = fs::last_write_time(callstream_path, time_error);
+      const auto dispatch_time = fs::last_write_time(dispatch_path, time_error);
+      dispatch_current = !time_error && dispatch_time >= source_time;
+    }
+
+    if (dispatch_current) {
+      const auto recorded_size = recorded_checksum_size(
+          options.bundle_root / apitrace::trace::kChecksumsFileName,
+          apitrace::trace::kD3D12CompiledDispatchName);
+      dispatch_current =
+          recorded_size && *recorded_size == 48 + dispatch_header.encoded_record_bytes;
+    }
+
+    bool has_replay_model = false;
+    for (const auto *relative : {
+             apitrace::trace::kD3D12ReplayModelJsonName,
+             apitrace::trace::kD3D12ReplayModelBlobName}) {
+      std::error_code model_error;
+      const auto bytes = fs::file_size(options.bundle_root / relative, model_error);
+      if (!model_error) {
+        has_replay_model = true;
+        (void)bytes;
+      }
+    }
+
+    // A current dispatch stream with no obsolete replay model requires no publication work. In
+    // particular, avoid parsing and rewriting the multi-million-entry checksum index on every
+    // no-op finalize invocation.
+    if (dispatch_current && !has_replay_model) {
+      stats.compiled_dispatch_records = dispatch_header.record_count;
+      stats.compiled_dispatch_bytes = 48 + dispatch_header.encoded_record_bytes;
+      const auto elapsed = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - started).count();
+      std::cout << "bundle-finalize: raw_to_final_reused=true finalize_fast_path=verified"
+                << " compiled_dispatch_records=" << stats.compiled_dispatch_records
+                << " compiled_dispatch_bytes=" << stats.compiled_dispatch_bytes
+                << " compiled_dispatch_ms=0 removed_replay_model_bytes=0"
+                << " elapsed_s=" << elapsed << "\n";
+      return 0;
+    }
+
+    auto prior_checksums = load_prior_checksums(options.bundle_root);
+    std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> dispatch_digest;
+    if (!dispatch_current) {
+      progress.begin_stage(1, 1, "compile_d3d12_dispatch");
+      if (!compile_d3d12_dispatch_stream(
+              options.bundle_root,
+              options,
+              stats,
+              digest_cache,
+              dispatch_digest,
+              &progress)) {
+        return 1;
+      }
+      progress.end_stage();
+      for (const auto &[path, digest_and_size] : dispatch_digest) {
+        prior_checksums[path] = digest_and_size;
+      }
+    } else {
+      stats.compiled_dispatch_records = dispatch_header.record_count;
+      stats.compiled_dispatch_bytes = 48 + dispatch_header.encoded_record_bytes;
+    }
+
+    for (const auto *relative : {
+             apitrace::trace::kD3D12ReplayModelJsonName,
+             apitrace::trace::kD3D12ReplayModelBlobName}) {
+      const auto path = options.bundle_root / relative;
+      std::error_code model_error;
+      const auto bytes = fs::file_size(path, model_error);
+      if (!model_error && fs::remove(path, model_error) && !model_error) {
+        stats.removed_replay_model_bytes += bytes;
+      }
+      prior_checksums.erase(fs::path(relative).generic_string());
+    }
+    if (!write_checksums_from_known(options.bundle_root, prior_checksums)) {
+      std::cerr << "error: failed to update checksums after dispatch-only finalize\n";
+      return 1;
+    }
+    const auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    std::cout << "bundle-finalize: raw_to_final_reused=true finalize_fast_path="
+              << (dispatch_current ? "verified" : "dispatch_rebuilt")
+              << " compiled_dispatch_records=" << stats.compiled_dispatch_records
+              << " compiled_dispatch_bytes=" << stats.compiled_dispatch_bytes
+              << " compiled_dispatch_ms=" << stats.compiled_dispatch_ms
+              << " removed_replay_model_bytes=" << stats.removed_replay_model_bytes
+              << " elapsed_s=" << elapsed << "\n";
+    return 0;
   }
   std::error_code callstream_size_error;
   const auto callstream_size =
@@ -9461,13 +10452,14 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
     loaded_asset_count = assets.size();
   });
   run_stage(options, progress, stage_index, kStageCount, "scan_raw_events", [&] {
-    if (!finalized_indexed_bundle || assets.empty()) {
+    if (!has_raw_capture && (!finalized_indexed_bundle || assets.empty())) {
       discover_raw_asset_references(options.bundle_root, assets, legacy_asset_discovery, &incomplete_spool_ref, stats);
     }
   });
   run_stage(options, progress, stage_index, kStageCount, "merge_assets", [&] {
     assets = merge_assets(std::move(assets));
-    repair_finalized_single_blob_asset_index(options.bundle_root, assets, finalized_indexed_bundle);
+    repair_finalized_single_blob_asset_index(
+        options.bundle_root, assets, finalized_indexed_bundle && !has_raw_capture);
     stats.indexed_assets = assets.size();
   });
   run_stage(options, progress, stage_index, kStageCount, "stat_assets", [&] {
@@ -9795,9 +10787,37 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
         &rewritten_digests,
         &stats);
   });
-  run_stage(options, progress, stage_index, kStageCount, "persist_d3d12_replay_model", [&] {
-    persist_d3d12_replay_model(options.bundle_root, options, stats);
+  run_stage(options, progress, stage_index, kStageCount, "compile_d3d12_dispatch", [&] {
+    if (!compile_d3d12_dispatch_stream(
+            options.bundle_root,
+            options,
+            stats,
+            digest_cache,
+            rewritten_digests,
+            &progress)) {
+      finalize_failed = true;
+      return;
+    }
+    if (options.dry_run) {
+      return;
+    }
+    // The old replay model duplicates tens of gigabytes of reconstructed state and is not used by
+    // chronological native replay. Keep it available through --persist-replay-model-only for
+    // offline validation, but do not retain it beside the compact dispatch artifact by default.
+    for (const auto *relative : {
+             apitrace::trace::kD3D12ReplayModelJsonName,
+             apitrace::trace::kD3D12ReplayModelBlobName}) {
+      const auto path = options.bundle_root / relative;
+      std::error_code model_error;
+      const auto bytes = fs::file_size(path, model_error);
+      if (!model_error && fs::remove(path, model_error) && !model_error) {
+        stats.removed_replay_model_bytes += bytes;
+      }
+    }
   });
+  if (finalize_failed) {
+    return 1;
+  }
   run_stage(options, progress, stage_index, kStageCount, "write_checksums", [&] {
     write_checksums(
         options.bundle_root,
@@ -9836,6 +10856,15 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
             << " repaired_missing_device_objects=" << stats.repaired_missing_device_objects
             << " sequence_regression_segments=" << stats.sequence_regression_segments
             << " remapped_sequence_records=" << stats.remapped_sequence_records
+            << " raw_sequence_regressions=" << stats.raw_sequence_regressions
+            << " raw_sequence_reordered_events=" << stats.raw_sequence_reordered_events
+            << " raw_batch_records_expanded=" << stats.raw_batch_records_expanded
+            << " raw_batch_ops_expanded=" << stats.raw_batch_ops_expanded
+            << " compiled_dispatch_records=" << stats.compiled_dispatch_records
+            << " compiled_dispatch_bytes=" << stats.compiled_dispatch_bytes
+            << " compiled_dispatch_ms=" << stats.compiled_dispatch_ms
+            << " removed_replay_model_bytes=" << stats.removed_replay_model_bytes
+            << " raw_to_final_reused=" << (stats.raw_to_final_reused ? "true" : "false")
             << " rebuilt_d3d12_pipeline_assets=" << stats.rebuilt_d3d12_pipeline_assets
             << " d3d12_replay_model_written=" << (stats.d3d12_replay_model_written ? "true" : "false")
             << " d3d12_replay_model_json_bytes=" << stats.d3d12_replay_model_json_bytes

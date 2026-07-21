@@ -7,6 +7,7 @@
 #include <cstdint>
 
 struct ID3D12Device;
+struct ID3D12CommandList;
 struct ID3D12Resource;
 struct D3D12_COMMAND_QUEUE_DESC;
 struct D3D12_DESCRIPTOR_HEAP_DESC;
@@ -173,6 +174,10 @@ void record_swapchain_back_buffer(
     std::uint32_t buffer_index);
 std::uint64_t record_execute_command_lists(
     const void *queue,
+    std::uint32_t command_list_count,
+    ID3D12CommandList *const *command_lists);
+std::uint64_t record_execute_command_lists(
+    const void *queue,
     const void *command_list);
 std::uint64_t record_present(
     const void *swapchain,
@@ -190,6 +195,13 @@ void record_present_frame(
     const void *rgba_data,
     std::size_t rgba_size);
 void record_resource_unmap(
+    const void *resource,
+    std::uint32_t subresource,
+    std::uint64_t written_begin,
+    std::uint64_t written_end,
+    const void *written_data,
+    std::size_t written_size);
+void record_resource_snapshot(
     const void *resource,
     std::uint32_t subresource,
     std::uint64_t written_begin,

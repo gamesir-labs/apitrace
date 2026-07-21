@@ -2550,6 +2550,45 @@ int main(int argc, char **argv)
     return 1;
   }
 
+  // Finalize rebuilds derived data before refreshing checksums.json. Verify that its reader mode
+  // can consume a valid finalized tail beyond the stale checksum byte size, while ordinary readers
+  // retain the checksum boundary that protects against a concurrently appended stream.
+  const auto stale_callstream_limit_bundle =
+      bundle.parent_path() / (bundle.filename().generic_string() + "-stale-callstream-limit");
+  std::filesystem::remove_all(stale_callstream_limit_bundle);
+  std::filesystem::copy(
+      bundle,
+      stale_callstream_limit_bundle,
+      std::filesystem::copy_options::recursive);
+  {
+    std::ofstream output(
+        stale_callstream_limit_bundle / "callstream.jsonl",
+        std::ios::binary | std::ios::app);
+    output << "{\"elapsed_ns\":0,\"function\":\"Test::PostChecksumTail\","
+              "\"object_refs\":[],\"payload\":{},\"record_kind\":\"call\","
+              "\"result_code\":0,\"sequence\":999999999,\"time_ns\":0}\n";
+  }
+  apitrace::trace::TraceBundleReader checksum_bounded_reader;
+  auto checksum_bounded_options = light_sideband_options;
+  checksum_bounded_options.validate_checksum_contents = false;
+  checksum_bounded_options.validate_file_references = false;
+  checksum_bounded_options.discover_referenced_assets = false;
+  if (!checksum_bounded_reader.open(stale_callstream_limit_bundle, checksum_bounded_options) ||
+      checksum_bounded_reader.events().size() != reader.events().size()) {
+    std::cerr << "checksum-bounded reader did not preserve the indexed callstream prefix\n";
+    return 1;
+  }
+  apitrace::trace::TraceBundleReader finalize_reader;
+  auto finalize_reader_options = checksum_bounded_options;
+  finalize_reader_options.enforce_checksum_byte_limits = false;
+  if (!finalize_reader.open(stale_callstream_limit_bundle, finalize_reader_options) ||
+      finalize_reader.events().size() != reader.events().size() + 1 ||
+      finalize_reader.events().back().callsite.function_name != "Test::PostChecksumTail") {
+    std::cerr << "finalize reader did not consume the post-checksum callstream tail: "
+              << finalize_reader.last_error() << "\n";
+    return 1;
+  }
+
   const auto callstream = read_text(bundle / "callstream.jsonl");
   const auto metal_callstream = read_text(bundle / "metal-callstream.jsonl");
   const auto pipeline_json = read_text(bundle / pipeline_reader_path);

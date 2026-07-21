@@ -92,6 +92,7 @@ set(APITRACE_CORE_SOURCES
     src/retrace/src/replay_session.cpp
     src/retrace/src/metal_replay_backend_factory.cpp
     src/retrace/src/d3d11_replay_parser.cpp
+    src/trace/src/compiled_dispatch_io.cpp
     src/trace/src/metal_callstream_writer.cpp
     src/trace/src/payload_object_refs.cpp
     src/trace/src/raw_capture_io.cpp

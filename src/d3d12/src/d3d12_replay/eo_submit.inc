@@ -5,6 +5,7 @@
                              " fn=" + event_ordered_event_name(event) +
                              " " + error;
     backend_.last_error_ = std::move(error);
+    event_ordered_failed_ = true;
     event_ordered_log(line);
   }
 
@@ -13,10 +14,11 @@
       std::uint64_t &value,
       std::string &error) const
   {
-    json payload;
-    if (!payload_to_json(event, payload, error)) {
+    const json *payload_ptr = payload_to_json_cached_ref(event, error);
+    if (!payload_ptr) {
       return false;
     }
+    const auto &payload = *payload_ptr;
     const auto value_it = payload.find("fence_value");
     if (value_it == payload.end()) {
       error = "fence operation missing fence_value";
@@ -100,12 +102,13 @@
       return;
     }
 
-    json payload;
     std::string error;
-    if (!payload_to_json(event, payload, error)) {
+    const json *payload_ptr = payload_to_json_cached_ref(event, error);
+    if (!payload_ptr) {
       event_ordered_submit_error(event, std::move(error));
       return;
     }
+    const auto &payload = *payload_ptr;
     const auto command_list_count =
         static_cast<std::size_t>(payload_u64(payload, "command_list_count", event.object_refs.size() - 1));
     if (command_list_count != event.object_refs.size() - 1) {
@@ -227,48 +230,25 @@
       return;
     }
 
-    ScopedFenceEvent event_handle;
-    if (!event_handle.valid()) {
-      event_ordered_submit_error(event, "SetEventOnCompletion failed to create host wait event");
+    auto event_handle = std::make_unique<ScopedFenceEvent>();
+    if (!event_handle->valid()) {
+      event_ordered_submit_error(event, "SetEventOnCompletion failed to create replay event");
       return;
     }
 
-    constexpr std::uint32_t kCpuWaitTimeoutMs = 5000;
 #ifdef _WIN32
-    const HRESULT hr = fence->SetEventOnCompletion(value, event_handle.get());
+    const HRESULT hr = fence->SetEventOnCompletion(value, event_handle->get());
     if (FAILED(hr)) {
       event_ordered_submit_error(event, hresult_error("ID3D12Fence::SetEventOnCompletion", hr));
       return;
     }
 #endif
-    ++event_ordered_cpu_waits_;
-
-#ifdef _WIN32
-    const auto wait_result = event_handle.wait(kCpuWaitTimeoutMs);
-#else
-    const auto wait_result = event_handle.wait_until(fence, value, kCpuWaitTimeoutMs);
-#endif
-    if (wait_result == ScopedFenceEvent::WaitResult::Timeout) {
-      ++event_ordered_cpu_wait_timeouts_;
-      const std::string removed = device_removed_detail();
-      std::ostringstream line;
-      line << "[event-ordered] wait:timeout seq=" << event.callsite.sequence
-           << " fence=" << event.object_refs[0]
-           << " value=" << value
-           << " completed=" << fence->GetCompletedValue()
-           << " device_removed=" << (removed.empty() ? "none" : removed);
-      event_ordered_log(line.str());
-      return;
-    }
-    if (wait_result == ScopedFenceEvent::WaitResult::Failed) {
-      event_ordered_submit_error(event, "SetEventOnCompletion host wait failed");
-      return;
-    }
-
-    const std::string removed = device_removed_detail();
-    if (!removed.empty()) {
-      event_ordered_submit_error(event, removed);
-    }
+    // The captured call only registers an event. Waiting here would insert a
+    // replay-only synchronization point and change DXMT's submitted workload.
+    // Keep the substituted handle alive without consuming it; the game's
+    // host-side WaitForSingleObject call is deliberately outside this D3D trace.
+    event_ordered_registered_fence_events_.push_back(std::move(event_handle));
+    ++event_ordered_fence_events_registered_;
   }
 
   bool event_ordered_drain_queue(

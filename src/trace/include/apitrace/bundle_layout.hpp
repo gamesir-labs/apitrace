@@ -1,6 +1,8 @@
 #pragma once
 
 #include <filesystem>
+#include <string>
+#include <system_error>
 
 namespace apitrace::trace {
 
@@ -12,11 +14,24 @@ inline constexpr const char *kAnalysisDirectoryName = "analysis";
 inline constexpr const char *kTranslationLinksFileName = "translation-links.jsonl";
 inline constexpr const char *kD3D12ReplayModelJsonName = "analysis/d3d12-replay-model.json";
 inline constexpr const char *kD3D12ReplayModelBlobName = "analysis/d3d12-replay-model.bin";
+inline constexpr const char *kD3D12CompiledDispatchName = "analysis/d3d12-dispatch.bin";
 inline constexpr const char *kMetalDirectoryName = "metal";
 inline constexpr const char *kMetalLibrariesDirectoryName = "libraries";
 inline constexpr const char *kMetalPipelinesDirectoryName = "pipelines";
 inline constexpr const char *kMetalBuffersDirectoryName = "buffers";
 inline constexpr const char *kMetalTexturesDirectoryName = "textures";
+
+inline std::string replay_model_source_identity(
+    const std::filesystem::path &bundle_root,
+    std::error_code &error)
+{
+  const auto callstream_size = std::filesystem::file_size(
+      bundle_root / kCallstreamFileName, error);
+  if (error) {
+    return {};
+  }
+  return "callstream-size:" + std::to_string(callstream_size);
+}
 
 struct BundleLayout {
   std::filesystem::path root_path;

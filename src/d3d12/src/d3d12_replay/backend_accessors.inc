@@ -19,6 +19,8 @@ void D3D12ReplayBackend::shutdown()
   resources_.clear();
   resource_versions_.clear();
   live_resource_version_indices_.clear();
+  event_ordered_resource_data_updates_.clear();
+  resource_data_update_notifications_.clear();
   resource_versions_by_id_.clear();
   resource_versions_by_va_.clear();
   max_resource_va_width_ = 0;

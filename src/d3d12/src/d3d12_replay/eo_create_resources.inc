@@ -120,36 +120,9 @@
     }
 
     const trace::ObjectId object_id = resource.resource_object_id;
-    const bool has_prior_version =
-        event_ordered_resource_has_prior_version(object_id, resource.create_sequence);
-    const bool tracks_versions = resource_version_natives_.find(object_id) != resource_version_natives_.end();
-
-    NativeResource version_native;
-    if (has_prior_version || tracks_versions) {
-      if (!make_native_resource(resource, version_native, error)) {
-        if (resource.reserved_resource) {
-          error += "; TODO(event-ordered P3): tile mapping materialization is handled separately";
-        }
-        event_ordered_record_materialize_error(event, std::move(error));
-        return;
-      }
-    }
-
-    if (has_prior_version || tracks_versions) {
-      auto &versions = resource_version_natives_[object_id];
-      if (versions.empty()) {
-        const auto existing = resources_.find(object_id);
-        const auto *previous =
-            event_ordered_previous_resource_semantic(object_id, resource.create_sequence);
-        if (existing != resources_.end() && previous != nullptr) {
-          versions.emplace_back(previous->create_sequence, std::move(existing->second));
-          resources_.erase(existing);
-        }
-      }
-      versions.emplace_back(resource.create_sequence, std::move(version_native));
-      std::stable_sort(versions.begin(), versions.end(),
-                       [](const auto &a, const auto &b) { return a.first < b.first; });
-    }
-
+    // Event-ordered replay owns only the object lifetime live at this sequence. Keeping historical
+    // native versions would retain COM objects after the captured Release and would change DXMT's
+    // resource/cache pressure. A reused capture id replaces the already-destroyed flat entry.
+    resource_version_natives_.erase(object_id);
     resources_[object_id] = std::move(native);
   }

@@ -29,6 +29,7 @@
                              " fn=" + event_ordered_event_name(event) +
                              " " + error;
     backend_.last_error_ = std::move(error);
+    event_ordered_failed_ = true;
     event_ordered_log(line);
   }
 
@@ -86,12 +87,13 @@
       return;
     }
 
-    json payload;
     std::string error;
-    if (!payload_to_json(event, payload, error)) {
+    const json *payload_ptr = payload_to_json_cached_ref(event, error);
+    if (!payload_ptr) {
       event_ordered_record_error(event, std::move(error));
       return;
     }
+    const auto &payload = *payload_ptr;
 
     trace::ObjectId initial_pipeline_state_object_id = 0;
     ID3D12PipelineState *initial_pso = nullptr;
@@ -169,18 +171,18 @@
 
   void event_ordered_record_last_command(const trace::EventRecord &event)
   {
-    if (backend_.replay_commands_.empty()) {
-      event_ordered_record_error(event, "record event did not append a replay command");
-      return;
-    }
-
-    const auto &record = backend_.replay_commands_.back();
-    if (record.sequence != event.callsite.sequence ||
-        record.function_name != event.callsite.function_name ||
-        record.kind == D3D12ReplayBackend::ReplayCommandKind::Unknown ||
+    D3D12ReplayBackend::ReplayCommandRecord record;
+    record.kind = event.command_kind;
+    record.sequence = event.callsite.sequence;
+    record.command_list_object_id =
+        event.object_refs.empty() ? trace::ObjectId{} : event.object_refs.front();
+    record.object_refs = event.object_refs;
+    record.function_name = event.callsite.function_name;
+    // record_one consumes the decoded payload override below; do not copy the encoded payload.
+    if (record.kind == D3D12ReplayBackend::ReplayCommandKind::Unknown ||
         record.kind == D3D12ReplayBackend::ReplayCommandKind::BeginCommandList ||
         record.kind == D3D12ReplayBackend::ReplayCommandKind::EndCommandList) {
-      event_ordered_record_error(event, "record event did not match the latest replay command");
+      event_ordered_record_error(event, "compiled record event has no executable command kind");
       return;
     }
 

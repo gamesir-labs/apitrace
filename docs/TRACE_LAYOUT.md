@@ -103,6 +103,7 @@ sample.apitrace/
     objects.json
 
   analysis/
+    d3d12-dispatch.bin
     shader-reflection.json
     translation-links.jsonl
 ```
@@ -137,6 +138,23 @@ sample.apitrace/
 - `callstream.jsonl` 保存“要做什么”
 - `assets.json` 保存“每个 blob id 对应哪个资源文件”
 - 资产目录保存“这些调用引用的真实载荷”
+
+### `analysis/d3d12-dispatch.bin`
+
+这是 `bundle-finalize` 从 `callstream.jsonl` 编译出的可删除、可重建 D3D12 retrace 加速文件。
+它逐条保留事件种类、原 sequence、函数标识、对象/资产引用和完整语义；finalize 同时把 native
+handler 路由及 command semantic kind 编译为固定 opcode。已覆盖的 route 使用带版本的类型化二进制
+payload（当前包括 `UpdateTileMappings` 的 region/range 数组，以及 `D3D12ResourceDataUpdate` 的
+resource/range/asset locator），其余 route 暂以 MessagePack 保存完整
+payload，直到对应类型化 schema 落地。不允许合并、跳过、
+重排或提前执行 API 调用。文件头同时记录源
+`callstream.jsonl` 字节数、记录数和编码字节数，reader 在使用前校验版本、源大小和 checksum。
+
+`callstream.jsonl` 仍然是调用语义权威来源。`d3d12-dispatch.bin` 把顶层 JSON 解析、payload
+规范化、记录边界检查、route-specific 字段验证和 native handler 分类前移到 finalize，使 native retrace 可以单记录流式
+解码后按 opcode 直接分发，而不把完整调用流载入内存，也不逐事件扫描函数名。缺失、过期或损坏
+时，native retrace 必须提示重新运行 `bundle-finalize`，
+不能静默回退到 retrace 内 JSON 解释器。
 
 ### `assets.json`
 
@@ -271,11 +289,12 @@ buffer 初始数据或快照独立保存，推荐压缩：
 
 - 文件后缀可用 `.buffer.zst`
 
-D3D12 的 `ID3D12Resource::Unmap` 如果带有非空 written range，capture 会把该范围保存为
-buffer 资产，并在对应调用 payload 中写入 `buffer_path`。这与 D3D11 的 Map/Unmap 资源内容
-记录语义保持一致。retrace 会按 resource object id 把 `written_begin` / `written_end`、
-`buffer_path`、`blob_refs` 和资产 bytes 挂回对应资源状态，并校验资产大小等于 written range
-长度；D3D12 后续仍需要按资源布局和 descriptor 重定位恢复到真实 replay 资源。
+D3D12 的真实 `ID3D12Resource::Map` / `Unmap` 必须作为 API call 原样记录。若 capture 为了冻结仍在
+映射中的资源内容而生成快照，则该记录使用内部函数名 `apitrace::D3D12ResourceDataUpdate`，并把
+written range 保存为 buffer 资产；它不是应用调用，retrace 不得因此额外调用 Map / Unmap。
+两类记录都按 resource object id 保存 `written_begin` / `written_end`、`buffer_path`、`blob_refs`
+和资产 bytes，并校验资产大小等于 written range 长度。旧 bundle 曾把两类记录都写成 Unmap，
+reader 只能按兼容数据快照处理；需要逐调用严格区分时必须用新 recorder 重新捕获。
 
 D3D12 buffer resource 的 `CreateCommittedResource` payload 应记录 `gpu_virtual_address`。
 command-list payload 中的 `buffer_location` 仍保存原始 API 传入的 GPU VA，但 retrace 必须用
@@ -588,12 +607,13 @@ translation link 现在至少使用这些字段：
 
 ## retrace 的最小读取路径
 
-一个最小的 retrace 实现至少需要读取：
+一个默认 native D3D12 retrace 至少需要读取：
 
 1. `callstream.jsonl`
 2. `assets.json`
 3. `checksums.json`
-4. `callstream.jsonl` 引用到的资产文件
+4. `analysis/d3d12-dispatch.bin`
+5. `callstream.jsonl` 引用到的资产文件
 
 `analysis/translation-links.jsonl` 这类辅助流不属于最小 retrace 必需输入。
 它们存在时可用于 debug、对比和转译层自定义分析。
@@ -603,6 +623,7 @@ translation link 现在至少使用这些字段：
 - `callstream.jsonl` 提供调用语义
 - `assets.json` 提供 `blob_refs` 到资源路径的权威映射
 - `checksums.json` 提供完整性校验
+- `analysis/d3d12-dispatch.bin` 提供由 finalize 编译、与原事件一一对应的快速分发输入
 - 资产目录提供 shader、纹理、buffer 等真实载荷
 
 默认 retrace 只校验它将要读取的最小闭包，以免大 trace 启动前重复扫描所有资源。

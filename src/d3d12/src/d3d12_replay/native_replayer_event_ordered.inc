@@ -26,23 +26,26 @@
     event_ordered_queue_signals_ = 0;
     event_ordered_queue_waits_ = 0;
     event_ordered_fence_signals_ = 0;
-    event_ordered_cpu_waits_ = 0;
-    event_ordered_cpu_wait_timeouts_ = 0;
+    event_ordered_fence_events_registered_ = 0;
+    event_ordered_registered_fence_events_.clear();
     event_ordered_stop_requested_ = false;
+    event_ordered_failed_ = false;
     g_event_ordered_profile_decode_us = 0;
+    g_event_ordered_profile_semantic_us = 0;
+    g_event_ordered_profile_content_sync_us = 0;
     g_event_ordered_profile_dispatch_us = 0;
     g_event_ordered_profile_events = 0;
     event_ordered_profile_dispatch_kind_counts_.fill(0);
     event_ordered_profile_dispatch_kind_us_.fill(0);
+    event_ordered_profile_semantic_kind_counts_.fill(0);
+    event_ordered_profile_semantic_kind_us_.fill(0);
     event_ordered_presented_frames_.clear();
     resource_update_timeline_.clear();
     descriptor_copy_timeline_.clear();
     next_resource_update_index_ = 0;
     next_descriptor_copy_index_ = 0;
-    event_ordered_resource_update_storage_.clear();
     event_ordered_ingested_update_keys_.clear();
-    event_ordered_resource_version_update_cursors_.clear();
-    event_ordered_resource_update_cursors_.clear();
+    event_ordered_resource_update_notification_cursor_ = 0;
     event_ordered_copied_descriptor_storage_.clear();
     event_ordered_resource_updates_applied_keys_.clear();
     event_ordered_copy_descriptors_applied_keys_.clear();
@@ -66,13 +69,6 @@
       }
     } event_ordered_recording_scope(this);
 
-    {
-      ScopedMsAccumulator timer(backend_.event_ordered_replay_timing_.bootstrap_ms);
-      if (!log_stage("event_ordered_bootstrap_device", [&] { return bootstrap_device(error); })) {
-        return false;
-      }
-    }
-
     begin_frame_timing();
     struct EventOrderedFrameTimingScope {
       D3D12NativeReplayer *self = nullptr;
@@ -84,20 +80,71 @@
       }
     } frame_timing_scope{this};
 
+    // Wine's display-device path can deadlock if the HWND is first created after DXMT has already
+    // initialized D3D12. The game created its host window before the captured D3D12 callstream, so
+    // reproduce that host prerequisite by prescanning only the recorded back-buffer dimensions.
+    // This does not materialize or reorder any captured D3D12 object or API call.
+    if (!headless_enabled()) {
+      bool found_window_shape = false;
+      bool prescan_ok = true;
+      std::string stream_error;
+      if (!reader.for_each_event([&](const trace::EventRecord &event) {
+        if (!event_ordered_is_swapchain_backbuffer_alias_event(event)) {
+          return true;
+        }
+        std::string payload_error;
+        const json *payload_ptr = payload_to_json_cached_ref(event, payload_error);
+        if (!payload_ptr ||
+            !payload_ptr->contains("resource_desc") ||
+            !(*payload_ptr)["resource_desc"].is_object()) {
+          error = "failed to read swapchain back-buffer dimensions before replay";
+          prescan_ok = false;
+          return false;
+        }
+        const auto &desc = (*payload_ptr)["resource_desc"];
+        const UINT width = static_cast<UINT>(desc.value("width", 0ull));
+        const UINT height = desc.value("height", 0u);
+        if (width == 0 || height == 0) {
+          error = "trace has invalid swapchain back-buffer dimensions";
+          prescan_ok = false;
+          return false;
+        }
+        if (!bootstrap_replay_window(width, height, error)) {
+          prescan_ok = false;
+          return false;
+        }
+        found_window_shape = true;
+        return false;
+      }, stream_error)) {
+        error = "failed to decode finalized dispatch stream: " + stream_error;
+        return false;
+      }
+      if (!prescan_ok) {
+        return false;
+      }
+      if (!found_window_shape) {
+        error = "trace is missing swapchain back-buffer semantics";
+        return false;
+      }
+    }
+
     bool swapchain_ready = swapchain_bootstrapped();
     std::uint64_t event_count = 0;
-    for (const auto &event : reader.events()) {
+    bool event_loop_ok = true;
+    std::string stream_error;
+    if (!reader.for_each_event([&](const trace::EventRecord &event) {
       std::chrono::steady_clock::time_point _iter_t0;
       if (perf_diag) {
         _iter_t0 = std::chrono::steady_clock::now();
       }
       const std::uint64_t event_sequence = event.callsite.sequence;
+      const auto dispatch_profile_kind = event_ordered_dispatch_profile_kind(event);
       {
         ScopedUsAccumulator profile_timer(
             g_event_ordered_profile_decode_us,
             event_ordered_profile_enabled_);
         std::chrono::steady_clock::time_point _t0;
-        if (perf_diag) {
+        if (perf_diag || event_ordered_profile_enabled_) {
           _t0 = std::chrono::steady_clock::now();
         }
         ScopedMsAccumulator timer(backend_.event_ordered_replay_timing_.semantic_replay_event_ms);
@@ -109,11 +156,25 @@
             error = "sequence " + std::to_string(event_sequence) + " " +
                     event_ordered_event_name(event) + ": D3D12 event-ordered replay failed";
           }
+          event_loop_ok = false;
           return false;
         }
+        const auto semantic_elapsed_us =
+            (perf_diag || event_ordered_profile_enabled_)
+                ? static_cast<std::uint64_t>(
+                      std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - _t0)
+                          .count())
+                : 0;
+        if (event_ordered_profile_enabled_) {
+          g_event_ordered_profile_semantic_us += semantic_elapsed_us;
+          const std::size_t kind_index =
+              event_ordered_dispatch_profile_index(dispatch_profile_kind);
+          ++event_ordered_profile_semantic_kind_counts_[kind_index];
+          event_ordered_profile_semantic_kind_us_[kind_index] += semantic_elapsed_us;
+        }
         if (perf_diag) {
-          backend_.event_ordered_replay_timing_.us_replay_event +=
-              std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _t0).count();
+          backend_.event_ordered_replay_timing_.us_replay_event += semantic_elapsed_us;
         }
       }
 
@@ -123,14 +184,22 @@
             g_event_ordered_profile_decode_us,
             event_ordered_profile_enabled_);
         std::chrono::steady_clock::time_point _t0;
-        if (perf_diag) {
+        if (perf_diag || event_ordered_profile_enabled_) {
           _t0 = std::chrono::steady_clock::now();
         }
         ScopedMsAccumulator timer(backend_.event_ordered_replay_timing_.content_sync_ms);
         event_ordered_sync_resource_content_before_consumer(event);
-        if (perf_diag) {
-          backend_.event_ordered_replay_timing_.us_content_sync +=
-              std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _t0).count();
+        if (perf_diag || event_ordered_profile_enabled_) {
+          const auto content_sync_us = static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - _t0)
+                  .count());
+          if (event_ordered_profile_enabled_) {
+            g_event_ordered_profile_content_sync_us += content_sync_us;
+          }
+          if (perf_diag) {
+            backend_.event_ordered_replay_timing_.us_content_sync += content_sync_us;
+          }
         }
       }
       {
@@ -138,12 +207,12 @@
             g_event_ordered_profile_decode_us,
             event_ordered_profile_enabled_);
         if (!event_ordered_maybe_bootstrap_swapchain(event, swapchain_ready, error)) {
+          event_loop_ok = false;
           return false;
         }
       }
 
       const auto dispatch_category = event_ordered_dispatch_category(event);
-      const auto dispatch_profile_kind = event_ordered_dispatch_profile_kind(event);
       {
         std::chrono::steady_clock::time_point _t0;
         if (perf_diag) {
@@ -170,6 +239,13 @@
               std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _t0).count();
         }
       }
+      if (event_ordered_failed_) {
+        error = backend_.last_error_.empty()
+                    ? "D3D12 event-ordered native dispatch failed"
+                    : backend_.last_error_;
+        event_loop_ok = false;
+        return false;
+      }
       ++g_event_ordered_profile_events;
       event_ordered_profile_maybe_emit(false);
       if (perf_diag) {
@@ -181,8 +257,15 @@
         event_ordered_stop_requested_ = true;
       }
       if (event_ordered_stop_requested_) {
-        break;
+        return false;
       }
+      return true;
+    }, stream_error)) {
+      error = "failed to decode finalized dispatch stream: " + stream_error;
+      return false;
+    }
+    if (!event_loop_ok) {
+      return false;
     }
 
     {
@@ -222,13 +305,25 @@ private:
     if (!out) {
       return;
     }
+    const auto semantic_us = g_event_ordered_profile_semantic_us;
+    const auto content_sync_us = g_event_ordered_profile_content_sync_us;
+    const auto classified_decode_us = semantic_us + content_sync_us;
+    const auto other_decode_us =
+        g_event_ordered_profile_decode_us > classified_decode_us
+            ? g_event_ordered_profile_decode_us - classified_decode_us
+            : 0;
     std::fprintf(
         out,
-        "RETRACE replayProfile events=%llu decodeUs=%llu dispatchUs=%llu\n",
+        "RETRACE replayProfile events=%llu decodeUs=%llu semanticUs=%llu "
+        "contentSyncUs=%llu otherDecodeUs=%llu dispatchUs=%llu\n",
         static_cast<unsigned long long>(g_event_ordered_profile_events),
         static_cast<unsigned long long>(g_event_ordered_profile_decode_us),
+        static_cast<unsigned long long>(semantic_us),
+        static_cast<unsigned long long>(content_sync_us),
+        static_cast<unsigned long long>(other_decode_us),
         static_cast<unsigned long long>(g_event_ordered_profile_dispatch_us));
     event_ordered_profile_emit_dispatch_by_kind(out);
+    event_ordered_profile_emit_semantic_by_kind(out);
     std::fclose(out);
   }
 
@@ -271,6 +366,40 @@ private:
     }
   }
 
+  void event_ordered_profile_emit_semantic_by_kind(FILE *out) const
+  {
+    std::array<std::size_t, kEventOrderedDispatchProfileKindCount> order{};
+    for (std::size_t index = 0; index < order.size(); ++index) {
+      order[index] = index;
+    }
+    std::sort(order.begin(), order.end(), [&](std::size_t lhs, std::size_t rhs) {
+      if (event_ordered_profile_semantic_kind_us_[lhs] !=
+          event_ordered_profile_semantic_kind_us_[rhs]) {
+        return event_ordered_profile_semantic_kind_us_[lhs] >
+               event_ordered_profile_semantic_kind_us_[rhs];
+      }
+      return event_ordered_profile_semantic_kind_counts_[lhs] >
+             event_ordered_profile_semantic_kind_counts_[rhs];
+    });
+
+    std::size_t emitted = 0;
+    for (const std::size_t index : order) {
+      if (event_ordered_profile_semantic_kind_counts_[index] == 0) {
+        continue;
+      }
+      std::fprintf(
+          out,
+          "RETRACE semanticByKind kind=%.*s count=%llu semanticUs=%llu\n",
+          static_cast<int>(kEventOrderedDispatchProfileKindNames[index].size()),
+          kEventOrderedDispatchProfileKindNames[index].data(),
+          static_cast<unsigned long long>(event_ordered_profile_semantic_kind_counts_[index]),
+          static_cast<unsigned long long>(event_ordered_profile_semantic_kind_us_[index]));
+      if (++emitted >= 20) {
+        break;
+      }
+    }
+  }
+
   bool event_ordered_swapchain_bootstrap_ready() const
   {
     UINT width = 0;
@@ -297,12 +426,12 @@ private:
       return false;
     }
 
-    json payload;
     std::string ignored_error;
-    if (!payload_to_json(event, payload, ignored_error)) {
+    const json *payload = payload_to_json_cached_ref(event, ignored_error);
+    if (!payload) {
       return false;
     }
-    return payload.value("swapchain_back_buffer", false);
+    return payload->value("swapchain_back_buffer", false);
   }
 
   bool event_ordered_maybe_bootstrap_swapchain(
@@ -410,20 +539,7 @@ private:
 
   bool event_ordered_is_record_call(const trace::EventRecord &event) const
   {
-    const std::string_view function_name(event.callsite.function_name);
-    if (function_name == "ID3D12CommandAllocator::Reset" ||
-        function_name == "ID3D12GraphicsCommandList::Reset" ||
-        function_name == "ID3D12GraphicsCommandList::Close") {
-      return true;
-    }
-    if (backend_.replay_commands_.empty()) {
-      return false;
-    }
-    const auto &record = backend_.replay_commands_.back();
-    return record.sequence == event.callsite.sequence &&
-           record.function_name == event.callsite.function_name &&
-           record.command_list_object_id != 0 &&
-           record.kind != D3D12ReplayBackend::ReplayCommandKind::Unknown;
+    return event.dispatch_route == trace::CompiledDispatchRoute::RecordCommand;
   }
 
   enum class EventOrderedDispatchCategory {
@@ -638,8 +754,8 @@ private:
            " queue_signals=" + std::to_string(event_ordered_queue_signals_) +
            " queue_waits=" + std::to_string(event_ordered_queue_waits_) +
            " fence_signals=" + std::to_string(event_ordered_fence_signals_) +
-           " cpu_waits=" + std::to_string(event_ordered_cpu_waits_) +
-           " cpu_wait_timeouts=" + std::to_string(event_ordered_cpu_wait_timeouts_);
+           " fence_events_registered=" +
+           std::to_string(event_ordered_fence_events_registered_);
   }
 
   std::string event_ordered_perf_breakdown_summary() const
@@ -691,6 +807,7 @@ private:
                              " fn=" + event_ordered_event_name(event) +
                              " " + error;
     backend_.last_error_ = std::move(error);
+    event_ordered_failed_ = true;
     ++event_ordered_present_errors_;
     event_ordered_log(line);
   }
@@ -700,10 +817,11 @@ private:
       EventOrderedPresentPayload &present,
       std::string &error) const
   {
-    json payload;
-    if (!payload_to_json(event, payload, error)) {
+    const json *payload_ptr = payload_to_json_cached_ref(event, error);
+    if (!payload_ptr) {
       return false;
     }
+    const auto &payload = *payload_ptr;
     if (!require_payload_key(event, payload, "frame_index", error) ||
         !require_payload_key(event, payload, "sync_interval", error) ||
         !require_payload_key(event, payload, "flags", error)) {
@@ -764,7 +882,54 @@ private:
     if (!event_ordered_present_payload(event, present, error) ||
         !event_ordered_verify_present_semantics(event, present, false, error)) {
       event_ordered_present_error(event, std::move(error));
+      return;
     }
+    if (!event_ordered_presented_frames_.insert(present.frame_index).second) {
+      event_ordered_present_error(
+          event,
+          "duplicate IDXGISwapChain::Present call frame=" +
+              std::to_string(present.frame_index));
+      return;
+    }
+
+    const UINT back_buffer_index = event_ordered_current_back_buffer_index();
+    if (back_buffer_index >= kBufferCount) {
+      event_ordered_present_error(
+          event,
+          "Present resolved invalid back-buffer index=" + std::to_string(back_buffer_index));
+      return;
+    }
+    if (!capture_present_frame(present.frame_index, present.sync_interval, present.flags, error)) {
+      event_ordered_present_error(
+          event,
+          error.empty() ? "capture_present_frame failed for frame=" +
+                              std::to_string(present.frame_index)
+                        : std::move(error));
+      return;
+    }
+
+    if (swap_chain_) {
+      const HRESULT hr = swap_chain_->Present(present.sync_interval, present.flags);
+      record_present_semantics(present.sync_interval, present.flags, hr);
+      if (FAILED(hr)) {
+        event_ordered_present_error(event, hresult_error("IDXGISwapChain::Present", hr));
+        return;
+      }
+    } else {
+      record_present_semantics(present.sync_interval, present.flags, S_OK);
+      if (!notify_dxmt_headless_frame_boundary(error)) {
+        event_ordered_present_error(
+            event,
+            error.empty() ? "DXMT headless frame boundary notification failed"
+                          : std::move(error));
+        return;
+      }
+      headless_back_buffer_index_ = (headless_back_buffer_index_ + 1) % kBufferCount;
+    }
+
+    event_ordered_maybe_begin_metal_capture(present.frame_index);
+    event_ordered_maybe_end_metal_capture(present.frame_index);
+    ++event_ordered_presents_executed_;
   }
 
   void event_ordered_handle_present_boundary(const trace::EventRecord &event)
@@ -777,43 +942,14 @@ private:
       return;
     }
 
-    if (!event_ordered_presented_frames_.insert(present.frame_index).second) {
-      event_ordered_log("[event-ordered] present:skip-duplicate frame=" +
-                        std::to_string(present.frame_index));
-      return;
-    }
-
-    const UINT back_buffer_index = event_ordered_current_back_buffer_index();
-    if (back_buffer_index >= kBufferCount) {
+    if (event_ordered_presented_frames_.find(present.frame_index) ==
+        event_ordered_presented_frames_.end()) {
       event_ordered_present_error(
           event,
-          "Present resolved invalid back-buffer index=" + std::to_string(back_buffer_index));
+          "Present boundary arrived before its IDXGISwapChain::Present call frame=" +
+              std::to_string(present.frame_index));
       return;
     }
-
-    if (!capture_present_frame(present.frame_index, present.sync_interval, present.flags, error)) {
-      event_ordered_present_error(
-          event,
-          error.empty() ? "capture_present_frame failed for frame=" +
-                              std::to_string(present.frame_index)
-                        : std::move(error));
-    }
-
-    if (swap_chain_) {
-      const HRESULT hr = swap_chain_->Present(present.sync_interval, present.flags);
-      record_present_semantics(present.sync_interval, present.flags, hr);
-      if (FAILED(hr)) {
-        event_ordered_present_error(event, hresult_error("IDXGISwapChain::Present", hr));
-      }
-    } else {
-      record_present_semantics(present.sync_interval, present.flags, S_OK);
-      headless_back_buffer_index_ = (headless_back_buffer_index_ + 1) % kBufferCount;
-    }
-
-    event_ordered_maybe_begin_metal_capture(present.frame_index);
-    event_ordered_maybe_end_metal_capture(present.frame_index);
-
-    ++event_ordered_presents_executed_;
     note_event_ordered_present_timing();
     log_frame_timing(present.frame_index);
     if (present_delay_ms_ != 0) {
@@ -833,90 +969,169 @@ private:
     }
   }
 
+  void event_ordered_destroy_native_object(const trace::EventRecord &event)
+  {
+    const trace::ObjectId object_id = event.object_id;
+    if (object_id == 0) {
+      event_ordered_record_materialize_error(event, "object_destroy missing object_id");
+      return;
+    }
+    switch (event.object_kind) {
+    case trace::ObjectKind::CommandQueue:
+      replay_queues_by_object_.erase(object_id);
+      break;
+    case trace::ObjectKind::CommandAllocator:
+      command_allocators_.erase(object_id);
+      break;
+    case trace::ObjectKind::CommandList:
+      command_lists_.erase(object_id);
+      break;
+    case trace::ObjectKind::CommandSignature:
+      command_signatures_.erase(object_id);
+      break;
+    case trace::ObjectKind::Fence:
+      app_fences_.erase(object_id);
+      break;
+    case trace::ObjectKind::Heap:
+      heaps_.erase(object_id);
+      break;
+    case trace::ObjectKind::Resource:
+      event_ordered_mapped_resources_.erase(object_id);
+      resources_.erase(object_id);
+      resource_version_natives_.erase(object_id);
+      break;
+    case trace::ObjectKind::PipelineState:
+      pipelines_.erase(object_id);
+      pipeline_version_natives_.erase(object_id);
+      break;
+    case trace::ObjectKind::RootSignature:
+      root_signatures_.erase(object_id);
+      break;
+    case trace::ObjectKind::DescriptorHeap:
+      descriptor_heaps_.erase(object_id);
+      break;
+    case trace::ObjectKind::QueryHeap:
+      query_heaps_.erase(object_id);
+      break;
+    case trace::ObjectKind::Device:
+    case trace::ObjectKind::SwapChain:
+    case trace::ObjectKind::Context:
+    case trace::ObjectKind::View:
+    case trace::ObjectKind::Shader:
+    case trace::ObjectKind::Unknown:
+      // The bootstrap device/swapchain are retrace process infrastructure, while views and shaders
+      // have no standalone D3D12 native object in this backend.
+      break;
+    }
+  }
+
+  void event_ordered_handle_create_device(const trace::EventRecord &event)
+  {
+    std::string error;
+    const json *payload_ptr = payload_to_json_cached_ref(event, error);
+    if (!payload_ptr) {
+      event_ordered_record_materialize_error(event, std::move(error));
+      return;
+    }
+    const auto &payload = *payload_ptr;
+    const auto feature_level = static_cast<D3D_FEATURE_LEVEL>(
+        payload_u32(payload, "minimum_feature_level", D3D_FEATURE_LEVEL_11_0));
+    ComPtr<ID3D12Device> native;
+    const HRESULT hr = D3D12CreateDevice(nullptr, feature_level, IID_PPV_ARGS(native.put()));
+    const bool replay_succeeded = SUCCEEDED(hr) && native;
+    const bool capture_succeeded = event.callsite.result_code >= 0;
+    if (replay_succeeded != capture_succeeded) {
+      event_ordered_record_materialize_error(
+          event,
+          "D3D12CreateDevice result differs from capture replay_hr=" +
+              std::to_string(static_cast<std::int32_t>(hr)) +
+              " captured_result=" + std::to_string(event.callsite.result_code));
+      return;
+    }
+    if (!replay_succeeded) {
+      return;
+    }
+    // Each captured D3D12CreateDevice is issued at its original sequence. Existing children retain
+    // their own COM parent references; subsequent creates use the newly returned device.
+    device_ = std::move(native);
+    queue_.reset();
+    fence_.reset();
+  }
+
   void dispatch_live(const trace::EventRecord &event)
   {
-    const std::string_view function_name(event.callsite.function_name);
-    if (event.kind == trace::EventKind::Boundary &&
-        event.boundary == trace::BoundaryKind::Present) {
+    // bundle-finalize has already validated the readable event and selected its native handler.
+    // Keep this loop to direct decode + dispatch; string classification and placeholder payload
+    // parsing belong to finalization, not per-retrace CPU work.
+    switch (event.dispatch_route) {
+    case trace::CompiledDispatchRoute::NoOp:
+      return;
+    case trace::CompiledDispatchRoute::ObjectDestroy:
+      event_ordered_destroy_native_object(event);
+      return;
+    case trace::CompiledDispatchRoute::CreateDevice:
+      event_ordered_handle_create_device(event);
+      return;
+    case trace::CompiledDispatchRoute::PresentBoundary:
       event_ordered_handle_present_boundary(event);
       return;
-    }
-    if (function_name == "IDXGISwapChain::Present") {
+    case trace::CompiledDispatchRoute::PresentCall:
       event_ordered_handle_present_call(event);
       return;
-    }
-    if (event_ordered_contains(function_name, "CreateHeap") ||
-        event_ordered_contains(function_name, "CreateQueryHeap")) {
+    case trace::CompiledDispatchRoute::CreateMemory:
       materialize_create_memory(event);
       return;
-    }
-    if (event_ordered_contains(function_name, "CreateCommittedResource") ||
-        event_ordered_contains(function_name, "CreatePlacedResource") ||
-        event_ordered_contains(function_name, "CreateReservedResource")) {
+    case trace::CompiledDispatchRoute::CreateResource:
       materialize_create_resources(event);
       return;
-    }
-    if (event_ordered_contains(function_name, "CreateDescriptorHeap") ||
-        function_name == "ID3D12Device::CreateDescriptorViewBatch" ||
-        function_name == "ID3D12Device::CreateConstantBufferView" ||
-        function_name == "ID3D12Device::CreateShaderResourceView" ||
-        function_name == "ID3D12Device::CreateUnorderedAccessView" ||
-        function_name == "ID3D12Device::CreateRenderTargetView" ||
-        function_name == "ID3D12Device::CreateDepthStencilView" ||
-        function_name == "ID3D12Device::CreateSampler") {
+    case trace::CompiledDispatchRoute::CreateDescriptor:
       materialize_create_descriptors(event);
       return;
-    }
-    if (function_name == "ID3D12Device::CreateGraphicsPipelineState" ||
-        function_name == "ID3D12Device::CreateComputePipelineState" ||
-        function_name == "ID3D12Device2::CreatePipelineState" ||
-        event_ordered_contains(function_name, "CreateRootSignature") ||
-        event_ordered_contains(function_name, "CreateCommandSignature")) {
+    case trace::CompiledDispatchRoute::CreatePipeline:
       materialize_create_pipelines(event);
       return;
-    }
-    if (event_ordered_contains(function_name, "CreateCommandQueue") ||
-        event_ordered_contains(function_name, "CreateCommandAllocator") ||
-        event_ordered_contains(function_name, "CreateCommandList") ||
-        event_ordered_contains(function_name, "CreateFence")) {
+    case trace::CompiledDispatchRoute::CreateCommandObject:
       materialize_create_command_objects(event);
       return;
-    }
-    if (event_ordered_is_record_call(event)) {
+    case trace::CompiledDispatchRoute::RecordCommand:
       handle_record_event(event);
       return;
-    }
-    if (event_ordered_is_copy_descriptors_event(event)) {
+    case trace::CompiledDispatchRoute::CopyDescriptors:
       event_ordered_apply_copy_descriptors(event);
       return;
-    }
-    if (function_name == "ID3D12CommandQueue::ExecuteCommandLists") {
+    case trace::CompiledDispatchRoute::ExecuteCommandLists:
       event_ordered_handle_execute_command_lists(event);
       return;
-    }
-    if (function_name == "ID3D12CommandQueue::UpdateTileMappings") {
+    case trace::CompiledDispatchRoute::UpdateTileMappings:
       event_ordered_log_stub_once("UpdateTileMappings(P4)", event);
       return;
-    }
-    if (function_name == "ID3D12CommandQueue::Signal") {
+    case trace::CompiledDispatchRoute::QueueSignal:
       event_ordered_handle_queue_signal(event);
       return;
-    }
-    if (function_name == "ID3D12CommandQueue::Wait") {
+    case trace::CompiledDispatchRoute::QueueWait:
       event_ordered_handle_queue_wait(event);
       return;
-    }
-    if (function_name == "ID3D12Fence::Signal") {
+    case trace::CompiledDispatchRoute::FenceSignal:
       event_ordered_handle_fence_signal(event);
       return;
-    }
-    if (function_name == "ID3D12Fence::SetEventOnCompletion") {
+    case trace::CompiledDispatchRoute::FenceSetEventOnCompletion:
       event_ordered_handle_fence_set_event_on_completion(event);
       return;
+    case trace::CompiledDispatchRoute::ResourceMap:
+      event_ordered_handle_resource_map(event);
+      return;
+    case trace::CompiledDispatchRoute::ResourceUnmap:
+      event_ordered_handle_resource_unmap(event);
+      return;
+    case trace::CompiledDispatchRoute::ResourceDataUpdate:
+      event_ordered_handle_resource_data_update(event);
+      return;
+    case trace::CompiledDispatchRoute::DiagnosticStub:
+      event_ordered_log_stub_once(event_ordered_category(event), event);
+      return;
+    case trace::CompiledDispatchRoute::Unspecified:
+      event_ordered_record_materialize_error(
+          event, "compiled dispatch record is missing its precomputed route");
+      return;
     }
-
-    event_ordered_log_stub_once(event_ordered_category(event), event);
-
-    // TODO(event-ordered): materialize remaining live operations for Map,
-    // Unmap, Present, ReleaseDestroy, and Default.
   }

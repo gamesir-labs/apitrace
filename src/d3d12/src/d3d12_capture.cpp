@@ -90,6 +90,7 @@ std::mutex g_present_mutex;
 std::mutex g_shader_asset_memo_mutex;
 std::unordered_map<const void *, trace::ObjectId> g_object_ids;
 std::unordered_map<const void *, trace::ObjectKind> g_object_kinds;
+std::unordered_map<const void *, std::uint64_t> g_resource_generations;
 constexpr std::uint64_t kRootConstantBufferSnapshotBytes =
     std::uint64_t{D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT} * 4u * sizeof(std::uint32_t);
 constexpr std::uint64_t kMappedUseSnapshotChunkBytes = 4u * 1024u;
@@ -171,6 +172,7 @@ struct FastHash128 {
 
 struct RawUnmapSignatureKey {
   const void *resource = nullptr;
+  std::uint64_t resource_generation = 0;
   std::uint32_t subresource = 0;
   std::uint64_t begin = 0;
   std::uint64_t end = 0;
@@ -178,6 +180,7 @@ struct RawUnmapSignatureKey {
   bool operator==(const RawUnmapSignatureKey &other) const noexcept
   {
     return resource == other.resource &&
+           resource_generation == other.resource_generation &&
            subresource == other.subresource &&
            begin == other.begin &&
            end == other.end;
@@ -188,6 +191,7 @@ struct RawUnmapSignatureKeyHash {
   std::size_t operator()(const RawUnmapSignatureKey &key) const noexcept
   {
     std::uint64_t hash = reinterpret_cast<std::uintptr_t>(key.resource);
+    hash ^= (key.resource_generation + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2));
     hash ^= (static_cast<std::uint64_t>(key.subresource) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2));
     hash ^= (key.begin + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2));
     hash ^= (key.end + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2));
@@ -231,6 +235,7 @@ void reset_raw_unmap_signatures_if_needed(TraceSession *session)
 struct MappedResourceState {
   const void *data = nullptr;
   std::uint32_t subresource = 0;
+  std::uint64_t resource_generation = 0;
 };
 
 std::unordered_map<const void *, MappedResourceState> g_mapped_resources;
@@ -253,6 +258,7 @@ inline bool present_recapture_enabled() {
 struct PresentRecaptureRange {
   const void *resource = nullptr;
   trace::ObjectId object_id = 0;
+  std::uint64_t resource_generation = 0;
   std::uint64_t begin = 0;
   std::uint64_t end = 0;
 };
@@ -271,7 +277,9 @@ inline void note_present_recapture_range(const void *resource, trace::ObjectId o
   if (!g_present_recapture_seen.insert(key).second) {
     return;
   }
-  g_present_recapture_ranges.push_back({resource, object_id, begin, end});
+  const auto generation_it = g_resource_generations.find(resource);
+  const auto generation = generation_it == g_resource_generations.end() ? 0 : generation_it->second;
+  g_present_recapture_ranges.push_back({resource, object_id, generation, begin, end});
 }
 
 struct MappedGpuvaUseRange {
@@ -1068,11 +1076,13 @@ bool record_raw_resource_unmap(
     TraceSession *session,
     const void *resource,
     trace::ObjectId resource_object_id,
+    std::uint64_t resource_generation,
     std::uint32_t subresource,
     std::uint64_t written_begin,
     std::uint64_t written_end,
     const void *written_data,
-    std::size_t written_size)
+    std::size_t written_size,
+    bool api_call)
 {
   if (!session ||
       !session->raw_capture_writer() ||
@@ -1089,9 +1099,12 @@ bool record_raw_resource_unmap(
     return false;
   }
 
-  const auto key = RawUnmapSignatureKey{resource, subresource, written_begin, written_end};
+  const auto key = RawUnmapSignatureKey{
+      resource, resource_generation, subresource, written_begin, written_end};
   const auto signature = fast_hash128_bytes(written_data, written_size);
-  if (raw_unmap_signature_unchanged(key, signature)) {
+  // Snapshot dedup is capture bookkeeping. Application Unmap calls are observable API chronology
+  // and must never disappear merely because their bytes match an earlier call.
+  if (!api_call && raw_unmap_signature_unchanged(key, signature)) {
     return true;
   }
 
@@ -1113,13 +1126,16 @@ bool record_raw_resource_unmap(
       resource_object_id,
       raw_blob_id,
       written_begin,
-      written_end);
+      written_end,
+      api_call);
   if (!sink.append_binary_event(sequence, trace::raw::RawEventOpcode::ResourceUnmap, payload)) {
     note_raw_unmap_write_failure();
     return true;
   }
 
-  mark_raw_unmap_signature(key, signature, static_cast<std::uint64_t>(written_size));
+  if (!api_call) {
+    mark_raw_unmap_signature(key, signature, static_cast<std::uint64_t>(written_size));
+  }
   return true;
 }
 
@@ -1159,11 +1175,13 @@ void record_mapped_resource_range_update_unbatched(
         session,
         resource,
         resource_object_id,
+        mapped.resource_generation,
         mapped.subresource,
         begin,
         end,
         bytes,
-        size);
+        size,
+        false);
   }
 }
 
@@ -1213,7 +1231,7 @@ void record_resource_bytes_snapshot_unbatched(
   const std::uint64_t blob_id = asset.blob_id;
   record_call_event_unbatched_with_object_ids(
       g_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
-      "ID3D12Resource::Unmap",
+      "apitrace::D3D12ResourceDataUpdate",
       payload.c_str(),
       {resource_object_id},
       &blob_id,
@@ -1233,7 +1251,10 @@ void capture_mapped_resource_range_before_use(const void *resource, std::uint64_
 
   std::lock_guard object_lock(g_object_mutex);
   auto mapped_it = g_mapped_resources.find(resource);
-  if (mapped_it == g_mapped_resources.end()) {
+  const auto generation_it = g_resource_generations.find(resource);
+  if (mapped_it == g_mapped_resources.end() ||
+      generation_it == g_resource_generations.end() ||
+      mapped_it->second.resource_generation != generation_it->second) {
     return;
   }
 
@@ -1273,7 +1294,10 @@ void capture_mapped_resource_chunks_before_use(
 
   std::lock_guard object_lock(g_object_mutex);
   auto mapped_it = g_mapped_resources.find(resource);
-  if (mapped_it == g_mapped_resources.end()) {
+  const auto generation_it = g_resource_generations.find(resource);
+  if (mapped_it == g_mapped_resources.end() ||
+      generation_it == g_resource_generations.end() ||
+      mapped_it->second.resource_generation != generation_it->second) {
     return;
   }
 
@@ -1320,7 +1344,11 @@ void maybe_recapture_present_ranges()
   std::lock_guard object_lock(g_object_mutex);
   for (const auto &range : g_present_recapture_ranges) {
     auto mapped_it = g_mapped_resources.find(range.resource);
-    if (mapped_it == g_mapped_resources.end()) {
+    const auto generation_it = g_resource_generations.find(range.resource);
+    if (mapped_it == g_mapped_resources.end() ||
+        generation_it == g_resource_generations.end() ||
+        range.resource_generation != generation_it->second ||
+        mapped_it->second.resource_generation != generation_it->second) {
       continue;
     }
     record_mapped_resource_range_update_unbatched(
@@ -3876,6 +3904,15 @@ void record_object_create(
     object_record.object_id = lookup_object_id_locked(object);
     object_record.parent_object_id = lookup_object_id_locked(parent_object);
     g_object_kinds[object] = to_trace_object_kind(kind);
+    if (kind == CaptureObjectKind::Resource) {
+      auto &generation = g_resource_generations[object];
+      ++generation;
+      if (generation == 0) {
+        generation = 1;
+      }
+      g_resource_gpu_virtual_addresses.erase(object);
+      g_mapped_resources.erase(object);
+    }
   }
   object_record.kind = to_trace_object_kind(kind);
   object_record.debug_name = debug_name ? debug_name : "";
@@ -3983,14 +4020,47 @@ std::uint64_t record_dxgi_create_swapchain(
   return record_call_with_object_ids("IDXGIFactory::CreateSwapChain", "{}", std::move(refs));
 }
 
-std::uint64_t record_execute_command_lists(const void *queue, const void *command_list)
+std::uint64_t record_execute_command_lists(
+    const void *queue,
+    std::uint32_t command_list_count,
+    ID3D12CommandList *const *command_lists)
 {
-  if (!queue || !command_list) {
+  if (!queue || command_list_count == 0 || !command_lists) {
     return 0;
   }
-  capture_command_list_mapped_inputs_before_submit(command_list);
-  const void *refs[] = {queue, command_list};
-  return record_call("ID3D12CommandQueue::ExecuteCommandLists", "{\"command_list_count\":1}", refs, 2);
+
+  for (std::uint32_t index = 0; index < command_list_count; ++index) {
+    if (!command_lists[index]) {
+      return 0;
+    }
+    capture_command_list_mapped_inputs_before_submit(command_lists[index]);
+  }
+
+  std::vector<trace::ObjectId> refs;
+  refs.reserve(static_cast<std::size_t>(command_list_count) + 1);
+  {
+    std::lock_guard lock(g_object_mutex);
+    refs.push_back(lookup_object_id_locked(queue));
+    for (std::uint32_t index = 0; index < command_list_count; ++index) {
+      // Preserve array order and duplicate entries exactly. The generic object-ref collector
+      // deduplicates refs for dependency metadata, which is not valid for an API argument array.
+      refs.push_back(lookup_object_id_locked(command_lists[index]));
+    }
+  }
+
+  const std::string payload =
+      "{\"command_list_count\":" + std::to_string(command_list_count) + "}";
+  return record_call_with_object_ids(
+      "ID3D12CommandQueue::ExecuteCommandLists",
+      payload.c_str(),
+      std::move(refs));
+}
+
+std::uint64_t record_execute_command_lists(const void *queue, const void *command_list)
+{
+  auto *native_command_list = reinterpret_cast<ID3D12CommandList *>(
+      const_cast<void *>(command_list));
+  return record_execute_command_lists(queue, 1, &native_command_list);
 }
 
 std::uint64_t record_present(
@@ -4131,22 +4201,85 @@ void record_resource_unmap(
     const void *written_data,
     std::size_t written_size)
 {
-  if (!resource || !written_data || written_size == 0 || written_end <= written_begin) {
+  if (!resource) {
     return;
   }
 
   if (auto *session = session_for(trace::ApiKind::D3D12)) {
     const auto resource_object_id = object_id(resource);
+    std::uint64_t resource_generation = 0;
+    {
+      std::lock_guard lock(g_object_mutex);
+      const auto generation_it = g_resource_generations.find(resource);
+      if (generation_it != g_resource_generations.end()) {
+        resource_generation = generation_it->second;
+      }
+    }
+    std::lock_guard event_lock(g_event_order_mutex);
+    if (written_data && written_size != 0 && written_end > written_begin) {
+      record_raw_resource_unmap(
+          session,
+          resource,
+          resource_object_id,
+          resource_generation,
+          subresource,
+          written_begin,
+          written_end,
+          written_data,
+          written_size,
+          true);
+    } else {
+      std::ostringstream payload;
+      payload << "{\"subresource\":" << subresource
+              << ",\"written_begin\":" << written_begin
+              << ",\"written_end\":" << written_end
+              << ",\"written_size\":0"
+              << ",\"api_call\":true}";
+      record_call_event_unbatched_with_object_ids(
+          g_sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+          "ID3D12Resource::Unmap",
+          payload.str().c_str(),
+          {resource_object_id},
+          nullptr,
+          0,
+          0);
+    }
+  }
+}
+
+void record_resource_snapshot(
+    const void *resource,
+    std::uint32_t subresource,
+    std::uint64_t written_begin,
+    std::uint64_t written_end,
+    const void *written_data,
+    std::size_t written_size)
+{
+  if (!resource || !written_data || written_size == 0 || written_end <= written_begin) {
+    return;
+  }
+  if (auto *session = session_for(trace::ApiKind::D3D12)) {
+    const auto resource_object_id = object_id(resource);
+    std::uint64_t resource_generation = 0;
+    {
+      std::lock_guard lock(g_object_mutex);
+      const auto generation_it = g_resource_generations.find(resource);
+      if (generation_it != g_resource_generations.end()) {
+        resource_generation = generation_it->second;
+      }
+    }
     std::lock_guard event_lock(g_event_order_mutex);
     record_raw_resource_unmap(
         session,
         resource,
         resource_object_id,
+        resource_generation,
         subresource,
         written_begin,
         written_end,
         written_data,
-        written_size);
+        written_size,
+        false);
   }
 }
 
@@ -4199,7 +4332,9 @@ std::uint64_t record_resource_map(
   {
     std::lock_guard lock(g_object_mutex);
     if (mapped && mapped_data) {
-      g_mapped_resources[resource] = MappedResourceState{mapped_data, subresource};
+      const auto generation_it = g_resource_generations.find(resource);
+      const auto generation = generation_it == g_resource_generations.end() ? 0 : generation_it->second;
+      g_mapped_resources[resource] = MappedResourceState{mapped_data, subresource, generation};
     } else {
       g_mapped_resources.erase(resource);
     }

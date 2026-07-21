@@ -7,6 +7,7 @@
 
 #include <filesystem>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -80,7 +81,7 @@ public:
   // Persisted replay-model schema. bundle-finalize reconstructs the object model once and
   // serializes it via save_replay_model; retrace loads it via load_replay_model to skip the
   // in-process initialize+replay_event reconstruction. Bump on any wire-format change.
-  static constexpr std::uint32_t kReplayModelSchemaVersion = 4;
+  static constexpr std::uint32_t kReplayModelSchemaVersion = 5;
   bool save_replay_model(
       const std::filesystem::path &json_path,
       const std::filesystem::path &blob_path,
@@ -94,43 +95,7 @@ public:
 
   const std::string &last_error() const noexcept;
   const std::vector<DescriptorSemanticState> &descriptors() const noexcept;
-  enum class ReplayCommandKind {
-    Unknown,
-    BeginCommandList,
-    EndCommandList,
-    SetPipelineState,
-    SetRootSignature,
-    SetDescriptorHeaps,
-    SetRootDescriptorTable,
-    SetRootConstants,
-    SetRootConstantBufferView,
-    SetViewports,
-    SetScissorRects,
-    SetRenderTargets,
-    ClearRenderTarget,
-    ClearDepthStencil,
-    ClearUnorderedAccess,
-    DiscardResource,
-    SetPrimitiveTopology,
-    SetVertexBuffers,
-    SetIndexBuffer,
-    ResourceBarrier,
-    SetDynamicState,
-    RenderPass,
-    Query,
-    Predication,
-    WriteBufferImmediate,
-    TemporalUpscale,
-    UnsupportedNative,
-    Draw,
-    Dispatch,
-    ExecuteIndirect,
-    ExecuteBundle,
-    Copy,
-    Resolve,
-    MapResource,
-    UnmapResource,
-  };
+  using ReplayCommandKind = trace::CompiledCommandKind;
 
   struct ReplayCommandRecord {
     ReplayCommandKind kind = ReplayCommandKind::Unknown;
@@ -146,7 +111,7 @@ public:
     trace::ObjectId queue_object_id = 0;
     trace::ObjectId resource_object_id = 0;
     trace::ObjectId heap_object_id = 0;
-    std::string payload;
+    trace::CompiledTileMappingPayload payload;
   };
 
   std::string last_error_;
@@ -227,6 +192,14 @@ public:
     std::filesystem::path relative_path;
     std::vector<trace::BlobId> blob_refs;
     std::vector<std::uint8_t> bytes;
+  };
+
+  // Event-ordered replay consumes resource updates as they are reconstructed. Keep a compact,
+  // append-only notification instead of rescanning every resource on every command consumer.
+  // Indices are resolved immediately after replay_event(), before any later mutation can occur.
+  struct ResourceDataUpdateNotification {
+    trace::ObjectId resource_object_id = 0;
+    std::size_t update_index = 0;
   };
 
   struct DeviceSemanticState {
@@ -968,6 +941,11 @@ private:
   // per-version native resources and resolve by sequence. See bugs.md BUG-20260614-004.
   std::vector<ResourceSemanticState> resource_versions_;
   std::unordered_map<trace::ObjectId, std::size_t> live_resource_version_indices_;
+  // Event-ordered retrace applies each update chronologically and never needs the duplicate
+  // lifetime/live-resource copies used by the persisted replay model. A deque keeps update
+  // addresses stable while notifications and the native timeline reference the single owner.
+  std::deque<ResourceDataUpdate> event_ordered_resource_data_updates_;
+  std::vector<ResourceDataUpdateNotification> resource_data_update_notifications_;
   // Index over resource_versions_ keyed by object_id, each value sorted ascending by create_sequence.
   // Built once (after reconstruction or model load) so GPU-virtual-address resolution can find the
   // version live at a command's sequence in O(log versions-per-id) instead of scanning the whole

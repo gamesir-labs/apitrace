@@ -21,13 +21,28 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       return true;
     case trace::BoundaryKind::Present:
     {
-      json boundary_payload;
-      if (!payload_to_json(event, boundary_payload, last_error_)) {
+      const json *boundary_payload_ptr = payload_to_json_cached_ref(event, last_error_);
+      if (!boundary_payload_ptr) {
+        return false;
+      }
+      const auto &boundary_payload = *boundary_payload_ptr;
+      if (!require_payload_key(event, boundary_payload, "frame_index", last_error_) ||
+          !require_payload_key(event, boundary_payload, "sync_interval", last_error_) ||
+          !require_payload_key(event, boundary_payload, "flags", last_error_)) {
         return false;
       }
       const auto frame_index = payload_u64(boundary_payload, "frame_index", presents_seen_);
-      const auto semantic = present_semantics_.find(frame_index);
-      (void)semantic;
+      if (frame_index != presents_seen_) {
+        last_error_ = record_prefix(event) + ": Present boundary frame_index is not contiguous";
+        return false;
+      }
+      if (!validate_present_semantic_match(
+              event,
+              frame_index,
+              payload_u32(boundary_payload, "sync_interval"),
+              payload_u32(boundary_payload, "flags"))) {
+        return false;
+      }
       ++presents_seen_;
       submissions_.mark_present(event.callsite.sequence, frame_index);
       if (submissions_.has_open_batch()) {
@@ -48,10 +63,24 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     }
   }
 
-	  json payload;
-	  if (!payload_to_json(event, payload, last_error_)) {
-	    return false;
+	  json compiled_payload_placeholder = json::object();
+	  const json *payload_ptr = &compiled_payload_placeholder;
+	  if (event.payload_encoding == trace::EventPayloadEncoding::CompiledTileMappings ||
+	      event.payload_encoding == trace::EventPayloadEncoding::CompiledResourceDataUpdate) {
+	    if ((event.payload_encoding == trace::EventPayloadEncoding::CompiledTileMappings &&
+	         event.dispatch_route != trace::CompiledDispatchRoute::UpdateTileMappings) ||
+	        (event.payload_encoding == trace::EventPayloadEncoding::CompiledResourceDataUpdate &&
+	         event.dispatch_route != trace::CompiledDispatchRoute::ResourceDataUpdate)) {
+	      last_error_ = record_prefix(event) + ": typed payload has the wrong dispatch route";
+	      return false;
+	    }
+	  } else {
+	    payload_ptr = payload_to_json_cached_ref(event, last_error_);
+	    if (!payload_ptr) {
+	      return false;
+	    }
 	  }
+	  const auto &payload = *payload_ptr;
 	  if (event.kind == trace::EventKind::Call &&
 	      event.object_refs.empty() &&
 	      event.blob_refs.empty() &&
@@ -200,7 +229,10 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
   }
 
   const auto &function_name = event.callsite.function_name;
-  const auto replay_command_kind = replay_command_kind_for(function_name);
+  const auto replay_command_kind =
+      event.command_kind != trace::CompiledCommandKind::Unknown
+          ? event.command_kind
+          : replay_command_kind_for(function_name);
   const auto command_list_id = event.object_refs.empty() ? trace::ObjectId{} : event.object_refs.front();
   const bool command_list_method = function_name.rfind("ID3D12GraphicsCommandList", 0) == 0;
   if (command_list_method &&
@@ -220,7 +252,10 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     last_error_ = record_prefix(event) + ": command-list call outside a recording interval";
     return false;
   }
-  if (replay_command_kind != ReplayCommandKind::Unknown) {
+  // Chronological native replay consumes each compiled command immediately. Retaining another
+  // copy of every function name, object-ref vector, and payload made retrace memory grow with the
+  // entire trace even though this history is only needed by validate-only/final-model paths.
+  if (!event_ordered_init_ && replay_command_kind != ReplayCommandKind::Unknown) {
     ReplayCommandRecord command;
     command.kind = replay_command_kind;
     command.sequence = event.callsite.sequence;
@@ -711,7 +746,9 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       return false;
     }
     required_pipeline_paths.insert(required_pipeline_paths.end(), shader_paths.begin(), shader_paths.end());
-    if (!verify_event_blob_refs_cover_paths(event, required_pipeline_paths, blob_paths_, last_error_)) {
+    if (!event_ordered_init_ &&
+        !verify_event_blob_refs_cover_paths(
+            event, required_pipeline_paths, blob_paths_, last_error_)) {
       return false;
     }
     PipelineSemanticState pipeline;
@@ -939,7 +976,9 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         last_error_ = record_prefix(event) + ": root signature asset is missing blob_refs";
         return false;
       }
-      if (!verify_event_blob_refs_cover_paths(event, {root_signature.relative_path}, blob_paths_, last_error_)) {
+      if (!event_ordered_init_ &&
+          !verify_event_blob_refs_cover_paths(
+              event, {root_signature.relative_path}, blob_paths_, last_error_)) {
         return false;
       }
       std::string asset_error;
@@ -3315,8 +3354,12 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     resource_it->second.mapped_subresource = payload_u32(payload, "subresource");
     resource_it->second.map_sequence = event.callsite.sequence;
     ++semantic_calls_seen_;
-  } else if (function_name == "ID3D12Resource::Unmap") {
-    if (!require_payload_key(event, payload, "subresource", last_error_)) {
+  } else if (function_name == "ID3D12Resource::Unmap" ||
+             function_name == "apitrace::D3D12ResourceDataUpdate") {
+    const bool api_unmap = function_name == "ID3D12Resource::Unmap";
+    const bool compiled_update =
+        event.payload_encoding == trace::EventPayloadEncoding::CompiledResourceDataUpdate;
+    if (!compiled_update && !require_payload_key(event, payload, "subresource", last_error_)) {
       return false;
     }
     if (event.object_refs.empty() || event.object_refs.front() == 0) {
@@ -3328,18 +3371,27 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       last_error_ = record_prefix(event) + ": Unmap references an unknown replay resource";
       return false;
     }
-    const auto subresource = payload_u32(payload, "subresource");
-    if (resource_it->second.mapped && resource_it->second.mapped_subresource != subresource) {
+    const auto subresource = compiled_update
+                                 ? event.compiled_resource_data_update.subresource
+                                 : payload_u32(payload, "subresource");
+    if (api_unmap && resource_it->second.mapped &&
+        resource_it->second.mapped_subresource != subresource) {
       last_error_ = record_prefix(event) + ": Unmap subresource does not match prior Map";
       return false;
     }
-    const auto buffer_path = payload_string(payload, "buffer_path");
+    const auto buffer_path = compiled_update
+                                 ? event.compiled_resource_data_update.buffer_path
+                                 : payload_string(payload, "buffer_path");
     if (!buffer_path.empty() && !std::filesystem::is_regular_file(bundle_root_ / buffer_path)) {
       last_error_ = record_prefix(event) + ": missing mapped buffer asset " + buffer_path;
       return false;
     }
-    const auto written_begin = payload_u64(payload, "written_begin");
-    const auto written_end = payload_u64(payload, "written_end", written_begin);
+    const auto written_begin = compiled_update
+                                   ? event.compiled_resource_data_update.written_begin
+                                   : payload_u64(payload, "written_begin");
+    const auto written_end = compiled_update
+                                 ? event.compiled_resource_data_update.written_end
+                                 : payload_u64(payload, "written_end", written_begin);
     if (written_end < written_begin) {
       last_error_ = record_prefix(event) + ": Unmap written range is invalid";
       return false;
@@ -3349,7 +3401,9 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         last_error_ = record_prefix(event) + ": Unmap buffer asset is missing blob_refs";
         return false;
       }
-      if (!verify_event_blob_refs_cover_paths(event, {std::filesystem::path(buffer_path)}, blob_paths_, last_error_)) {
+      if (!event_ordered_init_ &&
+          !verify_event_blob_refs_cover_paths(
+              event, {std::filesystem::path(buffer_path)}, blob_paths_, last_error_)) {
         return false;
       }
       const auto absolute_buffer_path = bundle_root_ / buffer_path;
@@ -3361,7 +3415,9 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       }
       ResourceDataUpdate update;
       update.sequence = event.callsite.sequence;
-      update.apply_sequence = payload_u64(payload, "apply_sequence");
+      update.apply_sequence = compiled_update
+                                  ? event.compiled_resource_data_update.apply_sequence
+                                  : payload_u64(payload, "apply_sequence");
       update.subresource = subresource;
       update.written_begin = written_begin;
       update.written_end = written_end;
@@ -3373,8 +3429,10 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         return false;
       }
     }
-    resource_it->second.mapped = false;
-    resource_it->second.map_sequence = 0;
+    if (api_unmap) {
+      resource_it->second.mapped = false;
+      resource_it->second.map_sequence = 0;
+    }
     ++semantic_calls_seen_;
   } else if (function_name == "ID3D12GraphicsCommandList::ResolveQueryDataResult") {
     if (!require_payload_key(event, payload, "dst_buffer_object_id", last_error_) ||
@@ -3402,7 +3460,9 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
         asset_error = "ResolveQueryDataResult buffer asset is missing blob_refs";
       } else {
         std::string blob_ref_error;
-        if (verify_event_blob_refs_cover_paths(event, {std::filesystem::path(buffer_path)}, blob_paths_, blob_ref_error)) {
+        if (event_ordered_init_ ||
+            verify_event_blob_refs_cover_paths(
+                event, {std::filesystem::path(buffer_path)}, blob_paths_, blob_ref_error)) {
           loaded_from_asset = read_exact_asset_bytes(bundle_root_ / buffer_path, resolved_size, bytes, asset_error);
         } else {
           asset_error = blob_ref_error;
@@ -3482,15 +3542,6 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
       last_error_ = record_prefix(event) + ": UpdateTileMappings missing resource object id";
       return false;
     }
-    if (!require_payload_key(event, payload, "region_count", last_error_) ||
-        !require_payload_key(event, payload, "range_count", last_error_) ||
-        !require_payload_key(event, payload, "regions", last_error_) ||
-        !require_payload_key(event, payload, "region_sizes", last_error_) ||
-        !require_payload_key(event, payload, "range_flags", last_error_) ||
-        !require_payload_key(event, payload, "heap_range_offsets", last_error_) ||
-        !require_payload_key(event, payload, "range_tile_counts", last_error_)) {
-      return false;
-    }
     const auto resource_object_id = event.object_refs[1];
     if (resources_.find(resource_object_id) == resources_.end()) {
       last_error_ = record_prefix(event) + ": UpdateTileMappings references an unknown resource";
@@ -3506,7 +3557,75 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
     update.queue_object_id = event.object_refs.empty() ? trace::ObjectId{} : event.object_refs.front();
     update.resource_object_id = resource_object_id;
     update.heap_object_id = heap_object_id;
-    update.payload = event.payload;
+    if (event.payload_encoding == trace::EventPayloadEncoding::CompiledTileMappings) {
+      update.payload = event.compiled_tile_mapping;
+    } else {
+      if (!require_payload_key(event, payload, "region_count", last_error_) ||
+          !require_payload_key(event, payload, "range_count", last_error_) ||
+          !require_payload_key(event, payload, "regions", last_error_) ||
+          !require_payload_key(event, payload, "region_sizes", last_error_) ||
+          !require_payload_key(event, payload, "range_flags", last_error_) ||
+          !require_payload_key(event, payload, "heap_range_offsets", last_error_) ||
+          !require_payload_key(event, payload, "range_tile_counts", last_error_)) {
+        return false;
+      }
+      const auto region_count = payload_u32(payload, "region_count");
+      const auto range_count = payload_u32(payload, "range_count");
+      const auto &regions = payload["regions"];
+      const auto &region_sizes = payload["region_sizes"];
+      const auto &range_flags = payload["range_flags"];
+      const auto &heap_offsets = payload["heap_range_offsets"];
+      const auto &tile_counts = payload["range_tile_counts"];
+      if (!regions.is_array() || regions.size() != region_count ||
+          !region_sizes.is_array() || region_sizes.size() != region_count ||
+          !range_flags.is_array() || range_flags.size() != range_count ||
+          !heap_offsets.is_array() || heap_offsets.size() != range_count ||
+          !tile_counts.is_array() || tile_counts.size() != range_count) {
+        last_error_ = record_prefix(event) +
+            ": UpdateTileMappings array sizes do not match region_count/range_count";
+        return false;
+      }
+      update.payload.flags = payload_u32(payload, "flags");
+      update.payload.regions.reserve(region_count);
+      update.payload.region_sizes.reserve(region_count);
+      update.payload.range_flags.reserve(range_count);
+      update.payload.heap_range_offsets.reserve(range_count);
+      update.payload.range_tile_counts.reserve(range_count);
+      for (const auto &region_json : regions) {
+        if (!region_json.is_object()) {
+          last_error_ = record_prefix(event) + ": UpdateTileMappings region must be an object";
+          return false;
+        }
+        trace::CompiledTileCoordinate region;
+        region.subresource = payload_u32(region_json, "subresource");
+        region.x = payload_u32(region_json, "x");
+        region.y = payload_u32(region_json, "y");
+        region.z = payload_u32(region_json, "z");
+        update.payload.regions.push_back(region);
+      }
+      for (const auto &size_json : region_sizes) {
+        if (!size_json.is_object()) {
+          last_error_ = record_prefix(event) + ": UpdateTileMappings region size must be an object";
+          return false;
+        }
+        trace::CompiledTileRegionSize size;
+        size.num_tiles = payload_u32(size_json, "num_tiles");
+        size.use_box = payload_bool(size_json, "use_box");
+        size.width = payload_u32(size_json, "width");
+        size.height = payload_u32(size_json, "height");
+        size.depth = payload_u32(size_json, "depth");
+        update.payload.region_sizes.push_back(size);
+      }
+      for (const auto &value : range_flags) {
+        update.payload.range_flags.push_back(static_cast<std::uint32_t>(json_u64(value)));
+      }
+      for (const auto &value : heap_offsets) {
+        update.payload.heap_range_offsets.push_back(static_cast<std::uint32_t>(json_u64(value)));
+      }
+      for (const auto &value : tile_counts) {
+        update.payload.range_tile_counts.push_back(static_cast<std::uint32_t>(json_u64(value)));
+      }
+    }
     tile_mapping_updates_.push_back(std::move(update));
     ++semantic_calls_seen_;
   } else if (function_name == "ID3D12CommandQueue::Signal" ||
@@ -3650,9 +3769,30 @@ bool D3D12ReplayBackend::replay_event(const trace::EventRecord &event)
              function_name == "DXMT::SparseTextureMappingOps" ||
              function_name == "DXMT::FenceDependencyBatch") {
     if (function_name == "IDXGISwapChain::Present" &&
-        (!require_payload_key(event, payload, "sync_interval", last_error_) ||
+        (!require_payload_key(event, payload, "frame_index", last_error_) ||
+         !require_payload_key(event, payload, "sync_interval", last_error_) ||
          !require_payload_key(event, payload, "flags", last_error_))) {
       return false;
+    }
+    if (function_name == "IDXGISwapChain::Present") {
+      const auto frame_index = payload_u64(payload, "frame_index");
+      if (frame_index != presents_seen_) {
+        last_error_ = record_prefix(event) +
+                      ": IDXGISwapChain::Present frame_index is not contiguous";
+        return false;
+      }
+      auto &semantic = present_semantics_[frame_index];
+      if (semantic.has_call) {
+        last_error_ = record_prefix(event) +
+                      ": duplicate IDXGISwapChain::Present frame_index";
+        return false;
+      }
+      semantic.frame_index = frame_index;
+      semantic.call_sequence = event.callsite.sequence;
+      semantic.sync_interval = payload_u32(payload, "sync_interval");
+      semantic.flags = payload_u32(payload, "flags");
+      semantic.result_code = event.callsite.result_code;
+      semantic.has_call = true;
     }
     ++semantic_calls_seen_;
   }

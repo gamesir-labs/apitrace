@@ -284,8 +284,38 @@ inline bool operator==(const B::CommandListSemanticState &a, const B::CommandLis
 inline bool operator==(const B::ReplayCommandRecord &a, const B::ReplayCommandRecord &b)
 { return F(kind) && F(sequence) && F(command_list_object_id) && F(object_refs) && F(function_name) && F(payload); }
 
+bool tile_mapping_payload_equal(
+    const apitrace::trace::CompiledTileMappingPayload &a,
+    const apitrace::trace::CompiledTileMappingPayload &b)
+{
+  if (a.flags != b.flags || a.regions.size() != b.regions.size() ||
+      a.region_sizes.size() != b.region_sizes.size() ||
+      a.range_flags != b.range_flags || a.heap_range_offsets != b.heap_range_offsets ||
+      a.range_tile_counts != b.range_tile_counts) {
+    return false;
+  }
+  for (std::size_t index = 0; index < a.regions.size(); ++index) {
+    const auto &left = a.regions[index];
+    const auto &right = b.regions[index];
+    if (left.subresource != right.subresource || left.x != right.x || left.y != right.y ||
+        left.z != right.z) {
+      return false;
+    }
+  }
+  for (std::size_t index = 0; index < a.region_sizes.size(); ++index) {
+    const auto &left = a.region_sizes[index];
+    const auto &right = b.region_sizes[index];
+    if (left.num_tiles != right.num_tiles || left.use_box != right.use_box ||
+        left.width != right.width || left.height != right.height || left.depth != right.depth) {
+      return false;
+    }
+  }
+  return true;
+}
+
 inline bool operator==(const B::TileMappingUpdateRecord &a, const B::TileMappingUpdateRecord &b)
-{ return F(sequence) && F(queue_object_id) && F(resource_object_id) && F(heap_object_id) && F(payload); }
+{ return F(sequence) && F(queue_object_id) && F(resource_object_id) && F(heap_object_id)
+      && tile_mapping_payload_equal(a.payload, b.payload); }
 
 inline bool operator==(const D3D12QueueWait &a, const D3D12QueueWait &b)
 { return F(queue_object_id) && F(fence_object_id) && F(fence_value) && F(sequence); }
@@ -1269,7 +1299,12 @@ struct D3D12ReplayBackendTestHook {
       record.queue_object_id = f.u64();
       record.resource_object_id = f.u64();
       record.heap_object_id = f.u64();
-      record.payload = f.str("{\"tile\":");
+      record.payload.flags = f.u32();
+      record.payload.regions.push_back({f.u32(), f.u32(), f.u32(), f.u32()});
+      record.payload.region_sizes.push_back({f.u32(), true, f.u32(), f.u32(), f.u32()});
+      record.payload.range_flags.push_back(f.u32());
+      record.payload.heap_range_offsets.push_back(f.u32());
+      record.payload.range_tile_counts.push_back(f.u32());
       backend.tile_mapping_updates_.push_back(record);
     }
   }
@@ -1412,6 +1447,4 @@ int main()
   std::cout << "d3d12 replay-model round-trip OK\n";
   return 0;
 }
-
-
 

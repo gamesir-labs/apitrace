@@ -1479,38 +1479,6 @@ std::unordered_map<std::uint64_t, std::uint64_t> merge_sideband_asset_shard(
   return blob_remap;
 }
 
-void add_asset_index_paths(
-    std::vector<std::filesystem::path> &relative_paths,
-    std::unordered_set<std::string> &seen,
-    const std::filesystem::path &asset_index_path)
-{
-  if (!std::filesystem::is_regular_file(asset_index_path)) {
-    return;
-  }
-
-  std::ifstream input(asset_index_path);
-  const auto root = json::parse(input, nullptr, false);
-  if (root.is_discarded() || !root.is_object()) {
-    return;
-  }
-
-  const auto list = root.find("assets");
-  if (list == root.end() || !list->is_array()) {
-    return;
-  }
-
-  for (const auto &entry : *list) {
-    const auto path = entry.find("path");
-    if (path != entry.end() && path->is_string()) {
-      add_checksum_candidate(relative_paths, seen, std::filesystem::path(path->get<std::string>()));
-    }
-    const auto payload_path = entry.find("payload_path");
-    if (payload_path != entry.end() && payload_path->is_string()) {
-      add_checksum_candidate(relative_paths, seen, std::filesystem::path(payload_path->get<std::string>()));
-    }
-  }
-}
-
 std::uint64_t max_metal_sequence_in_callstream(const std::filesystem::path &path)
 {
   if (!std::filesystem::is_regular_file(path))
@@ -2396,6 +2364,55 @@ public:
     enqueue(std::move(item));
   }
 
+  void write_lines(std::vector<std::string> lines)
+  {
+    if (!is_open() || lines.empty())
+      return;
+    std::vector<PendingItem> items;
+    items.reserve(lines.size());
+    std::size_t pending_size = 0;
+    for (auto &line : lines) {
+      line.push_back('\n');
+      PendingItem item;
+      item.pending_bytes = line.size();
+      pending_size += item.pending_bytes;
+      item.line = std::move(line);
+      items.push_back(std::move(item));
+    }
+    const auto wait_start_ns = monotonic_nanoseconds();
+    bool waited = false;
+    {
+      auto lock = timed_unique_lock(mutex_, lock_stats_);
+      cv_.wait(lock, [this, pending_size, &waited]() {
+        if (!(stop_ || pending_bytes_ == 0 ||
+              pending_bytes_ + pending_size <= max_pending_bytes_)) {
+          waited = true;
+        }
+        return stop_ || pending_bytes_ == 0 ||
+               pending_bytes_ + pending_size <= max_pending_bytes_;
+      });
+      if (stop_)
+        return;
+      const auto hold_start_ns = lock_stats_ ? monotonic_nanoseconds() : 0;
+      if (waited) {
+        const auto wait_ns = monotonic_nanoseconds() - wait_start_ns;
+        wait_count_.fetch_add(1, std::memory_order_relaxed);
+        wait_ns_.fetch_add(wait_ns, std::memory_order_relaxed);
+        update_atomic_max(max_wait_ns_, wait_ns);
+      }
+      enqueue_count_.fetch_add(items.size(), std::memory_order_relaxed);
+      enqueue_bytes_.fetch_add(pending_size, std::memory_order_relaxed);
+      pending_bytes_ += pending_size;
+      peak_pending_bytes_ = std::max(peak_pending_bytes_, pending_bytes_);
+      for (auto &item : items) {
+        queue_.push_back(std::move(item));
+      }
+      if (lock_stats_)
+        record_writer_lock_hold(lock_stats_, monotonic_nanoseconds() - hold_start_ns);
+    }
+    cv_.notify_one();
+  }
+
   void enqueue(PendingItem item)
   {
     const auto pending_size = item.pending_bytes;
@@ -2623,17 +2640,29 @@ private:
         }
       }
 
+      std::size_t serialized_bytes = 0;
       for (const auto &line : lines) {
-        const auto write_start_ns = monotonic_nanoseconds();
-        stream_.write(line.data(), static_cast<std::streamsize>(line.size()));
-        if (digest_valid_)
-          digest_.update(reinterpret_cast<const std::uint8_t *>(line.data()), line.size());
-        const auto write_ns = monotonic_nanoseconds() - write_start_ns;
-        write_count_.fetch_add(1, std::memory_order_relaxed);
-        write_bytes_.fetch_add(line.size(), std::memory_order_relaxed);
-        write_ns_.fetch_add(write_ns, std::memory_order_relaxed);
-        update_atomic_max(max_write_ns_, write_ns);
+        serialized_bytes += line.size();
       }
+      std::string serialized_batch;
+      serialized_batch.reserve(serialized_bytes);
+      for (auto &line : lines) {
+        serialized_batch.append(line);
+      }
+      const auto write_start_ns = monotonic_nanoseconds();
+      stream_.write(
+          serialized_batch.data(),
+          static_cast<std::streamsize>(serialized_batch.size()));
+      if (digest_valid_) {
+        digest_.update(
+            reinterpret_cast<const std::uint8_t *>(serialized_batch.data()),
+            serialized_batch.size());
+      }
+      const auto write_ns = monotonic_nanoseconds() - write_start_ns;
+      write_count_.fetch_add(lines.size(), std::memory_order_relaxed);
+      write_bytes_.fetch_add(serialized_batch.size(), std::memory_order_relaxed);
+      write_ns_.fetch_add(write_ns, std::memory_order_relaxed);
+      update_atomic_max(max_write_ns_, write_ns);
       batch.clear();
 
       {
@@ -5978,7 +6007,6 @@ struct TraceBundleWriter::Impl {
     add_asset_paths(asset_snapshot);
     add_asset_paths(metal_asset_snapshot);
 	    add_checksum_candidate(relative_paths, seen, std::filesystem::path(kAssetIndexFileName));
-	    add_asset_index_paths(relative_paths, seen, layout.asset_index_path);
 	    for (const auto &entry : known_file_digests_snapshot)
 	      add_checksum_candidate(relative_paths, seen, std::filesystem::path(entry.first));
     if (std::filesystem::is_directory(layout.root_path)) {
@@ -6112,7 +6140,10 @@ void TraceBundleWriter::set_progress_callback(ProgressCallback callback)
   }
 }
 
-bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBundleOpenMode mode)
+bool TraceBundleWriter::open(
+    const std::filesystem::path &bundle_root,
+    TraceBundleOpenMode mode,
+    const std::filesystem::path &primary_callstream_path_override)
 {
   impl_ = std::make_unique<Impl>();
   impl_->open_mode = mode;
@@ -6182,7 +6213,9 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
       impl->enqueue_asset_completion(completion);
   });
   impl_->layout.root_path = bundle_root;
-  impl_->layout.callstream_path = bundle_root / kCallstreamFileName;
+  impl_->layout.callstream_path = primary_callstream_path_override.empty()
+                                      ? bundle_root / kCallstreamFileName
+                                      : primary_callstream_path_override;
   impl_->layout.metal_callstream_path = bundle_root / kMetalCallstreamFileName;
   impl_->layout.checksums_path = bundle_root / kChecksumsFileName;
   impl_->layout.asset_index_path = bundle_root / kAssetIndexFileName;
@@ -6238,7 +6271,8 @@ bool TraceBundleWriter::open(const std::filesystem::path &bundle_root, TraceBund
     impl_->metadata_written.store(existing_primary_callstream, std::memory_order_relaxed);
     impl_->open = true;
   }
-  if (impl_->open && mode == TraceBundleOpenMode::Primary) {
+  if (impl_->open && mode == TraceBundleOpenMode::Primary &&
+      primary_callstream_path_override.empty()) {
     write_object_index({});
   } else if (impl_->open && !std::filesystem::exists(impl_->layout.object_index_path)) {
     write_object_index({});
@@ -6364,6 +6398,31 @@ void TraceBundleWriter::append_callstream_json_line(std::string_view json_line)
   }
   impl_->callstream_stream.write_line(std::string(json_line));
   impl_->signal_checkpoint_work(1, 0);
+}
+
+void TraceBundleWriter::append_callstream_json_line(std::string &&json_line)
+{
+  if (!impl_->open || !impl_->callstream_stream.is_open()) {
+    return;
+  }
+  if (!impl_->metadata_written.load(std::memory_order_acquire)) {
+    write_metadata(impl_->metadata);
+  }
+  impl_->callstream_stream.write_line(std::move(json_line));
+  impl_->signal_checkpoint_work(1, 0);
+}
+
+void TraceBundleWriter::append_callstream_json_lines(std::vector<std::string> json_lines)
+{
+  if (!impl_->open || !impl_->callstream_stream.is_open() || json_lines.empty()) {
+    return;
+  }
+  if (!impl_->metadata_written.load(std::memory_order_acquire)) {
+    write_metadata(impl_->metadata);
+  }
+  const auto line_count = json_lines.size();
+  impl_->callstream_stream.write_lines(std::move(json_lines));
+  impl_->signal_checkpoint_work(line_count, 0);
 }
 
 void TraceBundleWriter::append_metal_event(const MetalEventRecord &event)
@@ -7594,7 +7653,9 @@ void TraceBundleWriter::close()
 		    add_asset_paths(close_asset_snapshot);
 		    add_asset_paths(close_metal_asset_snapshot);
 		  }
-	  add_asset_index_paths(relative_paths, seen, impl_->layout.asset_index_path);
+	  // close_asset_snapshot and close_metal_asset_snapshot are the exact records just serialized
+	  // into assets.json above. Reparsing that potentially multi-hundred-megabyte JSON document here
+	  // only rebuilds an already available path set and dominated finalize close time and memory.
 	  for (const auto &entry : async_path_aliases)
 	    add_checksum_candidate(relative_paths, seen, std::filesystem::path(entry.second));
 	  std::sort(relative_paths.begin(), relative_paths.end());

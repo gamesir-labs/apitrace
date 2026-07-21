@@ -1,4 +1,5 @@
 #include "apitrace/trace_bundle_io.hpp"
+#include "apitrace/compiled_dispatch_io.hpp"
 #include "metal_callstream_writer.hpp"
 
 #include <nlohmann/json.hpp>
@@ -1470,6 +1471,23 @@ bool is_present_frame_blob(const EventRecord &event)
 
 } // namespace
 
+bool parse_event_record_json_line(
+    std::string_view line,
+    EventRecord &event,
+    std::string &error)
+{
+  error.clear();
+  if (parse_event_record_fast(line, event)) {
+    return true;
+  }
+  const json record = json::parse(line, nullptr, false);
+  if (record.is_discarded()) {
+    error = "invalid callstream event JSON";
+    return false;
+  }
+  return parse_event_record(record, std::filesystem::path(kCallstreamFileName), event, error);
+}
+
 struct TraceBundleReader::Impl {
   BundleLayout layout;
   TraceMetadata metadata;
@@ -1482,8 +1500,11 @@ struct TraceBundleReader::Impl {
   std::unordered_set<std::string> validated_checksum_paths;
   OpenTiming open_timing;
   std::string last_error;
+  std::filesystem::path compiled_dispatch_path;
+  std::uint64_t compiled_dispatch_source_bytes = 0;
   bool has_asset_index = false;
   bool prefix_limited = false;
+  bool compiled_dispatch_enabled = false;
   bool open = false;
 
   // TODO: track reader phases explicitly so validation, parsing, and asset discovery can fail independently.
@@ -1553,6 +1574,31 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
       if (!parse_bundle_header(record, impl_->layout.callstream_path, impl_->metadata, impl_->last_error)) {
         return false;
       }
+      if (options.use_compiled_d3d12_dispatch) {
+        const auto dispatch_path = impl_->layout.root_path / kD3D12CompiledDispatchName;
+        std::error_code source_size_error;
+        const auto source_callstream_bytes =
+            std::filesystem::file_size(impl_->layout.callstream_path, source_size_error);
+        if (source_size_error) {
+          impl_->last_error =
+              "failed to stat callstream.jsonl for compiled dispatch validation: " +
+              source_size_error.message();
+          return false;
+        }
+        CompiledDispatchHeader dispatch_header;
+        if (!inspect_compiled_dispatch(
+                dispatch_path,
+                source_callstream_bytes,
+                dispatch_header,
+                impl_->last_error)) {
+          impl_->last_error += "; run bundle-finalize to rebuild " +
+                               std::string(kD3D12CompiledDispatchName);
+          return false;
+        }
+        impl_->compiled_dispatch_path = dispatch_path;
+        impl_->compiled_dispatch_source_bytes = source_callstream_bytes;
+        impl_->compiled_dispatch_enabled = true;
+      }
       impl_->prefix_limited =
           options.stop_after_sequence != 0 ||
           options.stop_after_present_frame != 0;
@@ -1603,6 +1649,9 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
   impl_->has_asset_index = std::filesystem::is_regular_file(impl_->layout.asset_index_path);
 
   auto checksum_byte_limit = [&](const std::filesystem::path &relative_path) {
+    if (!options.enforce_checksum_byte_limits) {
+      return std::numeric_limits<std::uint64_t>::max();
+    }
     const auto entry = checksum_lookup.find(relative_path.generic_string());
     if (entry == checksum_lookup.end() || !entry->second.has_byte_size) {
       return std::numeric_limits<std::uint64_t>::max();
@@ -1941,6 +1990,40 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
   callstream_parse_timer.stop();
   register_blob_refs_secondary_target = nullptr;
 
+  if (options.use_compiled_d3d12_dispatch) {
+    if (!header_seen) {
+      impl_->last_error = file_label(impl_->layout.callstream_path) + ": missing bundle_header";
+      return false;
+    }
+    const auto dispatch_path = impl_->layout.root_path / kD3D12CompiledDispatchName;
+    std::error_code source_size_error;
+    const auto source_callstream_bytes =
+        std::filesystem::file_size(impl_->layout.callstream_path, source_size_error);
+    if (source_size_error) {
+      impl_->last_error = "failed to stat callstream.jsonl for compiled dispatch validation: " +
+                          source_size_error.message();
+      return false;
+    }
+    CompiledDispatchHeader dispatch_header;
+    {
+      ScopedDurationAccumulator dispatch_load_timer(
+          parse_callstream_total_duration,
+          options.collect_open_timing);
+      if (!inspect_compiled_dispatch(
+              dispatch_path,
+              source_callstream_bytes,
+              dispatch_header,
+              impl_->last_error)) {
+        impl_->last_error += "; run bundle-finalize to rebuild " +
+                             std::string(kD3D12CompiledDispatchName);
+        return false;
+      }
+    }
+    impl_->compiled_dispatch_path = dispatch_path;
+    impl_->compiled_dispatch_source_bytes = source_callstream_bytes;
+    impl_->compiled_dispatch_enabled = true;
+  }
+
   if (!header_seen) {
     impl_->last_error = file_label(impl_->layout.callstream_path) + ": missing bundle_header";
     return false;
@@ -1972,6 +2055,17 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
               options.validate_checksum_contents)) {
         return false;
       }
+    }
+    if (options.use_compiled_d3d12_dispatch &&
+        !validate_checksum_entry(
+            impl_->layout.root_path,
+            std::filesystem::path(kD3D12CompiledDispatchName),
+            checksum_lookup,
+            impl_->layout.checksums_path,
+            validated_checksum_paths,
+            impl_->last_error,
+            options.validate_checksum_contents)) {
+      return false;
     }
 
     for (const auto &asset : impl_->assets) {
@@ -2092,6 +2186,35 @@ const TraceMetadata &TraceBundleReader::metadata() const noexcept
 const std::vector<EventRecord> &TraceBundleReader::events() const noexcept
 {
   return impl_->events;
+}
+
+bool TraceBundleReader::for_each_event(
+    const std::function<bool(const EventRecord &event)> &callback,
+    std::string &error) const
+{
+  error.clear();
+  if (!impl_ || !impl_->open) {
+    error = "trace bundle reader is not open";
+    return false;
+  }
+  if (!callback) {
+    error = "trace event callback is empty";
+    return false;
+  }
+  if (impl_->compiled_dispatch_enabled) {
+    return for_each_compiled_dispatch_event(
+        impl_->compiled_dispatch_path,
+        impl_->compiled_dispatch_source_bytes,
+        callback,
+        nullptr,
+        error);
+  }
+  for (const auto &event : impl_->events) {
+    if (!callback(event)) {
+      break;
+    }
+  }
+  return true;
 }
 
 const std::vector<MetalEventRecord> &TraceBundleReader::metal_events() const noexcept

@@ -198,12 +198,13 @@
       return;
     }
 
-    json payload;
     std::string error;
-    if (!payload_to_json(event, payload, error)) {
+    const json *payload_ptr = payload_to_json_cached_ref(event, error);
+    if (!payload_ptr) {
       event_ordered_record_materialize_error(event, std::move(error));
       return;
     }
+    const auto &payload = *payload_ptr;
 
     const auto descriptor = payload_u64(payload, "descriptor");
     const auto *semantic =
@@ -224,12 +225,13 @@
 
   void materialize_create_descriptor_view_batch(const trace::EventRecord &event)
   {
-    json payload;
     std::string error;
-    if (!payload_to_json(event, payload, error)) {
+    const json *payload_ptr = payload_to_json_cached_ref(event, error);
+    if (!payload_ptr) {
       event_ordered_record_materialize_error(event, std::move(error));
       return;
     }
+    const auto &payload = *payload_ptr;
     if (payload_string(payload, "schema") != "descriptor-view-v2") {
       event_ordered_record_materialize_error(
           event,
@@ -293,12 +295,13 @@
 
   void materialize_create_sampler(const trace::EventRecord &event)
   {
-    json payload;
     std::string error;
-    if (!payload_to_json(event, payload, error)) {
+    const json *payload_ptr = payload_to_json_cached_ref(event, error);
+    if (!payload_ptr) {
       event_ordered_record_materialize_error(event, std::move(error));
       return;
     }
+    const auto &payload = *payload_ptr;
 
     const auto descriptor = payload_u64(payload, "descriptor");
     const auto *semantic = event_ordered_find_sampler_semantic(event.callsite.sequence, descriptor);

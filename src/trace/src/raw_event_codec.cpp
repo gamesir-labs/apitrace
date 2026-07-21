@@ -386,14 +386,26 @@ bool decode_resource_unmap(
   std::uint64_t raw_blob_id = 0;
   std::uint64_t written_begin = 0;
   std::uint64_t written_end = 0;
+  std::uint8_t api_call_flag = 0;
   if (!cursor.u64(resource) ||
       !cursor.u64(raw_blob_id) ||
       !cursor.u64(written_begin) ||
-      !cursor.u64(written_end) ||
-      !cursor.done()) {
+      !cursor.u64(written_end)) {
     error = "malformed ResourceUnmap payload";
     return false;
   }
+  // Legacy v1 records ended after written_end and overloaded ResourceUnmap for capture-side
+  // content snapshots. New records append an explicit API-call bit so retrace can distinguish a
+  // game Unmap from an internal byte update without changing the raw contract version.
+  if (!cursor.done() && !cursor.u8(api_call_flag)) {
+    error = "malformed ResourceUnmap api_call flag";
+    return false;
+  }
+  if (!cursor.done()) {
+    error = "malformed ResourceUnmap trailing payload bytes";
+    return false;
+  }
+  const bool api_call = api_call_flag != 0;
 
   AssetRecord asset;
   if (!materialize_raw_blob(context, raw_blob_id, AssetKind::Buffer, "d3d12-resource-unmap", asset, error)) {
@@ -403,7 +415,8 @@ bool decode_resource_unmap(
   auto &event = decoded.event;
   stamp_common(event, record);
   event.kind = EventKind::Call;
-  event.callsite.function_name = "ID3D12Resource::Unmap";
+  event.callsite.function_name =
+      api_call ? "ID3D12Resource::Unmap" : "apitrace::D3D12ResourceDataUpdate";
   event.callsite.result_code = static_cast<std::int32_t>(record.header.result_or_flags);
   event.object_refs = {resource};
   event.blob_refs = {asset.blob_id};
@@ -412,7 +425,10 @@ bool decode_resource_unmap(
                   ",\"written_begin\":" + std::to_string(written_begin) +
                   ",\"written_end\":" + std::to_string(written_end) +
                   ",\"written_size\":" + std::to_string(written_end - written_begin) +
-                  ",\"buffer_path\":\"" + asset.relative_path.generic_string() + "\"}";
+                  ",\"buffer_path\":\"" + asset.relative_path.generic_string() + "\"" +
+                  (api_call ? ",\"api_call\":true" :
+                              ",\"capture_reason\":\"mapped_resource_snapshot\"") +
+                  "}";
   decoded.assets.push_back(std::move(asset));
   return true;
 }
@@ -663,6 +679,7 @@ bool decode_passthrough_final_json(
     return false;
   }
 
+  stamp_common(decoded.event, record);
   decoded.passthrough = true;
   decoded.passthrough_jsonl_record.assign(
       reinterpret_cast<const char *>(record.payload.data()),
@@ -719,6 +736,7 @@ bool decode_passthrough_with_blob(
     return false;
   }
 
+  stamp_common(decoded.event, record);
   decoded.passthrough = true;
   decoded.passthrough_jsonl_record = std::move(final_jsonl_record);
   return true;
@@ -734,7 +752,7 @@ std::string raw_event_contract_markdown()
       "All integer fields are little-endian. RawEventHeader carries sequence, thread_id, timestamp_or_monotonic_counter, opcode, result_or_flags, and payload_len. Payloads never contain JSON, hashes, canonical paths, or dedup state.\n"
       "\n"
       "- ResourceCreate 0x0101: u64 device_object_id, u64 resource_object_id, u64 dimension, u64 width, u32 height, u16 depth_or_array_size, u16 mip_levels, u32 format, u32 flags, u32 initial_state, str debug_name.\n"
-      "- ResourceUnmap 0x0102: u64 resource_object_id, u64 raw_blob_id, u64 written_begin, u64 written_end. raw_blob_id must reference RawBlobKind::Buffer.\n"
+      "- ResourceUnmap 0x0102: u64 resource_object_id, u64 raw_blob_id, u64 written_begin, u64 written_end, optional u8 api_call. raw_blob_id must reference RawBlobKind::Buffer. api_call=1 preserves an application ID3D12Resource::Unmap; api_call=0 is an internal D3D12ResourceDataUpdate and must not emit an Unmap during retrace.\n"
       "- GraphicsPipelineCreate 0x0201: u64 device_object_id, u64 root_signature_object_id, u64 pipeline_state_object_id, u64 vs_raw_blob_id, u64 vs_bytecode_size, u64 ps_raw_blob_id, u64 ps_bytecode_size, u32 node_mask, u32 flags, u32 payload_flags. Shader raw blobs carry bytecode bytes; finalize emits existing pso_raw_version payload and later rebuilds pipeline_path.\n"
       "- DrawInstanced 0x0301: u64 command_list_object_id, u32 vertex_count_per_instance, u32 instance_count, u32 start_vertex_location, u32 start_instance_location.\n"
       "- Dispatch 0x0302: u64 command_list_object_id, u32 thread_group_count_x, u32 thread_group_count_y, u32 thread_group_count_z.\n"
@@ -776,13 +794,15 @@ std::vector<std::uint8_t> encode_resource_unmap_payload(
     ObjectId resource_object_id,
     std::uint64_t raw_blob_id,
     std::uint64_t written_begin,
-    std::uint64_t written_end)
+    std::uint64_t written_end,
+    bool api_call)
 {
   std::vector<std::uint8_t> bytes;
   put_u64(bytes, resource_object_id);
   put_u64(bytes, raw_blob_id);
   put_u64(bytes, written_begin);
   put_u64(bytes, written_end);
+  put_u8(bytes, api_call ? 1 : 0);
   return bytes;
 }
 

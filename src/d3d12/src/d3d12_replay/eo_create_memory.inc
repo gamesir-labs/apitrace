@@ -1,7 +1,8 @@
   void materialize_create_memory(const trace::EventRecord &event)
   {
     const std::string_view function_name(event.callsite.function_name);
-    if (event_ordered_contains(function_name, "CreateHeap")) {
+    if (event_ordered_contains(function_name, "CreateHeap") ||
+        event_ordered_contains(function_name, "OpenExistingHeap")) {
       materialize_create_heap(event);
       return;
     }
@@ -20,6 +21,7 @@
                              " fn=" + event_ordered_event_name(event) +
                              " " + error;
     backend_.last_error_ = std::move(error);
+    event_ordered_failed_ = true;
     event_ordered_log(line);
   }
 

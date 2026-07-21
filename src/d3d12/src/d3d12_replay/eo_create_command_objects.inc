@@ -371,12 +371,13 @@
       return;
     }
 
-    json payload;
     std::string error;
-    if (!payload_to_json(event, payload, error)) {
+    const json *payload_ptr = payload_to_json_cached_ref(event, error);
+    if (!payload_ptr) {
       event_ordered_record_materialize_error(event, std::move(error));
       return;
     }
+    const auto &payload = *payload_ptr;
 
     NativeCommandList native;
     native.type = type;

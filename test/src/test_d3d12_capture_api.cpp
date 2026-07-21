@@ -512,7 +512,7 @@ bool verify_mapped_root_cbv_capture(const std::filesystem::path &bundle)
     if (function == "ID3D12GraphicsCommandList::DrawInstanced") {
       found_draw = true;
     }
-    if (function != "ID3D12Resource::Unmap") {
+    if (function != "apitrace::D3D12ResourceDataUpdate") {
       continue;
     }
     const auto payload = record.value("payload", nlohmann::json::object());
@@ -552,7 +552,7 @@ bool verify_mapped_descriptor_cbv_capture(const std::filesystem::path &bundle)
       continue;
     }
     const auto function = record.value("function", std::string());
-    if (function == "ID3D12Resource::Unmap") {
+    if (function == "apitrace::D3D12ResourceDataUpdate") {
       const auto payload = record.value("payload", nlohmann::json::object());
       if (payload.is_object() &&
           payload.value("written_begin", UINT64_MAX) == 0x100 &&
@@ -645,6 +645,8 @@ int main(int argc, char **argv)
   auto *second_swapchain = fake_object(0x4000);
   auto *descriptor_heap = fake_object(0x4500);
   auto *command_list = fake_object(0x7000);
+  auto *second_command_list = fake_object(0xd100);
+  auto *command_queue = fake_object(0xd000);
   auto *copy_src = fake_object(0x7600);
   auto *copy_dst = fake_object(0x7800);
 
@@ -692,6 +694,27 @@ int main(int argc, char **argv)
       apitrace::d3d12::CaptureObjectKind::CommandList,
       device,
       "ID3D12GraphicsCommandList");
+  apitrace::d3d12::record_object_create(
+      second_command_list,
+      apitrace::d3d12::CaptureObjectKind::CommandList,
+      device,
+      "ID3D12GraphicsCommandList");
+  apitrace::d3d12::record_object_create(
+      command_queue,
+      apitrace::d3d12::CaptureObjectKind::CommandQueue,
+      device,
+      "ID3D12CommandQueue");
+  ID3D12CommandList *submitted_lists[] = {
+      reinterpret_cast<ID3D12CommandList *>(command_list),
+      reinterpret_cast<ID3D12CommandList *>(second_command_list),
+  };
+  if (apitrace::d3d12::record_execute_command_lists(
+          command_queue, 2, submitted_lists) == 0) {
+    std::cerr << "failed to record batched ExecuteCommandLists capture api call\n";
+    clear_trace_bundle_env();
+    apitrace::runtime::shutdown_process_trace_session();
+    return 1;
+  }
   D3D12_HEAP_PROPERTIES default_heap_properties = {};
   default_heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
   D3D12_RESOURCE_DESC texture_desc = {};
@@ -1091,6 +1114,7 @@ int main(int argc, char **argv)
       !has_call(reader, "ID3D12Device::CreateDescriptorViewBatch") ||
       !has_call(reader, "ID3D12GraphicsCommandList::ResourceBarrierBatch") ||
       !has_call(reader, "ID3D12GraphicsCommandList::CopyTextureRegionBatch") ||
+      !has_call(reader, "ID3D12CommandQueue::ExecuteCommandLists") ||
       !has_call(reader, "ID3D12Device::CreateQueryHeap") ||
       !has_call(reader, "ID3D12Device2::CreatePipelineState") ||
       !has_call(reader, "ID3D12GraphicsCommandList::BeginQuery") ||
@@ -1098,6 +1122,20 @@ int main(int argc, char **argv)
       !has_call(reader, "ID3D12GraphicsCommandList4::BeginRenderPass") ||
       !has_call(reader, "ID3D12GraphicsCommandList4::EndRenderPass")) {
     std::cerr << "capture api bundle is missing expected D3D12/DXGI calls\n";
+    return 1;
+  }
+
+  const auto *execute_event =
+      find_call(reader, "ID3D12CommandQueue::ExecuteCommandLists");
+  const auto execute_payload =
+      nlohmann::json::parse(execute_event->payload, nullptr, false);
+  if (execute_payload.is_discarded() ||
+      execute_payload.value("command_list_count", 0u) != 2 ||
+      execute_event->object_refs.size() != 3 ||
+      execute_event->object_refs[0] != apitrace::d3d12::object_id(command_queue) ||
+      execute_event->object_refs[1] != apitrace::d3d12::object_id(command_list) ||
+      execute_event->object_refs[2] != apitrace::d3d12::object_id(second_command_list)) {
+    std::cerr << "ExecuteCommandLists did not preserve its original list array\n";
     return 1;
   }
 

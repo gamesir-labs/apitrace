@@ -2317,7 +2317,7 @@ bool ReplaySession::run()
   reader_options.validate_checksum_contents = false;
   const bool d3d12_event_ordered_replay =
       !impl_->options.enable_metal_retrace &&
-      env_enabled("APITRACE_D3D12_RETRACE_EVENT_ORDERED");
+      !impl_->options.validate_only;
   const bool d3d12_event_ordered_perf_diag = std::getenv("DXMT_PERF_STATS") != nullptr;
   const bool d3d12_can_try_replay_model =
       !impl_->options.enable_metal_retrace &&
@@ -2368,7 +2368,16 @@ bool ReplaySession::run()
     reader_options.discover_referenced_assets = false;
   }
   if (d3d12_event_ordered_replay) {
-    reader_options.parse_callstream_events = true;
+    // Native D3D12 consumes the finalized binary dispatch stream. The readable JSONL remains the
+    // authority, but retrace must not repeat finalize's top-level or payload JSON parsing work.
+    reader_options.stop_after_sequence = 0;
+    reader_options.stop_after_present_frame = 0;
+    reader_options.extend_stop_after_sequence_to_command_list_submit = false;
+    reader_options.wait_for_present_frame_blob = false;
+    reader_options.parse_callstream_events = false;
+    reader_options.metadata_only = true;
+    reader_options.discover_referenced_assets = false;
+    reader_options.use_compiled_d3d12_dispatch = true;
     reader_options.collect_open_timing = d3d12_event_ordered_perf_diag;
   }
   const auto open_begin = std::chrono::steady_clock::now();
@@ -2484,7 +2493,7 @@ bool ReplaySession::run()
 
     if (d3d12_event_ordered_replay) {
       impl_->statistics.backend_name += "-event-ordered";
-      milestone_log("model:skipped — APITRACE_D3D12_RETRACE_EVENT_ORDERED set");
+      milestone_log("model:skipped — chronological event-ordered replay is the default native path");
       backend.set_event_ordered_timing_enabled(true);
       backend.set_event_ordered_init(true);
       const auto backend_init_begin = std::chrono::steady_clock::now();
@@ -2550,16 +2559,20 @@ bool ReplaySession::run()
       std::error_code model_ec;
       if (std::filesystem::exists(model_json_path, model_ec) &&
           std::filesystem::exists(model_blob_path, model_ec)) {
-        // Trust the persisted model as valid input: finalize and retrace are a configured pipeline,
-        // so the model is bound to the callstream it was built from by construction. We deliberately
-        // do NOT re-hash the (multi-GB) source to detect a user swapping in a mismatched callstream;
-        // that is user error to own, not a per-retrace cost to pay. Pass an empty expected hash to
-        // skip the staleness check. schema_version still guards serialization-format mismatch (our
-        // own concern), so a model written by older code is still rejected and falls back to rebuild.
-        const std::string expected_source_bundle_hash;
+        // Bind the model to the append-only callstream's byte size. This costs one stat rather than
+        // re-hashing a multi-GB stream, while still rejecting a model captured from an earlier file
+        // extent when finalize raced a writer that was still appending frames.
+        std::error_code source_identity_error;
+        const std::string expected_source_bundle_hash =
+            trace::replay_model_source_identity(
+                impl_->options.bundle_root, source_identity_error);
         const auto model_load_begin = std::chrono::steady_clock::now();
         std::string model_error;
-        if (backend.load_replay_model(
+        if (source_identity_error) {
+          model_error = "failed to stat callstream for replay-model identity: " +
+                        source_identity_error.message();
+        }
+        if (!source_identity_error && backend.load_replay_model(
                 model_json_path, model_blob_path, expected_source_bundle_hash, model_error)) {
           // Account the load against backend_init_ms; reconstruction is skipped (event_replay_ms = 0).
           impl_->statistics.backend_init_ms = elapsed_ms(model_load_begin);

@@ -1,4 +1,5 @@
 #include "apitrace/asset_index.hpp"
+#include "apitrace/compiled_dispatch_io.hpp"
 #include "apitrace/raw_capture_io.hpp"
 #include "apitrace/raw_event_codec.hpp"
 #include "apitrace/trace_bundle_io.hpp"
@@ -37,6 +38,127 @@ bool expect(bool condition, const char *message)
   return true;
 }
 
+bool validate_compiled_tile_mapping_codec(const std::filesystem::path &path)
+{
+  apitrace::trace::EventRecord input;
+  input.kind = apitrace::trace::EventKind::Call;
+  input.callsite.sequence = 77;
+  input.callsite.function_name = "ID3D12CommandQueue::UpdateTileMappings";
+  input.object_refs = {10, 20, 30};
+  input.payload = R"({"region_count":1,"range_count":2,"flags":3,"regions":[{"subresource":4,"x":5,"y":6,"z":7}],"region_sizes":[{"num_tiles":8,"use_box":true,"width":9,"height":10,"depth":11}],"range_flags":[12,13],"heap_range_offsets":[14,15],"range_tile_counts":[16,17]})";
+
+  std::vector<std::uint8_t> encoded;
+  std::string error;
+  if (!expect(
+          apitrace::trace::encode_compiled_dispatch_event(input, encoded, error),
+          "failed to compile typed UpdateTileMappings payload")) {
+    std::cerr << error << "\n";
+    return false;
+  }
+  apitrace::trace::CompiledDispatchHeader header;
+  header.source_callstream_bytes = 123;
+  header.record_count = 1;
+  header.encoded_record_bytes = encoded.size();
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  if (!expect(
+          output.is_open() && apitrace::trace::write_compiled_dispatch_header(output, header, error),
+          "failed to write typed UpdateTileMappings dispatch header")) {
+    std::cerr << error << "\n";
+    return false;
+  }
+  output.write(reinterpret_cast<const char *>(encoded.data()), encoded.size());
+  output.close();
+
+  bool visited = false;
+  bool payload_ok = false;
+  const bool decoded = apitrace::trace::for_each_compiled_dispatch_event(
+      path,
+      header.source_callstream_bytes,
+      [&](const apitrace::trace::EventRecord &event) {
+        visited = true;
+        const auto &payload = event.compiled_tile_mapping;
+        payload_ok = event.payload_encoding ==
+                         apitrace::trace::EventPayloadEncoding::CompiledTileMappings &&
+                     event.dispatch_route ==
+                         apitrace::trace::CompiledDispatchRoute::UpdateTileMappings &&
+                     event.payload.empty() && payload.flags == 3 && payload.regions.size() == 1 &&
+                     payload.regions[0].subresource == 4 && payload.regions[0].x == 5 &&
+                     payload.regions[0].y == 6 && payload.regions[0].z == 7 &&
+                     payload.region_sizes.size() == 1 && payload.region_sizes[0].num_tiles == 8 &&
+                     payload.region_sizes[0].use_box && payload.region_sizes[0].width == 9 &&
+                     payload.region_sizes[0].height == 10 && payload.region_sizes[0].depth == 11 &&
+                     payload.range_flags == std::vector<std::uint32_t>({12, 13}) &&
+                     payload.heap_range_offsets == std::vector<std::uint32_t>({14, 15}) &&
+                     payload.range_tile_counts == std::vector<std::uint32_t>({16, 17});
+        return true;
+      },
+      nullptr,
+      error);
+  if (!decoded) {
+    std::cerr << error << "\n";
+  }
+  return expect(decoded && visited && payload_ok, "typed UpdateTileMappings dispatch roundtrip failed");
+}
+
+bool validate_compiled_resource_data_update_codec(const std::filesystem::path &path)
+{
+  apitrace::trace::EventRecord input;
+  input.kind = apitrace::trace::EventKind::Call;
+  input.callsite.sequence = 88;
+  input.callsite.function_name = "apitrace::D3D12ResourceDataUpdate";
+  input.object_refs = {42};
+  input.blob_refs = {7};
+  input.payload = R"({"resource_object_id":42,"apply_sequence":99,"subresource":3,"written_begin":16,"written_end":80,"written_size":64,"buffer_path":"buffers/update.buffer"})";
+
+  std::vector<std::uint8_t> encoded;
+  std::string error;
+  if (!expect(
+          apitrace::trace::encode_compiled_dispatch_event(input, encoded, error),
+          "failed to compile typed ResourceDataUpdate payload")) {
+    std::cerr << error << "\n";
+    return false;
+  }
+  apitrace::trace::CompiledDispatchHeader header;
+  header.source_callstream_bytes = 456;
+  header.record_count = 1;
+  header.encoded_record_bytes = encoded.size();
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  if (!expect(
+          output.is_open() && apitrace::trace::write_compiled_dispatch_header(output, header, error),
+          "failed to write typed ResourceDataUpdate dispatch header")) {
+    std::cerr << error << "\n";
+    return false;
+  }
+  output.write(reinterpret_cast<const char *>(encoded.data()), encoded.size());
+  output.close();
+
+  bool visited = false;
+  bool payload_ok = false;
+  const bool decoded = apitrace::trace::for_each_compiled_dispatch_event(
+      path,
+      header.source_callstream_bytes,
+      [&](const apitrace::trace::EventRecord &event) {
+        visited = true;
+        const auto &payload = event.compiled_resource_data_update;
+        payload_ok = event.payload_encoding ==
+                         apitrace::trace::EventPayloadEncoding::CompiledResourceDataUpdate &&
+                     event.dispatch_route ==
+                         apitrace::trace::CompiledDispatchRoute::ResourceDataUpdate &&
+                     event.payload.empty() && payload.apply_sequence == 99 &&
+                     payload.subresource == 3 && payload.written_begin == 16 &&
+                     payload.written_end == 80 && payload.buffer_path == "buffers/update.buffer";
+        return true;
+      },
+      nullptr,
+      error);
+  if (!decoded) {
+    std::cerr << error << "\n";
+  }
+  return expect(
+      decoded && visited && payload_ok,
+      "typed ResourceDataUpdate dispatch roundtrip failed");
+}
+
 std::string quote_arg(const std::filesystem::path &path)
 {
   std::string text = path.string();
@@ -73,7 +195,7 @@ bool run_command(const std::string &command)
   const auto result = std::system(command.c_str());
 #endif
   if (result != 0) {
-    std::cerr << "command failed: " << command << "\n";
+    std::cerr << "command failed with status " << result << ": " << command << "\n";
     return false;
   }
   return true;
@@ -480,6 +602,12 @@ bool compare_finalized_bundles(const std::filesystem::path &left, const std::fil
               "streaming equivalence object index mismatch")) {
     return false;
   }
+  if (!expect(
+          std::filesystem::is_regular_file(left / apitrace::trace::kD3D12CompiledDispatchName) &&
+              std::filesystem::is_regular_file(right / apitrace::trace::kD3D12CompiledDispatchName),
+          "streaming equivalence compiled dispatch missing")) {
+    return false;
+  }
   return compare_asset_file_bytes(left, right);
 }
 
@@ -541,7 +669,7 @@ bool write_synthetic_raw_capture(const std::filesystem::path &bundle)
           2,
           RawEventOpcode::ResourceCreate,
           encode_resource_create_payload(100, 200, 1, 4096, 1, 1, 1, 87, 0, 4, "synthetic-buffer")) ||
-      !append_raw_event(writer, 3, RawEventOpcode::ResourceUnmap, encode_resource_unmap_payload(200, buffer_raw_id, 0, buffer_blob.size())) ||
+      !append_raw_event(writer, 3, RawEventOpcode::ResourceUnmap, encode_resource_unmap_payload(200, buffer_raw_id, 0, buffer_blob.size(), false)) ||
       !append_raw_event(
           writer,
           4,
@@ -562,6 +690,174 @@ bool write_synthetic_raw_capture(const std::filesystem::path &bundle)
   }
   writer.close();
   return true;
+}
+
+bool write_out_of_order_raw_capture(const std::filesystem::path &bundle)
+{
+  using namespace apitrace::trace::raw;
+
+  std::filesystem::remove_all(bundle);
+  RawCaptureWriter writer;
+  if (!expect(writer.open(bundle), "failed to open out-of-order raw writer")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  if (!append_raw_event(writer, 1, RawEventOpcode::FrameBegin, encode_frame_boundary_payload(0)) ||
+      !append_raw_event(writer, 3, RawEventOpcode::DrawInstanced, encode_draw_instanced_payload(500, 3, 1, 0, 0)) ||
+      !append_raw_event(writer, 2, RawEventOpcode::Dispatch, encode_dispatch_payload(500, 2, 3, 4)) ||
+      !append_raw_event(writer, 4, RawEventOpcode::PresentCall, encode_present_payload(600, 0, 1, 0)) ||
+      !append_raw_event(writer, 5, RawEventOpcode::PresentBoundary, encode_present_payload(600, 0, 1, 0)) ||
+      !append_raw_event(writer, 6, RawEventOpcode::FrameEnd, encode_frame_boundary_payload(0))) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  if (!expect(writer.flush_commit(), "failed to commit out-of-order raw capture")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+  writer.close();
+  return true;
+}
+
+bool validate_out_of_order_raw_bundle(const std::filesystem::path &bundle)
+{
+  const auto records = read_jsonl(bundle / "callstream.jsonl");
+  std::vector<std::uint64_t> sequences;
+  std::vector<std::string> functions;
+  for (const auto &record : records) {
+    const auto sequence = record.value("sequence", 0ull);
+    if (sequence == 0) {
+      continue;
+    }
+    sequences.push_back(sequence);
+    if (record.value("record_kind", std::string()) == "call") {
+      functions.push_back(record.value("function", std::string()));
+    }
+  }
+  return expect(
+             sequences == std::vector<std::uint64_t>({1, 2, 3, 4, 5, 6}),
+             "raw event sequence order was not restored") &&
+         expect(
+             functions == std::vector<std::string>({
+                              "ID3D12GraphicsCommandList::Dispatch",
+                              "ID3D12GraphicsCommandList::DrawInstanced",
+                              "IDXGISwapChain::Present"}),
+             "raw event call order was not restored");
+}
+
+bool write_invalid_sequence_raw_capture(
+    const std::filesystem::path &bundle,
+    std::uint64_t first_sequence,
+    std::uint64_t second_sequence)
+{
+  using namespace apitrace::trace::raw;
+
+  std::filesystem::remove_all(bundle);
+  RawCaptureWriter writer;
+  if (!expect(writer.open(bundle), "failed to open invalid-sequence raw writer")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  if (!append_raw_event(
+          writer,
+          first_sequence,
+          RawEventOpcode::Dispatch,
+          encode_dispatch_payload(500, 1, 1, 1)) ||
+      !append_raw_event(
+          writer,
+          second_sequence,
+          RawEventOpcode::DrawInstanced,
+          encode_draw_instanced_payload(500, 3, 1, 0, 0))) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  if (!expect(writer.flush_commit(), "failed to commit invalid-sequence raw capture")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+  writer.close();
+  return true;
+}
+
+bool write_interleaved_batch_raw_capture(const std::filesystem::path &bundle)
+{
+  using namespace apitrace::trace::raw;
+
+  std::filesystem::remove_all(bundle);
+  RawCaptureWriter writer;
+  if (!expect(writer.open(bundle), "failed to open interleaved-batch raw writer")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  const std::string batch_line =
+      "{\"record_kind\":\"call\",\"sequence\":1,\"time_ns\":1001,\"elapsed_ns\":1,"
+      "\"function\":\"ID3D12GraphicsCommandList::CopyBufferRegionBatch\",\"result_code\":0,"
+      "\"object_refs\":[500],\"payload\":{\"op_count\":2,\"ops\":["
+      "{\"sequence\":1,\"function\":\"ID3D12GraphicsCommandList::CopyBufferRegion\","
+      "\"dst_buffer_object_id\":100,\"dst_offset\":0,\"src_buffer_object_id\":200,"
+      "\"src_offset\":0,\"byte_count\":4},"
+      "{\"sequence\":3,\"function\":\"ID3D12GraphicsCommandList::CopyBufferRegion\","
+      "\"dst_buffer_object_id\":100,\"dst_offset\":4,\"src_buffer_object_id\":200,"
+      "\"src_offset\":4,\"byte_count\":4}]}}";
+  if (!append_raw_event(
+          writer,
+          1,
+          RawEventOpcode::PassthroughFinalJson,
+          encode_passthrough_final_json_payload(batch_line)) ||
+      !append_raw_event(
+          writer,
+          2,
+          RawEventOpcode::Dispatch,
+          encode_dispatch_payload(500, 2, 3, 4))) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+
+  if (!expect(writer.flush_commit(), "failed to commit interleaved-batch raw capture")) {
+    std::cerr << writer.last_error() << "\n";
+    return false;
+  }
+  writer.close();
+  return true;
+}
+
+bool validate_interleaved_batch_raw_bundle(const std::filesystem::path &bundle)
+{
+  const auto records = read_jsonl(bundle / "callstream.jsonl");
+  std::vector<std::uint64_t> sequences;
+  std::vector<std::string> functions;
+  for (const auto &record : records) {
+    if (record.value("record_kind", std::string()) != "call") {
+      continue;
+    }
+    sequences.push_back(record.value("sequence", 0ull));
+    functions.push_back(record.value("function", std::string()));
+    if (record.value("function", std::string()) ==
+        "ID3D12GraphicsCommandList::CopyBufferRegionBatch") {
+      const auto &payload = record.at("payload");
+      if (!expect(payload.value("op_count", 0u) == 1 &&
+                      payload.at("ops").size() == 1 &&
+                      payload.at("ops").front().value("sequence", 0ull) ==
+                          record.value("sequence", 0ull),
+                  "split batch record did not contain exactly its matching operation")) {
+        return false;
+      }
+    }
+  }
+  return expect(
+             sequences == std::vector<std::uint64_t>({1, 2, 3}),
+             "interleaved batch sequence order was not restored") &&
+         expect(
+             functions == std::vector<std::string>({
+                              "ID3D12GraphicsCommandList::CopyBufferRegionBatch",
+                              "ID3D12GraphicsCommandList::Dispatch",
+                              "ID3D12GraphicsCommandList::CopyBufferRegionBatch"}),
+             "interleaved batch call order was not restored");
 }
 
 bool write_passthrough_mixed_raw_capture(
@@ -823,17 +1119,17 @@ bool write_duplicate_content_raw_capture(const std::filesystem::path &bundle)
           writer,
           4,
           RawEventOpcode::ResourceUnmap,
-          encode_resource_unmap_payload(200, duplicate_raw_id_a, 0, duplicate_blob.size())) ||
+          encode_resource_unmap_payload(200, duplicate_raw_id_a, 0, duplicate_blob.size(), false)) ||
       !append_raw_event(
           writer,
           5,
           RawEventOpcode::ResourceUnmap,
-          encode_resource_unmap_payload(201, unique_raw_id, 16, 16 + unique_blob.size())) ||
+          encode_resource_unmap_payload(201, unique_raw_id, 16, 16 + unique_blob.size(), false)) ||
       !append_raw_event(
           writer,
           6,
           RawEventOpcode::ResourceUnmap,
-          encode_resource_unmap_payload(202, duplicate_raw_id_b, 32, 32 + duplicate_blob.size()))) {
+          encode_resource_unmap_payload(202, duplicate_raw_id_b, 32, 32 + duplicate_blob.size(), false))) {
     std::cerr << writer.last_error() << "\n";
     return false;
   }
@@ -896,7 +1192,7 @@ bool write_texture_unmap_raw_capture(
           writer,
           include_prior_map ? 3 : 2,
           RawEventOpcode::ResourceUnmap,
-          encode_resource_unmap_payload(900, texture_raw_id, 16, 16 + texture_blob.size()))) {
+          encode_resource_unmap_payload(900, texture_raw_id, 16, 16 + texture_blob.size(), false))) {
     std::cerr << writer.last_error() << "\n";
     return false;
   }
@@ -961,7 +1257,7 @@ bool write_streaming_equivalence_raw_capture(const std::filesystem::path &bundle
             writer,
             sequence++,
             RawEventOpcode::ResourceUnmap,
-            encode_resource_unmap_payload(resource_id, raw_blob_id, index, index + blob.size())) ||
+            encode_resource_unmap_payload(resource_id, raw_blob_id, index, index + blob.size(), false)) ||
         !append_raw_event(
             writer,
             sequence++,
@@ -1103,6 +1399,83 @@ bool validate_final_bundle(const std::filesystem::path &bundle)
               "canonical buffer asset bytes mismatch")) {
     return false;
   }
+
+  const auto dispatch_path = bundle / apitrace::trace::kD3D12CompiledDispatchName;
+  if (!expect(std::filesystem::is_regular_file(dispatch_path),
+              "finalize did not publish compiled D3D12 dispatch stream")) {
+    return false;
+  }
+  apitrace::trace::TraceBundleReader reader;
+  apitrace::trace::TraceBundleReader::OpenOptions options;
+  options.metadata_only = true;
+  options.load_metal_sideband = false;
+  options.parse_callstream_events = false;
+  options.discover_referenced_assets = false;
+  options.use_compiled_d3d12_dispatch = true;
+  if (!expect(reader.open(bundle, options), "compiled dispatch reader failed to open finalized bundle")) {
+    std::cerr << reader.last_error() << "\n";
+    return false;
+  }
+  if (!expect(reader.assets().empty(),
+              "compiled dispatch reader eagerly loaded assets index") ||
+      !expect(reader.objects().empty(),
+              "compiled dispatch reader eagerly loaded objects index")) {
+    return false;
+  }
+  std::vector<std::string> dispatched_functions;
+  std::vector<json> dispatched_payloads;
+  std::vector<apitrace::trace::CompiledDispatchRoute> dispatched_routes;
+  std::vector<apitrace::trace::CompiledCommandKind> dispatched_command_kinds;
+  std::string stream_error;
+  if (!expect(reader.for_each_event([&](const apitrace::trace::EventRecord &event) {
+        if (event.payload_encoding != apitrace::trace::EventPayloadEncoding::MessagePack) {
+          stream_error = "compiled dispatch event did not use MessagePack payload";
+          return false;
+        }
+        auto payload = json::from_msgpack(
+            event.payload.begin(), event.payload.end(), true, false);
+        if (payload.is_discarded() || !payload.is_object()) {
+          stream_error = "compiled dispatch payload failed to decode";
+          return false;
+        }
+        dispatched_functions.push_back(event.callsite.function_name);
+        dispatched_payloads.push_back(std::move(payload));
+        dispatched_routes.push_back(event.dispatch_route);
+        dispatched_command_kinds.push_back(event.command_kind);
+        return true;
+      }, stream_error),
+      "compiled dispatch stream traversal failed")) {
+    std::cerr << stream_error << "\n";
+    return false;
+  }
+  if (!expect(dispatched_functions == functions,
+              "compiled dispatch changed finalized call order") ||
+      !expect(dispatched_payloads.size() == functions.size(),
+              "compiled dispatch event count mismatch") ||
+      !expect(dispatched_payloads[1] == records[2]["payload"],
+              "compiled dispatch changed Unmap payload semantics") ||
+      !expect(dispatched_payloads[3] == records[4]["payload"],
+              "compiled dispatch changed DrawInstanced payload semantics") ||
+      !expect(
+          dispatched_routes ==
+              std::vector<apitrace::trace::CompiledDispatchRoute>({
+                  apitrace::trace::CompiledDispatchRoute::RecordCommand,
+                  apitrace::trace::CompiledDispatchRoute::ResourceUnmap,
+                  apitrace::trace::CompiledDispatchRoute::CreatePipeline,
+                  apitrace::trace::CompiledDispatchRoute::RecordCommand,
+          }),
+          "finalize did not precompile native dispatch routes") ||
+      !expect(
+          dispatched_command_kinds ==
+              std::vector<apitrace::trace::CompiledCommandKind>({
+                  apitrace::trace::CompiledCommandKind::SetPipelineState,
+                  apitrace::trace::CompiledCommandKind::UnmapResource,
+                  apitrace::trace::CompiledCommandKind::Unknown,
+                  apitrace::trace::CompiledCommandKind::Draw,
+              }),
+          "finalize did not precompile command semantic kinds")) {
+    return false;
+  }
   return true;
 }
 
@@ -1111,11 +1484,11 @@ bool validate_texture_unmap_raw_bundle(const std::filesystem::path &bundle)
   const auto records = read_jsonl(bundle / "callstream.jsonl");
   std::vector<json> unmaps;
   for (const auto &record : records) {
-    if (record.value("function", std::string()) == "ID3D12Resource::Unmap") {
+    if (record.value("function", std::string()) == "apitrace::D3D12ResourceDataUpdate") {
       unmaps.push_back(record);
     }
   }
-  if (!expect(unmaps.size() == 1, "texture-unmap bundle should contain one Unmap")) {
+  if (!expect(unmaps.size() == 1, "texture update bundle should contain one data update")) {
     return false;
   }
   const auto &payload = unmaps.front()["payload"];
@@ -1141,11 +1514,11 @@ bool validate_duplicate_content_raw_bundle(const std::filesystem::path &bundle)
 
   std::vector<json> unmaps;
   for (const auto &record : records) {
-    if (record.value("function", std::string()) == "ID3D12Resource::Unmap") {
+    if (record.value("function", std::string()) == "apitrace::D3D12ResourceDataUpdate") {
       unmaps.push_back(record);
     }
   }
-  if (!expect(unmaps.size() == 3, "duplicate-content raw finalize suppressed Unmap events")) {
+  if (!expect(unmaps.size() == 3, "duplicate-content raw finalize suppressed data update events")) {
     return false;
   }
 
@@ -1479,6 +1852,10 @@ int main(int argc, char **argv)
 
   const auto work_dir = unique_work_dir();
   const auto bundle = work_dir / "synthetic-raw.apitrace";
+  const auto out_of_order_raw_bundle = work_dir / "synthetic-out-of-order-raw.apitrace";
+  const auto zero_sequence_raw_bundle = work_dir / "synthetic-zero-sequence-raw.apitrace";
+  const auto duplicate_sequence_raw_bundle = work_dir / "synthetic-duplicate-sequence-raw.apitrace";
+  const auto interleaved_batch_raw_bundle = work_dir / "synthetic-interleaved-batch-raw.apitrace";
   const auto passthrough_bundle = work_dir / "synthetic-passthrough-raw.apitrace";
   const auto passthrough_blob_bundle = work_dir / "synthetic-passthrough-with-blob-raw.apitrace";
   const auto passthrough_d3d12_remap_bundle = work_dir / "synthetic-passthrough-d3d12-remap.apitrace";
@@ -1525,6 +1902,8 @@ int main(int argc, char **argv)
   std::filesystem::create_directories(work_dir);
 
   const bool ok =
+      validate_compiled_tile_mapping_codec(work_dir / "compiled-tile-mapping.bin") &&
+      validate_compiled_resource_data_update_codec(work_dir / "compiled-resource-update.bin") &&
       write_synthetic_trace_session_capture(bundle) &&
       run_command_expect_failure(quote_arg(argv[1]) + " --dry-run " + quote_arg(bundle)) &&
       run_command_expect_failure(quote_arg(argv[1]) + " --raw-format " + quote_arg(bundle)) &&
@@ -1534,6 +1913,21 @@ int main(int argc, char **argv)
       run_command(quote_arg(argv[1]) + " --no-progress " + quote_arg(bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(bundle)) &&
       validate_final_bundle(bundle) &&
+      write_out_of_order_raw_capture(out_of_order_raw_bundle) &&
+      run_command(quote_arg(argv[1]) + " --no-progress --jobs 4 " + quote_arg(out_of_order_raw_bundle)) &&
+      run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(out_of_order_raw_bundle)) &&
+      validate_out_of_order_raw_bundle(out_of_order_raw_bundle) &&
+      write_invalid_sequence_raw_capture(zero_sequence_raw_bundle, 0, 1) &&
+      run_command_expect_failure(
+          quote_arg(argv[1]) + " --no-progress " + quote_arg(zero_sequence_raw_bundle)) &&
+      write_invalid_sequence_raw_capture(duplicate_sequence_raw_bundle, 1, 1) &&
+      run_command_expect_failure(
+          quote_arg(argv[1]) + " --no-progress " + quote_arg(duplicate_sequence_raw_bundle)) &&
+      write_interleaved_batch_raw_capture(interleaved_batch_raw_bundle) &&
+      run_command(
+          quote_arg(argv[1]) + " --no-progress --jobs 4 " + quote_arg(interleaved_batch_raw_bundle)) &&
+      run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(interleaved_batch_raw_bundle)) &&
+      validate_interleaved_batch_raw_bundle(interleaved_batch_raw_bundle) &&
       write_passthrough_mixed_raw_capture(passthrough_bundle, passthrough_before, passthrough_after) &&
       run_command(quote_arg(argv[1]) + " --no-progress " + quote_arg(passthrough_bundle)) &&
       run_command(quote_arg(argv[2]) + " --verify-hashes " + quote_arg(passthrough_bundle)) &&

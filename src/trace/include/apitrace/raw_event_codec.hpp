@@ -92,7 +92,8 @@ std::vector<std::uint8_t> encode_resource_unmap_payload(
     ObjectId resource_object_id,
     std::uint64_t raw_blob_id,
     std::uint64_t written_begin,
-    std::uint64_t written_end);
+    std::uint64_t written_end,
+    bool api_call = false);
 
 std::vector<std::uint8_t> encode_graphics_pipeline_create_payload(
     ObjectId device_object_id,
