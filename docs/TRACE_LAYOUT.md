@@ -153,9 +153,10 @@ payload。不允许合并、跳过、
 
 `callstream.jsonl` 仍然是调用语义权威来源。`d3d12-dispatch.bin` 把顶层 JSON 解析、payload
 规范化、记录边界检查、route-specific 字段验证和 native handler 分类前移到 finalize，使 native retrace 可以单记录流式
-解码类型化节点后按 opcode 直接分发，而不把完整调用流载入内存，也不逐事件扫描函数名。fresh RAW
-物化时会按最终事件顺序同时生成 dispatch；若后续资产或 pipeline 修复改写 callstream，则在最后一次
-对象审计扫描中同步重建 dispatch，不再单独二次扫描 callstream。缺失、过期或损坏
+解码类型化节点后按 opcode 直接分发，而不把完整调用流载入内存，也不逐事件扫描函数名。没有 blob
+引用的 fresh RAW 可在物化时按最终事件顺序同时生成 dispatch；一旦 RAW 包含 blob，provisional asset
+path 必然触发后续规范化，因此从一开始就不生成已知会过期的 dispatch，而是在最后一次对象审计扫描中
+以有界、有序并行批次同步生成唯一的最终 dispatch，不再单独二次扫描 callstream。缺失、过期或损坏
 时，native retrace 必须提示重新运行 `bundle-finalize`，
 不能静默回退到 retrace 内 JSON 解释器。
 

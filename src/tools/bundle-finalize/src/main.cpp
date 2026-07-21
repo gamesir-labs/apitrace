@@ -23,6 +23,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -53,6 +54,9 @@ constexpr std::uint64_t kJsonlMinChunkSize = 64ull * 1024ull;
 // Each dispatch worker owns the source chunk, a parsed payload, and an encoded record. Keep the
 // source slice smaller than the generic JSONL chunk so parallel finalize memory stays bounded.
 constexpr std::uint64_t kCompiledDispatchChunkSize = 16ull * 1024ull * 1024ull;
+constexpr std::size_t kCompiledDispatchHeaderBytes = 48;
+constexpr std::size_t kOrderedDispatchBatchBytes = 4ull * 1024ull * 1024ull;
+constexpr std::size_t kOrderedDispatchBatchRecords = 16384;
 constexpr std::uint64_t kRawToFinalAssetFlushMinBytes = 256ull * 1024ull * 1024ull;
 constexpr std::uint64_t kRawToFinalAssetFlushMaxBytes = 2ull * 1024ull * 1024ull * 1024ull;
 constexpr std::uint64_t kRawToFinalAssetFlushBytesPerJob = 64ull * 1024ull * 1024ull;
@@ -207,6 +211,345 @@ struct Stats {
   std::size_t raw_to_final_peak_assets_per_event = 0;
   std::size_t raw_to_final_asset_flushes = 0;
   std::uint64_t raw_to_final_asset_flush_bytes = 0;
+};
+
+class OrderedDispatchCompiler {
+public:
+  OrderedDispatchCompiler(fs::path output_path, std::size_t worker_count)
+      : output_path_(std::move(output_path)),
+        worker_count_(std::max<std::size_t>(1, worker_count)),
+        max_outstanding_batches_(std::max<std::size_t>(2, worker_count_ * 2))
+  {
+  }
+
+  ~OrderedDispatchCompiler()
+  {
+    cancel();
+  }
+
+  bool open(std::string &error)
+  {
+    error.clear();
+    if (opened_) {
+      error = "ordered dispatch compiler is already open";
+      return false;
+    }
+    std::error_code directory_error;
+    fs::create_directories(output_path_.parent_path(), directory_error);
+    if (directory_error) {
+      error = "failed to create compiled dispatch directory: " + directory_error.message();
+      return false;
+    }
+    fs::remove(output_path_, directory_error);
+    output_.open(output_path_, std::ios::binary | std::ios::trunc);
+    if (!output_.is_open()) {
+      error = "failed to create ordered compiled dispatch stream";
+      return false;
+    }
+    apitrace::trace::CompiledDispatchHeader placeholder;
+    if (!apitrace::trace::write_compiled_dispatch_header(output_, placeholder, error)) {
+      output_.close();
+      fs::remove(output_path_, directory_error);
+      return false;
+    }
+    opened_ = true;
+    started_ = std::chrono::steady_clock::now();
+    workers_.reserve(worker_count_);
+    for (std::size_t index = 0; index < worker_count_; ++index) {
+      workers_.emplace_back([this] { worker_main(); });
+    }
+    return true;
+  }
+
+  bool append_event(const apitrace::trace::EventRecord &event, std::string &error)
+  {
+    Input input;
+    input.event = event;
+    input.approximate_bytes = event.payload.size() + event.callsite.function_name.size() +
+                              event.object_refs.size() * sizeof(std::uint64_t) +
+                              event.blob_refs.size() * sizeof(std::uint64_t) + 128;
+    current_batch_bytes_ += input.approximate_bytes;
+    current_batch_.inputs.push_back(std::move(input));
+    return flush_current_if_needed(error);
+  }
+
+  bool append_json_line(
+      std::string_view line,
+      std::uint64_t source_offset,
+      std::string &error)
+  {
+    Input input;
+    input.serialized_line.assign(line.data(), line.size());
+    input.source_offset = source_offset;
+    input.approximate_bytes = input.serialized_line.size();
+    current_batch_bytes_ += input.approximate_bytes;
+    current_batch_.inputs.push_back(std::move(input));
+    return flush_current_if_needed(error);
+  }
+
+  bool finish(
+      std::uint64_t source_callstream_bytes,
+      apitrace::trace::CompiledDispatchHeader &header,
+      std::string &error)
+  {
+    error.clear();
+    if (!opened_) {
+      error = "ordered dispatch compiler is not open";
+      return false;
+    }
+    if (!submit_current(error)) {
+      cancel_with_error(error);
+      return false;
+    }
+    while (outstanding_batches_ != 0) {
+      if (!drain_next_result(true, error)) {
+        cancel_with_error(error);
+        return false;
+      }
+    }
+    stop_workers(false);
+    header_.source_callstream_bytes = source_callstream_bytes;
+    if (header_.record_count == 0) {
+      error = "ordered compiled dispatch stream contains no records";
+      cancel_with_error(error);
+      return false;
+    }
+    output_.seekp(0, std::ios::beg);
+    if (!output_.good() ||
+        !apitrace::trace::write_compiled_dispatch_header(output_, header_, error)) {
+      if (error.empty()) {
+        error = "failed to patch ordered compiled dispatch header";
+      }
+      cancel_with_error(error);
+      return false;
+    }
+    output_.flush();
+    output_.close();
+    if (!output_) {
+      error = "failed to close ordered compiled dispatch stream";
+      cancel_with_error(error);
+      return false;
+    }
+    std::error_code size_error;
+    const auto bytes = fs::file_size(output_path_, size_error);
+    if (size_error || bytes != kCompiledDispatchHeaderBytes + header_.encoded_record_bytes) {
+      error = "ordered compiled dispatch stream has an invalid final size";
+      cancel_with_error(error);
+      return false;
+    }
+    header = header_;
+    opened_ = false;
+    elapsed_ms_ = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started_).count());
+    return true;
+  }
+
+  void cancel()
+  {
+    if (!opened_ && workers_.empty()) {
+      return;
+    }
+    stop_workers(true);
+    if (output_.is_open()) {
+      output_.close();
+    }
+    std::error_code remove_error;
+    fs::remove(output_path_, remove_error);
+    opened_ = false;
+  }
+
+  std::uint64_t elapsed_ms() const noexcept
+  {
+    return elapsed_ms_;
+  }
+
+private:
+  struct Input {
+    apitrace::trace::EventRecord event;
+    std::string serialized_line;
+    std::uint64_t source_offset = 0;
+    std::size_t approximate_bytes = 0;
+  };
+
+  struct Batch {
+    std::uint64_t index = 0;
+    std::size_t approximate_bytes = 0;
+    std::vector<Input> inputs;
+  };
+
+  struct Result {
+    std::uint64_t record_count = 0;
+    std::vector<std::uint8_t> bytes;
+    std::string error;
+  };
+
+  bool flush_current_if_needed(std::string &error)
+  {
+    if (current_batch_bytes_ < kOrderedDispatchBatchBytes &&
+        current_batch_.inputs.size() < kOrderedDispatchBatchRecords) {
+      return drain_next_result(false, error);
+    }
+    return submit_current(error);
+  }
+
+  bool submit_current(std::string &error)
+  {
+    if (current_batch_.inputs.empty()) {
+      return drain_next_result(false, error);
+    }
+    while (outstanding_batches_ >= max_outstanding_batches_) {
+      if (!drain_next_result(true, error)) {
+        return false;
+      }
+    }
+    current_batch_.index = next_submit_index_++;
+    current_batch_.approximate_bytes = current_batch_bytes_;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pending_batches_.push_back(std::move(current_batch_));
+    }
+    current_batch_ = Batch{};
+    current_batch_bytes_ = 0;
+    ++outstanding_batches_;
+    work_cv_.notify_one();
+    return drain_next_result(false, error);
+  }
+
+  bool drain_next_result(bool wait, std::string &error)
+  {
+    if (outstanding_batches_ == 0) {
+      return true;
+    }
+    Result result;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      if (wait) {
+        result_cv_.wait(lock, [&] {
+          return completed_results_.find(next_write_index_) != completed_results_.end();
+        });
+      }
+      const auto found = completed_results_.find(next_write_index_);
+      if (found == completed_results_.end()) {
+        return true;
+      }
+      result = std::move(found->second);
+      completed_results_.erase(found);
+    }
+    --outstanding_batches_;
+    ++next_write_index_;
+    if (!result.error.empty()) {
+      error = std::move(result.error);
+      return false;
+    }
+    output_.write(
+        reinterpret_cast<const char *>(result.bytes.data()),
+        static_cast<std::streamsize>(result.bytes.size()));
+    if (!output_) {
+      error = "failed to append ordered compiled dispatch batch";
+      return false;
+    }
+    header_.record_count += result.record_count;
+    header_.encoded_record_bytes += result.bytes.size();
+    return true;
+  }
+
+  void worker_main()
+  {
+    for (;;) {
+      Batch batch;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        work_cv_.wait(lock, [&] { return stopping_ || !pending_batches_.empty(); });
+        if (pending_batches_.empty()) {
+          if (stopping_) {
+            return;
+          }
+          continue;
+        }
+        batch = std::move(pending_batches_.front());
+        pending_batches_.pop_front();
+      }
+
+      Result result;
+      try {
+        result.bytes.reserve(batch.approximate_bytes + batch.inputs.size() * 64);
+        std::vector<std::uint8_t> encoded;
+        for (auto &input : batch.inputs) {
+          apitrace::trace::EventRecord event;
+          if (input.serialized_line.empty()) {
+            event = std::move(input.event);
+          } else if (!apitrace::trace::parse_event_record_json_line(
+                         input.serialized_line, event, result.error)) {
+            result.error = "callstream byte " + std::to_string(input.source_offset) +
+                           ": " + result.error;
+            break;
+          }
+          if (!apitrace::trace::encode_compiled_dispatch_event(
+                  event, encoded, result.error)) {
+            const auto location = input.serialized_line.empty()
+                                      ? "sequence " + std::to_string(event.callsite.sequence)
+                                      : "callstream byte " + std::to_string(input.source_offset);
+            result.error = location + ": " + result.error;
+            break;
+          }
+          result.bytes.insert(result.bytes.end(), encoded.begin(), encoded.end());
+          ++result.record_count;
+        }
+      } catch (const std::exception &exception) {
+        result.error = exception.what();
+      }
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        completed_results_.emplace(batch.index, std::move(result));
+      }
+      result_cv_.notify_one();
+    }
+  }
+
+  void stop_workers(bool discard_pending)
+  {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+      if (discard_pending) {
+        pending_batches_.clear();
+      }
+    }
+    work_cv_.notify_all();
+    for (auto &worker : workers_) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+    workers_.clear();
+  }
+
+  void cancel_with_error(const std::string &)
+  {
+    cancel();
+  }
+
+  fs::path output_path_;
+  std::size_t worker_count_ = 1;
+  std::size_t max_outstanding_batches_ = 2;
+  std::ofstream output_;
+  std::vector<std::thread> workers_;
+  std::deque<Batch> pending_batches_;
+  std::map<std::uint64_t, Result> completed_results_;
+  Batch current_batch_;
+  std::size_t current_batch_bytes_ = 0;
+  std::size_t outstanding_batches_ = 0;
+  std::uint64_t next_submit_index_ = 0;
+  std::uint64_t next_write_index_ = 0;
+  apitrace::trace::CompiledDispatchHeader header_;
+  std::mutex mutex_;
+  std::condition_variable work_cv_;
+  std::condition_variable result_cv_;
+  bool stopping_ = false;
+  bool opened_ = false;
+  std::chrono::steady_clock::time_point started_{};
+  std::uint64_t elapsed_ms_ = 0;
 };
 
 std::unordered_map<std::uint64_t, std::string> build_effective_path_by_blob_id(const std::vector<AssetEntry> &assets);
@@ -1377,46 +1720,30 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
   }
   const auto final_dispatch_path =
       options.bundle_root / apitrace::trace::kD3D12CompiledDispatchName;
-  fs::create_directories(final_dispatch_path.parent_path(), temporary_error);
-  if (temporary_error) {
-    std::cerr << "error: failed to create dispatch analysis directory: "
-              << temporary_error.message() << "\n";
-    writer.close();
-    fs::remove(temporary_callstream_path, temporary_error);
-    return false;
-  }
-  auto dispatch_body_path = final_dispatch_path;
-  dispatch_body_path += ".raw-body.tmp";
-  fs::remove(dispatch_body_path, temporary_error);
-  std::ofstream dispatch_body(dispatch_body_path, std::ios::binary | std::ios::trunc);
-  if (!dispatch_body.is_open()) {
-    std::cerr << "error: failed to create RAW compiled dispatch body\n";
-    writer.close();
-    fs::remove(temporary_callstream_path, temporary_error);
-    return false;
-  }
+  const auto temporary_dispatch_path = temporary_rewrite_path(final_dispatch_path);
+  // Raw blob references are published under provisional paths and therefore force a later
+  // callstream rewrite to canonical asset paths. In that case compiling here would knowingly
+  // create a stale multi-gigabyte dispatch stream. Defer once to the final object-audit scan.
+  const bool compile_dispatch_from_raw = reader.blob_extents().empty();
+  std::unique_ptr<OrderedDispatchCompiler> raw_dispatch_compiler;
   apitrace::trace::CompiledDispatchHeader raw_dispatch_header;
-  std::vector<std::uint8_t> raw_dispatch_record;
   std::string raw_dispatch_error;
-  std::chrono::steady_clock::duration raw_dispatch_encode_time{};
+  if (compile_dispatch_from_raw) {
+    raw_dispatch_compiler = std::make_unique<OrderedDispatchCompiler>(
+        temporary_dispatch_path, options.jobs);
+    if (!raw_dispatch_compiler->open(raw_dispatch_error)) {
+      std::cerr << "error: failed to start RAW dispatch compiler: "
+                << raw_dispatch_error << "\n";
+      writer.close();
+      fs::remove(temporary_callstream_path, temporary_error);
+      return false;
+    }
+  } else {
+    stats.compiled_dispatch_source = "deferred-final-scan";
+  }
   const auto append_raw_dispatch_event = [&](const apitrace::trace::EventRecord &event) {
-    const auto encode_begin = std::chrono::steady_clock::now();
-    const bool encoded = apitrace::trace::encode_compiled_dispatch_event(
-        event, raw_dispatch_record, raw_dispatch_error);
-    raw_dispatch_encode_time += std::chrono::steady_clock::now() - encode_begin;
-    if (!encoded) {
-      return false;
-    }
-    dispatch_body.write(
-        reinterpret_cast<const char *>(raw_dispatch_record.data()),
-        static_cast<std::streamsize>(raw_dispatch_record.size()));
-    if (!dispatch_body) {
-      raw_dispatch_error = "failed to append RAW compiled dispatch record";
-      return false;
-    }
-    ++raw_dispatch_header.record_count;
-    raw_dispatch_header.encoded_record_bytes += raw_dispatch_record.size();
-    return true;
+    return !raw_dispatch_compiler ||
+           raw_dispatch_compiler->append_event(event, raw_dispatch_error);
   };
   writer.set_registered_asset_payload_retention_enabled(false);
   if (existing_header_line.find("\"record_kind\":\"bundle_header\"") != std::string::npos) {
@@ -2400,82 +2727,50 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
   if (!ok) {
     flush_passthrough_lines();
     writer.close();
-    dispatch_body.close();
+    if (raw_dispatch_compiler) {
+      raw_dispatch_compiler->cancel();
+    }
     std::error_code remove_error;
     fs::remove(temporary_callstream_path, remove_error);
-    fs::remove(dispatch_body_path, remove_error);
     return false;
   }
   flush_passthrough_lines();
   flush_remaining_assets();
   writer.close();
-  dispatch_body.close();
-  if (!dispatch_body) {
-    std::cerr << "error: failed to close RAW compiled dispatch body\n";
-    std::error_code remove_error;
-    fs::remove(temporary_callstream_path, remove_error);
-    fs::remove(dispatch_body_path, remove_error);
-    return false;
-  }
   if (!replace_with_temporary_file(final_callstream_path, temporary_callstream_path)) {
     std::cerr << "error: failed to publish materialized callstream atomically\n";
-    std::error_code remove_error;
-    fs::remove(dispatch_body_path, remove_error);
+    if (raw_dispatch_compiler) {
+      raw_dispatch_compiler->cancel();
+    }
     return false;
+  }
+  if (!raw_dispatch_compiler) {
+    return true;
   }
   std::error_code callstream_size_error;
-  raw_dispatch_header.source_callstream_bytes =
-      fs::file_size(final_callstream_path, callstream_size_error);
-  if (callstream_size_error || raw_dispatch_header.record_count == 0) {
-    std::cerr << "error: failed to finalize RAW compiled dispatch header\n";
-    fs::remove(dispatch_body_path, callstream_size_error);
+  const auto callstream_size = fs::file_size(final_callstream_path, callstream_size_error);
+  if (callstream_size_error ||
+      !raw_dispatch_compiler->finish(
+          callstream_size, raw_dispatch_header, raw_dispatch_error)) {
+    std::cerr << "error: failed to finalize RAW compiled dispatch: "
+              << (raw_dispatch_error.empty() ? callstream_size_error.message()
+                                             : raw_dispatch_error)
+              << "\n";
     return false;
   }
-  const auto publish_begin = std::chrono::steady_clock::now();
-  const auto temporary_dispatch_path = temporary_rewrite_path(final_dispatch_path);
-  std::ofstream dispatch_output(
-      temporary_dispatch_path, std::ios::binary | std::ios::trunc);
-  std::string dispatch_header_error;
-  if (!dispatch_output.is_open() ||
-      !apitrace::trace::write_compiled_dispatch_header(
-          dispatch_output, raw_dispatch_header, dispatch_header_error)) {
-    std::cerr << "error: failed to write RAW compiled dispatch header: "
-              << dispatch_header_error << "\n";
-    std::error_code remove_error;
-    fs::remove(dispatch_body_path, remove_error);
-    fs::remove(temporary_dispatch_path, remove_error);
-    return false;
-  }
-  std::ifstream dispatch_body_input(dispatch_body_path, std::ios::binary);
-  std::vector<char> dispatch_copy_buffer(kFileCopyBufferSize);
-  while (dispatch_body_input) {
-    dispatch_body_input.read(
-        dispatch_copy_buffer.data(),
-        static_cast<std::streamsize>(dispatch_copy_buffer.size()));
-    const auto bytes = dispatch_body_input.gcount();
-    if (bytes > 0) {
-      dispatch_output.write(dispatch_copy_buffer.data(), bytes);
-    }
-  }
-  dispatch_output.close();
-  dispatch_body_input.close();
   std::error_code dispatch_size_error;
   const auto dispatch_size = fs::file_size(temporary_dispatch_path, dispatch_size_error);
   if (dispatch_size_error ||
-      dispatch_size != 48 + raw_dispatch_header.encoded_record_bytes ||
+      dispatch_size != kCompiledDispatchHeaderBytes + raw_dispatch_header.encoded_record_bytes ||
       !replace_with_temporary_file(final_dispatch_path, temporary_dispatch_path)) {
     std::cerr << "error: failed to publish RAW compiled dispatch stream\n";
     std::error_code remove_error;
-    fs::remove(dispatch_body_path, remove_error);
     fs::remove(temporary_dispatch_path, remove_error);
     return false;
   }
-  fs::remove(dispatch_body_path, dispatch_size_error);
-  raw_dispatch_encode_time += std::chrono::steady_clock::now() - publish_begin;
   stats.compiled_dispatch_records = raw_dispatch_header.record_count;
   stats.compiled_dispatch_bytes = dispatch_size;
-  stats.compiled_dispatch_ms = static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::milliseconds>(raw_dispatch_encode_time).count());
+  stats.compiled_dispatch_ms = raw_dispatch_compiler->elapsed_ms();
   stats.compiled_dispatch_from_raw = true;
   stats.compiled_dispatch_source = "raw";
   return true;
@@ -9736,7 +10031,7 @@ void collect_existing_object_index_ids(
   }
 }
 
-void repair_missing_d3d12_device_objects(
+bool repair_missing_d3d12_device_objects(
     const fs::path &bundle_root,
     const Options &options,
     Stats &stats,
@@ -9745,7 +10040,7 @@ void repair_missing_d3d12_device_objects(
 {
   const auto callstream_path = bundle_root / apitrace::trace::kCallstreamFileName;
   if (!fs::is_regular_file(callstream_path)) {
-    return;
+    return true;
   }
 
   const auto callstream_relative =
@@ -9755,21 +10050,18 @@ void repair_missing_d3d12_device_objects(
       rewritten_digests.find(callstream_relative) == rewritten_digests.end();
   const bool compile_dispatch_during_scan = !options.dry_run && !raw_dispatch_is_current;
   const auto dispatch_path = bundle_root / apitrace::trace::kD3D12CompiledDispatchName;
-  auto dispatch_body_path = dispatch_path;
-  dispatch_body_path += ".final-scan-body.tmp";
-  std::ofstream dispatch_body;
+  const auto temporary_dispatch_path = temporary_rewrite_path(dispatch_path);
+  std::unique_ptr<OrderedDispatchCompiler> dispatch_compiler;
   apitrace::trace::CompiledDispatchHeader dispatch_header;
-  std::vector<std::uint8_t> dispatch_record;
   std::string dispatch_error;
   const auto dispatch_started = std::chrono::steady_clock::now();
   if (compile_dispatch_during_scan) {
-    std::error_code directory_error;
-    fs::create_directories(dispatch_path.parent_path(), directory_error);
-    fs::remove(dispatch_body_path, directory_error);
-    dispatch_body.open(dispatch_body_path, std::ios::binary | std::ios::trunc);
-    if (!dispatch_body.is_open()) {
-      std::cerr << "error: failed to create final-scan dispatch body\n";
-      return;
+    dispatch_compiler = std::make_unique<OrderedDispatchCompiler>(
+        temporary_dispatch_path, options.jobs);
+    if (!dispatch_compiler->open(dispatch_error)) {
+      std::cerr << "error: failed to start final-scan dispatch compiler: "
+                << dispatch_error << "\n";
+      return false;
     }
   }
 
@@ -9786,23 +10078,10 @@ void repair_missing_d3d12_device_objects(
     ++stats.jsonl_records;
     stats.input_bytes += line_view.byte_size;
     if (compile_dispatch_during_scan && line_view.offset != 0 && !line.empty()) {
-      apitrace::trace::EventRecord event;
-      if (!apitrace::trace::parse_event_record_json_line(line, event, dispatch_error) ||
-          !apitrace::trace::encode_compiled_dispatch_event(
-              event, dispatch_record, dispatch_error)) {
-        dispatch_error = "callstream byte " + std::to_string(line_view.offset) +
-                         ": " + dispatch_error;
+      if (!dispatch_compiler->append_json_line(
+              line, line_view.offset, dispatch_error)) {
         return false;
       }
-      dispatch_body.write(
-          reinterpret_cast<const char *>(dispatch_record.data()),
-          static_cast<std::streamsize>(dispatch_record.size()));
-      if (!dispatch_body) {
-        dispatch_error = "failed to append final-scan dispatch record";
-        return false;
-      }
-      ++dispatch_header.record_count;
-      dispatch_header.encoded_record_bytes += dispatch_record.size();
     }
     const bool may_update_known_objects =
         line.find("\"object_create\"") != std::string_view::npos ||
@@ -9850,53 +10129,26 @@ void repair_missing_d3d12_device_objects(
   });
 
   if (compile_dispatch_during_scan) {
-    dispatch_body.close();
     std::error_code source_size_error;
-    dispatch_header.source_callstream_bytes = fs::file_size(callstream_path, source_size_error);
-    if (!scanned || !dispatch_error.empty() || !dispatch_body || source_size_error ||
-        dispatch_header.record_count == 0) {
+    const auto source_callstream_bytes = fs::file_size(callstream_path, source_size_error);
+    if (!scanned || !dispatch_error.empty() || source_size_error ||
+        !dispatch_compiler->finish(
+            source_callstream_bytes, dispatch_header, dispatch_error)) {
       std::cerr << "error: failed to compile dispatch during final object scan: "
                 << (dispatch_error.empty() ? source_size_error.message() : dispatch_error) << "\n";
-      std::error_code remove_error;
-      fs::remove(dispatch_body_path, remove_error);
-      return;
+      dispatch_compiler->cancel();
+      return false;
     }
-    const auto temporary_dispatch_path = temporary_rewrite_path(dispatch_path);
-    std::ofstream dispatch_output(
-        temporary_dispatch_path, std::ios::binary | std::ios::trunc);
-    std::string header_error;
-    if (!dispatch_output.is_open() ||
-        !apitrace::trace::write_compiled_dispatch_header(
-            dispatch_output, dispatch_header, header_error)) {
-      std::cerr << "error: failed to write final-scan dispatch header: "
-                << header_error << "\n";
-      std::error_code remove_error;
-      fs::remove(dispatch_body_path, remove_error);
-      fs::remove(temporary_dispatch_path, remove_error);
-      return;
-    }
-    std::ifstream body_input(dispatch_body_path, std::ios::binary);
-    std::vector<char> copy_buffer(kFileCopyBufferSize);
-    while (body_input) {
-      body_input.read(copy_buffer.data(), static_cast<std::streamsize>(copy_buffer.size()));
-      const auto bytes = body_input.gcount();
-      if (bytes > 0) {
-        dispatch_output.write(copy_buffer.data(), bytes);
-      }
-    }
-    dispatch_output.close();
-    body_input.close();
     std::error_code size_error;
     const auto dispatch_bytes = fs::file_size(temporary_dispatch_path, size_error);
-    if (size_error || dispatch_bytes != 48 + dispatch_header.encoded_record_bytes ||
+    if (size_error ||
+        dispatch_bytes != kCompiledDispatchHeaderBytes + dispatch_header.encoded_record_bytes ||
         !replace_with_temporary_file(dispatch_path, temporary_dispatch_path)) {
       std::cerr << "error: failed to publish final-scan dispatch stream\n";
       std::error_code remove_error;
-      fs::remove(dispatch_body_path, remove_error);
       fs::remove(temporary_dispatch_path, remove_error);
-      return;
+      return false;
     }
-    fs::remove(dispatch_body_path, size_error);
     const auto digest = digest_cache.digest_file(dispatch_path);
     const auto dispatch_relative =
         fs::path(apitrace::trace::kD3D12CompiledDispatchName).generic_string();
@@ -9912,7 +10164,7 @@ void repair_missing_d3d12_device_objects(
   }
 
   if (repaired_device_ids.empty()) {
-    return;
+    return true;
   }
 
   auto &objects = object_index["objects"];
@@ -9930,7 +10182,7 @@ void repair_missing_d3d12_device_objects(
   }
 
   if (stats.repaired_missing_device_objects == 0 || options.dry_run) {
-    return;
+    return true;
   }
 
   fs::create_directories(objects_path.parent_path());
@@ -9938,7 +10190,7 @@ void repair_missing_d3d12_device_objects(
   output.open(objects_path);
   if (!output.is_open()) {
     std::cerr << "warning: failed to repair object index " << objects_path << "\n";
-    return;
+    return true;
   }
   output.write_text(object_index.dump(2) + "\n");
   const auto digest_and_size = output.digest_and_size();
@@ -9950,6 +10202,7 @@ void repair_missing_d3d12_device_objects(
       digest_cache,
       rewritten_digests,
       stats);
+  return true;
 }
 
 std::string bundle_hash_from_records(std::vector<std::pair<std::string, std::pair<std::string, std::uint64_t>>> files)
@@ -11034,13 +11287,18 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
     }
   });
   run_stage(options, progress, stage_index, kStageCount, "repair_object_index", [&] {
-    repair_missing_d3d12_device_objects(
-        options.bundle_root,
-        options,
-        stats,
-        digest_cache,
-        rewritten_digests);
+    if (!repair_missing_d3d12_device_objects(
+            options.bundle_root,
+            options,
+            stats,
+            digest_cache,
+            rewritten_digests)) {
+      finalize_failed = true;
+    }
   });
+  if (finalize_failed) {
+    return 1;
+  }
   run_stage(options, progress, stage_index, kStageCount, "write_indexes", [&] {
     write_asset_index(
         options.bundle_root,

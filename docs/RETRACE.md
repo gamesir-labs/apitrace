@@ -135,9 +135,11 @@ descriptor、submission 和同步成本则原样保留，作为被测负载。
 
 finalize 的验收也区分一次性编译和无变化复用：一次性编译记录完整 wall time、CPU time、peak RSS、
 输入/输出字节和记录数；并行 JSONL 分块必须受内存上限约束，不能用 worker 数乘以大块输入换取吞吐。
-无变化复用不得读取或 hash 完整 callstream/dispatch，目标是亚秒级且常量内存。fresh RAW→final 在
-顺序物化 callstream 时直接生成 dispatch；若后续规范化确实改写 callstream，则把 dispatch 编译融合到
-本来就需要的最终对象审计扫描，禁止额外启动独立 callstream 编译扫描。retrace 必须分别输出 reader
+无变化复用不得读取或 hash 完整 callstream/dispatch，目标是亚秒级且常量内存。没有 blob 引用的
+fresh RAW→final 可在顺序物化 callstream 时直接生成 dispatch；只要 RAW 含 blob，就会使用 provisional
+asset path 并触发后续规范化，此时必须从一开始把 dispatch 编译延迟并融合到最终对象审计扫描。两条路径
+都使用有界、有序并行批次直接写最终格式，禁止生成已知会过期的中间 dispatch，也禁止额外启动独立
+callstream 编译扫描。retrace 必须分别输出 reader
 decode、semantic state、content sync 和 native dispatch 时间；语义状态阶段不得解析 MessagePack/JSON。
 
 `callstream.jsonl` 仍然是权威语义，compiled dispatch 只是可重建的执行索引；两者的记录数、顺序和

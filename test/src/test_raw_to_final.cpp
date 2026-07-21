@@ -655,6 +655,50 @@ bool compare_asset_file_bytes(const std::filesystem::path &left, const std::file
   return true;
 }
 
+bool normalized_compiled_dispatch_events(
+    const std::filesystem::path &bundle,
+    std::vector<std::string> &events)
+{
+  const auto callstream_path = bundle / "callstream.jsonl";
+  std::error_code size_error;
+  const auto callstream_bytes = std::filesystem::file_size(callstream_path, size_error);
+  if (size_error) {
+    std::cerr << "failed to stat streaming equivalence callstream\n";
+    return false;
+  }
+
+  std::string error;
+  const auto streamed = apitrace::trace::for_each_compiled_dispatch_event(
+      bundle / apitrace::trace::kD3D12CompiledDispatchName,
+      callstream_bytes,
+      [&](const apitrace::trace::EventRecord &event) {
+        if (event.payload_encoding != apitrace::trace::EventPayloadEncoding::CompiledNodes) {
+          error = "streaming equivalence dispatch unexpectedly used a specialized payload";
+          return false;
+        }
+        json payload;
+        if (!apitrace::trace::decode_compiled_payload_nodes(event.payload, payload, error)) {
+          return false;
+        }
+        auto normalized = event;
+        normalized.time_ns = 0;
+        normalized.elapsed_ns = 0;
+        normalized.payload_encoding = apitrace::trace::EventPayloadEncoding::Json;
+        normalized.payload = payload.dump();
+        events.push_back(
+            apitrace::trace::event_record_json(normalized) +
+            "|route=" + std::to_string(static_cast<std::uint32_t>(event.dispatch_route)) +
+            "|command=" + std::to_string(static_cast<std::uint16_t>(event.command_kind)));
+        return true;
+      },
+      nullptr,
+      error);
+  if (!streamed) {
+    std::cerr << error << "\n";
+  }
+  return streamed;
+}
+
 bool compare_finalized_bundles(const std::filesystem::path &left, const std::filesystem::path &right)
 {
   if (!expect(normalized_assets_json(left) == normalized_assets_json(right),
@@ -672,6 +716,15 @@ bool compare_finalized_bundles(const std::filesystem::path &left, const std::fil
           std::filesystem::is_regular_file(left / apitrace::trace::kD3D12CompiledDispatchName) &&
               std::filesystem::is_regular_file(right / apitrace::trace::kD3D12CompiledDispatchName),
           "streaming equivalence compiled dispatch missing")) {
+    return false;
+  }
+  std::vector<std::string> left_dispatch_events;
+  std::vector<std::string> right_dispatch_events;
+  if (!normalized_compiled_dispatch_events(left, left_dispatch_events) ||
+      !normalized_compiled_dispatch_events(right, right_dispatch_events) ||
+      !expect(
+          left_dispatch_events == right_dispatch_events,
+          "streaming equivalence compiled dispatch order or semantics mismatch")) {
     return false;
   }
   return compare_asset_file_bytes(left, right);
@@ -1323,14 +1376,26 @@ bool write_streaming_equivalence_raw_capture(const std::filesystem::path &bundle
             writer,
             sequence++,
             RawEventOpcode::ResourceUnmap,
-            encode_resource_unmap_payload(resource_id, raw_blob_id, index, index + blob.size(), false)) ||
-        !append_raw_event(
-            writer,
-            sequence++,
-            RawEventOpcode::DrawInstanced,
-            encode_draw_instanced_payload(500, 3, 1, static_cast<std::uint32_t>(index), 0))) {
+            encode_resource_unmap_payload(resource_id, raw_blob_id, index, index + blob.size(), false))) {
       std::cerr << writer.last_error() << "\n";
       return false;
+    }
+    // Keep this fixture larger than one ordered-dispatch batch so the serial/parallel
+    // comparison below exercises cross-batch publication order as well as worker order.
+    for (std::uint32_t draw = 0; draw < 192; ++draw) {
+      if (!append_raw_event(
+              writer,
+              sequence++,
+              RawEventOpcode::DrawInstanced,
+              encode_draw_instanced_payload(
+                  500,
+                  3,
+                  1,
+                  static_cast<std::uint32_t>(index) * 192 + draw,
+                  0))) {
+        std::cerr << writer.last_error() << "\n";
+        return false;
+      }
     }
   }
   if (!append_raw_event(writer, sequence++, RawEventOpcode::PresentCall, encode_present_payload(600, 0, 1, 0)) ||

@@ -14,9 +14,9 @@ the expensive publish-time work:
 - compile the authoritative D3D12 JSONL into `analysis/d3d12-dispatch.bin`, preserving one record
   per original event while compiling every payload to bounded typed nodes and preselecting the
   native handler opcode
-- emit dispatch records directly while materializing fresh RAW events; if later normalization
-  changes callstream semantics, rebuild them inside the already-required final object audit scan
-  instead of scanning `callstream.jsonl` again only for dispatch
+- emit dispatch records directly while materializing RAW captures that cannot require asset-path
+  rewrites; captures with raw blobs are known to publish provisional paths, so their dispatch work
+  is deferred from the start and fused into the already-required final object audit scan
 - remove duplicate asset files by default, while preserving any alias path that
   is still referenced after rewriting
 - regenerate root `assets.json`
@@ -28,8 +28,8 @@ selection work; retrace must not reparse the multi-GB JSONL, scan function names
 handler, or preload every event. A stale or missing artifact is an
 explicit finalization error rather than a reason to fall back to a slower replay interpreter.
 
-Finalize performance is part of the format contract. Dispatch compilation uses newline-aligned
-chunks and `--jobs N`, publishes chunks in source order, and reports
+Finalize performance is part of the format contract. Dispatch compilation uses bounded ordered
+batches and `--jobs N`, publishes batches in source order directly behind one final header, and reports
 `compiled_dispatch_records`, `compiled_dispatch_bytes`, and `compiled_dispatch_ms`. The old D3D12
 replay model is not generated or retained by a normal finalize; use `--persist-replay-model-only`
 only for offline validation and differential analysis.
