@@ -307,32 +307,40 @@
   {
     for (const auto &pair : copy.descriptors) {
       const auto *source = descriptor_semantic_at(pair.src_descriptor, copy.create_sequence);
-      D3D12ReplayBackend::DescriptorSemanticState copied;
       if (source != nullptr) {
-        copied = *source;
+        auto copied = *source;
+        copied.create_sequence = copy.create_sequence;
+        copied.descriptor = pair.dst_descriptor;
+        D3D12ReplayBackend::DescriptorBinding dst_binding;
+        std::string binding_error;
+        if (backend_.resolve_descriptor_binding_at(
+                pair.dst_descriptor,
+                false,
+                copy.create_sequence,
+                dst_binding,
+                binding_error)) {
+          copied.binding = dst_binding;
+        }
+        event_ordered_live_samplers_.erase(pair.dst_descriptor);
+        event_ordered_live_descriptors_[pair.dst_descriptor] = std::move(copied);
       } else if (const auto *sampler =
                      event_ordered_sampler_semantic_at(pair.src_descriptor, copy.create_sequence)) {
-        copied.kind = "Sampler";
-        copied.create_sequence = sampler->create_sequence;
-        copied.descriptor = sampler->descriptor;
-        copied.binding = sampler->binding;
-      } else {
-        continue;
+        auto copied = *sampler;
+        copied.create_sequence = copy.create_sequence;
+        copied.descriptor = pair.dst_descriptor;
+        D3D12ReplayBackend::DescriptorBinding dst_binding;
+        std::string binding_error;
+        if (backend_.resolve_descriptor_binding_at(
+                pair.dst_descriptor,
+                false,
+                copy.create_sequence,
+                dst_binding,
+                binding_error)) {
+          copied.binding = dst_binding;
+        }
+        event_ordered_live_descriptors_.erase(pair.dst_descriptor);
+        event_ordered_live_samplers_[pair.dst_descriptor] = std::move(copied);
       }
-      copied.create_sequence = copy.create_sequence;
-      copied.descriptor = pair.dst_descriptor;
-      D3D12ReplayBackend::DescriptorBinding dst_binding;
-      std::string binding_error;
-      if (backend_.resolve_descriptor_binding_at(
-              pair.dst_descriptor,
-              false,
-              copy.create_sequence,
-              dst_binding,
-              binding_error)) {
-        copied.binding = dst_binding;
-      }
-      event_ordered_live_samplers_.erase(pair.dst_descriptor);
-      event_ordered_live_descriptors_[pair.dst_descriptor] = std::move(copied);
     }
   }
 
