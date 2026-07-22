@@ -14,12 +14,14 @@
 
 namespace apitrace::trace {
 
-inline constexpr std::uint32_t kCompiledDispatchVersion = 5;
+inline constexpr std::uint32_t kCompiledDispatchVersion = 6;
+inline constexpr std::uint32_t kCompiledDispatchHeaderBytes = 112;
 
 struct CompiledDispatchHeader {
   std::uint64_t source_callstream_bytes = 0;
   std::uint64_t record_count = 0;
   std::uint64_t encoded_record_bytes = 0;
+  std::string source_callstream_sha256;
 };
 
 // Encodes one already-normalized callstream event. The readable callstream remains the
@@ -45,6 +47,7 @@ bool write_compiled_dispatch_header(
 bool inspect_compiled_dispatch(
     const std::filesystem::path &path,
     std::uint64_t expected_source_callstream_bytes,
+    std::string_view expected_source_callstream_sha256,
     CompiledDispatchHeader &header,
     std::string &error);
 
@@ -56,6 +59,7 @@ using CompiledDispatchEventCallback = std::function<bool(const EventRecord &even
 bool for_each_compiled_dispatch_event(
     const std::filesystem::path &path,
     std::uint64_t expected_source_callstream_bytes,
+    std::string_view expected_source_callstream_sha256,
     const CompiledDispatchEventCallback &callback,
     CompiledDispatchHeader *header,
     std::string &error);
@@ -63,6 +67,7 @@ bool for_each_compiled_dispatch_event(
 bool load_compiled_dispatch_events(
     const std::filesystem::path &path,
     std::uint64_t expected_source_callstream_bytes,
+    std::string_view expected_source_callstream_sha256,
     std::vector<EventRecord> &events,
     CompiledDispatchHeader *header,
     std::string &error);

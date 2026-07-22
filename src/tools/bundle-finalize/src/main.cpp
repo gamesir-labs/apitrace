@@ -54,7 +54,6 @@ constexpr std::uint64_t kJsonlMinChunkSize = 64ull * 1024ull;
 // Each dispatch worker owns the source chunk, a parsed payload, and an encoded record. Keep the
 // source slice smaller than the generic JSONL chunk so parallel finalize memory stays bounded.
 constexpr std::uint64_t kCompiledDispatchChunkSize = 16ull * 1024ull * 1024ull;
-constexpr std::size_t kCompiledDispatchHeaderBytes = 48;
 constexpr std::size_t kOrderedDispatchBatchBytes = 4ull * 1024ull * 1024ull;
 constexpr std::size_t kOrderedDispatchBatchRecords = 16384;
 constexpr std::uint64_t kRawToFinalAssetFlushMinBytes = 256ull * 1024ull * 1024ull;
@@ -289,6 +288,7 @@ public:
 
   bool finish(
       std::uint64_t source_callstream_bytes,
+      std::string source_callstream_sha256,
       apitrace::trace::CompiledDispatchHeader &header,
       std::string &error)
   {
@@ -309,6 +309,7 @@ public:
     }
     stop_workers(false);
     header_.source_callstream_bytes = source_callstream_bytes;
+    header_.source_callstream_sha256 = std::move(source_callstream_sha256);
     if (header_.record_count == 0) {
       error = "ordered compiled dispatch stream contains no records";
       cancel_with_error(error);
@@ -332,7 +333,9 @@ public:
     }
     std::error_code size_error;
     const auto bytes = fs::file_size(output_path_, size_error);
-    if (size_error || bytes != kCompiledDispatchHeaderBytes + header_.encoded_record_bytes) {
+    if (size_error ||
+        bytes != apitrace::trace::kCompiledDispatchHeaderBytes +
+                     header_.encoded_record_bytes) {
       error = "ordered compiled dispatch stream has an invalid final size";
       cancel_with_error(error);
       return false;
@@ -1675,7 +1678,11 @@ bool expand_raw_batch_event(
 fs::path temporary_rewrite_path(const fs::path &path);
 bool replace_with_temporary_file(const fs::path &path, const fs::path &temporary);
 
-bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stats, ProgressReporter *progress)
+bool materialize_raw_capture_to_final_bundle(
+    const Options &options,
+    Stats &stats,
+    FileDigestCache &digest_cache,
+    ProgressReporter *progress)
 {
   if (options.dry_run) {
     std::cerr << "error: --dry-run cannot materialize a raw capture; "
@@ -2749,9 +2756,16 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
   }
   std::error_code callstream_size_error;
   const auto callstream_size = fs::file_size(final_callstream_path, callstream_size_error);
+  const auto callstream_digest = callstream_size_error
+                                     ? std::string()
+                                     : digest_cache.digest_file(final_callstream_path);
   if (callstream_size_error ||
+      callstream_digest.empty() ||
       !raw_dispatch_compiler->finish(
-          callstream_size, raw_dispatch_header, raw_dispatch_error)) {
+          callstream_size,
+          callstream_digest,
+          raw_dispatch_header,
+          raw_dispatch_error)) {
     std::cerr << "error: failed to finalize RAW compiled dispatch: "
               << (raw_dispatch_error.empty() ? callstream_size_error.message()
                                              : raw_dispatch_error)
@@ -2761,7 +2775,8 @@ bool materialize_raw_capture_to_final_bundle(const Options &options, Stats &stat
   std::error_code dispatch_size_error;
   const auto dispatch_size = fs::file_size(temporary_dispatch_path, dispatch_size_error);
   if (dispatch_size_error ||
-      dispatch_size != kCompiledDispatchHeaderBytes + raw_dispatch_header.encoded_record_bytes ||
+      dispatch_size != apitrace::trace::kCompiledDispatchHeaderBytes +
+                           raw_dispatch_header.encoded_record_bytes ||
       !replace_with_temporary_file(final_dispatch_path, temporary_dispatch_path)) {
     std::cerr << "error: failed to publish RAW compiled dispatch stream\n";
     std::error_code remove_error;
@@ -5008,16 +5023,23 @@ bool compile_d3d12_dispatch_stream(
 
   const auto dispatch_path = bundle_root / apitrace::trace::kD3D12CompiledDispatchName;
   if (reuse_raw_dispatch) {
+    const auto callstream_digest = digest_cache.digest_file(callstream_path);
     apitrace::trace::CompiledDispatchHeader existing_header;
     std::string inspect_error;
     if (!apitrace::trace::inspect_compiled_dispatch(
-            dispatch_path, callstream_bytes, existing_header, inspect_error)) {
+            dispatch_path,
+            callstream_bytes,
+            callstream_digest,
+            existing_header,
+            inspect_error)) {
       std::cerr << "error: RAW-generated dispatch is not current: " << inspect_error << "\n";
       return false;
     }
     std::error_code dispatch_size_error;
     const auto dispatch_size = fs::file_size(dispatch_path, dispatch_size_error);
-    if (dispatch_size_error || dispatch_size != 48 + existing_header.encoded_record_bytes) {
+    if (dispatch_size_error ||
+        dispatch_size != apitrace::trace::kCompiledDispatchHeaderBytes +
+                             existing_header.encoded_record_bytes) {
       std::cerr << "error: RAW-generated dispatch size is invalid\n";
       return false;
     }
@@ -5091,6 +5113,7 @@ bool compile_d3d12_dispatch_stream(
   bool failed = false;
   apitrace::trace::CompiledDispatchHeader header;
   header.source_callstream_bytes = callstream_bytes;
+  header.source_callstream_sha256 = digest_cache.digest_file(callstream_path);
   for (const auto &result : results) {
     if (!result.error.empty()) {
       std::cerr << "error: compiled dispatch chunk failed: " << result.error << "\n";
@@ -5144,7 +5167,9 @@ bool compile_d3d12_dispatch_stream(
   output.close();
   std::error_code output_size_error;
   const auto output_size = fs::file_size(temporary, output_size_error);
-  if (output_size_error || output_size != 48 + header.encoded_record_bytes ||
+  if (output_size_error ||
+      output_size != apitrace::trace::kCompiledDispatchHeaderBytes +
+                         header.encoded_record_bytes ||
       !replace_with_temporary_file(dispatch_path, temporary)) {
     std::cerr << "error: failed to publish compiled dispatch stream\n";
     return false;
@@ -10131,9 +10156,16 @@ bool repair_missing_d3d12_device_objects(
   if (compile_dispatch_during_scan) {
     std::error_code source_size_error;
     const auto source_callstream_bytes = fs::file_size(callstream_path, source_size_error);
+    const auto source_callstream_sha256 = source_size_error
+                                              ? std::string()
+                                              : digest_cache.digest_file(callstream_path);
     if (!scanned || !dispatch_error.empty() || source_size_error ||
+        source_callstream_sha256.empty() ||
         !dispatch_compiler->finish(
-            source_callstream_bytes, dispatch_header, dispatch_error)) {
+            source_callstream_bytes,
+            source_callstream_sha256,
+            dispatch_header,
+            dispatch_error)) {
       std::cerr << "error: failed to compile dispatch during final object scan: "
                 << (dispatch_error.empty() ? source_size_error.message() : dispatch_error) << "\n";
       dispatch_compiler->cancel();
@@ -10142,7 +10174,8 @@ bool repair_missing_d3d12_device_objects(
     std::error_code size_error;
     const auto dispatch_bytes = fs::file_size(temporary_dispatch_path, size_error);
     if (size_error ||
-        dispatch_bytes != kCompiledDispatchHeaderBytes + dispatch_header.encoded_record_bytes ||
+        dispatch_bytes != apitrace::trace::kCompiledDispatchHeaderBytes +
+                              dispatch_header.encoded_record_bytes ||
         !replace_with_temporary_file(dispatch_path, temporary_dispatch_path)) {
       std::cerr << "error: failed to publish final-scan dispatch stream\n";
       std::error_code remove_error;
@@ -10835,7 +10868,8 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
       if (!options.dry_run && can_reuse_materialized_raw_output(options.bundle_root)) {
         stats.raw_to_final_reused = true;
       } else {
-        raw_to_final_ok = materialize_raw_capture_to_final_bundle(options, stats, &progress);
+        raw_to_final_ok = materialize_raw_capture_to_final_bundle(
+            options, stats, digest_cache, &progress);
       }
     } else if (!has_materialized_bundle_header(options.bundle_root)) {
       std::cerr << "error: bundle has neither a committed raw capture nor a materialized callstream\n";
@@ -10857,12 +10891,23 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
         options.bundle_root / apitrace::trace::kD3D12CompiledDispatchName;
     std::error_code source_size_error;
     const auto source_bytes = fs::file_size(callstream_path, source_size_error);
+    auto prior_checksums = load_prior_checksums(options.bundle_root);
+    const auto prior_callstream =
+        prior_checksums.find(apitrace::trace::kCallstreamFileName);
+    const auto source_digest = prior_callstream == prior_checksums.end()
+                                   ? std::string()
+                                   : prior_callstream->second.first;
     apitrace::trace::CompiledDispatchHeader dispatch_header;
     std::string dispatch_error;
     bool dispatch_current =
         !source_size_error &&
+        !source_digest.empty() &&
         apitrace::trace::inspect_compiled_dispatch(
-            dispatch_path, source_bytes, dispatch_header, dispatch_error);
+            dispatch_path,
+            source_bytes,
+            source_digest,
+            dispatch_header,
+            dispatch_error);
     std::error_code time_error;
     if (dispatch_current) {
       const auto source_time = fs::last_write_time(callstream_path, time_error);
@@ -10875,7 +10920,9 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
           options.bundle_root / apitrace::trace::kChecksumsFileName,
           apitrace::trace::kD3D12CompiledDispatchName);
       dispatch_current =
-          recorded_size && *recorded_size == 48 + dispatch_header.encoded_record_bytes;
+          recorded_size &&
+          *recorded_size == apitrace::trace::kCompiledDispatchHeaderBytes +
+                                dispatch_header.encoded_record_bytes;
     }
 
     bool has_replay_model = false;
@@ -10895,7 +10942,9 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
     // no-op finalize invocation.
     if (dispatch_current && !has_replay_model) {
       stats.compiled_dispatch_records = dispatch_header.record_count;
-      stats.compiled_dispatch_bytes = 48 + dispatch_header.encoded_record_bytes;
+      stats.compiled_dispatch_bytes =
+          apitrace::trace::kCompiledDispatchHeaderBytes +
+          dispatch_header.encoded_record_bytes;
       const auto elapsed = std::chrono::duration<double>(
           std::chrono::steady_clock::now() - started).count();
       std::cout << "bundle-finalize: raw_to_final_reused=true finalize_fast_path=verified"
@@ -10907,7 +10956,6 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
       return 0;
     }
 
-    auto prior_checksums = load_prior_checksums(options.bundle_root);
     std::unordered_map<std::string, std::pair<std::string, std::uint64_t>> dispatch_digest;
     if (!dispatch_current) {
       progress.begin_stage(1, 1, "compile_d3d12_dispatch");
@@ -10927,7 +10975,9 @@ int apitrace::tools::run_bundle_finalize(int argc, char **argv){
       }
     } else {
       stats.compiled_dispatch_records = dispatch_header.record_count;
-      stats.compiled_dispatch_bytes = 48 + dispatch_header.encoded_record_bytes;
+      stats.compiled_dispatch_bytes =
+          apitrace::trace::kCompiledDispatchHeaderBytes +
+          dispatch_header.encoded_record_bytes;
     }
 
     for (const auto *relative : {

@@ -16,8 +16,8 @@ namespace {
 using json = nlohmann::json;
 
 constexpr std::array<std::uint8_t, 8> kMagic = {
-    'A', 'P', 'I', 'D', 'S', 'P', '5', '\0'};
-constexpr std::uint32_t kHeaderBytes = 48;
+    'A', 'P', 'I', 'D', 'S', 'P', '6', '\0'};
+constexpr std::uint32_t kHeaderBytes = kCompiledDispatchHeaderBytes;
 constexpr std::uint32_t kRecordFixedBytes = 72;
 constexpr std::uint32_t kCompiledNodeMaxDepth = 64;
 
@@ -32,6 +32,59 @@ enum class CompiledNodeTag : std::uint8_t {
   Array = 7,
   Object = 8,
 };
+
+std::uint64_t checksum64_mix(std::uint64_t value)
+{
+  value ^= value >> 30u;
+  value *= 0xbf58476d1ce4e5b9ull;
+  value ^= value >> 27u;
+  value *= 0x94d049bb133111ebull;
+  return value ^ (value >> 31u);
+}
+
+std::uint64_t checksum64_update(
+    std::uint64_t hash,
+    const std::uint8_t *data,
+    std::size_t size)
+{
+  while (size >= sizeof(std::uint64_t)) {
+    std::uint64_t word = 0;
+    std::memcpy(&word, data, sizeof(word));
+    hash ^= checksum64_mix(word + 0x9e3779b97f4a7c15ull);
+    hash = (hash << 27u) | (hash >> 37u);
+    hash = hash * 5u + 0x52dce729ull;
+    data += sizeof(word);
+    size -= sizeof(word);
+  }
+  if (size != 0) {
+    std::uint64_t tail = 0;
+    std::memcpy(&tail, data, size);
+    hash ^= checksum64_mix(tail ^ (static_cast<std::uint64_t>(size) << 56u));
+  }
+  return hash;
+}
+
+std::uint64_t record_checksum64(
+    const std::uint8_t *size_bytes,
+    std::size_t size_byte_count,
+    const std::uint8_t *body,
+    std::size_t body_size)
+{
+  auto hash = checksum64_update(
+      0x243f6a8885a308d3ull ^ static_cast<std::uint64_t>(body_size),
+      size_bytes,
+      size_byte_count);
+  hash = checksum64_update(hash, body, body_size);
+  return checksum64_mix(hash ^ 0x13198a2e03707344ull);
+}
+
+bool valid_sha256(std::string_view digest)
+{
+  return digest.size() == 64 &&
+         std::all_of(digest.begin(), digest.end(), [](char ch) {
+           return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+         });
+}
 
 bool contains(std::string_view text, std::string_view needle)
 {
@@ -780,6 +833,7 @@ bool read_compiled_dispatch_header(
     std::ifstream &input,
     const std::filesystem::path &path,
     std::uint64_t expected_source_callstream_bytes,
+    std::string_view expected_source_callstream_sha256,
     CompiledDispatchHeader &header,
     std::string &error)
 {
@@ -802,8 +856,18 @@ bool read_compiled_dispatch_header(
       !read_le(header_cursor, header_end, header_bytes) ||
       !read_le(header_cursor, header_end, header.source_callstream_bytes) ||
       !read_le(header_cursor, header_end, header.record_count) ||
-      !read_le(header_cursor, header_end, header.encoded_record_bytes) ||
-      !read_le(header_cursor, header_end, reserved) ||
+      !read_le(header_cursor, header_end, header.encoded_record_bytes)) {
+    error = "compiled dispatch stream has a malformed header";
+    return false;
+  }
+  if (static_cast<std::size_t>(header_end - header_cursor) < 64) {
+    error = "compiled dispatch stream has a malformed source identity";
+    return false;
+  }
+  header.source_callstream_sha256.assign(
+      reinterpret_cast<const char *>(header_cursor), 64);
+  header_cursor += 64;
+  if (!read_le(header_cursor, header_end, reserved) ||
       header_cursor != header_end) {
     error = "compiled dispatch stream has a malformed header";
     return false;
@@ -820,6 +884,12 @@ bool read_compiled_dispatch_header(
     error = "compiled dispatch stream source size does not match callstream.jsonl";
     return false;
   }
+  if (!valid_sha256(expected_source_callstream_sha256) ||
+      !valid_sha256(header.source_callstream_sha256) ||
+      header.source_callstream_sha256 != expected_source_callstream_sha256) {
+    error = "compiled dispatch stream source checksum does not match callstream.jsonl";
+    return false;
+  }
   std::error_code size_error;
   const auto file_size = std::filesystem::file_size(path, size_error);
   if (size_error || file_size != kHeaderBytes + header.encoded_record_bytes) {
@@ -827,7 +897,8 @@ bool read_compiled_dispatch_header(
     return false;
   }
   if (header.record_count >
-      header.encoded_record_bytes / (sizeof(std::uint32_t) + kRecordFixedBytes)) {
+      header.encoded_record_bytes /
+          (sizeof(std::uint32_t) + kRecordFixedBytes + sizeof(std::uint64_t))) {
     error = "compiled dispatch stream record count is impossible for its byte size";
     return false;
   }
@@ -962,7 +1033,11 @@ bool encode_compiled_dispatch_event(
     append_le(encoded, static_cast<std::uint64_t>(ref));
   }
   encoded.insert(encoded.end(), compiled_payload.begin(), compiled_payload.end());
-  return encoded.size() == sizeof(std::uint32_t) + body_size;
+  const auto checksum = record_checksum64(
+      encoded.data(), sizeof(std::uint32_t),
+      encoded.data() + sizeof(std::uint32_t), body_size);
+  append_le(encoded, checksum);
+  return encoded.size() == sizeof(std::uint32_t) + body_size + sizeof(std::uint64_t);
 }
 
 bool write_compiled_dispatch_header(
@@ -971,13 +1046,24 @@ bool write_compiled_dispatch_header(
     std::string &error)
 {
   error.clear();
+  const auto source_digest = header.source_callstream_sha256.empty()
+                                 ? std::string(64, '0')
+                                 : header.source_callstream_sha256;
+  if (!valid_sha256(source_digest)) {
+    error = "compiled dispatch source checksum is not lowercase sha256";
+    return false;
+  }
   output.write(reinterpret_cast<const char *>(kMagic.data()), kMagic.size());
   if (!write_le(output, kCompiledDispatchVersion) ||
       !write_le(output, kHeaderBytes) ||
       !write_le(output, header.source_callstream_bytes) ||
       !write_le(output, header.record_count) ||
-      !write_le(output, header.encoded_record_bytes) ||
-      !write_le(output, std::uint64_t{0})) {
+      !write_le(output, header.encoded_record_bytes)) {
+    error = "failed to write compiled dispatch header";
+    return false;
+  }
+  output.write(source_digest.data(), static_cast<std::streamsize>(source_digest.size()));
+  if (!output || !write_le(output, std::uint64_t{0})) {
     error = "failed to write compiled dispatch header";
     return false;
   }
@@ -987,6 +1073,7 @@ bool write_compiled_dispatch_header(
 bool inspect_compiled_dispatch(
     const std::filesystem::path &path,
     std::uint64_t expected_source_callstream_bytes,
+    std::string_view expected_source_callstream_sha256,
     CompiledDispatchHeader &header,
     std::string &error)
 {
@@ -997,12 +1084,14 @@ bool inspect_compiled_dispatch(
     return false;
   }
   return read_compiled_dispatch_header(
-      input, path, expected_source_callstream_bytes, header, error);
+      input, path, expected_source_callstream_bytes,
+      expected_source_callstream_sha256, header, error);
 }
 
 bool for_each_compiled_dispatch_event(
     const std::filesystem::path &path,
     std::uint64_t expected_source_callstream_bytes,
+    std::string_view expected_source_callstream_sha256,
     const CompiledDispatchEventCallback &callback,
     CompiledDispatchHeader *header_out,
     std::string &error)
@@ -1022,7 +1111,8 @@ bool for_each_compiled_dispatch_event(
   }
   CompiledDispatchHeader header;
   if (!read_compiled_dispatch_header(
-          input, path, expected_source_callstream_bytes, header, error)) {
+          input, path, expected_source_callstream_bytes,
+          expected_source_callstream_sha256, header, error)) {
     return false;
   }
 
@@ -1047,6 +1137,21 @@ bool for_each_compiled_dispatch_event(
     record.resize(body_size);
     if (!read_exact(input, record.data(), record.size())) {
       error = "compiled dispatch stream has a truncated record " + std::to_string(index);
+      return false;
+    }
+    std::array<std::uint8_t, 8> raw_checksum{};
+    if (!read_exact(input, raw_checksum.data(), raw_checksum.size())) {
+      error = "compiled dispatch stream has a truncated record checksum";
+      return false;
+    }
+    const std::uint8_t *checksum_cursor = raw_checksum.data();
+    const std::uint8_t *checksum_end = checksum_cursor + raw_checksum.size();
+    std::uint64_t stored_checksum = 0;
+    if (!read_le(checksum_cursor, checksum_end, stored_checksum) ||
+        stored_checksum != record_checksum64(
+            raw_size.data(), raw_size.size(), record.data(), record.size())) {
+      error = "compiled dispatch stream record " + std::to_string(index) +
+              " failed checksum validation";
       return false;
     }
 
@@ -1183,6 +1288,7 @@ bool for_each_compiled_dispatch_event(
 bool load_compiled_dispatch_events(
     const std::filesystem::path &path,
     std::uint64_t expected_source_callstream_bytes,
+    std::string_view expected_source_callstream_sha256,
     std::vector<EventRecord> &events,
     CompiledDispatchHeader *header,
     std::string &error)
@@ -1190,13 +1296,15 @@ bool load_compiled_dispatch_events(
   events.clear();
   CompiledDispatchHeader inspected;
   if (!inspect_compiled_dispatch(
-          path, expected_source_callstream_bytes, inspected, error)) {
+          path, expected_source_callstream_bytes,
+          expected_source_callstream_sha256, inspected, error)) {
     return false;
   }
   events.reserve(static_cast<std::size_t>(inspected.record_count));
   return for_each_compiled_dispatch_event(
       path,
       expected_source_callstream_bytes,
+      expected_source_callstream_sha256,
       [&](const EventRecord &event) {
         events.push_back(event);
         return true;

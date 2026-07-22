@@ -57,6 +57,7 @@ bool validate_compiled_tile_mapping_codec(const std::filesystem::path &path)
   }
   apitrace::trace::CompiledDispatchHeader header;
   header.source_callstream_bytes = 123;
+  header.source_callstream_sha256 = std::string(64, '1');
   header.record_count = 1;
   header.encoded_record_bytes = encoded.size();
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -74,6 +75,7 @@ bool validate_compiled_tile_mapping_codec(const std::filesystem::path &path)
   const bool decoded = apitrace::trace::for_each_compiled_dispatch_event(
       path,
       header.source_callstream_bytes,
+      header.source_callstream_sha256,
       [&](const apitrace::trace::EventRecord &event) {
         visited = true;
         const auto &payload = event.compiled_tile_mapping;
@@ -120,6 +122,7 @@ bool validate_compiled_resource_data_update_codec(const std::filesystem::path &p
   }
   apitrace::trace::CompiledDispatchHeader header;
   header.source_callstream_bytes = 456;
+  header.source_callstream_sha256 = std::string(64, '2');
   header.record_count = 1;
   header.encoded_record_bytes = encoded.size();
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -137,6 +140,7 @@ bool validate_compiled_resource_data_update_codec(const std::filesystem::path &p
   const bool decoded = apitrace::trace::for_each_compiled_dispatch_event(
       path,
       header.source_callstream_bytes,
+      header.source_callstream_sha256,
       [&](const apitrace::trace::EventRecord &event) {
         visited = true;
         const auto &payload = event.compiled_resource_data_update;
@@ -180,6 +184,7 @@ bool validate_compiled_node_codec(const std::filesystem::path &path)
   }
   apitrace::trace::CompiledDispatchHeader header;
   header.source_callstream_bytes = 789;
+  header.source_callstream_sha256 = std::string(64, '3');
   header.record_count = 1;
   header.encoded_record_bytes = encoded.size();
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -197,6 +202,7 @@ bool validate_compiled_node_codec(const std::filesystem::path &path)
   const bool decoded = apitrace::trace::for_each_compiled_dispatch_event(
       path,
       header.source_callstream_bytes,
+      header.source_callstream_sha256,
       [&](const apitrace::trace::EventRecord &event) {
         visited = true;
         json payload;
@@ -220,8 +226,43 @@ bool validate_compiled_node_codec(const std::filesystem::path &path)
   if (!decoded) {
     std::cerr << error << "\n";
   }
+  bool mismatch_visited = false;
+  std::string mismatch_error;
+  const bool accepted_wrong_source = apitrace::trace::for_each_compiled_dispatch_event(
+      path,
+      header.source_callstream_bytes,
+      std::string(64, '4'),
+      [&](const apitrace::trace::EventRecord &) {
+        mismatch_visited = true;
+        return true;
+      },
+      nullptr,
+      mismatch_error);
+
+  std::fstream corrupt(path, std::ios::binary | std::ios::in | std::ios::out);
+  corrupt.seekg(-9, std::ios::end);
+  char payload_byte = 0;
+  corrupt.read(&payload_byte, 1);
+  payload_byte ^= 0x01;
+  corrupt.seekp(-9, std::ios::end);
+  corrupt.write(&payload_byte, 1);
+  corrupt.close();
+  bool corrupt_visited = false;
+  std::string corrupt_error;
+  const bool accepted_corrupt_record = apitrace::trace::for_each_compiled_dispatch_event(
+      path,
+      header.source_callstream_bytes,
+      header.source_callstream_sha256,
+      [&](const apitrace::trace::EventRecord &) {
+        corrupt_visited = true;
+        return true;
+      },
+      nullptr,
+      corrupt_error);
   return expect(
-      decoded && visited && payload_ok && rejected_malformed,
+      decoded && visited && payload_ok && rejected_malformed &&
+          !accepted_wrong_source && !mismatch_visited && !mismatch_error.empty() &&
+          !accepted_corrupt_record && !corrupt_visited && !corrupt_error.empty(),
       "typed-node dispatch roundtrip or malformed-input rejection failed");
 }
 
@@ -671,6 +712,7 @@ bool normalized_compiled_dispatch_events(
   const auto streamed = apitrace::trace::for_each_compiled_dispatch_event(
       bundle / apitrace::trace::kD3D12CompiledDispatchName,
       callstream_bytes,
+      apitrace::trace::content_hash_file(callstream_path),
       [&](const apitrace::trace::EventRecord &event) {
         if (event.payload_encoding != apitrace::trace::EventPayloadEncoding::CompiledNodes) {
           error = "streaming equivalence dispatch unexpectedly used a specialized payload";

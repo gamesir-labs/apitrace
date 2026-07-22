@@ -148,8 +148,10 @@ payload：通用 route 把 null、布尔、无符号/有符号整数、浮点、
 `UpdateTileMappings` 的 region/range 数组及 `D3D12ResourceDataUpdate` 的
 resource/range/asset locator 使用更紧凑的专用结构。生产 dispatch 不再包含 MessagePack 或 JSON
 payload。不允许合并、跳过、
-重排或提前执行 API 调用。文件头同时记录源
-`callstream.jsonl` 字节数、记录数和编码字节数，reader 在使用前校验版本、源大小和 checksum。
+重排或提前执行 API 调用。v6 文件头同时记录源 `callstream.jsonl` 的字节数、SHA-256、记录数和
+编码字节数；reader 在使用前把源 SHA-256 与 `checksums.json` 中的权威记录比较。每条 dispatch
+record 还带有 64-bit 流式内容校验值，reader 必须先校验该记录再调用 native handler，因此单条 payload 位翻转不会
+在执行后才被发现。reader 读入单条 record 后先校验再解码，不会为了完整性检查预扫描数 GB 的 dispatch 文件。
 
 `callstream.jsonl` 仍然是调用语义权威来源。`d3d12-dispatch.bin` 把顶层 JSON 解析、payload
 规范化、记录边界检查、route-specific 字段验证和 native handler 分类前移到 finalize，使 native retrace 可以单记录流式

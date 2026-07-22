@@ -123,9 +123,9 @@ dispatch 中不允许 MessagePack 或 JSON payload。
 finalize 也是交付路径的一部分，必须同时约束一次性编译与重复运行成本。它负责完整解析和验证
 `callstream.jsonl`、`checksums.json`、`assets.json`、`objects.json` 及资产闭包，并把 retrace 所需的
 路由、command kind、直接资产路径和规范化 payload 编译进 dispatch 文件。dispatch 与源
-callstream 未变化时，重复 finalize 只校验文件头和源大小后复用结果，不再解析或重写大型 JSON。
-native compiled-dispatch retrace 打开 bundle 时只读取 bundle header 和 dispatch header，不加载 checksums、assets
-或 objects 索引；资产仍在实际消费点按 finalize 已验证的相对路径打开，并保留文件存在、长度和读取
+callstream 未变化时，重复 finalize 校验文件头、源大小及文件头绑定的源 SHA-256 后复用结果，不再解析或重写大型 JSON。
+native compiled-dispatch retrace 打开 bundle 时读取 bundle header、dispatch header，并从 checksums 中定向流式读取
+`callstream.jsonl` 的 SHA-256；它不构建 checksums、assets 或 objects 全量索引。资产仍在实际消费点按 finalize 已验证的相对路径打开，并保留文件存在、长度和读取
 结果检查。新增需要全局索引或前向扫描的语义必须移到 finalize，不能把预处理重新塞回 retrace。
 
 性能验收必须分别记录 finalize wall time / peak RSS，以及 retrace open time / peak RSS、逐事件 decode
@@ -149,7 +149,7 @@ callstream 编译扫描。retrace 必须分别输出 reader
 decode、semantic state、content sync 和 native dispatch 时间；语义状态阶段不得解析 MessagePack/JSON。
 
 `callstream.jsonl` 仍然是权威语义，compiled dispatch 只是可重建的执行索引；两者的记录数、顺序和
-payload 语义必须一一对应。dispatch 文件缺失、源大小不匹配、版本不支持或解码失败时，native retrace
+payload 语义必须一一对应。dispatch 文件缺失、源大小或 SHA-256 不匹配、版本不支持、记录校验失败或解码失败时，native retrace
 必须明确失败并提示重新 finalize，不能静默回到 JSON 解释路径。持久化 replay model 只用于
 validate-only、离线语义检查和差异分析，不是默认 native replay 的执行输入。遇到尚未覆盖的 native
 D3D12 语义时也必须在原事件处明确失败，不能回退到持久化模型或 present-frame playback。

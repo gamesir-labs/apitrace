@@ -991,6 +991,53 @@ bool parse_checksums(
   return true;
 }
 
+bool read_checksum_record(
+    const std::filesystem::path &checksums_path,
+    std::string_view relative_path,
+    ChecksumRecord &record,
+    std::string &error)
+{
+  std::ifstream input(checksums_path, std::ios::binary);
+  if (!input.is_open()) {
+    error = "missing required file: " + file_label(checksums_path);
+    return false;
+  }
+  const std::string key = "\"" + std::string(relative_path) + "\"";
+  std::string line;
+  while (std::getline(input, line)) {
+    const auto key_at = line.find(key);
+    if (key_at == std::string::npos) {
+      continue;
+    }
+    const auto value_begin = line.find("\"sha256:", key_at + key.size());
+    const auto value_end = value_begin == std::string::npos
+                               ? std::string::npos
+                               : line.find('"', value_begin + 1);
+    if (value_begin == std::string::npos || value_end == std::string::npos) {
+      break;
+    }
+    const auto encoded = line.substr(value_begin + 1, value_end - value_begin - 1);
+    const auto digest_end = encoded.find(':', 7);
+    if (digest_end == std::string::npos || digest_end != 71) {
+      break;
+    }
+    record = ChecksumRecord{};
+    record.relative_path = std::string(relative_path);
+    record.algorithm = "sha256";
+    record.digest = encoded.substr(7, 64);
+    try {
+      record.byte_size = std::stoull(encoded.substr(digest_end + 1));
+      record.has_byte_size = true;
+    } catch (const std::exception &) {
+      break;
+    }
+    return true;
+  }
+  error = file_label(checksums_path) + ": missing or malformed checksum entry for " +
+          std::string(relative_path);
+  return false;
+}
+
 bool parse_objects(
     const std::filesystem::path &objects_path,
     std::vector<ObjectRecord> &objects,
@@ -1502,6 +1549,7 @@ struct TraceBundleReader::Impl {
   std::string last_error;
   std::filesystem::path compiled_dispatch_path;
   std::uint64_t compiled_dispatch_source_bytes = 0;
+  std::string compiled_dispatch_source_sha256;
   bool has_asset_index = false;
   bool prefix_limited = false;
   bool compiled_dispatch_enabled = false;
@@ -1586,9 +1634,18 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
           return false;
         }
         CompiledDispatchHeader dispatch_header;
+        ChecksumRecord callstream_checksum;
+        if (!read_checksum_record(
+                impl_->layout.checksums_path,
+                kCallstreamFileName,
+                callstream_checksum,
+                impl_->last_error)) {
+          return false;
+        }
         if (!inspect_compiled_dispatch(
                 dispatch_path,
                 source_callstream_bytes,
+                callstream_checksum.digest,
                 dispatch_header,
                 impl_->last_error)) {
           impl_->last_error += "; run bundle-finalize to rebuild " +
@@ -1597,6 +1654,7 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
         }
         impl_->compiled_dispatch_path = dispatch_path;
         impl_->compiled_dispatch_source_bytes = source_callstream_bytes;
+        impl_->compiled_dispatch_source_sha256 = callstream_checksum.digest;
         impl_->compiled_dispatch_enabled = true;
       }
       impl_->prefix_limited =
@@ -2005,6 +2063,12 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
       return false;
     }
     CompiledDispatchHeader dispatch_header;
+    const auto callstream_checksum =
+        checksum_lookup.find(std::string(kCallstreamFileName));
+    if (callstream_checksum == checksum_lookup.end()) {
+      impl_->last_error = "checksums.json: missing checksum entry for callstream.jsonl";
+      return false;
+    }
     {
       ScopedDurationAccumulator dispatch_load_timer(
           parse_callstream_total_duration,
@@ -2012,6 +2076,7 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
       if (!inspect_compiled_dispatch(
               dispatch_path,
               source_callstream_bytes,
+              callstream_checksum->second.digest,
               dispatch_header,
               impl_->last_error)) {
         impl_->last_error += "; run bundle-finalize to rebuild " +
@@ -2021,6 +2086,7 @@ bool TraceBundleReader::open(const std::filesystem::path &bundle_root, const Ope
     }
     impl_->compiled_dispatch_path = dispatch_path;
     impl_->compiled_dispatch_source_bytes = source_callstream_bytes;
+    impl_->compiled_dispatch_source_sha256 = callstream_checksum->second.digest;
     impl_->compiled_dispatch_enabled = true;
   }
 
@@ -2205,6 +2271,7 @@ bool TraceBundleReader::for_each_event(
     return for_each_compiled_dispatch_event(
         impl_->compiled_dispatch_path,
         impl_->compiled_dispatch_source_bytes,
+        impl_->compiled_dispatch_source_sha256,
         callback,
         nullptr,
         error);
